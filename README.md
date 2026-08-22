@@ -121,9 +121,25 @@ node scripts/uninstall.mjs      # 卸载
 
 ```bash
 pnpm install
-pnpm smoke        # 12 项冒烟测试
+pnpm smoke        # 14 项冒烟测试
+pnpm test:plugin  # 插件模拟运行（假 ctx 拉起/回收网关）
 node scripts/probe-ws.mjs [端口]   # 对运行中的网关+DSH 做 WS 直通探针
 ```
+
+### 部署 VPS 前的本地全链路自测（无需 VPS）
+
+在同一台机器上把 frps + frpc + 网关整条链路跑起来，验证除真实跨网外的所有环节：
+
+1. `~/.dsh-remote/vendor/frp/` 放好 `frpc.exe` 与 `frps.exe`（同一 release）
+2. 写一个本地 frps 配置（模拟 VPS）：`bindPort=17000`、与 `state/secrets.json`
+   相同的 `auth.token`、`allowPorts=[{start=18448,end=18448}]`
+3. `config.json` 里 `frp.serverAddr="127.0.0.1"`、`serverPort=17000`、`remotePort=18448`
+4. 启动 frps → 启动网关（自动拉起 frpc 并注册代理）
+5. 访问 `https://127.0.0.1:18448` 应看到配对页；`node scripts/probe-ws.mjs 18448`
+   应输出两条 `101 Switching Protocols`
+
+全绿即代表：隧道握手、代理注册、认证门、配对、反代、WS 直通全部工作，
+VPS 上唯一要验证的只剩网络可达性。
 
 ## 路线图
 

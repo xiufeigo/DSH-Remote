@@ -115,5 +115,11 @@ node packages/gateway/src/cli.ts doctor    # 各环节逐项检查
 | doctor 显示控制端口不可达 | 安全组没放行 7000；frps 没起来（`systemctl status`） |
 | 控制通但入口不通 | PC 侧 frpc 没跑起来（看 `[frpc]` 日志）；token 不一致 |
 | 入口通但配对页打不开 | 网关没监听（`netstat -ano \| findstr 18443`）；upstreamPort 填错不影响配对页 |
-| 配对页能开、登录后 502 | `upstreamPort` 不是当前 DSH GUI 端口；桌面端重启后端口可能变化 |
+| 配对页能开、登录后 502 | `upstreamPort` 不是当前 DSH GUI 端口；网关启动时会自动探测跟随 |
 | frpc 反复重启 | 网关日志里找 `[frpc]` 报错：多为 token 不匹配或 allowPorts 未覆盖 remotePort |
+
+## 7. 不想先动 VPS？本地先把整条链路验掉
+
+见 README「部署 VPS 前的本地全链路自测」——在本机同时跑 frps+frpc+网关，
+除真实跨网外所有环节（隧道握手/代理注册/认证/配对/WS 直通）都可提前验证。
+本项目交付时已用此方法完成全链路验证。
