@@ -116,7 +116,9 @@ async function cmdStart(store: Store, flags: Map<string, string | boolean>): Pro
 	});
 	await server.start();
 
-	const entry = entryUrl(config, server.actualPort ?? config.listenPort);
+	const entry = config.frp.enabled && typeof config.frp.serverAddr === "string"
+		? `https://${config.frp.serverAddr}:${String(config.frp.remotePort)}/`
+		: `https://${config.listenHost}:${String(server.actualPort ?? config.listenPort)}/`;
 	console.log(`[dsh-remote] 入口地址：${entry}`);
 	console.log(`[dsh-remote] 上游：http://127.0.0.1:${String(config.upstreamPort)}（DSH Web GUI）`);
 	if (!config.frp.enabled) console.log("[dsh-remote] 提示：config.json 里 frp.enabled=true 后将自动托管 frpc");

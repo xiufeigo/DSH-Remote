@@ -12,6 +12,8 @@
     "smoke": "node scripts/smoke.mjs",
     "test:plugin": "node scripts/test-plugin-sim.mjs",
     "test:routes": "node --test scripts/test-plugin-routes.mjs",
+    "test:panel": "node scripts/test-panel-e2e.mjs",
+    "test:client": "node scripts/test-client-bundle.mjs",
     "start": "node packages/gateway/src/cli.ts start"
   }
 }
