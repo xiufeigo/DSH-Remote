@@ -1,0 +1,15 @@
+{
+  "name": "dsh-remote",
+  "private": true,
+  "version": "0.1.0",
+  "description": "DSH Remote Control —— 让手机随时随地安全访问本机 DSH Desktop Web GUI",
+  "license": "MIT",
+  "privateWorkspace": true,
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "smoke": "node scripts/smoke.mjs",
+    "start": "node packages/gateway/src/cli.ts start"
+  }
+}

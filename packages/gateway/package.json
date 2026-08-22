@@ -1,0 +1,26 @@
+{
+  "name": "@dsh-remote/gateway",
+  "version": "0.1.0",
+  "description": "DSH Remote 网关：设备配对认证 + HTTP/WS 反向代理 + frp 传输适配器",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "dsh-remote": "./src/cli.ts"
+  },
+  "scripts": {
+    "start": "node src/cli.ts start",
+    "doctor": "node src/cli.ts doctor",
+    "test": "node --test ../../scripts/"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "selfsigned": "^2.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/qrcode": "^1.5.5"
+  }
+}

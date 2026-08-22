@@ -1,0 +1,298 @@
+#!/usr/bin/env node
+/**
+ * DSH-Remote 网关冒烟测试（node:test，零外部依赖）。
+ *
+ * 覆盖：
+ *   1. 未认证导航 302 → 配对页；未认证 XHR/API 401
+ *   2. 内部资源：health / pair 页 / manifest / icon
+ *   3. 一次性配对码：错误码拒绝 → 正确码发 Cookie
+ *   4. 认证后反代：上游收到改写后的 Host/Origin，设备 Cookie 不外泄
+ *   5. HTML 注入 PWA 标记
+ *   6. WebSocket 升级：无 Cookie 拒绝；有 Cookie 字节级双向直通
+ *   7. RateLimiter 单元行为 + 连续配对失败锁定
+ */
+
+import assert from "node:assert/strict";
+import https from "node:https";
+import http from "node:http";
+import tls from "node:tls";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test, before, after } from "node:test";
+
+// ---------- 测试夹具状态 ----------
+
+const fixture = {
+	homeDir: "",
+	upstream: /** @type {http.Server | undefined} */ (undefined),
+	upstreamPort: 0,
+	gateway: undefined,
+	gatewayPort: 0,
+	deviceCookie: "",
+	seenByUpstream: /** @type {Record<string, string | undefined>} */ ({}),
+};
+
+/** 假上游：记录寻址头/Cookie 泄露；GET / 返回带 __dsh_boot__ 标记的 HTML；upgrade 原样回声。 */
+async function startFakeUpstream() {
+	const server = http.createServer((req, res) => {
+		fixture.seenByUpstream.host = req.headers.host;
+		fixture.seenByUpstream.origin = req.headers.origin;
+		fixture.seenByUpstream.cookie = req.headers.cookie;
+		res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+		res.end("<!doctype html><html><head><title>fake dsh</title></head><body>__dsh_boot__ ok</body></html>");
+	});
+	server.on("upgrade", (req, socket, head) => {
+		fixture.seenByUpstream.upgradeHost = req.headers.host;
+		socket.write("HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\r\n");
+		if (head.length > 0) socket.write(head);
+		socket.pipe(socket); // 原始字节回声：只验证管道保真，不实现 WS 协议
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	fixture.upstream = server;
+	fixture.upstreamPort = server.address().port;
+	return server;
+}
+
+/** 用自签证书场景下的 https.request 封装（rejectUnauthorized:false）。 */
+function callGateway(pathname, { method = "GET", headers = {}, body } = {}) {
+	return new Promise((resolve, reject) => {
+		const req = https.request(
+			{
+				host: "127.0.0.1",
+				port: fixture.gatewayPort,
+				path: pathname,
+				method,
+				headers,
+				rejectUnauthorized: false,
+			},
+			(res) => {
+				const chunks = [];
+				res.on("data", (chunk) => chunks.push(chunk));
+				res.on("end", () => resolve({
+					status: res.statusCode,
+					headers: res.headers,
+					body: Buffer.concat(chunks).toString("utf8"),
+					setCookie: res.headers["set-cookie"]?.join("; ") ?? "",
+				}));
+			},
+		);
+		req.on("error", reject);
+		if (body !== undefined) req.write(body);
+		req.end();
+	});
+}
+
+before(async () => {
+	fixture.homeDir = await mkdtemp(join(tmpdir(), "dsh-remote-smoke-"));
+	process.env.DSH_REMOTE_HOME = fixture.homeDir;
+
+	await startFakeUpstream();
+
+	const [{ Store }, { DEFAULT_CONFIG }, { GatewayServer }] = await Promise.all([
+		import("../packages/gateway/src/store.ts"),
+		import("../packages/gateway/src/config.ts"),
+		import("../packages/gateway/src/server.ts"),
+	]);
+	const store = await Store.open(fixture.homeDir);
+	const config = {
+		...DEFAULT_CONFIG,
+		upstreamPort: fixture.upstreamPort,
+		listenPort: 0, // OS 分配
+		pairingFailLockThreshold: 3,
+	};
+	const gateway = new GatewayServer({ store, config, log: () => {} });
+	await gateway.start();
+	fixture.gateway = gateway;
+	fixture.gatewayPort = gateway.actualPort;
+});
+
+after(async () => {
+	await fixture.gateway?.stop();
+	await new Promise((resolve) => fixture.upstream?.close(resolve));
+	await rm(fixture.homeDir, { recursive: true, force: true });
+});
+
+// ---------- 1. 认证门 ----------
+
+test("未认证导航重定向到配对页", async () => {
+	// 浏览器导航必带 Accept: text/html
+	const response = await callGateway("/", { headers: { accept: "text/html,application/xhtml+xml" } });
+	assert.equal(response.status, 302);
+	assert.match(response.headers.location ?? "", /^\/__dsh_remote__\/pair/);
+});
+
+test("未认证 API/XHR 返回 401 JSON", async () => {
+	const response = await callGateway("/api/session/list", { headers: { accept: "application/json" } });
+	assert.equal(response.status, 401);
+	assert.match(response.body, /unpaired-device/);
+});
+
+// ---------- 2. 内部资源 ----------
+
+test("health 探针可用", async () => {
+	const response = await callGateway("/__dsh_remote__/health");
+	assert.equal(response.status, 200);
+	assert.equal(JSON.parse(response.body).ok, true);
+});
+
+test("manifest 与图标可获取", async () => {
+	const manifest = await callGateway("/__dsh_remote__/manifest.webmanifest");
+	assert.equal(manifest.status, 200);
+	assert.equal(JSON.parse(manifest.body).name, "DSH Remote");
+	const icon = await callGateway("/__dsh_remote__/icon.svg");
+	assert.equal(icon.status, 200);
+	assert.match(icon.body, /<svg/);
+});
+
+test("管理端点拒绝非回环来源（模拟头不可绕过，仅回环判定）——本机可访问", async () => {
+	const status = await callGateway("/__dsh_remote__/admin/status");
+	assert.equal(status.status, 200);
+	assert.match(status.body, /certFingerprint/);
+});
+
+// ---------- 3. 配对流程 ----------
+
+test("错误配对码被拒绝并计数", async () => {
+	const response = await callGateway("/__dsh_remote__/pair", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ code: "0000-0000", name: "测试机" }),
+	});
+	assert.equal(response.status, 403);
+});
+
+test("正确一次性配对码签发设备 Cookie", async () => {
+	const store = await import("../packages/gateway/src/store.ts").then((mod) => mod.Store.open(fixture.homeDir));
+	await store.putPendingCode("ABCD-EFGH", 10);
+	const response = await callGateway("/__dsh_remote__/pair", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ code: "abcd-efgh", name: "冒烟手机" }),
+	});
+	assert.equal(response.status, 200);
+	const cookie = /dr_device=([^;]+)/.exec(response.setCookie)?.[1];
+	assert.ok(cookie, "应下发 dr_device Cookie");
+	assert.match(response.setCookie, /HttpOnly/i);
+	fixture.deviceCookie = `dr_device=${cookie}`;
+});
+
+test("同一配对码不可复用", async () => {
+	const response = await callGateway("/__dsh_remote__/pair", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ code: "ABCD-EFGH", name: "再来一次" }),
+	});
+	assert.equal(response.status, 403);
+});
+
+// ---------- 4. 反向代理 ----------
+
+test("认证后请求代理到上游：Host 改写、Cookie 剥离、HTML 注入", async () => {
+	const response = await callGateway("/", {
+		headers: { cookie: fixture.deviceCookie, origin: "https://vps.example:8443", accept: "text/html" },
+	});
+	assert.equal(response.status, 200);
+	assert.match(response.body, /__dsh_boot__/);
+	assert.match(response.body, /manifest\.webmanifest/, "应注入 PWA manifest 引用");
+	// 上游看到的 Host 必须是回环形态（信任栅栏）
+	assert.equal(fixture.seenByUpstream.host, `127.0.0.1:${String(fixture.upstreamPort)}`);
+	assert.equal(fixture.seenByUpstream.origin, `http://127.0.0.1:${String(fixture.upstreamPort)}`);
+	assert.equal(fixture.seenByUpstream.cookie, undefined, "设备 Cookie 不得外泄给上游");
+});
+
+// ---------- 5. WebSocket 直通 ----------
+
+test("WS 升级：无 Cookie 被拒；有 Cookie 字节级双向透传", async () => {
+	// 无 Cookie → 401 后断开
+	const rejected = await new Promise((resolve) => {
+		const socket = tls.connect({
+			host: "127.0.0.1",
+			port: fixture.gatewayPort,
+			rejectUnauthorized: false,
+		}, () => {
+			socket.write("GET /ws HTTP/1.1\r\nhost: x\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: aAA=\r\nsec-websocket-version: 13\r\n\r\n");
+		});
+		let data = "";
+		socket.on("data", (chunk) => {
+			data += chunk.toString("latin1");
+			resolve(data);
+			socket.destroy();
+		});
+		socket.on("error", () => resolve(data));
+	});
+	assert.match(rejected, /^HTTP\/1\.1 401/);
+
+	// 有 Cookie → 101 + 原始字节回声
+	const echoed = await new Promise((resolve, reject) => {
+		const socket = tls.connect({
+			host: "127.0.0.1",
+			port: fixture.gatewayPort,
+			rejectUnauthorized: false,
+		}, () => {
+			socket.write([
+				"GET /ws HTTP/1.1",
+				`cookie: ${fixture.deviceCookie}`,
+				"upgrade: websocket",
+				"connection: Upgrade",
+				"sec-websocket-key: aAA=",
+				"sec-websocket-version: 13",
+				"\r\n",
+			].join("\r\n"));
+		});
+		const payload = Buffer.from([0x81, 0x85, 0x11, 0x22, 0x33, 0x44, 0xde, 0xad, 0xbe, 0xef]);
+		let received = [];
+		let got101 = false;
+		socket.on("data", (chunk) => {
+			if (!got101) {
+				received.push(chunk);
+				const text = Buffer.concat(received).toString("latin1");
+				if (!text.includes("\r\n\r\n")) return;
+				got101 = true;
+				assert.match(text, /^HTTP\/1\.1 101/);
+				assert.equal(fixture.seenByUpstream.upgradeHost, `127.0.0.1:${String(fixture.upstreamPort)}`);
+				socket.write(payload);
+				return;
+			}
+			if (chunk.equals(payload)) {
+				resolve(true);
+				socket.destroy();
+			}
+		});
+		socket.on("error", reject);
+		setTimeout(() => reject(new Error("WS 回声超时")), 4000);
+	});
+	assert.ok(echoed);
+});
+
+// ---------- 6. RateLimiter 单元 ----------
+
+test("RateLimiter：窗口限流与失败锁定", async () => {
+	const { RateLimiter } = await import("../packages/gateway/src/auth.ts");
+	const limiter = new RateLimiter(3, 2, 15);
+	for (let i = 0; i < 3; i += 1) assert.equal(limiter.allow("ip-a"), true, `第${String(i + 1)}个请求应放行`);
+	assert.equal(limiter.allow("ip-a"), false, "超出窗口应拒绝");
+	assert.equal(limiter.allow("ip-b"), true, "不同 IP 不受影响");
+
+	assert.equal(limiter.notePairFail("ip-c"), true);
+	assert.equal(limiter.notePairFail("ip-c"), false, "达到阈值应锁定");
+	assert.equal(limiter.isLocked("ip-c"), true);
+	assert.equal(limiter.allow("ip-c"), false, "锁定期间全部拒绝");
+});
+
+// ---------- 7. 配对失败锁定（放最后，会锁住回环 IP） ----------
+
+test("连续配对失败触发临时锁定", async () => {
+	const body = JSON.stringify({ code: "ZZZZ-ZZZZ", name: "攻击者" });
+	let lastStatus = 0;
+	for (let attempt = 0; attempt < 5; attempt += 1) {
+		const response = await callGateway("/__dsh_remote__/pair", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body,
+		});
+		lastStatus = response.status;
+		if (response.status === 429) break;
+	}
+	assert.equal(lastStatus, 429, "第 3 次失败后应返回 429 锁定");
+});
