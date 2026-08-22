@@ -12,7 +12,7 @@
  */
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, rename, appendFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, appendFile, stat as statFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
 	DEFAULT_CONFIG,
@@ -42,6 +42,7 @@ interface SecretsFile {
 
 export class Store {
 	readonly home: string;
+	private devicesCache?: { at: number; devices: DeviceRecord[] };
 	private constructor(home: string) {
 		this.home = home;
 	}
@@ -104,12 +105,19 @@ export class Store {
 	// ---------- 设备 ----------
 
 	async listDevices(): Promise<DeviceRecord[]> {
+		// 会话 UI 每次请求都会查设备表，短 TTL 缓存避免每请求读盘
+		if (this.devicesCache !== undefined && Date.now() - this.devicesCache.at < 1500) {
+			return this.devicesCache.devices;
+		}
 		const file = await this.readJson<{ devices: DeviceRecord[] }>("state/devices.json");
-		return file?.devices ?? [];
+		const devices = file?.devices ?? [];
+		this.devicesCache = { at: Date.now(), devices };
+		return devices;
 	}
 
 	async saveDevices(devices: DeviceRecord[]): Promise<void> {
 		await this.writeAtomic("state/devices.json", `${JSON.stringify({ devices }, null, "\t")}\n`);
+		this.devicesCache = { at: Date.now(), devices };
 	}
 
 	async deviceByToken(token: string): Promise<DeviceRecord | undefined> {
@@ -179,9 +187,21 @@ export class Store {
 
 	// ---------- 审计 ----------
 
+	static readonly AUDIT_MAX_BYTES = 5 * 1024 * 1024;
+
 	async audit(event: string, details: Record<string, unknown> = {}): Promise<void> {
+		const auditPath = this.path("logs", "audit.jsonl");
+		// 简单轮转：超过 5MB 归档为 .1（保留一代，个人使用足够）
+		try {
+			const info = await statFile(auditPath);
+			if (info !== undefined && info.size > Store.AUDIT_MAX_BYTES) {
+				await rename(auditPath, `${auditPath}.1`);
+			}
+		} catch {
+			// 轮转失败不阻塞审计
+		}
 		const line = `${JSON.stringify({ at: new Date().toISOString(), event, ...details })}\n`;
-		await appendFile(this.path("logs", "audit.jsonl"), line, "utf8").catch(() => {});
+		await appendFile(auditPath, line, "utf8").catch(() => {});
 	}
 }
 

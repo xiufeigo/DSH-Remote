@@ -172,6 +172,18 @@ test("管理端点拒绝非回环来源（模拟头不可绕过，仅回环判�
 	assert.match(status.body, /certFingerprint/);
 });
 
+test("配对页 next 参数防 XSS：注入载荷被清洗、正常路径保留", async () => {
+	const evil = encodeURIComponent("/';alert(1);//");
+	const evilResponse = await callGateway(`/__dsh_remote__/pair?next=${evil}`);
+	assert.equal(evilResponse.status, 200);
+	assert.ok(!evilResponse.body.includes("alert(1)"), "注入载荷不得出现在页面中");
+	// 非法协议形态也被清洗为 "/"
+	const proto = await callGateway(`/__dsh_remote__/pair?next=${encodeURIComponent("//evil.example")}`);
+	assert.ok(proto.body.includes('location.href="/"'), "双斜线外链应回退为根路径");
+	const legit = await callGateway(`/__dsh_remote__/pair?next=${encodeURIComponent("/sessions?tab=all")}`);
+	assert.match(legit.body, /location\.href="\/sessions\?tab=all"/);
+});
+
 // ---------- 3. 配对流程 ----------
 
 test("错误配对码被拒绝并计数", async () => {

@@ -155,9 +155,20 @@ export class GatewayServer {
 		const pathname = url.pathname;
 
 		try {
+			// 纵深防御：请求行含控制字符一律 400（防上游请求走私）
+			if (/[\r\n\0]/.test(req.url ?? "")) {
+				res.writeHead(400).end();
+				return;
+			}
 			// —— 内部路由 ——
 			if (pathname.startsWith(INTERNAL_PREFIX)) {
 				if (!isLoopback(req) && pathname.startsWith(`${INTERNAL_PREFIX}admin`)) {
+					res.writeHead(403).end();
+					return;
+				}
+				// 管理端点防 CSRF：拒绝来自非本机页面的跨站请求
+				// （自签证书下浏览器通常直接握手失败，这里再加一道来源闸门）
+				if (pathname.startsWith(`${INTERNAL_PREFIX}admin`) && !isSameSiteLoopbackOrigin(req)) {
 					res.writeHead(403).end();
 					return;
 				}
@@ -235,8 +246,7 @@ export class GatewayServer {
 			return;
 		}
 		const locked = this.limiter.isLocked(clientIp(req));
-		const next = safeNext(new URL(req.url ?? "/", "https://gateway.invalid").searchParams.get("next"));
-		const html = `<!doctype html>
+		const next = safeNext(new URL(req.url ?? "/", "https://gateway.invalid").searchParams.get("next"));		const html = `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>DSH Remote · 设备配对</title>
@@ -258,7 +268,7 @@ async function submit(){
  const err=document.getElementById('err');
  err.textContent='';
  const r=await fetch('${PAIR_PAGE}',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code:document.getElementById('code').value.trim(),name:document.getElementById('name').value})});
- if(r.ok){location.href='${next}';return;}
+ if(r.ok){location.href=${JSON.stringify(next)};return;}
  const j=await r.json().catch(()=>({}));
  err.textContent= j.message ?? ('配对失败 ('+r.status+')');
 }
@@ -342,6 +352,11 @@ document.getElementById('code').addEventListener('keydown',e=>{if(e.key==='Enter
 
 	private async handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
 		const url = req.url ?? "/";
+		// 升级请求按原始字节直通上游，控制字符必须在此拦死（防走私）
+		if (/[\r\n\0]/.test(url)) {
+			socket.destroy();
+			return;
+		}
 		if (url.startsWith(INTERNAL_PREFIX)) {
 			socket.destroy();
 			return;
@@ -363,10 +378,31 @@ document.getElementById('code').addEventListener('keydown',e=>{if(e.key==='Enter
 
 // ---------- 小工具 ----------
 
+/**
+ * 配对页回跳地址白名单校验。
+ * 只允许路径与基础 URL 字符；显式排除引号/反斜杠/尖括号等，
+ * 杜绝经 `location.href='${next}'` 注入 JS 的 XSS（配对页可被未认证访问）。
+ */
 function safeNext(raw: string | null): string {
 	if (raw === null || raw === "") return "/";
-	if (!raw.startsWith("/") || raw.startsWith("//")) return "/";
+	if (!raw.startsWith("/") || raw.startsWith("//") || raw.includes("\\")) return "/";
+	if (!/^[A-Za-z0-9\-._~!$&()*+,;=:@%?+\/]+$/.test(raw.slice(1))) return "/";
 	return raw;
+}
+
+/**
+ * 管理端点的同源判定：无 Origin（CLI/curl）或 Origin 指向本机网关自身才放行。
+ * 局域网监听模式下，恶意网页从用户浏览器向 127.0.0.1 发起的跨站请求会被拦下。
+ */
+function isSameSiteLoopbackOrigin(req: IncomingMessage): boolean {
+	const origin = req.headers.origin;
+	if (origin === undefined) return true; // 非浏览器客户端（CLI/探针）
+	try {
+		const parsed = new URL(origin);
+		return parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "[::1]";
+	} catch {
+		return false;
+	}
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
