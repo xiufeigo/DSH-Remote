@@ -1,0 +1,23 @@
+{
+  "name": "dsh-remote-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH Remote —— 随 DSH web profile 启动自动拉起远程网关的 cordis 插件",
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "package.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "plugin:install": "node scripts/install.mjs",
+    "plugin:uninstall": "node scripts/uninstall.mjs"
+  },
+  "license": "MIT"
+}

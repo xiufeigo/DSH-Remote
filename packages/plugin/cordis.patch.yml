@@ -1,0 +1,5 @@
+# DSH-Remote bundle 层：随 web profile 启动拉起远程网关子进程。
+# 网关本体与数据目录见仓库 packages/gateway 与 ~/.dsh-remote/。
+- insert:
+    - id: dsh-remote-plugin
+      name: dsh-remote-plugin

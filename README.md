@@ -1,0 +1,122 @@
+# DSH-Remote
+
+让手机随时随地安全访问本机运行中的 **DSH Desktop / DeepSeek Harness**——看到和桌面端
+一模一样的界面：会话列表、会话过程、发消息、中止任务、审批交互，全部原生支持。
+
+```
+📱 手机浏览器 / PWA（二期：自研壳 App）
+      │ HTTPS 端到端加密
+      ▼
+☁️ VPS · frps（公网唯一暴露点，仅开 2 个 TCP 端口）
+      │ frp 加密隧道（PC 主动外连，家宽不开任何端口、无需公网 IP）
+      ▼
+🚪 网关 @127.0.0.1:18443（LAN/WAN 完全不可见）
+      │ 设备配对 + Token 认证 · 限流锁定 · Host/Origin 改写
+      ▼
+💻 DSH Desktop Web GUI @127.0.0.1:<port>（零侵入，不改 DSH 一行代码）
+```
+
+## 仓库结构
+
+| 路径 | 说明 |
+|---|---|
+| `packages/gateway/` | 网关核心（TypeScript，Node ≥24 原生 TS 运行，无构建步骤） |
+| `packages/plugin/` | cordis 插件：随 DSH web profile 自启网关 |
+| `scripts/install-frps.sh` | VPS 一键安装 frps |
+| `scripts/smoke.mjs` | 冒烟测试（12 项） |
+| `docs/` | 架构决策、VPS 部署、安全模型 |
+
+## 快速开始
+
+### 0. 前置
+
+- PC：Node.js ≥ 24；DSH Desktop 正在运行
+- VPS：任意有公网 IP 的 Linux（Debian/Ubuntu/CentOS）
+
+### 1. VPS 装 frps
+
+```bash
+# 本地下载脚本上传到 VPS 后：
+sudo bash install-frps.sh                      # 自动生成 token 并回显
+# 或指定 token（与 PC 保持一致）：
+sudo bash install-frps.sh --token <密钥>
+```
+
+详见 [docs/vps-frps-setup.md](docs/vps-frps-setup.md)。
+
+### 2. PC 配置网关
+
+```powershell
+# 首次生成配置
+mkdir ~\.dsh-remote
+@'
+{
+  "listenPort": 18443,
+  "upstreamPort": 52392,
+  "frp": {
+    "enabled": true,
+    "serverAddr": "<VPS 公网 IP>",
+    "serverPort": 7000,
+    "remotePort": 8443
+  }
+}
+'@ | Set-Content ~\.dsh-remote\config.json -Encoding utf8
+
+# 放入 frpc.exe（见 docs/vps-frps-setup.md §3）
+# 启动
+pnpm start          # 或 node packages/gateway/src/cli.ts start
+node packages/gateway/src/cli.ts doctor   # 全链路体检
+```
+
+> `upstreamPort` 是 DSH Web GUI 的端口（本会话为 52392）。若桌面端重启后端口变化，
+> 更新配置即可；`doctor` 会帮你探测并提示。
+
+### 3. 手机配对
+
+```powershell
+node packages/gateway/src/cli.ts pair --name 我的手机
+# 终端出现二维码 → 手机扫码（或手动访问入口地址）→ 输入配对码
+```
+
+配对一次长期有效。设备管理：
+
+```powershell
+node packages/gateway/src/cli.ts devices          # 列出已配对设备
+node packages/gateway/src/cli.ts revoke dev-xxxx  # 吊销
+```
+
+### 4. （可选）随 DSH 自启
+
+```powershell
+cd packages/plugin
+node scripts/install.mjs        # junction 进 profile 农场 + 写 patch 行
+node scripts/uninstall.mjs      # 卸载
+```
+
+重启 DSH Desktop 后，网关随 profile 自动拉起（`config.json` 里 `"autoStart": false`
+可关闭）。
+
+## 安全模型（摘要）
+
+- **网络层**：网关只监听 `127.0.0.1`，局域网/外网都摸不到；公网只有 VPS 上 frp 的两个端口。
+- **认证层**：一次性配对码（10 分钟有效、用后即焚）换取长效设备 Token（httpOnly Cookie，
+  服务端只存 SHA-256）；配对失败 5 次锁 IP 15 分钟；每 IP 滑动窗口限流。
+- **传输层**：手机↔网关 TLS（自签，指纹可校验；壳 App 将做证书锁定）；frpc↔frps 隧道 TLS。
+- **隔离层**：设备 Cookie 不转发给上游 DSH；审计日志记录全部配对/拒绝事件。
+
+完整说明见 [docs/architecture.md](docs/architecture.md)。
+
+## 开发
+
+```bash
+pnpm install
+pnpm smoke        # 12 项冒烟测试
+node scripts/probe-ws.mjs [端口]   # 对运行中的网关+DSH 做 WS 直通探针
+```
+
+## 路线图
+
+- [x] 网关核心：认证/反代/WS 直通/PWA 注入/frp 托管/CLI
+- [x] cordis 插件自启
+- [ ] tsnet 传输适配器（无 VPS 备选）
+- [ ] Android/iOS 自研壳 App（WebView + 证书锁定 + STCP 访客模式）
