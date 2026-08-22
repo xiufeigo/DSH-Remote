@@ -193,24 +193,40 @@ async function cmdStatus(store: Store): Promise<number> {
 
 async function cmdDoctor(store: Store): Promise<number> {
 	const config = await store.loadConfig();
+	const { hasDshFingerprint, listLoopbackListeners, resolveUpstreamPort } = await import("./upstream.ts");
 	const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
 
-	const upstreamOk = await probeTcp("127.0.0.1", config.upstreamPort);
+	const upstreamOk = await hasDshFingerprint(config.upstreamPort);
 	checks.push({
 		name: `上游 DSH GUI 127.0.0.1:${String(config.upstreamPort)}`,
 		ok: upstreamOk,
 		detail: upstreamOk
-			? "端口可达"
-			: `不可达。若桌面端每次启动端口变化，请在 ${store.path("config.json")} 修改 upstreamPort`,
+			? "端口可达且指纹匹配"
+			: `失配。回环监听候选：[${listLoopbackListeners().slice(0, 12).map((entry) => String(entry.port)).join(", ") || "未探测到"}]…` +
+				"；启动网关会自动跟随（autoFixUpstreamPort）",
 	});
 	if (upstreamOk) {
-		const fingerprint = await probeUpstreamFingerprint(config.upstreamPort);
+		checks.push({ name: "上游指纹", ok: true, detail: "确认是 DSH Web 界面" });
+	} else {
+		const resolution = await resolveUpstreamPort(config.upstreamPort);
 		checks.push({
-			name: "上游指纹",
-			ok: fingerprint.isDsh,
-			detail: fingerprint.isDsh ? "确认是 DSH Web 界面" : `响应不像 DSH（HTTP ${String(fingerprint.status)}），请核对端口`,
+			name: "上游自动纠正",
+			ok: resolution !== null,
+			detail: resolution === null
+				? "候选端口全部失配——DSH 是否在运行？"
+				: `探测到真实端口 ${String(resolution.port)}，下次 start 自动切换`,
 		});
 	}
+
+	const listenLoopback = config.listenHost === "127.0.0.1" || config.listenHost === "::1";
+	checks.push({
+		name: "网关监听面",
+		ok: true,
+		detail: listenLoopback
+			? `${config.listenHost}:${String(config.listenPort)}（仅本机，最安全）`
+			: `${config.listenHost}:${String(config.listenPort)} —— 局域网模式：家庭网络内设备可直接访问，` +
+				"请确认网络可信或配置防火墙限制来源",
+	});
 
 	const listenBusy = await probeTcp(config.listenHost, config.listenPort);
 	checks.push({
@@ -276,20 +292,6 @@ function probeTcp(host: string, port: number, timeoutMs = 2000): Promise<boolean
 		socket.once("connect", () => done(true));
 		socket.once("error", () => done(false));
 	});
-}
-
-async function probeUpstreamFingerprint(port: number): Promise<{ isDsh: boolean; status?: number }> {
-	try {
-		const response = await fetch(`http://127.0.0.1:${String(port)}/`, {
-			headers: { host: `127.0.0.1:${String(port)}`, accept: "text/html" },
-			signal: AbortSignal.timeout(3000),
-		});
-		const text = (await response.text()).slice(0, 400_000).toLowerCase();
-		const markers = ["__dsh_boot__", "deepseek", "dsh"];
-		return { isDsh: response.ok && markers.some((marker) => text.includes(marker)), status: response.status };
-	} catch {
-		return { isDsh: false };
-	}
 }
 
 main()

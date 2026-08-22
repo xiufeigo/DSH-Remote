@@ -68,8 +68,19 @@ pnpm start          # 或 node packages/gateway/src/cli.ts start
 node packages/gateway/src/cli.ts doctor   # 全链路体检
 ```
 
-> `upstreamPort` 是 DSH Web GUI 的端口（本会话为 52392）。若桌面端重启后端口变化，
-> 更新配置即可；`doctor` 会帮你探测并提示。
+> `upstreamPort` 是 DSH Web GUI 的端口（本会话为 52392）。桌面端重启后端口若漂移，
+> 网关启动时会**自动探测并回写**（`autoFixUpstreamPort: true` 默认开启）；`doctor` 可手动体检。
+
+### 局域网模式（可选，无 VPS 时先用起来）
+
+默认网关只监听 `127.0.0.1`（最安全）。想在家里 WiFi 直接用手机访问：
+
+```jsonc
+{ "listenHost": "0.0.0.0", "listenPort": 18443, ... }
+```
+
+并在 Windows 防火墙放行该端口。手机浏览器打开 `https://<电脑局域网IP>:18443` 配对即可。
+认证门对所有来源生效，但请仅在可信家庭网络使用此模式；出门在外请走 frp 通道。
 
 ### 3. 手机配对
 

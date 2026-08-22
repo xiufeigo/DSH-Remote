@@ -69,12 +69,16 @@ function callGateway(pathname, { method = "GET", headers = {}, body } = {}) {
 			(res) => {
 				const chunks = [];
 				res.on("data", (chunk) => chunks.push(chunk));
-				res.on("end", () => resolve({
-					status: res.statusCode,
-					headers: res.headers,
-					body: Buffer.concat(chunks).toString("utf8"),
-					setCookie: res.headers["set-cookie"]?.join("; ") ?? "",
-				}));
+				res.on("end", () => {
+					const raw = Buffer.concat(chunks);
+					resolve({
+						status: res.statusCode,
+						headers: res.headers,
+						body: raw.toString("utf8"),
+						raw,
+						setCookie: res.headers["set-cookie"]?.join("; ") ?? "",
+					});
+				});
 			},
 		);
 		req.on("error", reject);
@@ -139,10 +143,27 @@ test("health 探针可用", async () => {
 test("manifest 与图标可获取", async () => {
 	const manifest = await callGateway("/__dsh_remote__/manifest.webmanifest");
 	assert.equal(manifest.status, 200);
-	assert.equal(JSON.parse(manifest.body).name, "DSH Remote");
+	const parsed = JSON.parse(manifest.body);
+	assert.equal(parsed.name, "DSH Remote");
+	assert.ok(parsed.icons.some((icon) => icon.src.endsWith("icon-192.png")), "manifest 应引用 PNG 图标");
 	const icon = await callGateway("/__dsh_remote__/icon.svg");
 	assert.equal(icon.status, 200);
 	assert.match(icon.body, /<svg/);
+});
+
+test("PNG 图标：魔数、尺寸与解码完整性", async () => {
+	for (const [path, size] of [["/__dsh_remote__/icon-192.png", 192], ["/__dsh_remote__/icon-512.png", 512]]) {
+		const response = await callGateway(path);
+		assert.equal(response.status, 200);
+		const buf = response.raw;
+		// PNG 签名
+		assert.deepEqual([...buf.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+		// IHDR 尺寸
+		assert.equal(buf.readUInt32BE(16), size);
+		assert.equal(buf.readUInt32BE(20), size);
+		assert.equal(buf.readUInt8(24), 8);  // bit depth
+		assert.equal(buf.readUInt8(25), 6);  // RGBA
+	}
 });
 
 test("管理端点拒绝非回环来源（模拟头不可绕过，仅回环判定）——本机可访问", async () => {

@@ -28,9 +28,10 @@ import {
 import { ensureCert, type GatewayCert } from "./cert.ts";
 import type { GatewayConfig } from "./config.ts";
 import { FrpSupervisor, locateFrpcBinary, renderFrpcToml } from "./frp.ts";
-import { ICON_SVG, injectIntoHtml, renderManifest } from "./pwa.ts";
+import { ICON_SVG, iconPng, injectIntoHtml, renderManifest } from "./pwa.ts";
 import { proxyHttp, proxyUpgrade } from "./proxy.ts";
 import type { Store } from "./store.ts";
+import { resolveUpstreamPort } from "./upstream.ts";
 
 export interface GatewayServerOptions {
 	store: Store;
@@ -67,7 +68,31 @@ export class GatewayServer {
 		return this.cert;
 	}
 
+	/**
+	 * 启动前解析上游端口：失配时自动探测 dsh-gui 监听端口，
+	 * 命中后按 autoFixUpstreamPort 决定是否回写配置。
+	 */
+	private async resolveUpstream(): Promise<void> {
+		const configured = this.config.upstreamPort;
+		const resolution = await resolveUpstreamPort(configured);
+		if (resolution === null) {
+			this.log(`警告：127.0.0.1:${String(configured)} 未探测到 DSH 指纹，仍按配置继续（可运行 doctor 体检）`);
+			return;
+		}
+		if (resolution.how !== "auto-detected") return;
+		this.config.upstreamPort = resolution.port;
+		this.log(
+			`上游端口漂移：${String(configured)} → ${String(resolution.port)}` +
+			(resolution.candidates && resolution.candidates.length > 0 ? `（候选：${resolution.candidates.map(String).join(", ")}）` : ""),
+		);
+		if (this.config.autoFixUpstreamPort !== false) {
+			await this.store.saveConfig(this.config);
+			this.log("已回写 config.json 的 upstreamPort");
+		}
+	}
+
 	async start(): Promise<void> {
+		await this.resolveUpstream();
 		this.cert = await ensureCert(this.store.path("certs"));
 		this.server = https.createServer(
 			{ key: this.cert.keyPem, cert: this.cert.certPem },
@@ -146,6 +171,13 @@ export class GatewayServer {
 					case "GET /__dsh_remote__/icon.svg":
 						res.writeHead(200, { "content-type": "image/svg+xml" }).end(ICON_SVG);
 						return;
+					case "GET /__dsh_remote__/icon-192.png":
+					case "GET /__dsh_remote__/icon-512.png": {
+						const size = pathname.endsWith("512.png") ? 512 : 192;
+						res.writeHead(200, { "content-type": "image/png", "cache-control": "public, max-age=604800" });
+						res.end(iconPng(size));
+						return;
+					}
 					case "GET /__dsh_remote__/pair":
 						await this.handlePairPage(req, res);
 						return;

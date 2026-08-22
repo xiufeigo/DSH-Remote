@@ -26,6 +26,8 @@ export interface GatewayConfig {
 	listenPort: number;
 	/** 上游 DSH Web GUI 端口（127.0.0.1） */
 	upstreamPort: number;
+	/** 上游端口失配时是否自动探测并回写配置 */
+	autoFixUpstreamPort: boolean;
 	/** 设备 Token 有效期（天） */
 	deviceTokenDays: number;
 	/** 配对码有效期（分钟） */
@@ -42,6 +44,7 @@ export const DEFAULT_CONFIG: GatewayConfig = {
 	listenHost: "127.0.0.1",
 	listenPort: 18443,
 	upstreamPort: 52392,
+	autoFixUpstreamPort: true,
 	deviceTokenDays: 365,
 	pairingCodeMinutes: 10,
 	pairingFailLockThreshold: 5,
