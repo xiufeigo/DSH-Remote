@@ -107,6 +107,19 @@ node scripts/uninstall.mjs      # 卸载
 重启 DSH Desktop 后，网关随 profile 自动拉起（`config.json` 里 `"autoStart": false`
 可关闭）。
 
+### 5. 设置面板（设置 → 插件 → DSH Remote）
+
+插件已接入 DSH 官方的插件设置扩展点，重启 DSH 后在 **设置 → 插件** 页会出现
+「DSH Remote」卡片，可视化完成：
+
+- frp 隧道开关、VPS 地址、控制端口、入口端口（共享密钥不出面板，走 `secrets.json`）
+- 监听面切换（仅本机 / 局域网）、上游端口与自动跟随开关、随 DSH 自启开关
+- 网关状态实时展示（运行中/离线、已配对设备数）
+- 一键生成配对码、一键重启网关
+
+所有修改保存后自动写入 `~/.dsh-remote/config.json` 并重启网关生效；等价于手改
+配置文件，两条路径随时混用。
+
 ## 安全模型（摘要）
 
 - **网络层**：网关只监听 `127.0.0.1`，局域网/外网都摸不到；公网只有 VPS 上 frp 的两个端口。
@@ -121,8 +134,10 @@ node scripts/uninstall.mjs      # 卸载
 
 ```bash
 pnpm install
-pnpm smoke        # 14 项冒烟测试
-pnpm test:plugin  # 插件模拟运行（假 ctx 拉起/回收网关）
+pnpm smoke          # 14 项冒烟测试（网关）
+pnpm test:plugin    # 插件模拟运行（假 ctx 拉起/回收网关）
+pnpm test:routes    # 插件宿主路由逻辑单测（9 项）
+pnpm -C packages/plugin build   # 构建设置卡片客户端 bundle
 node scripts/probe-ws.mjs [端口]   # 对运行中的网关+DSH 做 WS 直通探针
 ```
 

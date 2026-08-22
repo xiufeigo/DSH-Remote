@@ -11,6 +11,7 @@
   "scripts": {
     "smoke": "node scripts/smoke.mjs",
     "test:plugin": "node scripts/test-plugin-sim.mjs",
+    "test:routes": "node --test scripts/test-plugin-routes.mjs",
     "start": "node packages/gateway/src/cli.ts start"
   }
 }
