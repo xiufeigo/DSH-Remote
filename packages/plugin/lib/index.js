@@ -109,7 +109,10 @@ var plugin_default = {
 				});
 				const forward = (chunk) => {
 					for (const line of chunk.toString("utf8").split("\n")) {
-						if (line.trim().length > 0) console.log(`${TAG}${line.startsWith("[") ? "" : " "}${line.trimEnd()}`);
+						const trimmed = line.trimEnd();
+						if (trimmed.length === 0) continue;
+						// 网关自身日志已带 [dsh-remote] 前缀，避免叠加
+						console.log(trimmed.startsWith("[dsh-remote]") ? trimmed : `${TAG} ${trimmed}`);
 					}
 				};
 				child.stdout?.on("data", forward);

@@ -34,6 +34,26 @@ if (existsSync(PATCH_PATH)) {
 		while (start > 0 && lines[start - 1].trim() !== "- insert:" && !lines[start - 1].startsWith("- ")) start -= 1;
 		let end = anchorIndex;
 		while (end + 1 < lines.length && (lines[end + 1].startsWith(" ") || lines[end + 1].startsWith("#"))) end += 1;
+
+		// 若 "- insert:" 开行与被删内容之间只有本块的注释/缩进行，
+		// 且删完后该 insert 块不再有任何子项，则把开行一并移除
+		const openerIndex = (() => {
+			for (let i = start - 1; i >= 0; i -= 1) {
+				if (lines[i].trim() === "- insert:") {
+					const between = lines.slice(i + 1, start);
+					if (between.every((l) => l.startsWith(" ") || l.startsWith("#"))) return i;
+					return -1;
+				}
+				if (!lines[i].startsWith(" ") && !lines[i].startsWith("#") && lines[i].trim() !== "") break;
+			}
+			return -1;
+		})();
+		if (openerIndex >= 0) {
+			const rest = lines.slice(end + 1);
+			const hasMoreChildren = rest.length > 0 && (rest[0].startsWith(" ") || rest[0].startsWith("#"));
+			if (!hasMoreChildren) start = openerIndex;
+		}
+
 		const kept = [...lines.slice(0, start), ...lines.slice(end + 1)];
 		console.log(`- 从 ${PATCH_PATH} 移除第 ${String(start + 1)}~${String(end + 1)} 行`);
 		if (!DRY) writeFileSync(PATCH_PATH, kept.join("\n"), "utf8");

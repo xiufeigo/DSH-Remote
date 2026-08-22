@@ -10,6 +10,7 @@
   },
   "scripts": {
     "smoke": "node scripts/smoke.mjs",
+    "test:plugin": "node scripts/test-plugin-sim.mjs",
     "start": "node packages/gateway/src/cli.ts start"
   }
 }
