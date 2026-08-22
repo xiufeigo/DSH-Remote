@@ -49,6 +49,16 @@ assert.equal(typeof exports.apply, "function", "应导出 apply");
 assert.ok(Array.isArray(exports.inject), "应导出 inject");
 assert.equal(exports.name, "dsh-remote-plugin");
 
+// ── SSR 渲染冒烟：抓组件渲染期崩溃 ──
+// 卡片默认折叠，SSR 只渲染头部；展开态的表单在浏览器端由数据加载后渲染。
+const React = pluginRequire("react");
+const { renderToString } = pluginRequire("react-dom/server");
+const html = renderToString(React.createElement(exports.DshRemoteSettingsCard));
+for (const marker of ["DSH Remote", "手机远程访问本机 DSH", 'aria-expanded="false"']) {
+	assert.ok(html.includes(marker), `渲染产物应包含「${marker}」`);
+}
+console.log("✓ SSR 渲染通过（折叠态头部完整，长度", html.length, "字符）");
+
 // 模拟槽位上下文，验证设置卡片注册
 const registrations = [];
 const injected = [];
