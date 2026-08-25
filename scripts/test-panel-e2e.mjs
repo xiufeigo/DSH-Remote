@@ -142,7 +142,7 @@ async function waitPort(port, timeoutMs) {
 	const res = await callRoute(
 		"/dsh-remote/config",
 		// 与真实设置卡片一致：frp 段全量提交（表单用展示默认值补齐过）
-		fakeReq(JSON.stringify({ autoStart: true, frp: { enabled: true, serverAddr: "203.0.113.7", serverPort: 17000, remotePort: 18448 } })),
+		fakeReq(JSON.stringify({ autoStart: true, frp: { enabled: true, serverAddr: "203.0.113.7", serverPort: 17000, remotePort: 18448, mode: "xtcp" } })),
 	);
 	const payload = parseBody(res, "config-post");
 	assert.equal(payload.ok, true, `保存应成功：${res.state.body}`);
@@ -151,6 +151,7 @@ async function waitPort(port, timeoutMs) {
 	assert.equal(persisted.listenPort, LISTEN_PORT, "未提交的顶层键保持原值");
 	assert.equal(persisted.frp.enabled, true);
 	assert.equal(persisted.frp.serverAddr, "203.0.113.7");
+	assert.equal(persisted.frp.mode, "xtcp", "访客形态应写盘");
 	console.log("✓ 配置已写盘");
 
 	const up = await waitPort(LISTEN_PORT, 15000);

@@ -6,13 +6,27 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm, readdir } from "node:fs/promises";
+import { mkdtemp, rm, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
 
 const tempHome = await mkdtemp(join(tmpdir(), "dshr-plugin-test-"));
 process.env.DSH_REMOTE_HOME = tempHome;
+
+// 随机空闲端口：默认 18443 可能被真实部署的网关占用（随 DSH 自启的场景）
+const freePort = await new Promise((resolve) => {
+	const probe = net.createServer();
+	probe.listen(0, "127.0.0.1", () => {
+		const port = probe.address().port;
+		probe.close(() => resolve(port));
+	});
+});
+await writeFile(
+	join(tempHome, "config.json"),
+	JSON.stringify({ autoStart: true, listenPort: freePort }),
+	"utf8",
+);
 
 // 假 cordis ctx
 const effects = [];
@@ -69,14 +83,14 @@ function check(name, ok) {
 }
 
 check("ctx.effect 注册了生命周期", effects.length === 1);
-const up = await waitPort(18443, 15000);
-check("网关子进程已监听 18443", up);
+const up = await waitPort(freePort, 15000);
+check(`网关子进程已监听 ${freePort}`, up);
 
 if (up) {
 	// dispose 后进程应收掉
 	effects[0].dispose();
 	await new Promise((r) => setTimeout(r, 1500));
-	const stillUp = await waitPort(18443, 2000);
+	const stillUp = await waitPort(freePort, 2000);
 	check("dispose 后网关端口已释放", !stillUp);
 }
 

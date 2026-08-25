@@ -24,11 +24,12 @@ import {
 	isLoopback,
 	issueDeviceCookie,
 	parseCookies,
+	visitorKeyAdmits,
 } from "./auth.ts";
 import { ensureCert, type GatewayCert } from "./cert.ts";
 import type { GatewayConfig } from "./config.ts";
-import { FrpSupervisor, locateFrpcBinary, renderFrpcToml } from "./frp.ts";
-import { ICON_SVG, iconPng, injectIntoHtml, renderManifest } from "./pwa.ts";
+import { FrpSupervisor, locateFrpcBinary, normalizeFrpMode, renderFrpcToml } from "./frp.ts";
+import { BRAND_SVG, ICON_SVG, iconPng, injectIntoHtml, renderManifest } from "./pwa.ts";
 import { proxyHttp, proxyUpgrade } from "./proxy.ts";
 import type { Store } from "./store.ts";
 import { resolveUpstreamPort } from "./upstream.ts";
@@ -126,15 +127,21 @@ export class GatewayServer {
 			return;
 		}
 		const secrets = await this.store.ensureSecrets();
+		const mode = normalizeFrpMode(frp.mode);
 		const toml = renderFrpcToml({
 			serverAddr: frp.serverAddr,
 			serverPort: frp.serverPort,
 			authToken: secrets.frpAuthToken,
 			localPort: this.actualPort ?? this.config.listenPort,
 			remotePort: frp.remotePort,
+			mode,
+			secretKey: secrets.frpVisitorKey,
 		});
 		const configPath = this.store.path("frp", "frpc.toml");
 		await this.store.writeAtomic("frp/frpc.toml", toml);
+		this.log(mode === "entry"
+			? `frp 传输适配器启动（entry，入口端口 ${String(frp.remotePort)}）`
+			: `frp 传输适配器启动（${mode}，VPS 不开入口端口；手机填写同一把访客密钥即可连入，无需扫码）`);
 		this.frp = new FrpSupervisor(binary, configPath, (line) => this.log(`[frpc] ${line}`));
 		this.frp.start();
 	}
@@ -182,6 +189,13 @@ export class GatewayServer {
 					case "GET /__dsh_remote__/icon.svg":
 						res.writeHead(200, { "content-type": "image/svg+xml" }).end(ICON_SVG);
 						return;
+					case "GET /__dsh_remote__/brand.svg":
+						res.writeHead(200, {
+							"content-type": "image/svg+xml",
+							"cache-control": "public, max-age=604800",
+							"x-content-type-options": "nosniff",
+						}).end(BRAND_SVG);
+						return;
 					case "GET /__dsh_remote__/icon-192.png":
 					case "GET /__dsh_remote__/icon-512.png": {
 						const size = pathname.endsWith("512.png") ? 512 : 192;
@@ -215,7 +229,10 @@ export class GatewayServer {
 			}
 
 			// —— 认证门 ——
-			const verdict = await checkRequest(req, { store: this.store, config: this.config });
+			// xtcp/stcp：访客密钥已经挡在隧道外，网关侧不再要求配对码。
+			const verdict = visitorKeyAdmits(this.config)
+				? { ok: true as const, deviceId: "visitor-key" }
+				: await checkRequest(req, { store: this.store, config: this.config });
 			if (!verdict.ok) {
 				const acceptsHtml = String(req.headers.accept ?? "").includes("text/html");
 				if (acceptsHtml) {
@@ -246,35 +263,10 @@ export class GatewayServer {
 			return;
 		}
 		const locked = this.limiter.isLocked(clientIp(req));
-		const next = safeNext(new URL(req.url ?? "/", "https://gateway.invalid").searchParams.get("next"));		const html = `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>DSH Remote · 设备配对</title>
-<style>
- body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#101418;color:#e8eaed;display:flex;justify-content:center;padding-top:12vh;margin:0}
- .card{background:#1a2027;border-radius:16px;padding:32px;width:min(92vw,380px)}
- h1{font-size:20px;margin:0 0 8px} p{color:#9aa4af;font-size:13px;line-height:1.6;margin:0 0 20px}
- input{width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #2c3641;background:#0d1115;color:#fff;font-size:16px;margin-bottom:12px;text-transform:uppercase}
- button{width:100%;padding:12px;border:none;border-radius:10px;background:#1b66ff;color:#fff;font-size:15px;font-weight:600}
- .err{color:#ff6b6b;font-size:13px;min-height:18px;margin-bottom:8px}
-</style></head><body><div class="card">
-<h1>DSH Remote</h1><p>新设备需要配对。在电脑终端运行 <code>dsh-remote pair</code> 获取一次性配对码，输入后本设备将被授权访问。</p>
-<div class="err" id="err"></div>
-<input id="code" placeholder="配对码（如 XK4M-P2VW）" autocomplete="off" autocapitalize="characters">
-<input id="name" placeholder="设备名称（如 我的手机）">
-<button onclick="submit()">配对</button>
-<script>
-async function submit(){
- const err=document.getElementById('err');
- err.textContent='';
- const r=await fetch('${PAIR_PAGE}',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code:document.getElementById('code').value.trim(),name:document.getElementById('name').value})});
- if(r.ok){location.href=${JSON.stringify(next)};return;}
- const j=await r.json().catch(()=>({}));
- err.textContent= j.message ?? ('配对失败 ('+r.status+')');
-}
-document.getElementById('code').addEventListener('keydown',e=>{if(e.key==='Enter')submit()});
-</script></div>${locked ? "<script>document.getElementById('err').textContent='失败次数过多，请稍后再试'</script>" : ""}
-</body></html>`;
+		const next = safeNext(new URL(req.url ?? "/", "https://gateway.invalid").searchParams.get("next"));
+		const html = isDshRemoteAndroid(req)
+			? renderAndroidPairPage(next, locked)
+			: renderDefaultPairPage(next, locked);
 		res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
 		res.end(html);
 	}
@@ -338,9 +330,16 @@ document.getElementById('code').addEventListener('keydown',e=>{if(e.key==='Enter
 				res.end(JSON.stringify({
 					port: this.actualPort,
 					certFingerprint: this.cert?.fingerprintSha256,
+					frpMode: normalizeFrpMode(this.config.frp.mode),
 					frp: this.frpStatus(),
 					upstream: `127.0.0.1:${String(this.config.upstreamPort)}`,
 				}, null, "\t"));
+				return;
+			}
+			case "POST /__dsh_remote__/admin/shutdown": {
+				res.writeHead(200, { "content-type": "application/json" });
+				res.end(JSON.stringify({ ok: true }));
+				void this.stop().finally(() => process.exit(0));
 				return;
 			}
 			default:
@@ -361,7 +360,9 @@ document.getElementById('code').addEventListener('keydown',e=>{if(e.key==='Enter
 			socket.destroy();
 			return;
 		}
-		const verdict = await checkRequest(req, { store: this.store, config: this.config });
+		const verdict = visitorKeyAdmits(this.config)
+			? { ok: true as const, deviceId: "visitor-key" }
+			: await checkRequest(req, { store: this.store, config: this.config });
 		if (!verdict.ok) {
 			socket.write("HTTP/1.1 401 Unauthorized\r\nconnection: close\r\n\r\n");
 			socket.destroy();
@@ -374,6 +375,66 @@ document.getElementById('code').addEventListener('keydown',e=>{if(e.key==='Enter
 		}
 		proxyUpgrade(req, socket as never, head, { host: "127.0.0.1", port: this.config.upstreamPort });
 	}
+}
+
+function isDshRemoteAndroid(req: IncomingMessage): boolean {
+	return String(req.headers["user-agent"] ?? "").includes("DSHRemoteAndroid/1");
+}
+
+function pairScript(next: string, locked: boolean): string {
+	return `<script>
+async function submit(){
+ const err=document.getElementById('err');
+ err.textContent='';
+ const r=await fetch('${PAIR_PAGE}',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code:document.getElementById('code').value.trim(),name:document.getElementById('name').value})});
+ if(r.ok){location.href=${JSON.stringify(next)};return;}
+ const j=await r.json().catch(()=>({}));
+ err.textContent= j.message ?? ('配对失败 ('+r.status+')');
+}
+document.getElementById('code').addEventListener('keydown',e=>{if(e.key==='Enter')submit()});
+${locked ? "document.getElementById('err').textContent='失败次数过多，请稍后再试';" : ""}
+</script>`;
+}
+
+function renderDefaultPairPage(next: string, locked: boolean): string {
+	return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DSH Remote · 设备配对</title>
+<style>
+ body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#101418;color:#e8eaed;display:flex;justify-content:center;padding-top:12vh;margin:0}
+ .card{background:#1a2027;border-radius:16px;padding:32px;width:min(92vw,380px)}
+ h1{font-size:20px;margin:0 0 8px} p{color:#9aa4af;font-size:13px;line-height:1.6;margin:0 0 20px}
+ input{width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #2c3641;background:#0d1115;color:#fff;font-size:16px;margin-bottom:12px;text-transform:uppercase}
+ button{width:100%;padding:12px;border:none;border-radius:10px;background:#1b66ff;color:#fff;font-size:15px;font-weight:600}
+ .err{color:#ff6b6b;font-size:13px;min-height:18px;margin-bottom:8px}
+</style></head><body><div class="card">
+<h1>DSH Remote</h1><p>新设备需要配对。在电脑终端运行 <code>dsh-remote pair</code> 获取一次性配对码，输入后本设备将被授权访问。</p>
+<div class="err" id="err"></div>
+<input id="code" placeholder="配对码（如 XK4M-P2VW）" autocomplete="off" autocapitalize="characters">
+<input id="name" placeholder="设备名称（如 我的手机）">
+<button onclick="submit()">配对</button>
+${pairScript(next, locked)}</div></body></html>`;
+}
+
+function renderAndroidPairPage(next: string, locked: boolean): string {
+	return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DSH Remote · 设备配对</title>
+<style>
+ :root{color-scheme:light;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+ *{box-sizing:border-box}html,body{min-height:100%;margin:0}body{color:#111318;background:#fff}
+ main{min-height:100vh;display:flex;flex-direction:column;padding:max(20px,env(safe-area-inset-top)) 24px max(28px,env(safe-area-inset-bottom))}
+ header{display:flex;align-items:center;gap:10px;font-size:19px;font-weight:650;line-height:28px}header img{width:30px;height:30px}header small{display:inline-flex;align-items:center;min-height:17px;padding:1px 5px;border-radius:3px;background:#111318;color:#fff;font-size:10px;line-height:1}
+ section{width:min(100%,360px);margin:auto;transform:translateY(-7vh)}h1{margin:0;font-size:24px;font-weight:650;line-height:1.35}p{margin:10px 0 26px;color:#73777f;font-size:14px;line-height:1.65}label{display:block;margin:0 0 7px;font-size:13px;font-weight:600}input{display:block;width:100%;min-height:48px;margin:0 0 17px;padding:0 12px;border:1px solid #d9dde5;border-radius:7px;background:#fff;color:#111318;font:inherit;font-size:16px;outline:none}input:focus{border-color:#111318;box-shadow:0 0 0 2px rgba(17,19,24,.12)}#code{text-transform:uppercase}.err{min-height:20px;margin:0 0 10px;color:#b33b3b;font-size:13px;line-height:20px}button{width:100%;min-height:48px;border:1px solid #111318;border-radius:7px;background:#111318;color:#fff;font:inherit;font-size:15px;font-weight:650;cursor:pointer}
+</style></head><body><main><header><img src="/__dsh_remote__/brand.svg" alt=""><span>deepseek</span><small>HARNESS</small></header>
+<section aria-labelledby="title"><h1 id="title">配对这台设备</h1><p>在电脑终端运行 <code>dsh-remote pair</code> 获取一次性配对码。</p>
+<div class="err" id="err" role="status" aria-live="polite"></div>
+<label for="code">配对码</label><input id="code" placeholder="如 XK4M-P2VW" autocomplete="off" autocapitalize="characters">
+<label for="name">设备名称</label><input id="name" placeholder="如 我的手机" autocomplete="nickname">
+<button type="button" onclick="submit()">配对</button>
+${pairScript(next, locked)}</section></main></body></html>`;
 }
 
 // ---------- 小工具 ----------

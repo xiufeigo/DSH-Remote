@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+	package="top.d1studio.dshremote"
+	android:versionCode="31"
+	android:versionName="0.1.1-rc.2.5">
+
+	<uses-permission android:name="android.permission.INTERNET" />
+	<!-- frpc visitor 前台服务（stcp/xtcp 隧道保活） -->
+	<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+	<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+	<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+	<application
+		android:label="DSH Remote"
+		android:icon="@mipmap/ic_launcher"
+		android:allowBackup="false"
+		android:usesCleartextTraffic="true"
+		android:theme="@style/AppTheme">
+		<activity
+			android:name=".MainActivity"
+			android:exported="true"
+			android:launchMode="singleTask"
+			android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+			android:windowSoftInputMode="adjustNothing">
+			<intent-filter>
+				<action android:name="android.intent.action.MAIN" />
+				<category android:name="android.intent.category.LAUNCHER" />
+			</intent-filter>
+			<!-- 扫码导入：PC 端 dsh-remote visitor 生成二维码，任意第三方扫码器
+			     打开 dsh-remote://visitor?... 链接时系统会弹到本 App 接管 -->
+			<intent-filter>
+				<action android:name="android.intent.action.VIEW" />
+				<category android:name="android.intent.category.DEFAULT" />
+				<data android:scheme="dsh-remote" android:host="visitor" />
+			</intent-filter>
+		</activity>
+
+		<service
+			android:name=".TunnelService"
+			android:exported="false"
+			android:foregroundServiceType="dataSync" />
+	</application>
+</manifest>

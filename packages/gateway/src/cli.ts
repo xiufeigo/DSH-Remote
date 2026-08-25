@@ -4,6 +4,7 @@
  *
  *   dsh-remote start              启动网关守护进程（含 frpc 托管）
  *   dsh-remote pair [--name X]    生成一次性配对码并在终端渲染二维码
+ *   dsh-remote visitor            生成 stcp/xtcp 访客侧配置（手机壳 App 扫码导入）
  *   dsh-remote devices            列出已配对设备
  *   dsh-remote revoke <deviceId>  吊销设备
  *   dsh-remote status             查看网关/上游/frp 状态
@@ -15,6 +16,7 @@ import process from "node:process";
 import { GatewayServer } from "./server.ts";
 import { Store } from "./store.ts";
 import type { GatewayConfig } from "./config.ts";
+import { normalizeFrpMode, renderVisitorToml, visitorConnectionString } from "./frp.ts";
 
 interface CliArgs {
 	command: string;
@@ -49,6 +51,9 @@ const USAGE = `dsh-remote —— DSH Desktop 远程控制网关
 用法：
   dsh-remote start                启动网关（前台运行；Ctrl-C 退出）
   dsh-remote pair [--name 名称]   生成一次性配对码 + 二维码
+  dsh-remote visitor [--mode stcp|xtcp] [--bind-port 端口] [--out 路径]
+                                  生成访客侧 frpc 配置 + 壳 App 导入二维码
+                                  （stcp/xtcp 形态下手机凭密钥连入，VPS 不开入口端口）
   dsh-remote devices              列出已配对设备
   dsh-remote revoke <设备ID>      吊销设备
   dsh-remote status               网关 / 上游 / frp 状态
@@ -66,6 +71,8 @@ async function main(): Promise<number> {
 			return cmdStart(store, flags);
 		case "pair":
 			return await cmdPair(store, flags);
+		case "visitor":
+			return await cmdVisitor(store, flags);
 		case "devices":
 			return await cmdDevices(store);
 		case "revoke": {
@@ -108,18 +115,25 @@ async function cmdStart(store: Store, flags: Map<string, string | boolean>): Pro
 		log: (line) => console.log(`[dsh-remote] ${line}`),
 	});
 
-	process.on("SIGINT", () => {
+	const quit = () => {
 		void (async () => {
 			await server.stop();
 			process.exit(0);
 		})();
-	});
+	};
+	process.on("SIGINT", quit);
+	process.on("SIGTERM", quit);
 	await server.start();
 
-	const entry = config.frp.enabled && typeof config.frp.serverAddr === "string"
+	const frpMode = normalizeFrpMode(config.frp.mode);
+	const frpEntry = config.frp.enabled && typeof config.frp.serverAddr === "string" && frpMode === "entry";
+	const entry = frpEntry
 		? `https://${config.frp.serverAddr}:${String(config.frp.remotePort)}/`
 		: `https://${config.listenHost}:${String(server.actualPort ?? config.listenPort)}/`;
 	console.log(`[dsh-remote] 入口地址：${entry}`);
+	if (config.frp.enabled && !frpEntry) {
+		console.log(`[dsh-remote] ${frpMode} 形态：VPS 不开公网入口；手机端运行 dsh-remote visitor 生成访客配置后连入`);
+	}
 	console.log(`[dsh-remote] 上游：http://127.0.0.1:${String(config.upstreamPort)}（DSH Web GUI）`);
 	if (!config.frp.enabled) console.log("[dsh-remote] 提示：config.json 里 frp.enabled=true 后将自动托管 frpc");
 
@@ -157,6 +171,75 @@ async function cmdPair(store: Store, flags: Map<string, string | boolean>): Prom
 	return 0;
 }
 
+// ---------- visitor（stcp/xtcp 访客配置导出） ----------
+
+async function cmdVisitor(store: Store, flags: Map<string, string | boolean>): Promise<number> {
+	const config = await store.loadConfig();
+	const frp = config.frp;
+	if (!frp.enabled || typeof frp.serverAddr !== "string" || frp.serverAddr.length === 0) {
+		console.error("请先启用 frp 并配置 frp.serverAddr（frps 地址）：config.json → frp.enabled / frp.serverAddr");
+		return 1;
+	}
+	const flagMode = typeof flags.get("mode") === "string" ? String(flags.get("mode")) : undefined;
+	if (flagMode !== undefined && flagMode !== "stcp" && flagMode !== "xtcp") {
+		console.error("--mode 仅支持 stcp 或 xtcp");
+		return 1;
+	}
+	// 显式 flag 优先；否则沿用 config 里已选的访客形态；entry 形态没有访客概念
+	const configured = normalizeFrpMode(frp.mode);
+	const mode = flagMode ?? (configured === "entry" ? undefined : configured);
+	if (mode === undefined) {
+		console.error('当前为 entry（公网入口）形态，无需访客配置。\n如要改为不开公网端口的形态，请传 --mode xtcp（P2P，失败自动回退中转）或 --mode stcp（固定中转）。');
+		return 1;
+	}
+	const rawBindPort = typeof flags.get("bind-port") === "string" ? Number(flags.get("bind-port")) : NaN;
+	const bindPort = Number.isInteger(rawBindPort) && rawBindPort >= 1 && rawBindPort <= 65535 ? rawBindPort : config.listenPort;
+
+	const secrets = await store.ensureSecrets();
+	const toml = renderVisitorToml({
+		serverAddr: frp.serverAddr,
+		serverPort: frp.serverPort,
+		authToken: secrets.frpAuthToken,
+		secretKey: secrets.frpVisitorKey,
+		mode,
+		bindPort,
+	});
+	const out = typeof flags.get("out") === "string" ? String(flags.get("out")) : "frp/frpc-visitor.toml";
+	await store.writeAtomic(out, toml);
+
+	// 网关证书指纹进连接串：App 扫码即完成证书锁定
+	let fingerprint: string | undefined;
+	try {
+		const cert = await (await import("./cert.ts")).ensureCert(store.path("certs"));
+		fingerprint = cert.fingerprintSha256;
+	} catch {
+		// 拿不到指纹就不放进连接串（App 端退化为不锁定，仅提示）
+	}
+	const link = visitorConnectionString({
+		mode,
+		serverAddr: frp.serverAddr,
+		serverPort: frp.serverPort,
+		secretKey: secrets.frpVisitorKey,
+		authToken: secrets.frpAuthToken,
+		bindPort,
+		fingerprint,
+	});
+
+	console.log(`形态          ${mode}${mode === "xtcp" ? "（P2P 打洞优先，失败自动回退 stcp 中转）" : "（固定经 VPS 中转）"}`);
+	console.log(`frps          ${frp.serverAddr}:${String(frp.serverPort)}`);
+	console.log(`访客配置      ${store.path(out)}（frpc -c 该文件后访问 https://127.0.0.1:${String(bindPort)}）`);
+	await store.audit("visitor_config_exported", { mode, out });
+	try {
+		const QRCode = (await import("qrcode")).default;
+		const qr = await QRCode.toString(link, { type: "terminal", small: true });
+		console.log("\nAndroid 壳 App 扫码导入（含密钥与证书锁定指纹，注意不要截图外传）：\n");
+		console.log(qr);
+	} catch {
+		console.log("(二维码渲染失败：PC 端访客直接用上方 toml 文件即可；壳 App 请在终端字体正常时重试)");
+	}
+	return 0;
+}
+
 // ---------- devices ----------
 
 async function cmdDevices(store: Store): Promise<number> {
@@ -181,8 +264,16 @@ async function cmdStatus(store: Store): Promise<number> {
 	console.log(`上游 DSH      127.0.0.1:${String(config.upstreamPort)} ${await probeTcp("127.0.0.1", config.upstreamPort) ? "[可达]" : "[不可达]"}`);
 	if (config.frp.enabled) {
 		const binary = await import("./frp.ts").then((mod) => mod.locateFrpcBinary(config.frp, store));
-		console.log(`frp           ${config.frp.serverAddr ?? "?"}:${String(config.frp.serverPort)} → 本机:${String(config.frp.remotePort)} ${binary === undefined ? "[缺 frpc 二进制]" : "[frpc 就绪]"}`);
-		console.log(`公网入口      https://${config.frp.serverAddr ?? "?"}:${String(config.frp.remotePort)}`);
+		const mode = normalizeFrpMode(config.frp.mode);
+		const shape = mode === "entry"
+			? ` → 公网入口:${String(config.frp.remotePort)}`
+			: ` 形态=${mode}（不开公网端口）`;
+		console.log(`frp           ${config.frp.serverAddr ?? "?"}:${String(config.frp.serverPort)}${shape} ${binary === undefined ? "[缺 frpc 二进制]" : "[frpc 就绪]"}`);
+		if (mode === "entry") {
+			console.log(`公网入口      https://${config.frp.serverAddr ?? "?"}:${String(config.frp.remotePort)}`);
+		} else {
+			console.log("访客连入      运行 dsh-remote visitor 生成手机端配置（壳 App 扫码导入）");
+		}
 	} else {
 		console.log("frp           未启用（config.json → frp.enabled）");
 	}
@@ -258,11 +349,16 @@ async function cmdDoctor(store: Store): Promise<number> {
 			ok: typeof config.frp.serverAddr === "string",
 			detail: typeof config.frp.serverAddr === "string" ? config.frp.serverAddr : "未配置",
 		});
+		const frpMode = normalizeFrpMode(config.frp.mode);
 		if (typeof config.frp.serverAddr === "string") {
 			const controlOk = await probeTcp(config.frp.serverAddr, config.frp.serverPort);
 			checks.push({ name: `frps 控制端口 ${String(config.frp.serverPort)}`, ok: controlOk, detail: controlOk ? "可达" : "不可达（检查 VPS 防火墙/frps 是否运行）" });
-			const entryOk = await probeTcp(config.frp.serverAddr, config.frp.remotePort);
-			checks.push({ name: `公网入口端口 ${String(config.frp.remotePort)}`, ok: true, detail: entryOk ? "开放" : "未开放（网关+frpc 未连上时属正常）" });
+			if (frpMode === "entry") {
+				const entryOk = await probeTcp(config.frp.serverAddr, config.frp.remotePort);
+				checks.push({ name: `公网入口端口 ${String(config.frp.remotePort)}`, ok: true, detail: entryOk ? "开放" : "未开放（网关+frpc 未连上时属正常）" });
+			} else {
+				checks.push({ name: "公网入口端口", ok: true, detail: `${frpMode} 形态不开入口端口，VPS 暴露面仅剩控制口 + 访客密钥` });
+			}
 		}
 		const binary = await import("./frp.ts").then((mod) => mod.locateFrpcBinary(config.frp, store));
 		checks.push({ name: "frpc 二进制", ok: binary !== undefined, detail: binary ?? `缺失，放到 ${store.path("vendor", "frp")} 下` });

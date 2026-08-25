@@ -2,10 +2,13 @@
 /**
  * dsh-remote-plugin 安装器（幂等）。
  *
- * 做两件事：
- *   1. 把 plugin 与 gateway 两个包 junction 进 DSH 的包解析农场
- *      （优先共享农场 ~/.dsh/profiles/node_modules，其次 per-profile 目录）；
- *   2. 向 profile 的 cordis.patch.yml 追加 insert 行（已存在则跳过）。
+ * 做三件事：
+ *   1. 把 plugin 与 gateway 两个包 junction 进 DSH 的共享包农场
+ *      ~/.dsh/profiles/node_modules（服务 gateway 兜底解析）；
+ *   2. 把 plugin 以裸包名 dsh-remote-plugin junction 进目标 profile 的
+ *      node_modules——cordis loader 按 patch 行的 name 从 profile 目录向上
+ *      解析裸名，作用域链接解析不到（与 dsh-explorer 等兄弟插件一致）；
+ *   3. 向 profile 的 cordis.patch.yml 追加 insert 行（已存在则跳过）。
  *
  * 用法：
  *   node scripts/install.mjs               # 默认 profile web
@@ -33,6 +36,7 @@ const DSH_HOME = process.env.DSH_HOME || join(process.env.USERPROFILE || process
 const PROFILE_DIR = join(DSH_HOME, "profiles", PROFILE);
 const PATCH_PATH = join(PROFILE_DIR, "cordis.patch.yml");
 const FARM_DIR = join(DSH_HOME, "profiles", "node_modules");
+const PLUGIN_NAME = JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).name;
 
 const log = (...parts) => console.log(...parts);
 
@@ -107,6 +111,9 @@ if (!DRY) mkdirSync(base, { recursive: true });
 const scope = join(base, "@dsh-remote");
 ensureLink(join(scope, "gateway"), GATEWAY_DIR);
 ensureLink(join(scope, "plugin"), PLUGIN_DIR);
+
+// 关键：loader 按裸名解析，必须链接进 per-profile node_modules
+ensureLink(join(PROFILE_DIR, "node_modules", PLUGIN_NAME), PLUGIN_DIR);
 
 log("▶ profile patch");
 ensurePatchRow();

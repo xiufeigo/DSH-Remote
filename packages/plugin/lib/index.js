@@ -12,7 +12,7 @@
  * 幂等性：网关端口已被监听时不重复拉起。配置开关：config.json 的 autoStart。
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import https from "node:https";
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -43,6 +43,67 @@ export function resolveRemoteHome() {
 
 function configPath(home) {
 	return join(home, "config.json");
+}
+
+/**
+ * 读磁盘上正在生效的 frpc.toml（插件设置页并不编辑这份文件）。
+ * 解析失败或文件不存在时返回 null。
+ */
+export function readTunnelSnapshot(home) {
+	try {
+		const tomlPath = join(home, "frp", "frpc.toml");
+		const toml = readFileSync(tomlPath, "utf8");
+		const proxies = [];
+		for (const block of toml.split("[[proxies]]").slice(1)) {
+			const name = /(?:^|\n)\s*name\s*=\s*"([^"]+)"/.exec(block)?.[1];
+			const type = /(?:^|\n)\s*type\s*=\s*"([^"]+)"/.exec(block)?.[1];
+			if (name !== undefined && type !== undefined) proxies.push({ name, type });
+		}
+		const serverAddr = /(?:^|\n)\s*serverAddr\s*=\s*"([^"]+)"/.exec(toml)?.[1] ?? "";
+		const portMatch = /(?:^|\n)\s*serverPort\s*=\s*(\d+)/.exec(toml);
+		const serverPort = portMatch === null ? 0 : Number(portMatch[1]);
+		return {
+			tomlPath,
+			serverAddr,
+			serverPort,
+			proxies,
+			dualProxy: proxies.some((proxy) => proxy.type === "xtcp") && proxies.some((proxy) => proxy.type === "stcp"),
+		};
+	} catch {
+		return null;
+	}
+}
+
+function requestAdmin(port, path, method = "GET") {
+	return new Promise((resolveRequest) => {
+		const request = https.request(
+			{ host: "127.0.0.1", port, path, method, rejectUnauthorized: false, timeout: 4000 },
+			(response) => {
+				const chunks = [];
+				response.on("data", (chunk) => chunks.push(chunk));
+				response.on("end", () => resolveRequest({
+					status: response.statusCode,
+					body: Buffer.concat(chunks).toString("utf8"),
+				}));
+			},
+		);
+		request.on("timeout", () => {
+			request.destroy();
+			resolveRequest(undefined);
+		});
+		request.on("error", () => resolveRequest(undefined));
+		request.end();
+	});
+}
+
+function killProcessTree(proc) {
+	if (proc === null || proc === undefined) return;
+	const pid = proc.pid;
+	if (process.platform === "win32" && typeof pid === "number") {
+		spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+		return;
+	}
+	if (proc.exitCode === null) proc.kill("SIGTERM");
 }
 
 function readConfigFile(home) {
@@ -85,11 +146,15 @@ const TAG = "[dsh-remote]";
  *   log: (line: string) => void,
  *   readConfig: () => object,
  *   writeConfig: (next: object) => Promise<void> | void,
+ *   readSecrets?: () => object,
+ *   writeSecrets?: (next: object) => Promise<void> | void,
  *   restartGateway: () => void,
  *   adminRequest: (path: string, method?: string) => Promise<{ status: number, body: string } | undefined>,
  * }}
  */
 export function createRouteHandlers(deps) {
+	const readSecrets = typeof deps.readSecrets === "function" ? deps.readSecrets : () => ({});
+	const writeSecrets = typeof deps.writeSecrets === "function" ? deps.writeSecrets : async () => {};
 	function sendJson(res, payload, status = 200) {
 		res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
 		res.end(JSON.stringify(payload));
@@ -107,10 +172,18 @@ export function createRouteHandlers(deps) {
 	}
 
 	return {
-		/** GET /dsh-remote/config —— 当前配置 + 展示默认值。 */
+		/** GET /dsh-remote/config —— 当前配置 + 展示默认值 + 密钥（供面板填写，与 Android 对齐）。 */
 		async handleConfigGet(req, res) {
 			const current = deps.readConfig();
-			sendJson(res, { config: current, defaults: DISPLAY_DEFAULTS });
+			const secretsFile = readSecrets() ?? {};
+			sendJson(res, {
+				config: current,
+				defaults: DISPLAY_DEFAULTS,
+				secrets: {
+					authToken: typeof secretsFile.frpAuthToken === "string" ? secretsFile.frpAuthToken : "",
+					visitorKey: typeof secretsFile.frpVisitorKey === "string" ? secretsFile.frpVisitorKey : "",
+				},
+			});
 		},
 
 		/** POST /dsh-remote/config —— 校验 → 合并写盘 → 重启网关。 */
@@ -129,6 +202,16 @@ export function createRouteHandlers(deps) {
 			}
 			const next = mergeConfigFile(deps.readConfig(), verdict.patch);
 			await deps.writeConfig(next);
+			const secretsPatch = {};
+			if (typeof verdict.secrets?.authToken === "string") secretsPatch.frpAuthToken = verdict.secrets.authToken;
+			if (typeof verdict.secrets?.visitorKey === "string") secretsPatch.frpVisitorKey = verdict.secrets.visitorKey;
+			if (Object.keys(secretsPatch).length > 0) {
+				const currentSecrets = readSecrets() ?? {};
+				await writeSecrets({
+					frpAuthToken: secretsPatch.frpAuthToken ?? currentSecrets.frpAuthToken ?? "",
+					frpVisitorKey: secretsPatch.frpVisitorKey ?? currentSecrets.frpVisitorKey ?? "",
+				});
+			}
 			deps.log("配置已更新，正在重启网关…");
 			deps.restartGateway();
 			sendJson(res, { ok: true, config: next });
@@ -160,6 +243,7 @@ export function createRouteHandlers(deps) {
 					? deviceList.devices.filter((device) => !device.revokedAt).length
 					: null,
 				listenPort,
+				tunnel: readTunnelSnapshot(deps.home),
 			});
 		},
 
@@ -200,19 +284,26 @@ var plugin_default = {
 		let child = null;
 		let disposed = false;
 		let restartTimer = null;
+		let plannedStop = false;
 
 		const spawnGateway = () => {
 			if (disposed) return;
+			if (child !== null && child.exitCode === null) {
+				console.log(`${TAG} 网关子进程已在运行，跳过重复拉起`);
+				return;
+			}
 			const cliPath = locateGatewayCli();
 			if (cliPath === undefined) {
 				console.warn(`${TAG} 未找到 gateway 入口，跳过自动拉起`);
 				return;
 			}
-			child = spawn(process.execPath, [cliPath, "start"], {
+			plannedStop = false;
+			const proc = spawn(process.execPath, [cliPath, "start"], {
 				env: { ...process.env, DSH_REMOTE_HOME: home },
 				stdio: ["ignore", "pipe", "pipe"],
 				windowsHide: true,
 			});
+			child = proc;
 			const forward = (chunk) => {
 				for (const line of chunk.toString("utf8").split("\n")) {
 					const trimmed = line.trimEnd();
@@ -220,24 +311,46 @@ var plugin_default = {
 					console.log(trimmed.startsWith("[dsh-remote]") ? trimmed : `${TAG} ${trimmed}`);
 				}
 			};
-			child.stdout?.on("data", forward);
-			child.stderr?.on("data", forward);
-			child.on("exit", (code, signal) => {
-				if (disposed) return;
+			proc.stdout?.on("data", forward);
+			proc.stderr?.on("data", forward);
+			proc.on("exit", (code, signal) => {
+				if (child === proc) child = null;
+				if (disposed || plannedStop) return;
+				if (child !== null && child !== proc) return;
 				console.warn(`${TAG} 网关退出（code=${String(code)} signal=${String(signal)}），3s 后重启`);
 				restartTimer = setTimeout(spawnGateway, 3_000);
 			});
 		};
 
 		const killChild = () => {
-			if (child !== null && child.exitCode === null) child.kill();
+			plannedStop = true;
+			if (restartTimer !== null) {
+				clearTimeout(restartTimer);
+				restartTimer = null;
+			}
+			const proc = child;
 			child = null;
+			killProcessTree(proc);
 		};
 
 		const restartGateway = () => {
 			killChild();
-			if (restartTimer !== null) clearTimeout(restartTimer);
-			restartTimer = setTimeout(spawnGateway, 800);
+			restartTimer = setTimeout(() => {
+				void (async () => {
+					const cfg = readConfigFile(home);
+					const listenPort = Number.isInteger(cfg.listenPort) ? cfg.listenPort : 18443;
+					if (await isPortBound("127.0.0.1", listenPort)) {
+						console.log(`${TAG} 端口 ${String(listenPort)} 仍被占用，请求已有网关退出后重拉`);
+						await requestAdmin(listenPort, "/__dsh_remote__/admin/shutdown", "POST");
+						for (let i = 0; i < 25; i += 1) {
+							if (!(await isPortBound("127.0.0.1", listenPort))) break;
+							await new Promise((resolveWait) => setTimeout(resolveWait, 200));
+						}
+					}
+					if (disposed) return;
+					spawnGateway();
+				})();
+			}, 400);
 		};
 
 		ctx.effect(() => {
@@ -276,29 +389,26 @@ var plugin_default = {
 					await writeFile(tmp, `${JSON.stringify(next, null, "\t")}\n`, "utf8");
 					await rename(tmp, target);
 				},
+				readSecrets: () => {
+					try {
+						return JSON.parse(readFileSync(join(home, "state", "secrets.json"), "utf8"));
+					} catch {
+						return {};
+					}
+				},
+				writeSecrets: async (next) => {
+					const { writeFile, rename, mkdir } = await import("node:fs/promises");
+					const target = join(home, "state", "secrets.json");
+					await mkdir(dirname(target), { recursive: true });
+					const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
+					await writeFile(tmp, `${JSON.stringify(next, null, "\t")}\n`, "utf8");
+					await rename(tmp, target);
+				},
 				restartGateway,
 				adminRequest: async (path, method = "GET") => {
 					const cfg = readConfigFile(home);
 					const port = Number.isInteger(cfg.listenPort) ? cfg.listenPort : 18443;
-					return await new Promise((resolveRequest) => {
-						const request = https.request(
-							{ host: "127.0.0.1", port, path, method, rejectUnauthorized: false, timeout: 4000 },
-							(response) => {
-								const chunks = [];
-								response.on("data", (chunk) => chunks.push(chunk));
-								response.on("end", () => resolveRequest({
-									status: response.statusCode,
-									body: Buffer.concat(chunks).toString("utf8"),
-								}));
-							},
-						);
-						request.on("timeout", () => {
-							request.destroy();
-							resolveRequest(undefined);
-						});
-						request.on("error", () => resolveRequest(undefined));
-						request.end();
-					});
+					return await requestAdmin(port, path, method);
 				},
 			});
 

@@ -1,0 +1,43 @@
+# Android 壳 App 构建：复用 android/build.ps1（无 Gradle 手工工具链）。
+# ubuntu runner 预装 pwsh；SDK/JDK 由官方 action 提供，与本地同一套版本要求。
+name: android-apk
+
+on:
+  push:
+    paths:
+      - "android/**"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 17（build.ps1 走 JAVA_HOME）
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK（platforms;android-36 + build-tools;35.0.0）
+        uses: android-actions/setup-android@v3
+
+      - name: 安装构建所需 SDK 组件
+        run: |
+          sdkmanager --install "platforms;android-36" "build-tools;35.0.0" >/dev/null
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: 构建签名 APK（自动下载 frpc android_arm64 打包）
+        working-directory: android
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+        run: pwsh -NoProfile -File ./build.ps1
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-remote-apk
+          path: android/dist/dsh-remote.apk
+          if-no-files-found: error

@@ -4,11 +4,13 @@
 一模一样的界面：会话列表、会话过程、发消息、中止任务、审批交互，全部原生支持。
 
 ```
-📱 手机浏览器 / PWA（二期：自研壳 App）
+📱 手机：壳 App（内嵌 frpc visitor）/ 浏览器 PWA
       │ HTTPS 端到端加密
       ▼
-☁️ VPS · frps（公网唯一暴露点，仅开 2 个 TCP 端口）
+☁️ VPS · frps（访客模式仅开控制口；入口模式另开 1 个入口端口）
       │ frp 加密隧道（PC 主动外连，家宽不开任何端口、无需公网 IP）
+      │ stcp/xtcp 形态下 VPS 不监听入口端口，只有持密钥的访客能连入；
+      │ xtcp 打洞成功后手机 ⇄ PC 直连，数据不过 VPS
       ▼
 🚪 网关 @127.0.0.1:18443（LAN/WAN 完全不可见）
       │ 设备配对 + Token 认证 · 限流锁定 · Host/Origin 改写
@@ -22,8 +24,9 @@
 |---|---|
 | `packages/gateway/` | 网关核心（TypeScript，Node ≥24 原生 TS 运行，无构建步骤） |
 | `packages/plugin/` | cordis 插件：随 DSH web profile 自启网关 |
+| `android/` | Android 壳 App：内嵌 frpc visitor + 证书锁定（见 [android/README.md](android/README.md)） |
 | `scripts/install-frps.sh` | VPS 一键安装 frps |
-| `scripts/smoke.mjs` | 冒烟测试（12 项） |
+| `scripts/smoke.mjs` | 冒烟测试（18 项） |
 | `docs/` | 架构决策、VPS 部署、安全模型 |
 
 ## 快速开始
@@ -57,7 +60,7 @@ mkdir ~\.dsh-remote
     "enabled": true,
     "serverAddr": "<VPS 公网 IP>",
     "serverPort": 7000,
-    "remotePort": 8443
+    "mode": "xtcp"
   }
 }
 '@ | Set-Content ~\.dsh-remote\config.json -Encoding utf8
@@ -68,8 +71,32 @@ pnpm start          # 或 node packages/gateway/src/cli.ts start
 node packages/gateway/src/cli.ts doctor   # 全链路体检
 ```
 
+> `frp.mode` 三选一：`"xtcp"`（推荐，P2P 打洞优先、失败自动回退中转，不开公网端口）、
+> `"stcp"`（固定走 VPS 中转，也不开公网端口）、`"entry"`（经典公网入口，
+> 需另配 `"remotePort": 8443`，任何人可扫到该端口）。
+
 > `upstreamPort` 是 DSH Web GUI 的端口（本会话为 52392）。桌面端重启后端口若漂移，
 > 网关启动时会**自动探测并回写**（`autoFixUpstreamPort: true` 默认开启）；`doctor` 可手动体检。
+
+### 3.5 访客模式 + Android 壳 App（推荐，不开公网入口）
+
+`mode` 设为 `stcp`/`xtcp` 后，VPS 上不再有任何可被扫到的 DSH 端口：
+
+```powershell
+node packages/gateway/src/cli.ts visitor --mode xtcp
+# 终端出二维码 + 生成 ~/.dsh-remote/frp/frpc-visitor.toml
+```
+
+- **Android**：安装壳 App（[android/README.md](android/README.md)，仓库内
+  `powershell -File android\build.ps1` 即可出 APK），任意扫码器扫上面的
+  二维码 → App 自动接管导入并自动建立隧道 → 直接进入 DSH；无可用后端时只显示本地连接状态，
+  不会显示伪造的工作区或会话内容。证书指纹随码下发，无告警。
+  手机端移动界面（隐藏桌面 rail、鲸鱼侧栏入口、设置底部 sheet、状态栏沉浸避让）
+  由 **App 注入的脚本完成，不依赖服务器端是否安装本插件**，连接官方 DSH Web 同样生效。
+- **PC/其他设备**：拿 `frpc-visitor.toml` 跑 `frpc -c`，访问 `https://127.0.0.1:<bindPort>`。
+
+xtcp 打洞成功时数据手机 ⇄ PC 直连不过 VPS；失败自动回退 stcp 中转不断连。
+详见 [docs/vps-frps-setup.md §4.5](docs/vps-frps-setup.md)。
 
 ### 局域网模式（可选，无 VPS 时先用起来）
 
@@ -112,7 +139,7 @@ node scripts/uninstall.mjs      # 卸载
 插件已接入 DSH 官方的插件设置扩展点，重启 DSH 后在 **设置 → 插件** 页会出现
 「DSH Remote」卡片，可视化完成：
 
-- frp 隧道开关、VPS 地址、控制端口、入口端口（共享密钥不出面板，走 `secrets.json`）
+- frp 隧道开关、VPS 地址、控制端口、**隧道形态**（xtcp / stcp / entry，入口端口仅 entry 需要；共享密钥不出面板，走 `secrets.json`）
 - 监听面切换（仅本机 / 局域网）、上游端口与自动跟随开关、随 DSH 自启开关
 - 网关状态实时展示（运行中/离线、已配对设备数）
 - 一键生成配对码、一键重启网关
@@ -122,7 +149,9 @@ node scripts/uninstall.mjs      # 卸载
 
 ## 安全模型（摘要）
 
-- **网络层**：网关只监听 `127.0.0.1`，局域网/外网都摸不到；公网只有 VPS 上 frp 的两个端口。
+- **网络层**：网关只监听 `127.0.0.1`，局域网/外网都摸不到；访客模式（stcp/xtcp）下
+  公网上连 DSH 的端口都不存在（只剩 frps 控制口），只有持密钥的设备能连入；
+  entry 模式公网暴露 VPS 上 frp 的两个端口。
 - **认证层**：一次性配对码（10 分钟有效、用后即焚）换取长效设备 Token（httpOnly Cookie，
   服务端只存 SHA-256）；配对失败 5 次锁 IP 15 分钟；每 IP 滑动窗口限流。
 - **传输层**：手机↔网关 TLS（自签，指纹可校验；壳 App 将做证书锁定）；frpc↔frps 隧道 TLS。
@@ -160,5 +189,7 @@ VPS 上唯一要验证的只剩网络可达性。
 
 - [x] 网关核心：认证/反代/WS 直通/PWA 注入/frp 托管/CLI
 - [x] cordis 插件自启
+- [x] frp 访客模式（stcp/xtcp）：VPS 不开公网入口，`dsh-remote visitor` 出码导入
+- [x] Android 壳 App：内嵌 frpc visitor + 证书锁定 + 扫码导入
 - [ ] tsnet 传输适配器（无 VPS 备选）
-- [ ] Android/iOS 自研壳 App（WebView + 证书锁定 + STCP 访客模式）
+- [ ] iOS 壳 App（需开发者账号分发）

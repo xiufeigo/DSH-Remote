@@ -3,7 +3,7 @@
  *
  * 布局：
  *   config.json            配置（见 config.ts）
- *   state/secrets.json     frp authToken 等机密（首次自动生成）
+ *   state/secrets.json     frp authToken、访客 secretKey 等机密（首次自动生成）
  *   state/devices.json     已配对设备（只存 Token 的 SHA-256，不存原文）
  *   state/pending-codes.json  待使用的一次性配对码（CLI 写入、守护进程消费）
  *   logs/audit.jsonl       审计日志（追加写）
@@ -37,7 +37,10 @@ export interface PendingCode {
 }
 
 interface SecretsFile {
+	/** frpc↔frps 登录密钥 */
 	frpAuthToken: string;
+	/** stcp/xtcp 访客密钥（proxy 与 visitor 两端必须一致） */
+	frpVisitorKey: string;
 }
 
 export class Store {
@@ -96,8 +99,12 @@ export class Store {
 
 	async ensureSecrets(): Promise<SecretsFile> {
 		const existing = await this.readJson<SecretsFile>("state/secrets.json");
-		if (existing?.frpAuthToken) return existing;
-		const fresh: SecretsFile = { frpAuthToken: randomBytes(32).toString("base64url") };
+		if (existing?.frpAuthToken && existing?.frpVisitorKey) return existing;
+		// 兼容旧版 secrets.json（只有 frpAuthToken）：缺哪个补哪个，其余保留
+		const fresh: SecretsFile = {
+			frpAuthToken: existing?.frpAuthToken ?? randomBytes(32).toString("base64url"),
+			frpVisitorKey: existing?.frpVisitorKey ?? randomBytes(32).toString("base64url"),
+		};
 		await this.writeAtomic("state/secrets.json", `${JSON.stringify(fresh, null, "\t")}\n`);
 		return fresh;
 	}

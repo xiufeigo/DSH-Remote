@@ -23,6 +23,12 @@ for (const name of ["gateway", "plugin"]) {
 	}
 }
 
+const profilePluginLink = join(DSH_HOME, "profiles", PROFILE, "node_modules", "dsh-remote-plugin");
+if (existsSync(profilePluginLink)) {
+	console.log(`- 移除 ${profilePluginLink}`);
+	if (!DRY) rmSync(profilePluginLink, { recursive: true, force: true });
+}
+
 if (existsSync(PATCH_PATH)) {
 	const lines = readFileSync(PATCH_PATH, "utf8").split("\n");
 	const anchorIndex = lines.findIndex((line) => line.includes("dsh-remote-plugin"));

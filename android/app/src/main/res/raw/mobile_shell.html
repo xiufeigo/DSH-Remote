@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DSH Remote</title>
+<style>
+:root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+* { box-sizing: border-box; }
+html, body { width: 100%; min-height: 100%; margin: 0; }
+body { color: #1b1b1f; background: #f2f3f6; }
+.shell { min-height: 100vh; display: flex; flex-direction: column; padding: max(18px, var(--dshr-inset-top, env(safe-area-inset-top, 0px))) 24px max(28px, var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px))); }
+.brand { display: flex; align-items: center; gap: 8px; font-size: 18px; font-weight: 700; letter-spacing: 0; line-height: 28px; color: #1b1b1f; background: none; border: 0; padding: 0; }
+.brand svg { width: 28px; height: 21px; }
+main { flex: 1; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; padding: 48px 0 72px; }
+.status-mark { position: relative; width: 42px; height: 42px; margin-bottom: 20px; border: 2px solid #d9dbe0; border-radius: 50%; }
+.status-mark::after { content: ""; position: absolute; inset: -2px; border: 2px solid transparent; border-top-color: #1b66ff; border-radius: inherit; }
+body[data-state="connecting"] .status-mark::after { animation: spin .8s linear infinite; }
+body[data-state="ready"] .status-mark { border-color: #b6d6c1; }
+body[data-state="ready"] .status-mark::after { inset: 11px 9px 13px 10px; border: 0; border-right: 2px solid #27804b; border-bottom: 2px solid #27804b; border-radius: 0; transform: rotate(45deg); }
+body[data-state="failed"] .status-mark { border-color: #efd0d0; }
+body[data-state="failed"] .status-mark::after { content: "×"; inset: 0; display: grid; place-items: center; border: 0; color: #b33b3b; font-size: 30px; font-weight: 400; line-height: 1; }
+@keyframes spin { to { transform: rotate(360deg); } }
+h1 { max-width: 300px; margin: 0; font-size: 22px; font-weight: 650; line-height: 1.35; letter-spacing: 0; }
+p { max-width: 300px; margin: 10px 0 0; color: #62626b; font-size: 14px; line-height: 1.6; }
+.actions { display: flex; flex-direction: column; gap: 10px; width: min(100%, 280px); margin-top: 28px; }
+a { text-decoration: none; }
+.action { display: flex; align-items: center; justify-content: center; min-height: 46px; border: 1px solid #d9dbe0; border-radius: 10px; color: #1b1b1f; font-size: 15px; font-weight: 580; background: #fff; }
+.action.primary { border-color: #1b66ff; background: #1b66ff; color: #ffffff; }
+.action.secondary:empty { display: none; }
+</style>
+</head>
+<body data-state="{{STATE}}">
+<div class="shell">
+<header>
+  <button type="button" class="brand" id="whale" aria-label="打开 DSH 侧边栏菜单">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 23.16 17.04" fill="none" aria-hidden="true"><path fill="currentColor" d="M22.9168 1.43018C22.6713 1.31018 22.5658 1.53918 22.4223 1.65519C22.3733 1.69269 22.3318 1.74169 22.2903 1.78669C21.9317 2.1697 21.5127 2.42121 20.9657 2.39121C20.1657 2.34621 19.4827 2.59771 18.8787 3.20973C18.7502 2.45521 18.3236 2.0047 17.6746 1.71569C17.3351 1.56568 16.9916 1.41518 16.7536 1.08867C16.5876 0.856163 16.5421 0.597155 16.4591 0.341647C16.4061 0.187643 16.3536 0.0301382 16.1761 0.00363739C15.9836 -0.0263635 15.9081 0.135141 15.8326 0.270145C15.5306 0.822162 15.4136 1.43018 15.4251 2.0462C15.4516 3.43174 16.0366 4.53527 17.1991 5.3203C17.3311 5.4103 17.3651 5.5003 17.3236 5.63181C17.2441 5.90231 17.1501 6.16482 17.0671 6.43533C17.0141 6.60784 16.9351 6.64584 16.7501 6.57033C16.1121 6.30383 15.5611 5.90931 15.074 5.4328C14.2475 4.63328 13.5 3.75075 12.568 3.05973C12.349 2.89822 12.13 2.74822 11.9034 2.60522C10.9524 1.68169 12.028 0.923165 12.277 0.833162C12.5375 0.739159 12.3675 0.41615 11.5259 0.42015C10.6844 0.42365 9.91439 0.705658 8.93286 1.08117C8.78935 1.13767 8.63835 1.17867 8.48384 1.21267C7.59332 1.04367 6.66829 1.00617 5.70226 1.11517C3.88321 1.31768 2.43016 2.1777 1.36213 3.64575C0.0790928 5.4103 -0.222916 7.41536 0.146595 9.50642C0.535106 11.7105 1.66014 13.535 3.38869 14.9616C5.18125 16.4406 7.24581 17.1657 9.60138 17.0266C11.0319 16.9441 12.6245 16.7526 14.421 15.2321C14.874 15.4576 15.3496 15.5476 16.1381 15.6151C16.7456 15.6716 17.3306 15.5851 17.7836 15.4911C18.4931 15.3411 18.4441 14.6841 18.1876 14.5636C16.1081 13.595 16.5646 13.9891 16.1496 13.67C17.2061 12.42 18.8202 10.1979 19.3182 7.17235C19.3672 6.83834 19.4297 6.36783 19.4222 6.09732C19.4182 5.93231 19.4562 5.86831 19.6447 5.84931C20.1657 5.78931 20.6712 5.64681 21.1357 5.3913C22.4833 4.65528 23.0268 3.44624 23.1548 1.9972C23.1738 1.77569 23.1508 1.54668 22.9168 1.43018Z"/></svg>
+    DSH Remote
+  </button>
+</header>
+<main>
+  <div class="status-mark" aria-hidden="true"></div>
+  <h1>{{TITLE}}</h1>
+  <p>{{MESSAGE}}</p>
+  <div class="actions">
+    <a class="action primary" href="{{PRIMARY_HREF}}">{{PRIMARY_LABEL}}</a>
+    <a class="action secondary" href="{{SECONDARY_HREF}}">{{SECONDARY_LABEL}}</a>
+  </div>
+</main>
+</div>
+<script>
+window.__dshRemoteInsets = { set: function (top, bottom) {
+  document.documentElement.style.setProperty('--dshr-inset-top', top + 'px');
+  document.documentElement.style.setProperty('--dshr-inset-bottom', bottom + 'px');
+} };
+(function () {
+  var whale = document.getElementById('whale');
+  if (!whale) return;
+  var timer = null;
+  function openSettings() {
+    try {
+      if (window.DshRemoteApp && typeof window.DshRemoteApp.openSettings === 'function') {
+        window.DshRemoteApp.openSettings();
+        return;
+      }
+    } catch (ignored) {}
+  }
+  whale.addEventListener('contextmenu', function (event) {
+    event.preventDefault();
+    openSettings();
+  });
+  whale.addEventListener('touchstart', function () {
+    timer = window.setTimeout(function () { timer = null; openSettings(); }, 650);
+  }, { passive: true });
+  whale.addEventListener('touchend', function () { if (timer) window.clearTimeout(timer); timer = null; });
+  whale.addEventListener('touchcancel', function () { if (timer) window.clearTimeout(timer); timer = null; });
+})();
+</script>
+</body>
+</html>

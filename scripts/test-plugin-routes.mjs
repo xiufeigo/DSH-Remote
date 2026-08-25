@@ -7,10 +7,10 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createRouteHandlers, resolveRemoteHome } from "../packages/plugin/lib/index.js";
+import { createRouteHandlers, readTunnelSnapshot, resolveRemoteHome } from "../packages/plugin/lib/index.js";
 import { validateConfigPatch, mergeConfigFile, DISPLAY_DEFAULTS } from "../packages/plugin/lib/config-schema.js";
 
 /** 捕获 writeHead/end 的假 res。 */
@@ -56,11 +56,38 @@ test("validateConfigPatch：白名单与类型校验", () => {
 	});
 	assert.equal(good.ok, true);
 	assert.deepEqual(good.patch.frp, { enabled: true, serverAddr: "1.2.3.4", serverPort: 7000, remotePort: 8443 });
+	assert.deepEqual(good.secrets, {});
 
 	// 端口边界
 	assert.equal(validateConfigPatch({ listenPort: 0 }).ok, false);
 	assert.equal(validateConfigPatch({ listenPort: 65536 }).ok, false);
 	assert.equal(validateConfigPatch({ listenPort: 65535 }).ok, true);
+});
+
+test("validateConfigPatch：登录密钥与访客密钥进 secrets 不进 config", () => {
+	const ok = validateConfigPatch({
+		authToken: "frps-token",
+		visitorKey: "visitor-sk",
+		frp: { enabled: true, serverAddr: "1.2.3.4", serverPort: 7000, mode: "xtcp" },
+	});
+	assert.equal(ok.ok, true);
+	assert.equal(ok.patch.frp.mode, "xtcp");
+	assert.deepEqual(ok.secrets, { authToken: "frps-token", visitorKey: "visitor-sk" });
+	assert.equal(ok.patch.authToken, undefined);
+
+	const bad = validateConfigPatch({ authToken: "has\nnewline" });
+	assert.equal(bad.ok, false);
+});
+
+test("validateConfigPatch：frp.mode 白名单", () => {
+	for (const mode of ["entry", "stcp", "xtcp"]) {
+		const ok = validateConfigPatch({ frp: { mode } });
+		assert.equal(ok.ok, true, `${mode} 应合法：${JSON.stringify(ok)}`);
+		assert.deepEqual(ok.patch.frp, { mode });
+	}
+	const bad = validateConfigPatch({ frp: { mode: "tcp" } });
+	assert.equal(bad.ok, false);
+	assert.ok(bad.errors.some((e) => e.includes("frp.mode")));
 });
 
 test("mergeConfigFile：顶层浅覆盖 + frp 深合并", () => {
@@ -102,6 +129,35 @@ test("handleConfigPost：合法补丁 → 写盘 + 重启联动", async () => {
 	assert.equal(written.frp.serverPort, 7000);
 	assert.equal(restarts, 1, "保存后必须联动重启网关");
 	await rm(home, { recursive: true, force: true });
+});
+
+test("handleConfigPost：密钥写入 secrets.json 且不进 config", async () => {
+	let writtenConfig = null;
+	let writtenSecrets = null;
+	const handlers = createRouteHandlers({
+		home: ".",
+		log: () => {},
+		readConfig: () => ({ frp: { enabled: false } }),
+		writeConfig: async (next) => { writtenConfig = next; },
+		readSecrets: () => ({}),
+		writeSecrets: async (next) => { writtenSecrets = next; },
+		restartGateway: () => {},
+		adminRequest: async () => undefined,
+	});
+	const res = fakeRes();
+	await handlers.handleConfigPost(
+		fakeReq(JSON.stringify({
+			frp: { enabled: true, serverAddr: "9.9.9.9", serverPort: 7000, mode: "xtcp" },
+			authToken: "login-key",
+			visitorKey: "visit-key",
+		})),
+		res,
+	);
+	assert.equal(res.calls.status, 200);
+	assert.equal(writtenConfig.frp.enabled, true);
+	assert.equal(writtenConfig.frp.serverAddr, "9.9.9.9");
+	assert.equal(writtenConfig.authToken, undefined);
+	assert.deepEqual(writtenSecrets, { frpAuthToken: "login-key", frpVisitorKey: "visit-key" });
 });
 
 test("handleConfigPost：非法补丁 → 400 且不写盘不重启", async () => {
@@ -172,6 +228,61 @@ test("handleStatusGet：网关在线时聚合数据", async () => {
 	assert.equal(payload.deviceCount, 1, "已吊销设备不计数");
 });
 
+test("readTunnelSnapshot：解析 xtcp + stcp 双 proxy", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "dshr-tun-"));
+	await mkdir(join(dir, "frp"), { recursive: true });
+	await writeFile(join(dir, "frp", "frpc.toml"), `# generated
+serverAddr = "8.138.19.15"
+serverPort = 7180
+
+[[proxies]]
+name = "dsh-remote-stcp"
+type = "stcp"
+
+[[proxies]]
+name = "dsh-remote"
+type = "xtcp"
+`);
+	const snap = readTunnelSnapshot(dir);
+	assert.equal(snap.serverAddr, "8.138.19.15");
+	assert.equal(snap.serverPort, 7180);
+	assert.equal(snap.dualProxy, true);
+	assert.deepEqual(snap.proxies.map((p) => `${p.name}:${p.type}`), ["dsh-remote-stcp:stcp", "dsh-remote:xtcp"]);
+	assert.equal(readTunnelSnapshot(join(dir, "missing")), null);
+	await rm(dir, { recursive: true, force: true });
+});
+
+test("handleStatusGet：附带磁盘上的 tunnel 快照", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "dshr-st-"));
+	await mkdir(join(dir, "frp"), { recursive: true });
+	await writeFile(join(dir, "frp", "frpc.toml"), `serverAddr = "1.2.3.4"
+serverPort = 7100
+
+[[proxies]]
+name = "dsh-remote-stcp"
+type = "stcp"
+
+[[proxies]]
+name = "dsh-remote"
+type = "xtcp"
+`);
+	const handlers = createRouteHandlers({
+		home: dir,
+		log: () => {},
+		readConfig: () => ({ listenPort: 18443 }),
+		writeConfig: async () => {},
+		restartGateway: () => {},
+		adminRequest: async () => undefined,
+	});
+	const res = fakeRes();
+	await handlers.handleStatusGet(fakeReq(), res);
+	const payload = JSON.parse(res.calls.body);
+	assert.equal(payload.tunnel.dualProxy, true);
+	assert.equal(payload.tunnel.serverAddr, "1.2.3.4");
+	assert.equal(payload.tunnel.serverPort, 7100);
+	await rm(dir, { recursive: true, force: true });
+});
+
 test("handlePairCodePost：转发成功与失败", async () => {
 	const ok = createRouteHandlers({
 		home: ".", log: () => {}, readConfig: () => ({}), writeConfig: async () => {}, restartGateway: () => {},
@@ -205,5 +316,7 @@ test("DISPLAY_DEFAULTS 与网关 DEFAULT_CONFIG 对齐抽查", async () => {
 	assert.equal(DISPLAY_DEFAULTS.listenPort, DEFAULT_CONFIG.listenPort);
 	assert.equal(DISPLAY_DEFAULTS.upstreamPort, DEFAULT_CONFIG.upstreamPort);
 	assert.equal(DISPLAY_DEFAULTS.frp.serverPort, DEFAULT_CONFIG.frp.serverPort);
+	assert.equal(DISPLAY_DEFAULTS.frp.mode, "xtcp", "插件面板缺省形态为 xtcp（访客密钥连入）");
+	assert.equal(DEFAULT_CONFIG.frp.mode, "entry", "网关文件缺省仍为 entry，避免未写 mode 的历史部署被改写");
 	assert.equal(DISPLAY_DEFAULTS.autoFixUpstreamPort, DEFAULT_CONFIG.autoFixUpstreamPort);
 });

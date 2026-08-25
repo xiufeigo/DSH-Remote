@@ -1,7 +1,7 @@
 {
   "name": "dsh-remote",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1-rc.2.5",
   "description": "DSH Remote Control —— 让手机随时随地安全访问本机 DSH Desktop Web GUI",
   "license": "MIT",
   "privateWorkspace": true,
@@ -13,7 +13,8 @@
     "test:plugin": "node scripts/test-plugin-sim.mjs",
     "test:routes": "node --test scripts/test-plugin-routes.mjs",
     "test:panel": "node scripts/test-panel-e2e.mjs",
-    "test:client": "node scripts/test-client-bundle.mjs",
+	"test:client": "node scripts/test-client-bundle.mjs",
+	"test:mobile": "node scripts/test-mobile-chrome.mjs",
     "start": "node packages/gateway/src/cli.ts start"
   }
 }

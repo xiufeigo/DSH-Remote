@@ -150,3 +150,13 @@ export async function issueDeviceCookie(res: ServerResponse, token: string, days
 export function clearDeviceCookie(res: ServerResponse): void {
 	res.setHeader("Set-Cookie", `${COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`);
 }
+
+/**
+ * stcp/xtcp 下隧道本身就是准入：VPS 不开入口，只有持有访客密钥的 frpc visitor
+ * 能打到本机网关。此时不再要求一次性配对码 / 扫码。
+ */
+export function visitorKeyAdmits(config: GatewayConfig): boolean {
+	if (config.frp.enabled !== true) return false;
+	const mode = config.frp.mode;
+	return mode === "stcp" || mode === "xtcp";
+}

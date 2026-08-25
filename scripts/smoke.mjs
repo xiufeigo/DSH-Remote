@@ -10,6 +10,7 @@
  *   5. HTML 注入 PWA 标记
  *   6. WebSocket 升级：无 Cookie 拒绝；有 Cookie 字节级双向直通
  *   7. RateLimiter 单元行为 + 连续配对失败锁定
+ *   8. frp 适配器：entry/stcp/xtcp 三形态 toml 渲染、访客配置与连接串
  */
 
 import assert from "node:assert/strict";
@@ -149,6 +150,10 @@ test("manifest 与图标可获取", async () => {
 	const icon = await callGateway("/__dsh_remote__/icon.svg");
 	assert.equal(icon.status, 200);
 	assert.match(icon.body, /<svg/);
+	const brand = await callGateway("/__dsh_remote__/brand.svg");
+	assert.equal(brand.status, 200);
+	assert.equal(brand.headers["content-type"], "image/svg+xml");
+	assert.match(brand.body, /<svg/);
 });
 
 test("PNG 图标：魔数、尺寸与解码完整性", async () => {
@@ -182,6 +187,17 @@ test("配对页 next 参数防 XSS：注入载荷被清洗、正常路径保留"
 	assert.ok(proto.body.includes('location.href="/"'), "双斜线外链应回退为根路径");
 	const legit = await callGateway(`/__dsh_remote__/pair?next=${encodeURIComponent("/sessions?tab=all")}`);
 	assert.match(legit.body, /location\.href="\/sessions\?tab=all"/);
+});
+
+test("Android WebView 获得移动配对页，不改变配对协议", async () => {
+	const response = await callGateway("/__dsh_remote__/pair", {
+		headers: { "user-agent": "Mozilla/5.0 DSHRemoteAndroid/1" },
+	});
+	assert.equal(response.status, 200);
+	assert.match(response.body, /配对这台设备/);
+	assert.match(response.body, /__dsh_remote__\/brand\.svg/);
+	assert.ok(!response.body.includes('class="card"'), "移动配对页不应回退为旧卡片布局");
+	assert.match(response.body, /location\.href="\/"/);
 });
 
 // ---------- 3. 配对流程 ----------
@@ -328,4 +344,145 @@ test("连续配对失败触发临时锁定", async () => {
 		if (response.status === 429) break;
 	}
 	assert.equal(lastStatus, 429, "第 3 次失败后应返回 429 锁定");
+});
+
+// ---------- 8. frp 适配器渲染（纯函数，放最后避免干扰上面的 HTTP 用例编号） ----------
+
+test("renderFrpcToml：entry 形态保持 tcp + remotePort", async () => {
+	const { renderFrpcToml } = await import("../packages/gateway/src/frp.ts");
+	const toml = renderFrpcToml({
+		serverAddr: "v.example", serverPort: 7000, authToken: "tok",
+		localPort: 18443, remotePort: 8443, mode: "entry", secretKey: "sk",
+	});
+	assert.match(toml, /type = "tcp"/);
+	assert.match(toml, /remotePort = 8443/);
+	assert.ok(!toml.includes("secretKey"), "entry 形态不应出现访客密钥");
+});
+
+test("renderFrpcToml：stcp/xtcp 形态带 secretKey 且无 remotePort", async () => {
+	const { renderFrpcToml, normalizeFrpMode } = await import("../packages/gateway/src/frp.ts");
+	const stcp = renderFrpcToml({
+		serverAddr: "v.example", serverPort: 7000, authToken: "tok",
+		localPort: 18443, remotePort: 9999, mode: "stcp", secretKey: "sk-1",
+	});
+	assert.match(stcp, /type = "stcp"/);
+	assert.match(stcp, /secretKey = "sk-1"/);
+	assert.ok(!stcp.includes("remotePort"), "stcp 不应监听任何 VPS 端口");
+	assert.equal((stcp.match(/\[\[proxies\]\]/g) || []).length, 1);
+
+	const xtcp = renderFrpcToml({
+		serverAddr: "v.example", serverPort: 7000, authToken: "tok",
+		localPort: 18443, remotePort: 9999, mode: "xtcp", secretKey: "sk-1",
+	});
+	assert.match(xtcp, /type = "xtcp"/);
+	assert.match(xtcp, /type = "stcp"/, "xtcp 服务端必须同时挂 stcp 供 fallback");
+	assert.match(xtcp, /name = "dsh-remote-stcp"/);
+	assert.match(xtcp, /secretKey = "sk-1"/);
+	assert.ok(!xtcp.includes("remotePort"), "xtcp 不应监听任何 VPS 端口");
+	assert.equal((xtcp.match(/\[\[proxies\]\]/g) || []).length, 2);
+	assert.equal(normalizeFrpMode("xtcp"), "xtcp");
+	assert.equal(normalizeFrpMode("tcp"), "entry", "未知形态回落 entry");
+	assert.equal(normalizeFrpMode(undefined), "entry");
+});
+
+test("renderVisitorToml：访客配置与 proxy 通过 serverName+secretKey 关联", async () => {
+	const { renderVisitorToml } = await import("../packages/gateway/src/frp.ts");
+	const toml = renderVisitorToml({
+		serverAddr: "v.example", serverPort: 7000, authToken: "tok",
+		mode: "xtcp", secretKey: "sk-1", bindPort: 18443,
+	});
+	assert.match(toml, /\[\[visitors\]\]/);
+	assert.match(toml, /type = "xtcp"/);
+	assert.match(toml, /type = "stcp"/);
+	assert.match(toml, /serverName = "dsh-remote"/);
+	assert.match(toml, /serverName = "dsh-remote-stcp"/);
+	assert.match(toml, /bindAddr = "127\.0\.0\.1"/);
+	assert.match(toml, /bindPort = 18443/);
+	assert.match(toml, /bindPort = -1/);
+	assert.match(toml, /fallbackTo = "dsh-remote-stcp-visitor"/);
+	assert.match(toml, /fallbackTimeoutMs = 5000/);
+	assert.match(toml, /auth\.token = "tok"/, "visitor 也要登录 frps");
+});
+
+test("visitorKeyAdmits：仅启用的 stcp/xtcp 跳过配对", async () => {
+	const { visitorKeyAdmits } = await import("../packages/gateway/src/auth.ts");
+	const { DEFAULT_CONFIG } = await import("../packages/gateway/src/config.ts");
+	assert.equal(visitorKeyAdmits(DEFAULT_CONFIG), false);
+	assert.equal(visitorKeyAdmits({
+		...DEFAULT_CONFIG,
+		frp: { ...DEFAULT_CONFIG.frp, enabled: true, mode: "entry" },
+	}), false);
+	assert.equal(visitorKeyAdmits({
+		...DEFAULT_CONFIG,
+		frp: { ...DEFAULT_CONFIG.frp, enabled: true, mode: "xtcp" },
+	}), true);
+	assert.equal(visitorKeyAdmits({
+		...DEFAULT_CONFIG,
+		frp: { ...DEFAULT_CONFIG.frp, enabled: true, mode: "stcp" },
+	}), true);
+	assert.equal(visitorKeyAdmits({
+		...DEFAULT_CONFIG,
+		frp: { ...DEFAULT_CONFIG.frp, enabled: false, mode: "xtcp" },
+	}), false);
+});
+
+test("xtcp 形态未配对即可访问上游（访客密钥即准入）", async () => {
+	const { Store } = await import("../packages/gateway/src/store.ts");
+	const { DEFAULT_CONFIG } = await import("../packages/gateway/src/config.ts");
+	const { GatewayServer } = await import("../packages/gateway/src/server.ts");
+	const homeDir = await mkdtemp(join(tmpdir(), "dshr-xtcp-"));
+	const store = await Store.open(homeDir);
+	const gateway = new GatewayServer({
+		store,
+		config: {
+			...DEFAULT_CONFIG,
+			upstreamPort: fixture.upstreamPort,
+			listenPort: 0,
+			frp: { ...DEFAULT_CONFIG.frp, enabled: true, serverAddr: "127.0.0.1", mode: "xtcp" },
+		},
+		log: () => {},
+	});
+	await gateway.start();
+	try {
+		const port = gateway.actualPort;
+		const response = await new Promise((resolve, reject) => {
+			const req = https.request({
+				host: "127.0.0.1", port, path: "/", method: "GET",
+				headers: { accept: "text/html" }, rejectUnauthorized: false,
+			}, (res) => {
+				const chunks = [];
+				res.on("data", (chunk) => chunks.push(chunk));
+				res.on("end", () => resolve({
+					status: res.statusCode,
+					location: res.headers.location ?? "",
+					body: Buffer.concat(chunks).toString("utf8"),
+				}));
+			});
+			req.on("error", reject);
+			req.end();
+		});
+		assert.equal(response.status, 200, "不应再 302 到配对页");
+		assert.equal(response.location, "");
+		assert.match(response.body, /__dsh_boot__/);
+	} finally {
+		await gateway.stop();
+		await rm(homeDir, { recursive: true, force: true });
+	}
+});
+
+test("visitorConnectionString：参数齐全、指纹归一化、URL 编码安全", async () => {
+	const { visitorConnectionString } = await import("../packages/gateway/src/frp.ts");
+	const link = visitorConnectionString({
+		mode: "xtcp", serverAddr: "v.example", serverPort: 7000,
+		secretKey: "s k", authToken: "t&o", bindPort: 18443,
+		fingerprint: "AB:CD:EF",
+	});
+	assert.match(link, /^dsh-remote:\/\/visitor\?/);
+	const url = new URL(link.replace(/^dsh-remote:/, "https:"));
+	assert.equal(url.searchParams.get("mode"), "xtcp");
+	assert.equal(url.searchParams.get("server"), "v.example");
+	assert.equal(url.searchParams.get("cport"), "7000");
+	assert.equal(url.searchParams.get("bport"), "18443");
+	assert.equal(url.searchParams.get("fp"), "abcdef", "指纹应去冒号并小写");
+	assert.equal(url.searchParams.get("token"), "t&o", "特殊字符应被编码且可还原");
 });

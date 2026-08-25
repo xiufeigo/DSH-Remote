@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mobile chrome selftest</title>
+<style>
+html, body { margin: 0; font-family: "Segoe UI", sans-serif; background: #ececee; color: #1b1b1f; }
+.frame { width: 390px; min-height: 100vh; margin: 0 auto; display: grid; grid-template-columns: 56px minmax(0, 1fr) 0; background: #fff; }
+.sidebar { overflow: hidden; display: flex; flex-direction: column; gap: 8px; padding: 8px; }
+.session-list { display: flex; flex-direction: column; gap: 4px; }
+.session-list button { text-align: left; border: 0; background: #ececee; border-radius: 8px; padding: 10px 8px; font: inherit; }
+.main { display: flex; flex-direction: column; min-width: 0; min-height: 100vh; }
+header { padding: 8px 12px 0 20px; }
+.title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.hello { font-size: 16px; font-weight: 600; }
+.mode { font-size: 12px; color: #5c5c66; }
+header nav { display: flex; gap: 16px; padding: 8px 0 0; }
+header nav button { border: 0; background: none; padding: 6px 0; font: inherit; color: #8b8b93; }
+header nav button.active { color: #1b66ff; box-shadow: inset 0 -2px 0 #1b66ff; }
+.session-log { width: auto; height: 32px; border: 0; background: #f0f0f2; border-radius: 999px; display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; }
+.column { flex: 1; display: flex; flex-direction: column; gap: 16px; padding: 16px; min-height: 240px; }
+.bubble { align-self: flex-end; background: #e8eaf6; border-radius: 12px; padding: 10px 12px; max-width: 80%; }
+.reply { line-height: 1.55; }
+.actions { display: flex; align-items: center; gap: 10px; height: 28px; }
+.action { width: 28px; height: 28px; padding: 6px; border: 0; background: none; display: inline-flex; color: #8b8b93; }
+.time { color: #8b8b93; white-space: nowrap; padding-left: 12px; font-size: 14px; }
+.dot { margin: 0 10px; }
+.seat { margin-top: auto; padding-bottom: 8px; }
+.card { margin: 0 16px; border: 1px solid #d9dbe0; background: #fff; border-radius: 22px; display: flex; flex-direction: column; gap: 12px; padding-top: 10px; }
+.ta { min-height: 48px; padding: 8px 16px; border: 0; font: inherit; resize: none; }
+.row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; padding: 2px 8px 6px; }
+.tools, .modes, .trailing { display: flex; align-items: center; }
+.tools { gap: 16px; }
+.trailing { gap: 12px; margin-left: auto; }
+.add, .send, .meter { border: 0; border-radius: 999px; }
+.add { width: 28px; height: 28px; background: #ececee; }
+.send { width: 34px; height: 34px; background: #1b66ff; color: #fff; }
+.meter { width: 28px; height: 28px; background: none; }
+.access { height: 28px; border: 0; background: none; display: inline-flex; align-items: center; gap: 4px; padding: 0 4px 0 8px; }
+.model { max-width: none; min-width: max-content; height: 28px; border: 0; background: #ececee; display: flex; align-items: center; gap: 4px; }
+.stats { text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 4px 32px 0; font-size: 12px; color: #8b8b93; }
+.handle { width: 8px; background: #d9dbe0; }
+.details { min-height: 100vh; background: #fff; }
+.dshx-root { min-height: 120px; padding: 16px; font-size: 16px; }
+#report { display: none; }
+/* 自测关掉抽屉过渡，避免断言落在动画中途 */
+html.dshr-mobile [data-dshr-main-col] { transition: none !important; }
+.empty-home {
+  display: none;
+  position: fixed;
+  inset: 0;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 24px;
+  pointer-events: none;
+  z-index: 3;
+}
+.empty-home.show { display: flex; }
+.empty-home h1 { margin: 0; font-size: 28px; font-weight: 600; }
+.empty-home .empty-card {
+  width: 320px;
+  border: 1px solid #d9dbe0;
+  border-radius: 22px;
+  padding: 16px;
+  background: #fff;
+}
+</style>
+</head>
+<body>
+<div class="frame" data-sidebar-collapsed>
+  <div class="sidebar">
+    <div>
+      <div>
+        <button type="button" id="sidebar-toggle" aria-label="打开侧边栏">☰</button>
+      </div>
+      <div class="session-list">
+        <button type="button" id="session-a">你好</button>
+        <button type="button" id="session-b">第二个会话</button>
+        <button type="button" id="session-more" aria-label="更多" aria-haspopup="menu"><svg width="12" height="12" viewBox="0 0 12 12"><circle cx="6" cy="2" r="1"/><circle cx="6" cy="6" r="1"/><circle cx="6" cy="10" r="1"/></svg></button>
+      </div>
+    </div>
+    <div id="settings-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.2);">
+      <div role="dialog" aria-modal="true" id="settings-dialog" style="position:absolute;left:0;right:0;top:0;bottom:0;height:100%;width:100%;background:#fff;display:flex;flex-direction:column;">
+        <nav style="display:flex;gap:8px;padding:12px;">
+          <div>设置</div>
+          <div style="display:flex;gap:4px;">
+            <button type="button" aria-current="true">通用设置</button>
+            <button type="button">模型</button>
+            <button type="button">插件</button>
+          </div>
+        </nav>
+        <div style="flex:1;overflow:auto;padding:16px;" id="settings-body">通用设置内容，全屏盖住会话浮层。</div>
+      </div>
+    </div>
+  </div>
+  <div class="main">
+    <header>
+      <div class="title">
+        <div>
+          <div class="hello" id="session-title">你好</div>
+          <div class="mode">标准模式</div>
+        </div>
+        <button type="button" class="session-log" aria-label="Session log">
+          <svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 2v8M5 7l3 3 3-3M3 13h10" stroke="currentColor" fill="none"/></svg>
+          <span>Session log</span>
+        </button>
+      </div>
+      <nav>
+        <button type="button" class="active">对话</button>
+        <button type="button">轨迹</button>
+      </nav>
+    </header>
+    <div class="column" id="chat-column">
+      <div class="bubble" id="user-msg">你是什么模型</div>
+      <div>
+        <div class="reply" id="reply-1">我是 NVIDIA Nemotron 3 Super，由 NVIDIA 开发的模型。这段文字必须保持完整可见，不能被裁成一行小气泡。</div>
+        <div data-turn-tail="1">
+          <div class="actions">
+            <button type="button" class="action" aria-label="复制"><svg width="16" height="16" viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" fill="none" stroke="currentColor"/></svg></button>
+            <button type="button" class="action" aria-label="好的回答"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M4 8h8" stroke="currentColor"/></svg></button>
+            <button type="button" class="action" aria-label="有问题的回答"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M4 8h8" stroke="currentColor"/></svg></button>
+            <button type="button" class="action" aria-label="在新对话中分支"><svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5" fill="none" stroke="currentColor"/></svg></button>
+            <span class="time">00:59 <span class="dot" aria-hidden="true">·</span> 用时 7秒 <span class="dot" aria-hidden="true">·</span> 首 token 5.4秒 <span class="dot" aria-hidden="true">·</span> 165 tok/s</span>
+          </div>
+        </div>
+      </div>
+      <div>
+        <div class="reply" id="reply-2">第二轮回复同样要保持完整高度，用来防止把整列聊天误标成操作栏。</div>
+        <div class="actions" id="actions-no-tail">
+          <button type="button" class="action" aria-label="复制"><svg width="16" height="16" viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" fill="none" stroke="currentColor"/></svg></button>
+          <button type="button" class="action" aria-label="好的回答"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M4 8h8" stroke="currentColor"/></svg></button>
+          <button type="button" class="action" aria-label="有问题的回答"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M4 8h8" stroke="currentColor"/></svg></button>
+          <button type="button" class="action" aria-label="在新对话中分支"><svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5" fill="none" stroke="currentColor"/></svg></button>
+          <span class="time">01:02 <span class="dot" aria-hidden="true">·</span> 用时 3秒 <span class="dot" aria-hidden="true">·</span> 72 tok/s</span>
+        </div>
+      </div>
+    </div>
+    <div class="seat" data-composer-seat="">
+      <div class="card" data-composer-card="true" id="composer-card">
+        <textarea class="ta" rows="2" placeholder="给智能体发消息"></textarea>
+        <div class="row" id="composer-row">
+          <div class="tools">
+            <button type="button" class="add" id="add-btn" aria-label="命令" aria-haspopup="listbox">+</button>
+            <div class="modes">
+              <button type="button" class="access" id="access-btn" aria-label="访问模式，当前：Workspace Write">
+                <span aria-hidden="true"><svg width="14" height="14" viewBox="0 0 16 16"><path d="M8 2l6 2v4c0 4-3 6-6 7C5 14 2 12 2 8V4l6-2z" fill="none" stroke="currentColor"/></svg></span>
+                <span id="access-label">Workspace Write</span>
+                <span aria-hidden="true" id="access-chevron"><svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" fill="none"/></svg></span>
+              </button>
+            </div>
+          </div>
+          <div class="trailing">
+            <button type="button" class="model" id="model-btn" aria-label="DeepSeek-V4-Flash-Vision-Experimental Default" aria-haspopup="menu">
+              <span id="model-label">DeepSeek-V4-Flash-Vision-Experimental</span>
+              <span>Default</span>
+              <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" fill="none"/></svg>
+            </button>
+            <button type="button" class="meter" aria-label="上下文占用">○</button>
+            <button type="button" class="send" aria-label="发送消息"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 2v12M3 7l5-5 5 5" stroke="#fff" fill="none"/></svg></button>
+          </div>
+        </div>
+      </div>
+      <div class="stats" id="stats">
+        <span>5 轮 · 5 步</span>
+        <span class="sep" aria-hidden="true">|</span>
+        <span>LLM 18.3s</span>
+        <span class="sep" aria-hidden="true">|</span>
+        <span>首 token 平均 4.6s · 27 tok/s</span>
+        <span class="sep" aria-hidden="true">|</span>
+        <span>缓存命中 0%</span>
+        <span class="sep" aria-hidden="true">|</span>
+        <span>输入 25.8K tok · 输出 90 tok</span>
+      </div>
+    </div>
+  </div>
+  <div class="handle" data-side="details" id="details-handle" aria-hidden="true"></div>
+  <div class="details" data-side="details" id="explorer-col">
+    <div class="dshx-root" id="explorer-panel">审查面板必须可见，不能被 Remote 壳藏成白屏。</div>
+  </div>
+</div>
+<div id="float-model-wrap" style="position:fixed;left:0;top:0;transform:translate(-48px,420px);min-width:max-content;z-index:50;background:#fff;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.12);">
+  <div role="menu" id="float-model-menu" style="width:360px;padding:8px;">
+    <div role="menuitem">DeepSeek-V4-Flash-Vision-Exp</div>
+    <div role="menuitem">Nemotron 3 Ultra Free</div>
+  </div>
+</div>
+<div id="float-sub-wrap" style="position:fixed;left:0;top:0;transform:translate(-36px,520px);z-index:51;background:#fff;border-radius:12px;">
+  <div role="menu" id="float-sub-menu" style="width:280px;padding:8px;">
+    <div role="menuitem">模型 DeepSeek-V4-Flash-Vision-Exp</div>
+    <div role="menuitem">推理等级 High</div>
+  </div>
+</div>
+<div id="float-access-wrap" style="position:fixed;left:0;top:0;transform:translate(300px,480px);z-index:50;background:#fff;border-radius:12px;">
+  <div role="listbox" id="float-access-list" style="width:220px;padding:8px;">
+    <div role="option">Workspace Write</div>
+    <div role="option">Ask</div>
+  </div>
+</div>
+<div id="float-cmd-wrap" style="position:fixed;left:0;top:0;transform:translate(-24px,560px);z-index:50;background:#fff;border-radius:12px;">
+  <div role="listbox" id="float-cmd-list" style="width:320px;padding:8px;">
+    <div role="option">命令面板</div>
+    <div role="option">插入文件</div>
+  </div>
+</div>
+<div id="float-mode-wrap" style="position:fixed;left:0;top:0;transform:translate(-20px,40px);z-index:50;background:#fff;border-radius:12px;">
+  <div role="menu" id="float-mode-menu" style="width:200px;padding:8px;">
+    <div role="menuitem">标准模式</div>
+    <div role="menuitem">计划模式</div>
+  </div>
+</div>
+<div id="empty-home" class="empty-home">
+  <h1 id="empty-title">探索未至之境</h1>
+  <div class="empty-card" id="empty-composer">描述你想要构建的内容</div>
+</div>
+<pre id="report"></pre>
+<script src="/android/app/src/main/res/raw/mobile.js"></script>
+<script>
+(function () {
+  var frame = document.querySelector('.frame');
+  var toggle = document.getElementById('sidebar-toggle');
+  toggle.addEventListener('click', function () {
+    if (frame.hasAttribute('data-sidebar-collapsed')) {
+      frame.removeAttribute('data-sidebar-collapsed');
+      toggle.setAttribute('aria-label', '收起侧边栏');
+    } else {
+      frame.setAttribute('data-sidebar-collapsed', '');
+      toggle.setAttribute('aria-label', '打开侧边栏');
+    }
+  });
+  document.getElementById('session-b').addEventListener('click', function () {
+    document.getElementById('session-title').textContent = '第二个会话';
+  });
+})();
+function rect(id) {
+  var el = document.getElementById(id);
+  return el ? el.getBoundingClientRect() : { height: 0, width: 0 };
+}
+function finish(checks) {
+  var failed = checks.filter(function (c) { return !c.ok; });
+  var report = { ok: failed.length === 0, failed: failed, checks: checks };
+  var pre = document.getElementById('report');
+  pre.textContent = JSON.stringify(report);
+  document.body.setAttribute('data-test-ok', report.ok ? '1' : '0');
+  document.body.setAttribute('data-test-report', JSON.stringify(report));
+  window.__dshrSelftest = report;
+}
+function add(checks, name, ok, detail) { checks.push({ name: name, ok: !!ok, detail: detail || '' }); }
+function inViewport(id) {
+  var el = document.getElementById(id);
+  if (!el) return { ok: false, detail: 'missing' };
+  var r = el.getBoundingClientRect();
+  var vw = window.innerWidth;
+  var vh = window.innerHeight;
+  var ok = r.left >= 7 && r.right <= vw - 7 + 0.5 && r.top >= 7 && r.bottom <= vh - 7 + 0.5;
+  return { ok: ok, detail: 'l=' + Math.round(r.left) + ' r=' + Math.round(r.right) + ' t=' + Math.round(r.top) + ' b=' + Math.round(r.bottom) + ' vw=' + vw };
+}
+function overlaps(a, b) {
+  return !(a.right <= b.left + 0.5 || b.right <= a.left + 0.5 || a.bottom <= b.top + 0.5 || b.bottom <= a.top + 0.5);
+}
+function fireSwipe(el, x0, y0, x1, y1) {
+  var swipeBridge = window.__dshRemoteAndroidMobile;
+  if (swipeBridge && typeof swipeBridge.considerSwipe === 'function') {
+    swipeBridge.considerSwipe(x0, y0, x1, y1, el);
+  }
+}
+function run() {
+  var column = document.getElementById('chat-column');
+  var card = document.getElementById('composer-card');
+  var row = document.getElementById('composer-row');
+  var model = document.getElementById('model-btn');
+  var label = document.getElementById('model-label');
+  var stats = document.getElementById('stats');
+  var accessLabel = document.getElementById('access-label');
+  var actions = document.querySelectorAll('[data-dshr-msg-actions]');
+  var frame = document.querySelector('.frame');
+  var checks = [];
+  add(checks, 'script-installed', window.__dshRemoteMobileInstalled === true);
+  add(checks, 'mobile-class', document.documentElement.classList.contains('dshr-mobile'));
+  var androidShell = /DSHRemoteAndroid\//.test(String(navigator.userAgent || ''));
+  var vp = document.querySelector('meta[name="viewport"]');
+  var vpContent = vp ? vp.getAttribute('content') || '' : '';
+  if (androidShell) {
+    add(checks, 'ime-viewport-meta', /interactive-widget\s*=\s*overlays-content/i.test(vpContent), vpContent);
+  } else {
+    add(checks, 'ime-viewport-meta', /interactive-widget\s*=\s*resizes-content/i.test(vpContent), vpContent);
+  }
+  add(checks, 'column-not-clipped', !column.hasAttribute('data-dshr-msg-actions'), 'column marked=' + column.hasAttribute('data-dshr-msg-actions'));
+  add(checks, 'action-rows', actions.length === 2, 'count=' + actions.length);
+  add(checks, 'reply1-visible', rect('reply-1').height > 40, 'h=' + Math.round(rect('reply-1').height));
+  add(checks, 'reply2-visible', rect('reply-2').height > 24, 'h=' + Math.round(rect('reply-2').height));
+  add(checks, 'user-msg-visible', rect('user-msg').height > 24, 'h=' + Math.round(rect('user-msg').height));
+  add(checks, 'user-msg-full', (document.getElementById('user-msg').innerText || '').indexOf('你是什么模型') === 0);
+  add(checks, 'composer-row-marked', row.hasAttribute('data-dshr-composer-row'));
+  add(checks, 'row-has-no-textarea', !row.querySelector('textarea'));
+  add(checks, 'card-not-row', !card.hasAttribute('data-dshr-composer-row'));
+  add(checks, 'model-marked', model.hasAttribute('data-dshr-composer-model'));
+  add(checks, 'tools-marked', !!row.querySelector('[data-dshr-composer-tools]'));
+  add(checks, 'trailing-marked', !!row.querySelector('[data-dshr-composer-trailing]'));
+  var addBtn = document.getElementById('add-btn');
+  var accessBtn = document.getElementById('access-btn');
+  var addR = addBtn.getBoundingClientRect();
+  var accessR = accessBtn.getBoundingClientRect();
+  var modelR = model.getBoundingClientRect();
+  add(checks, 'model-not-cover-add', !overlaps(addR, modelR), 'add.r=' + Math.round(addR.right) + ' model.l=' + Math.round(modelR.left));
+  add(checks, 'model-not-cover-access', !overlaps(accessR, modelR), 'access.r=' + Math.round(accessR.right) + ' model.l=' + Math.round(modelR.left));
+  add(checks, 'add-visible', addR.width >= 20 && addR.height >= 20, 'w=' + Math.round(addR.width));
+  add(checks, 'model-width', modelR.width >= 64, 'w=' + Math.round(modelR.width));
+  var shown = (label && label.innerText || '').trim();
+  add(checks, 'model-long-name', shown.indexOf('DeepSeek') === 0, 'text=' + shown);
+  add(checks, 'model-ellipsis', label && label.scrollWidth > label.clientWidth + 1, 'scroll=' + (label && Math.round(label.scrollWidth)) + ' client=' + (label && Math.round(label.clientWidth)));
+  var accessHidden = accessLabel && getComputedStyle(accessLabel).display === 'none';
+  add(checks, 'access-label-hidden', accessHidden);
+  var chevron = document.getElementById('access-chevron');
+  var chevronHidden = chevron && getComputedStyle(chevron).display === 'none';
+  add(checks, 'access-chevron-hidden', chevronHidden);
+  add(checks, 'access-compact', accessR.width <= 28 && accessR.width >= 20, 'w=' + Math.round(accessR.width));
+  var accessSvgs = accessBtn ? accessBtn.querySelectorAll('svg') : [];
+  var visibleAccessSvg = 0;
+  for (var si = 0; si < accessSvgs.length; si++) {
+    var st = getComputedStyle(accessSvgs[si]);
+    var wrapSt = accessSvgs[si].parentElement ? getComputedStyle(accessSvgs[si].parentElement) : st;
+    if (st.display !== 'none' && wrapSt.display !== 'none') visibleAccessSvg++;
+  }
+  add(checks, 'access-shield-only', visibleAccessSvg === 1, 'visibleSvg=' + visibleAccessSvg);
+  add(checks, 'stats-marked', stats.hasAttribute('data-dshr-stats-line') || (stats.parentElement && stats.parentElement.hasAttribute('data-dshr-stats-line')));
+  var statsStyle = getComputedStyle(stats);
+  add(checks, 'stats-nowrap', statsStyle.whiteSpace === 'nowrap' || (stats.parentElement && getComputedStyle(stats.parentElement).whiteSpace === 'nowrap'), 'ws=' + statsStyle.whiteSpace);
+  add(checks, 'stats-one-line', rect('stats').height <= 40, 'h=' + Math.round(rect('stats').height));
+  var statsHost = stats.hasAttribute('data-dshr-stats-line') ? stats : stats.parentElement;
+  var ox = getComputedStyle(statsHost).overflowX;
+  add(checks, 'stats-scroll-x', ox === 'auto' || ox === 'scroll', 'ox=' + ox);
+  add(checks, 'card-tall', rect('composer-card').height > 80, 'h=' + Math.round(rect('composer-card').height));
+
+  var bridge = window.__dshRemoteAndroidMobile;
+  if (bridge && typeof bridge.clampFloatingMenus === 'function') bridge.clampFloatingMenus();
+  var floatIds = ['float-model-wrap', 'float-sub-wrap', 'float-access-wrap', 'float-cmd-wrap', 'float-mode-wrap'];
+  for (var f = 0; f < floatIds.length; f++) {
+    var fit = inViewport(floatIds[f]);
+    add(checks, 'float-in-view-' + floatIds[f].replace('float-', '').replace('-wrap', ''), fit.ok, fit.detail);
+  }
+  add(checks, 'sidebar-not-float', !document.querySelector('.sidebar').hasAttribute('data-dshr-float'));
+  add(checks, 'composer-not-float', !card.hasAttribute('data-dshr-float'));
+  add(checks, 'model-menu-text', (document.getElementById('float-model-menu').innerText || '').indexOf('DeepSeek') >= 0);
+  add(checks, 'sub-menu-text', (document.getElementById('float-sub-menu').innerText || '').indexOf('推理等级') >= 0);
+
+  add(checks, 'sidebar-starts-collapsed', frame.hasAttribute('data-sidebar-collapsed'));
+  add(checks, 'main-marked', !!document.querySelector('[data-dshr-main-col]'));
+  if (bridge && typeof bridge.setDrawerDrag === 'function') {
+    bridge.setDrawerDrag(0.5);
+    var dragMain = document.querySelector('[data-dshr-main-col]');
+    var dragR = dragMain ? dragMain.getBoundingClientRect() : { left: 0 };
+    add(checks, 'drag-follow-halfway', dragR.left >= 120 && dragR.left <= 260, 'left=' + Math.round(dragR.left));
+    add(checks, 'drag-attr', document.documentElement.getAttribute('data-dshr-dragging') === '1');
+    bridge.clearDrawerDrag();
+    add(checks, 'drag-cleared', document.documentElement.getAttribute('data-dshr-dragging') !== '1');
+  } else {
+    add(checks, 'drag-follow-halfway', false, 'missing setDrawerDrag');
+    add(checks, 'drag-attr', false);
+    add(checks, 'drag-cleared', false);
+  }
+  fireSwipe(column, 48, 360, 170, 358);
+  window.setTimeout(function () {
+    add(checks, 'swipe-opens-sidebar', !frame.hasAttribute('data-sidebar-collapsed'), 'collapsed=' + frame.hasAttribute('data-sidebar-collapsed'));
+    var mainEl = document.querySelector('[data-dshr-main-col]') || document.querySelector('.main');
+    var mainStyle = mainEl ? getComputedStyle(mainEl) : null;
+    var radius = mainStyle ? parseFloat(mainStyle.borderTopLeftRadius) || 0 : 0;
+    add(checks, 'drawer-main-radius', radius >= 12, 'r=' + radius);
+    var tx = 0;
+    if (mainStyle && mainStyle.transform && mainStyle.transform !== 'none') {
+      var m = mainStyle.transform.match(/matrix\(([^)]+)\)/);
+      if (m) tx = parseFloat(m[1].split(',')[4]) || 0;
+    }
+    add(checks, 'drawer-main-shifted', tx > 120, 'tx=' + Math.round(tx));
+    var sideEl = document.querySelector('[data-dshr-sidebar-col]') || document.querySelector('.sidebar');
+    var sideZ = sideEl ? (parseInt(getComputedStyle(sideEl).zIndex, 10) || 0) : 0;
+    var mainZ = mainStyle ? (parseInt(mainStyle.zIndex, 10) || 0) : 0;
+    add(checks, 'drawer-main-above-sidebar', mainZ > sideZ, 'mainZ=' + mainZ + ' sideZ=' + sideZ);
+    var mainR = mainEl ? mainEl.getBoundingClientRect() : { left: 0 };
+    add(checks, 'drawer-main-peek', mainR.left >= 200, 'left=' + Math.round(mainR.left));
+    var openedLeft = mainR.left;
+    if (bridge && typeof bridge.setDrawerDrag === 'function') {
+      bridge.setDrawerDrag(0.25);
+      var followLeft = mainEl.getBoundingClientRect().left;
+      add(checks, 'drag-close-follow', followLeft < openedLeft - 40, 'from=' + Math.round(openedLeft) + ' to=' + Math.round(followLeft));
+      bridge.clearDrawerDrag();
+    } else {
+      add(checks, 'drag-close-follow', false, 'missing setDrawerDrag');
+    }
+    fireSwipe(mainEl, 360, 420, 40, 420);
+    window.setTimeout(function () {
+      add(checks, 'swipe-closes-from-main', frame.hasAttribute('data-sidebar-collapsed'), 'collapsed=' + frame.hasAttribute('data-sidebar-collapsed'));
+      fireSwipe(column, 48, 360, 170, 358);
+      window.setTimeout(function () {
+    document.getElementById('settings-overlay').style.display = 'flex';
+    if (bridge && typeof bridge.syncNow === 'function') bridge.syncNow();
+    window.setTimeout(function () {
+      add(checks, 'settings-keeps-drawer', !frame.hasAttribute('data-sidebar-collapsed'), 'collapsed=' + frame.hasAttribute('data-sidebar-collapsed'));
+      add(checks, 'settings-dialog-flag', document.documentElement.getAttribute('data-dshr-dialog') === '1');
+      var panel = document.getElementById('settings-dialog');
+      var panelR = panel ? panel.getBoundingClientRect() : { height: 0, width: 0 };
+      add(checks, 'settings-fullscreen', panelR.height >= window.innerHeight * 0.9 && panelR.width >= window.innerWidth * 0.9, 'h=' + Math.round(panelR.height) + ' w=' + Math.round(panelR.width));
+      var overlay = document.getElementById('settings-overlay');
+      add(checks, 'settings-overlay-marked', overlay.hasAttribute('data-dshr-sheet-overlay'));
+      var oz = parseInt(getComputedStyle(overlay).zIndex, 10) || 0;
+      add(checks, 'settings-overlay-on-top', oz >= 1000, 'z=' + oz);
+      var mainVis = mainEl ? getComputedStyle(mainEl).visibility : '';
+      var hit = document.elementFromPoint(Math.max(8, window.innerWidth - 24), 200);
+      var covers = mainVis === 'hidden' || !!(hit && overlay && (hit === overlay || overlay.contains(hit)));
+      add(checks, 'settings-covers-main', covers, 'vis=' + mainVis + ' hit=' + (hit && (hit.id || hit.tagName)));
+      document.getElementById('settings-overlay').style.display = 'none';
+      if (bridge && typeof bridge.syncNow === 'function') bridge.syncNow();
+      add(checks, 'settings-dialog-cleared', document.documentElement.getAttribute('data-dshr-dialog') !== '1');
+      window.setTimeout(function () {
+        document.getElementById('session-more').click();
+        window.setTimeout(function () {
+          add(checks, 'icon-more-keeps-sidebar', !frame.hasAttribute('data-sidebar-collapsed'), 'collapsed=' + frame.hasAttribute('data-sidebar-collapsed'));
+          document.getElementById('session-b').click();
+          window.setTimeout(function () {
+            add(checks, 'session-click-closes', frame.hasAttribute('data-sidebar-collapsed'), 'collapsed=' + frame.hasAttribute('data-sidebar-collapsed') + ' dialog=' + document.documentElement.getAttribute('data-dshr-dialog'));
+            add(checks, 'session-title-updated', (document.getElementById('session-title').textContent || '').indexOf('第二个') >= 0);
+            var detailsCol = document.getElementById('explorer-col');
+            var explorerPanel = document.getElementById('explorer-panel');
+            var mainCol = document.querySelector('[data-dshr-main-col]');
+            var detailsBefore = detailsCol ? detailsCol.getBoundingClientRect() : { width: 0 };
+            var detailsDisplayBefore = detailsCol ? getComputedStyle(detailsCol).display : '';
+            add(checks, 'explorer-hidden-by-default', detailsDisplayBefore === 'none' || detailsBefore.width < 8, 'w=' + Math.round(detailsBefore.width) + ' d=' + detailsDisplayBefore);
+            if (detailsCol) detailsCol.setAttribute('data-dshx-details-col', '');
+            if (mainCol) mainCol.setAttribute('data-dshx-center-col', '');
+            frame.setAttribute('data-dshx-overlay', '');
+            if (bridge && typeof bridge.syncNow === 'function') bridge.syncNow();
+            add(checks, 'explorer-handshake', document.documentElement.getAttribute('data-dshr-explorer-details') === '1');
+            var panelR = explorerPanel ? explorerPanel.getBoundingClientRect() : { width: 0, height: 0 };
+            var detailsDisplay = detailsCol ? getComputedStyle(detailsCol).display : '';
+            add(checks, 'explorer-panel-visible', panelR.width >= 200 && panelR.height >= 40 && detailsDisplay !== 'none', 'w=' + Math.round(panelR.width) + ' h=' + Math.round(panelR.height) + ' d=' + detailsDisplay);
+            var mainDisplay = mainCol ? getComputedStyle(mainCol).display : '';
+            add(checks, 'explorer-hides-main', mainDisplay === 'none', 'd=' + mainDisplay);
+            var whale = document.getElementById('dshr-mobile-whale');
+            var whaleDisplay = whale ? getComputedStyle(whale).display : 'none';
+            add(checks, 'explorer-hides-whale', whaleDisplay === 'none', 'd=' + whaleDisplay);
+            var gridCols = getComputedStyle(frame).gridTemplateColumns.trim().split(/\s+/);
+            add(checks, 'explorer-grid-third-col', gridCols.length >= 3 && parseFloat(gridCols[0]) === 0 && parseFloat(gridCols[1]) === 0 && parseFloat(gridCols[2]) > 8, 'grid=' + getComputedStyle(frame).gridTemplateColumns);
+            var handle = document.getElementById('details-handle');
+            var handleDisplay = handle ? getComputedStyle(handle).display : '';
+            add(checks, 'explorer-hides-handle', !handle || handleDisplay === 'none' || handle.getBoundingClientRect().width < 2, 'd=' + handleDisplay);
+            frame.removeAttribute('data-dshx-overlay');
+            if (detailsCol) detailsCol.removeAttribute('data-dshx-details-col');
+            if (mainCol) mainCol.removeAttribute('data-dshx-center-col');
+            if (bridge && typeof bridge.syncNow === 'function') bridge.syncNow();
+            add(checks, 'explorer-handshake-cleared', document.documentElement.getAttribute('data-dshr-explorer-details') !== '1');
+            var mainAfter = mainCol ? getComputedStyle(mainCol).display : '';
+            add(checks, 'explorer-restores-main', mainAfter !== 'none', 'd=' + mainAfter);
+            var root = document.documentElement;
+            var emptyHome = document.getElementById('empty-home');
+            var emptyTitle = document.getElementById('empty-title');
+            var emptyComposer = document.getElementById('empty-composer');
+            if (emptyHome) emptyHome.classList.add('show');
+            var titleTop0 = emptyTitle ? emptyTitle.getBoundingClientRect().top : 0;
+            var composerTop0 = emptyComposer ? emptyComposer.getBoundingClientRect().top : 0;
+            var vv = window.visualViewport;
+            for (var s = 0; s < 8; s++) {
+              if (vv && typeof vv.dispatchEvent === 'function') vv.dispatchEvent(new Event('scroll'));
+              if (bridge && typeof bridge.applyImeLift === 'function') bridge.applyImeLift();
+            }
+            var titleTop1 = emptyTitle ? emptyTitle.getBoundingClientRect().top : 0;
+            var composerTop1 = emptyComposer ? emptyComposer.getBoundingClientRect().top : 0;
+            add(checks, 'ime-empty-home-stable', Math.abs(titleTop1 - titleTop0) < 2 && Math.abs(composerTop1 - composerTop0) < 2,
+              'title=' + Math.round(titleTop0) + '→' + Math.round(titleTop1) + ' composer=' + Math.round(composerTop0) + '→' + Math.round(composerTop1));
+            window.__dshrTestImeGap = 320;
+            window.__dshrTestVvHeight = 500;
+            if (bridge && typeof bridge.applyImeLift === 'function') bridge.applyImeLift();
+            if (androidShell) {
+              add(checks, 'android-shell-no-ime-lock', root.getAttribute('data-dshr-ime') !== '1', 'ime=' + root.getAttribute('data-dshr-ime'));
+              add(checks, 'android-shell-no-vv-height', !root.style.getPropertyValue('--dshr-vv-height'), 'vv=' + root.style.getPropertyValue('--dshr-vv-height'));
+            } else {
+              add(checks, 'pwa-ime-locks-height', root.getAttribute('data-dshr-ime') === '1' && root.style.getPropertyValue('--dshr-vv-height') === '500px',
+                'ime=' + root.getAttribute('data-dshr-ime') + ' vv=' + root.style.getPropertyValue('--dshr-vv-height'));
+              window.__dshrTestVvHeight = 504;
+              if (bridge && typeof bridge.applyImeLift === 'function') bridge.applyImeLift();
+              add(checks, 'pwa-ime-ignores-small-vv', root.style.getPropertyValue('--dshr-vv-height') === '500px',
+                'vv=' + root.style.getPropertyValue('--dshr-vv-height'));
+            }
+            delete window.__dshrTestImeGap;
+            delete window.__dshrTestVvHeight;
+            if (bridge && typeof bridge.applyImeLift === 'function') bridge.applyImeLift();
+            root.style.setProperty('--dshr-vv-height', '500px');
+            root.setAttribute('data-dshr-ime', '1');
+            var imeH = frame.getBoundingClientRect().height;
+            add(checks, 'ime-frame-shrinks', imeH <= 510 && imeH >= 400, 'h=' + Math.round(imeH));
+            root.removeAttribute('data-dshr-ime');
+            root.style.removeProperty('--dshr-vv-height');
+            if (emptyHome) emptyHome.classList.remove('show');
+            finish(checks);
+          }, 200);
+        }, 80);
+      }, 80);
+    }, 200);
+      }, 120);
+    }, 120);
+  }, 120);
+}
+function waitAndRun() {
+  if (/[?&]manual=1\b/.test(String(location.search || ''))) return;
+  if (!window.__dshRemoteMobileInstalled) {
+    window.setTimeout(waitAndRun, 50);
+    return;
+  }
+  window.requestAnimationFrame(function () {
+    window.requestAnimationFrame(run);
+  });
+}
+waitAndRun();
+</script>
+</body>
+</html>
+
