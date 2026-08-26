@@ -131,7 +131,9 @@ public class TunnelService extends Service {
 			b.setVisibility(running ? Notification.VISIBILITY_PUBLIC : Notification.VISIBILITY_SECRET);
 			b.setCategory(running ? Notification.CATEGORY_PROGRESS : Notification.CATEGORY_SERVICE);
 		}
-		if (Build.VERSION.SDK_INT >= 29) b.setSilent(!running);
+		// 静音由渠道保证（onCreate 里两渠道均 setSound(null,null)、无振动无灯光，
+		// 空闲另走 IMPORTANCE_MIN 渠道）。framework Notification.Builder 没有
+		// setSilent(boolean)——那是 androidx NotificationCompat 的 API。
 
 		if (running) {
 			String title = sessionTitle.length() > 0 ? clip(sessionTitle, 64) : "DSH 会话";
