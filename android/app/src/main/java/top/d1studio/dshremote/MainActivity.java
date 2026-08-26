@@ -8,6 +8,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Rect;
@@ -19,6 +20,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.text.InputType;
 import android.text.TextUtils;
+import android.view.ContextThemeWrapper;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
@@ -95,7 +97,7 @@ public class MainActivity extends Activity {
 	private LinearLayout profilesBox;
 	private ScrollView setupScroll;
 	private EditText urlInput;
-	private EditText etName, etServer, etCport, etSk, etToken;
+	private EditText etName, etServer, etCport, etTunnel, etSk, etToken;
 	private TextView tvTunnelState;
 	private Button resumeSessionBtn;
 	private String editingProfileId = "";
@@ -120,6 +122,11 @@ public class MainActivity extends Activity {
 	private String mobileAdaptJs;
 	/** 当前已应用到根布局的 IME 底边距（px）。-1 表示尚未同步。 */
 	private int currentImePadding = -1;
+	/** 当前实际平移量（可能小于 IME 高度，避免把输入框顶出屏幕）。 */
+	private int currentImeShift = Integer.MIN_VALUE;
+	/** WebView 内焦点输入框相对 WebView 顶部的 CSS 像素，已换算成设备像素。 */
+	private int lastImeFocusTopPx = -1;
+	private int lastImeFocusBottomPx = -1;
 	/** IME 动画进行中：只平移，不改布局、不注入 inset JS。 */
 	private boolean imeAnimating = false;
 	/** 会话页已成为 WebView 历史根，避免返回键退到连接壳 / settings URL。 */
@@ -128,6 +135,10 @@ public class MainActivity extends Activity {
 	private boolean suppressGatewayErrors = false;
 	private int suppressGatewayEpoch = 0;
 	private long lastBackAt = 0;
+	/** DSH 页面是否处于深色（body[data-ds-dark-theme]），用于状态栏图标和 WebView 底色。 */
+	private boolean pageDark = false;
+	/** 会话页沉浸状态栏；注入失败时退回实色。 */
+	private boolean edgeToEdgeChrome = true;
 
 	@Override
 	protected void onCreate(Bundle savedInstanceState) {
@@ -176,6 +187,7 @@ public class MainActivity extends Activity {
 			getWindow().setAttributes(attrs);
 		}
 		if (Build.VERSION.SDK_INT >= 29) getWindow().setStatusBarContrastEnforced(false);
+		if (Build.VERSION.SDK_INT >= 29) getWindow().setNavigationBarContrastEnforced(false);
 		int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
 			| View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
 			| View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
@@ -345,13 +357,14 @@ public class MainActivity extends Activity {
 		title.setTypeface(null, android.graphics.Typeface.BOLD);
 		title.setPadding(0, dp(12, d), 0, dp(4, d));
 		box.addView(title);
-		box.addView(hintText("与电脑插件设置相同的四项。本地端口由网关固定为 18443，无需填写。", d));
+		box.addView(hintText("与电脑插件设置相同：VPS、控制端口、隧道名、登录密钥、访客密钥。本地端口由网关固定为 18443，无需填写。", d));
 
 		LinearLayout form = card(d);
 		etName = labeled(form, "名称", "例如 家里电脑", d, InputType.TYPE_CLASS_TEXT);
 		etServer = labeled(form, "VPS 地址", "与电脑端一致，例如 1.2.3.4", d,
 			InputType.TYPE_TEXT_VARIATION_URI);
 		etCport = labeled(form, "控制端口", "frps bindPort，通常 7000", d, InputType.TYPE_CLASS_NUMBER);
+		etTunnel = labeled(form, "隧道名", "与电脑插件一致，默认 dsh-remote", d, InputType.TYPE_CLASS_TEXT);
 		etToken = labeled(form, "登录密钥", "与 VPS frps.toml 的 auth.token 一致", d,
 			InputType.TYPE_TEXT_VARIATION_PASSWORD);
 		etSk = labeled(form, "访客密钥", "与电脑插件里的访客密钥一致", d,
@@ -504,6 +517,7 @@ public class MainActivity extends Activity {
 			webView.stopLoading();
 			webView.setVisibility(View.GONE);
 		}
+		applySystemBars();
 	}
 
 	/**
@@ -536,6 +550,7 @@ public class MainActivity extends Activity {
 		}
 		if (homeScroll != null) homeScroll.setVisibility(View.VISIBLE);
 		if (setupScroll != null) setupScroll.setVisibility(View.GONE);
+		applySystemBars();
 	}
 
 	private void clearResumeSession() {
@@ -591,6 +606,7 @@ public class MainActivity extends Activity {
 			etName.setText("");
 			etServer.setText("");
 			etCport.setText("7000");
+			etTunnel.setText(ProfileStore.DEFAULT_TUNNEL_NAME);
 			etToken.setText("");
 			etSk.setText("");
 		} else {
@@ -598,12 +614,15 @@ public class MainActivity extends Activity {
 			etName.setText(existing.name);
 			etServer.setText(existing.serverAddr);
 			etCport.setText(existing.serverPort > 0 ? String.valueOf(existing.serverPort) : "7000");
+			etTunnel.setText(TextUtils.isEmpty(existing.tunnelName)
+				? ProfileStore.DEFAULT_TUNNEL_NAME : existing.tunnelName);
 			etToken.setText(existing.authToken);
 			etSk.setText(existing.secretKey);
 		}
 		if (homeScroll != null) homeScroll.setVisibility(View.GONE);
 		if (setupScroll != null) setupScroll.setVisibility(View.VISIBLE);
 		if (webView != null) webView.setVisibility(View.GONE);
+		applySystemBars();
 	}
 
 	private void leaveEditor() {
@@ -623,6 +642,12 @@ public class MainActivity extends Activity {
 		if (p.serverPort <= 0) p.serverPort = 7000;
 		p.authToken = TextUtils.isEmpty(etToken.getText()) ? "" : etToken.getText().toString().trim();
 		p.secretKey = TextUtils.isEmpty(etSk.getText()) ? "" : etSk.getText().toString().trim();
+		String tunnelRaw = TextUtils.isEmpty(etTunnel.getText()) ? "" : etTunnel.getText().toString().trim();
+		if (!ProfileStore.isValidTunnelNameInput(tunnelRaw)) {
+			Toast.makeText(this, "隧道名须以字母开头，仅含字母数字和 - _，最长 32 位", Toast.LENGTH_LONG).show();
+			return;
+		}
+		p.tunnelName = ProfileStore.normalizeTunnelName(tunnelRaw);
 		p.mode = ProfileStore.DEFAULT_MODE;
 		if (TextUtils.isEmpty(p.name)) p.name = p.serverAddr;
 		if (!p.isValid()) {
@@ -692,6 +717,7 @@ public class MainActivity extends Activity {
 		p.authToken = c.authToken;
 		p.secretKey = c.secretKey;
 		p.mode = ProfileStore.DEFAULT_MODE;
+		p.tunnelName = ProfileStore.normalizeTunnelName(c.serverName);
 		ProfileStore.upsert(prefs(), p);
 		ProfileStore.setActiveId(prefs(), p.id);
 		beginTunnel(p.toVisitorConfig());
@@ -874,8 +900,14 @@ public class MainActivity extends Activity {
 
 	private void ensureWebView() {
 		if (webView != null) return;
-		webView = new WebView(this);
-		webView.setBackgroundColor(Color.WHITE);
+		// DayNight 包装让 WebView 的 prefers-color-scheme 跟系统深浅，而不是跟
+		// Activity 的 Light 主题。Activity 自己保持浅色，避免原生连接设置白底浅字。
+		Context webCtx = this;
+		if (Build.VERSION.SDK_INT >= 29) {
+			webCtx = new ContextThemeWrapper(this, android.R.style.Theme_DeviceDefault_DayNight);
+		}
+		webView = new WebView(webCtx);
+		webView.setBackgroundColor(pageDark ? 0xFF111318 : Color.WHITE);
 		WebSettings s = webView.getSettings();
 		s.setJavaScriptEnabled(true);
 		s.setDomStorageEnabled(true);
@@ -886,6 +918,11 @@ public class MainActivity extends Activity {
 		s.setAllowFileAccess(false);
 		s.setAllowFileAccessFromFileURLs(false);
 		s.setAllowUniversalAccessFromFileURLs(false);
+		if (Build.VERSION.SDK_INT >= 33) {
+			s.setAlgorithmicDarkeningAllowed(false);
+		} else if (Build.VERSION.SDK_INT >= 29) {
+			s.setForceDark(WebSettings.FORCE_DARK_OFF);
+		}
 		String userAgent = s.getUserAgentString();
 		if (userAgent == null || !userAgent.contains(MOBILE_UA_TOKEN.trim())) {
 			s.setUserAgentString((userAgent == null ? "" : userAgent) + MOBILE_UA_TOKEN);
@@ -993,8 +1030,9 @@ public class MainActivity extends Activity {
 	}
 
 	/**
-	 * Edge-to-edge 下窗口不随键盘缩小。用 translationY 把整页抬到键盘上方，
+	 * Edge-to-edge 下窗口不随键盘缩小。用 translationY 把页面抬到键盘上方，
 	 * 不改 WebView 布局高度，避免 100vh/垂直居中重排和字体抖动。
+	 * 平移量按焦点输入框位置计算：已经在键盘上方就不动，不够才抬，且不得顶出状态栏。
 	 */
 	private void installImeInsetHandling() {
 		if (rootLayout == null) return;
@@ -1045,17 +1083,61 @@ public class MainActivity extends Activity {
 		return 0;
 	}
 
-	/** API 30+：平移整页。更旧系统走 adjustResize，不再叠加平移。 */
+	/** API 30+：按焦点位置平移。更旧系统走 adjustResize，不再叠加平移。 */
 	private void applyImeShift(int imePx) {
 		if (rootLayout == null) return;
 		if (Build.VERSION.SDK_INT < 30) return;
 		if (imePx < 0) imePx = 0;
-		if (imePx == currentImePadding) return;
+		int shift = computeImeShift(imePx);
+		if (imePx == currentImePadding && shift == currentImeShift) return;
 		currentImePadding = imePx;
+		currentImeShift = shift;
 		if (rootLayout.getPaddingBottom() != 0 || rootLayout.getPaddingTop() != 0) {
 			rootLayout.setPadding(0, 0, 0, 0);
 		}
-		rootLayout.setTranslationY(-imePx);
+		rootLayout.setTranslationY(-shift);
+	}
+
+	/**
+	 * 只抬到让焦点输入框露在键盘上方。空会话/设置页元素少时，整页抬满 IME
+	 * 高度会把输入框顶出屏幕。
+	 */
+	private int computeImeShift(int imePx) {
+		if (imePx <= 0 || rootLayout == null) return 0;
+		int rootH = rootLayout.getHeight();
+		if (rootH <= 0) rootH = getWindow().getDecorView().getHeight();
+		if (rootH <= 0) return 0;
+		int keyboardTop = rootH - imePx;
+		float density = getResources().getDisplayMetrics().density;
+		int pad = dp(12, density);
+		int insetTop = 0;
+		if (Build.VERSION.SDK_INT >= 30) {
+			WindowInsets insets = rootLayout.getRootWindowInsets();
+			if (insets != null) insetTop = insets.getInsets(WindowInsets.Type.statusBars()).top;
+		}
+		int[] rootLoc = new int[2];
+		rootLayout.getLocationOnScreen(rootLoc);
+		int fieldTop = -1;
+		int fieldBottom = -1;
+		if (uiState == UiState.WEB && webView != null && lastImeFocusBottomPx >= 0) {
+			int[] webLoc = new int[2];
+			webView.getLocationOnScreen(webLoc);
+			fieldTop = (webLoc[1] - rootLoc[1]) + lastImeFocusTopPx;
+			fieldBottom = (webLoc[1] - rootLoc[1]) + lastImeFocusBottomPx;
+		} else {
+			View focused = getCurrentFocus();
+			if (focused == null || focused == rootLayout || focused == webView) return 0;
+			int[] loc = new int[2];
+			focused.getLocationOnScreen(loc);
+			fieldTop = loc[1] - rootLoc[1];
+			fieldBottom = fieldTop + Math.max(focused.getHeight(), dp(36, density));
+		}
+		if (fieldBottom < 0 || fieldTop < 0) return 0;
+		int needed = fieldBottom + pad - keyboardTop;
+		if (needed <= 0) return 0;
+		int maxKeep = Math.max(0, fieldTop - insetTop - pad);
+		if (maxKeep <= 0) return 0;
+		return Math.min(imePx, Math.min(needed, maxKeep));
 	}
 
 	/** 部分 OEM WebView 不派发 IME inset：用可见区域差兜底。 */
@@ -1150,15 +1232,49 @@ public class MainActivity extends Activity {
 		}, 6000);
 	}
 
+	@Override
+	public void onConfigurationChanged(Configuration newConfig) {
+		super.onConfigurationChanged(newConfig);
+		// Activity 声明了 configChanges=uiMode，不重建。必须把新配置派发给
+		// WebView，prefers-color-scheme / 「跟随系统」才会跟着系统深浅变。
+		if (rootLayout != null) rootLayout.dispatchConfigurationChanged(newConfig);
+		else if (webView != null) webView.dispatchConfigurationChanged(newConfig);
+		if (webView != null && uiState == UiState.WEB) {
+			applyInsetsToPage(webView);
+			webView.evaluateJavascript(
+				"(function(){var a=window.__dshRemoteAndroidMobile;if(a&&a.syncViewport)a.syncViewport();})()",
+				null);
+		}
+	}
+
 	/** edgeToEdge=true：透明状态栏沉浸；false：实色状态栏、内容排在状态栏下方。 */
 	private void applySystemBarMode(boolean edgeToEdge) {
+		edgeToEdgeChrome = edgeToEdge;
+		applySystemBars();
+	}
+
+	private void applyPageDark(boolean dark) {
+		pageDark = dark;
+		if (webView != null) webView.setBackgroundColor(dark ? 0xFF111318 : Color.WHITE);
+		applySystemBars();
+	}
+
+	private void applySystemBars() {
+		boolean session = uiState == UiState.WEB;
+		boolean dark = session && pageDark;
+		boolean edge = session && edgeToEdgeChrome;
+		int nav = dark ? 0xFF111318 : Color.WHITE;
 		WindowManager.LayoutParams attrs = getWindow().getAttributes();
-		boolean immersiveNow = (getWindow().getStatusBarColor() == Color.TRANSPARENT);
-		if (immersiveNow == edgeToEdge) return;
 		View decor = getWindow().getDecorView();
-		int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
-		if (Build.VERSION.SDK_INT >= 26) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
-		if (edgeToEdge) {
+		int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
+		getWindow().addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
+		getWindow().clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS);
+		if (Build.VERSION.SDK_INT >= 30) getWindow().setDecorFitsSystemWindows(false);
+		if (Build.VERSION.SDK_INT >= 29) {
+			getWindow().setStatusBarContrastEnforced(false);
+			getWindow().setNavigationBarContrastEnforced(false);
+		}
+		if (edge) {
 			getWindow().setStatusBarColor(Color.TRANSPARENT);
 			flags |= View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN;
 			if (Build.VERSION.SDK_INT >= 28) {
@@ -1166,14 +1282,28 @@ public class MainActivity extends Activity {
 					WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
 			}
 		} else {
-			getWindow().setStatusBarColor(Color.WHITE);
+			getWindow().setStatusBarColor(dark ? 0xFF111318 : Color.WHITE);
 			if (Build.VERSION.SDK_INT >= 28) {
 				attrs.layoutInDisplayCutoutMode =
 					WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT;
 			}
 		}
+		if (!dark) {
+			flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+			if (Build.VERSION.SDK_INT >= 26) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+		}
+		getWindow().setNavigationBarColor(nav);
+		if (Build.VERSION.SDK_INT >= 28) getWindow().setNavigationBarDividerColor(nav);
 		getWindow().setAttributes(attrs);
 		decor.setSystemUiVisibility(flags);
+		if (Build.VERSION.SDK_INT >= 30) {
+			android.view.WindowInsetsController controller = getWindow().getInsetsController();
+			if (controller != null) {
+				int mask = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+					| android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+				controller.setSystemBarsAppearance(dark ? 0 : mask, mask);
+			}
+		}
 	}
 
 	private void hideSettings() {
@@ -1220,6 +1350,7 @@ public class MainActivity extends Activity {
 		boolean alreadyInSession = uiState == UiState.WEB && sessionHistoryRooted;
 		hideSettings();
 		uiState = UiState.WEB;
+		applySystemBars();
 		if (webView != null && webView.getVisibility() != View.VISIBLE) {
 			webView.setVisibility(View.VISIBLE);
 		}
@@ -1249,6 +1380,7 @@ public class MainActivity extends Activity {
 		clearResumeSession();
 		activeUrl = target;
 		uiState = UiState.WEB;
+		applySystemBars();
 		webView.setVisibility(View.VISIBLE);
 		injectMobileAdaptation(webView);
 		applyInsetsToPage(webView);
@@ -1741,6 +1873,34 @@ public class MainActivity extends Activity {
 		@JavascriptInterface
 		public void openSettings() {
 			runOnUiThread(() -> showConnectionSettings());
+		}
+
+		@JavascriptInterface
+		public void setPageDark(boolean dark) {
+			runOnUiThread(() -> applyPageDark(dark));
+		}
+
+		@JavascriptInterface
+		public void setSessionNotice(String title, String text, boolean running) {
+			TunnelService.updateSessionNotice(getApplicationContext(), title, text, running);
+		}
+
+		@JavascriptInterface
+		public void imeFocusRect(double topCssPx, double bottomCssPx) {
+			float density = getResources().getDisplayMetrics().density;
+			if (topCssPx < 0 || bottomCssPx < 0) {
+				lastImeFocusTopPx = -1;
+				lastImeFocusBottomPx = -1;
+			} else {
+				lastImeFocusTopPx = Math.round((float) topCssPx * density);
+				lastImeFocusBottomPx = Math.round((float) bottomCssPx * density);
+			}
+			runOnUiThread(() -> {
+				if (rootLayout == null || Build.VERSION.SDK_INT < 30) return;
+				WindowInsets insets = rootLayout.getRootWindowInsets();
+				int ime = insets == null ? 0 : imeBottomPx(insets);
+				if (ime > 0 || currentImePadding > 0) applyImeShift(ime);
+			});
 		}
 	}
 

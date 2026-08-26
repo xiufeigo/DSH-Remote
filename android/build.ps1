@@ -49,6 +49,18 @@ $DistDir = Join-Path $PSScriptRoot "dist"
 Remove-Item -Recurse -Force $OutDir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force "$OutDir/classes", "$OutDir/gen", "$OutDir/dex", "$DistDir" | Out-Null
 
+# ---- 版本号（单一来源：仓库根 package.json；规则见 docs/versioning.md）----
+# 版本号 = <deepseek-harness 基线版本>.<发版号>，如 0.1.1-rc.2.6
+$PkgJson = Join-Path (Split-Path $PSScriptRoot -Parent) "package.json"
+$AppVersion = (Get-Content -Raw -LiteralPath $PkgJson | ConvertFrom-Json).version
+if (-not $AppVersion) { throw "无法从 $PkgJson 读取 version" }
+# versionCode：把版本号的数字段逐个按百进制折叠成整数（0.1.1-rc.2.6 -> 1010206）。
+# 每段占两位十进制且各数字段 <100，因此任意一段递增 ⇒ 整体递增，满足 Android 升级安装要求。
+$VersionCode = 0
+foreach ($seg in [regex]::Matches($AppVersion, "\d+")) { $VersionCode = $VersionCode * 100 + [int]$seg.Value }
+if ($VersionCode -ge 2100000000) { throw "versionCode 溢出 int32：$VersionCode（版本号数字段过多或过大）" }
+Write-Host "== 版本：$AppVersion (versionCode $VersionCode) =="
+
 Write-Host "== aapt2 compile =="
 & "$Bt/aapt2$exe" compile --dir (Join-Path $AppDir "src/main/res") -o "$OutDir/res.zip"
 if ($LASTEXITCODE -ne 0) { throw "aapt2 compile 失败" }
@@ -58,7 +70,7 @@ Write-Host "== aapt2 link（同时生成 R.java）=="
 	--manifest (Join-Path $AppDir "src/main/AndroidManifest.xml") `
 	--java "$OutDir/gen" `
 	--min-sdk-version 24 --target-sdk-version 34 `
-	--version-code 31 --version-name 0.1.1-rc.2.5 `
+	--version-code $VersionCode --version-name $AppVersion `
 	"$OutDir/res.zip"
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link 失败" }
 

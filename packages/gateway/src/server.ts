@@ -28,7 +28,7 @@ import {
 } from "./auth.ts";
 import { ensureCert, type GatewayCert } from "./cert.ts";
 import type { GatewayConfig } from "./config.ts";
-import { FrpSupervisor, locateFrpcBinary, normalizeFrpMode, renderFrpcToml } from "./frp.ts";
+import { FrpSupervisor, locateFrpcBinary, normalizeFrpMode, normalizeTunnelName, renderFrpcToml } from "./frp.ts";
 import { BRAND_SVG, ICON_SVG, iconPng, injectIntoHtml, renderManifest } from "./pwa.ts";
 import { proxyHttp, proxyUpgrade } from "./proxy.ts";
 import type { Store } from "./store.ts";
@@ -136,12 +136,13 @@ export class GatewayServer {
 			remotePort: frp.remotePort,
 			mode,
 			secretKey: secrets.frpVisitorKey,
+			name: frp.name,
 		});
 		const configPath = this.store.path("frp", "frpc.toml");
 		await this.store.writeAtomic("frp/frpc.toml", toml);
 		this.log(mode === "entry"
-			? `frp 传输适配器启动（entry，入口端口 ${String(frp.remotePort)}）`
-			: `frp 传输适配器启动（${mode}，VPS 不开入口端口；手机填写同一把访客密钥即可连入，无需扫码）`);
+			? `frp 传输适配器启动（entry，入口端口 ${String(frp.remotePort)}，隧道名 ${normalizeTunnelName(frp.name)}）`
+			: `frp 传输适配器启动（${mode}，隧道名 ${normalizeTunnelName(frp.name)}；VPS 不开入口端口；手机填写同一把访客密钥和同一隧道名即可连入）`);
 		this.frp = new FrpSupervisor(binary, configPath, (line) => this.log(`[frpc] ${line}`));
 		this.frp.start();
 	}

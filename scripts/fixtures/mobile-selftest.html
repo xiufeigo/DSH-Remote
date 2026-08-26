@@ -277,7 +277,10 @@ function run() {
   var frame = document.querySelector('.frame');
   var checks = [];
   add(checks, 'script-installed', window.__dshRemoteMobileInstalled === true);
-  add(checks, 'mobile-class', document.documentElement.classList.contains('dshr-mobile'));
+	add(checks, 'mobile-class', document.documentElement.classList.contains('dshr-mobile'));
+	add(checks, 'phone-not-tablet', document.documentElement.getAttribute('data-dshr-tablet') !== '1',
+		'tablet=' + document.documentElement.getAttribute('data-dshr-tablet'));
+	add(checks, 'phone-not-official-inset', !document.documentElement.classList.contains('dshr-official-inset'));
   var androidShell = /DSHRemoteAndroid\//.test(String(navigator.userAgent || ''));
   var vp = document.querySelector('meta[name="viewport"]');
   var vpContent = vp ? vp.getAttribute('content') || '' : '';
@@ -491,6 +494,20 @@ function run() {
             root.removeAttribute('data-dshr-ime');
             root.style.removeProperty('--dshr-vv-height');
             if (emptyHome) emptyHome.classList.remove('show');
+            var noticeApi = window.__dshRemoteAndroidMobile;
+            var idleNotice = noticeApi && noticeApi.readSessionNotice ? noticeApi.readSessionNotice() : null;
+            add(checks, 'notice-idle', idleNotice && idleNotice.running === false, idleNotice ? JSON.stringify(idleNotice) : 'missing');
+            var sendBtn = document.querySelector('[data-dshr-composer-send], .send');
+            if (sendBtn) sendBtn.setAttribute('aria-label', '停止生成');
+            if (noticeApi && noticeApi.syncNow) noticeApi.syncNow();
+            var runNotice = noticeApi && noticeApi.readSessionNotice ? noticeApi.readSessionNotice() : null;
+            add(checks, 'notice-running', runNotice && runNotice.running === true, runNotice ? JSON.stringify(runNotice) : 'missing');
+            add(checks, 'notice-title', runNotice && /第二个会话|你好/.test(runNotice.title || ''), runNotice ? 'title=' + runNotice.title : 'missing');
+            add(checks, 'notice-prompt', runNotice && String(runNotice.text || '').indexOf('你是什么模型') >= 0, runNotice ? 'text=' + runNotice.text : 'missing');
+            if (sendBtn) sendBtn.setAttribute('aria-label', '发送消息');
+            if (noticeApi && noticeApi.syncNow) noticeApi.syncNow();
+            var idleAgain = noticeApi && noticeApi.readSessionNotice ? noticeApi.readSessionNotice() : null;
+            add(checks, 'notice-idle-after-stop', idleAgain && idleAgain.running === false, idleAgain ? JSON.stringify(idleAgain) : 'missing');
             finish(checks);
           }, 200);
         }, 80);

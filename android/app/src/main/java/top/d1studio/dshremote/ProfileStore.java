@@ -11,13 +11,17 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Android 端配置组：与电脑插件面板相同的四项（VPS / 控制端口 / 登录密钥 / 访客密钥）。
+ * Android 端配置组：与电脑插件面板相同的五项
+ * （VPS / 控制端口 / 隧道名 / 登录密钥 / 访客密钥）。
  * 本地监听端口固定 18443，与网关 listenPort 对齐，无需用户填写。
  */
 public final class ProfileStore {
 
 	public static final int BIND_PORT = 18443;
 	public static final String DEFAULT_MODE = "xtcp";
+	public static final String DEFAULT_TUNNEL_NAME = "dsh-remote";
+	private static final java.util.regex.Pattern TUNNEL_NAME =
+		java.util.regex.Pattern.compile("^[A-Za-z][A-Za-z0-9_-]{0,31}$");
 
 	private static final String KEY_PROFILES = "vp_profiles";
 	private static final String KEY_ACTIVE = "vp_active_id";
@@ -30,6 +34,8 @@ public final class ProfileStore {
 		public String authToken = "";
 		public String secretKey = "";
 		public String mode = DEFAULT_MODE;
+		/** 与电脑端 frp.name 一致，写进 frps 的 proxy 名；不是配置组显示名。 */
+		public String tunnelName = DEFAULT_TUNNEL_NAME;
 
 		public boolean isValid() {
 			return serverAddr.length() > 0
@@ -43,7 +49,7 @@ public final class ProfileStore {
 			c.mode = DEFAULT_MODE.equals(mode) || "stcp".equals(mode) ? mode : DEFAULT_MODE;
 			c.serverAddr = serverAddr;
 			c.serverPort = serverPort;
-			c.serverName = "dsh-remote";
+			c.serverName = normalizeTunnelName(tunnelName);
 			c.secretKey = secretKey;
 			c.authToken = authToken;
 			c.bindPort = BIND_PORT;
@@ -61,6 +67,7 @@ public final class ProfileStore {
 				o.put("authToken", authToken);
 				o.put("secretKey", secretKey);
 				o.put("mode", mode);
+				o.put("tunnelName", tunnelName);
 			} catch (Exception ignored) {
 			}
 			return o;
@@ -76,6 +83,7 @@ public final class ProfileStore {
 			p.secretKey = o.optString("secretKey", "");
 			String mode = o.optString("mode", DEFAULT_MODE);
 			p.mode = "stcp".equals(mode) ? "stcp" : DEFAULT_MODE;
+			p.tunnelName = normalizeTunnelName(o.optString("tunnelName", DEFAULT_TUNNEL_NAME));
 			return p;
 		}
 	}
@@ -159,11 +167,25 @@ public final class ProfileStore {
 		}
 	}
 
+	public static String normalizeTunnelName(String raw) {
+		if (TextUtils.isEmpty(raw)) return DEFAULT_TUNNEL_NAME;
+		String trimmed = raw.trim();
+		if (trimmed.length() == 0) return DEFAULT_TUNNEL_NAME;
+		return TUNNEL_NAME.matcher(trimmed).matches() ? trimmed : DEFAULT_TUNNEL_NAME;
+	}
+
+	public static boolean isValidTunnelNameInput(String raw) {
+		if (raw == null) return true;
+		String trimmed = raw.trim();
+		return trimmed.length() == 0 || TUNNEL_NAME.matcher(trimmed).matches();
+	}
+
 	public static Profile newProfile() {
 		Profile p = new Profile();
 		p.id = UUID.randomUUID().toString();
 		p.serverPort = 7000;
 		p.mode = DEFAULT_MODE;
+		p.tunnelName = DEFAULT_TUNNEL_NAME;
 		return p;
 	}
 
@@ -183,6 +205,7 @@ public final class ProfileStore {
 		p.authToken = legacy.authToken;
 		p.secretKey = legacy.secretKey;
 		p.mode = "stcp".equals(legacy.mode) ? "stcp" : DEFAULT_MODE;
+		p.tunnelName = normalizeTunnelName(legacy.serverName);
 		upsert(prefs, p);
 		setActiveId(prefs, p.id);
 	}

@@ -221,10 +221,10 @@ export function DshRemoteSettingsCard() {
           ...{
             autoStart: true, listenHost: '127.0.0.1', listenPort: 18443,
             upstreamPort: 52392, autoFixUpstreamPort: true,
-            frp: { enabled: false, serverAddr: '', serverPort: 7000, remotePort: 8443, mode: 'xtcp' },
+            frp: { enabled: false, serverAddr: '', serverPort: 7000, remotePort: 8443, mode: 'xtcp', name: 'dsh-remote' },
           },
           ...payload.config,
-          frp: { enabled: false, serverAddr: '', serverPort: 7000, remotePort: 8443, mode: 'xtcp', ...payload.config?.frp },
+          frp: { enabled: false, serverAddr: '', serverPort: 7000, remotePort: 8443, mode: 'xtcp', name: 'dsh-remote', ...payload.config?.frp },
         }
         setForm(merged)
         setAuthToken(typeof payload.secrets?.authToken === 'string' ? payload.secrets.authToken : '')
@@ -264,6 +264,7 @@ export function DshRemoteSettingsCard() {
           serverAddr: String(form.frp.serverAddr ?? '').trim(),
           serverPort: form.frp.serverPort,
           mode: 'xtcp',
+          name: String(form.frp.name ?? '').trim() || 'dsh-remote',
         },
       }
       if (form.frp.enabled) {
@@ -299,8 +300,15 @@ export function DshRemoteSettingsCard() {
   const tunnel = status?.tunnel ?? null
   const formAddr = String(form?.frp?.serverAddr ?? '').trim()
   const formPort = Number(form?.frp?.serverPort ?? 0)
+  const formName = String(form?.frp?.name ?? '').trim() || 'dsh-remote'
+  const liveName = Array.isArray(tunnel?.proxies)
+    ? (tunnel.proxies.find((proxy: { type: string }) => proxy.type === 'xtcp')?.name
+      ?? tunnel.proxies[0]?.name)
+    : undefined
   const tunnelMismatch = tunnel !== null
-    && (formAddr !== String(tunnel.serverAddr ?? '') || formPort !== Number(tunnel.serverPort ?? 0))
+    && (formAddr !== String(tunnel.serverAddr ?? '')
+      || formPort !== Number(tunnel.serverPort ?? 0)
+      || (typeof liveName === 'string' && liveName.length > 0 && liveName !== formName))
 
   return (
     <li className={`dshr-card${open ? ' open' : ''}`}>
@@ -308,7 +316,7 @@ export function DshRemoteSettingsCard() {
         <span className="dshr-copy">
           <span className="dshr-name">DSH Remote</span>
           <span className="dshr-desc">
-            手机远程访问本机 DSH：填写与 Android 端相同的四项即可连入。展开后可看到正在生效的 xtcp + stcp 双代理。
+            手机远程访问本机 DSH：填写与 Android 端相同的 VPS、端口、隧道名和两把密钥即可连入。展开后可看到正在生效的 xtcp + stcp 双代理。
             {status !== undefined && status !== null
               ? (
                 <span className="dshr-desc-inline">
@@ -352,6 +360,13 @@ export function DshRemoteSettingsCard() {
                       patchForm({ frp: { ...form.frp, serverPort: Number.isFinite(n) ? n : 0 } })
                     }}
                     hint="必须与 VPS frps.toml 的 bindPort 完全一致，不是默认 7000"
+                  />
+                  <TextField
+                    label="隧道名"
+                    placeholder="dsh-remote"
+                    value={form.frp.name ?? ''}
+                    onChange={v => { patchForm({ frp: { ...form.frp, name: v } }) }}
+                    hint="写进 frps 的 proxy 名。多人共用一台 VPS 时必须互不相同；手机填同一名字（扫码会自动带上）。仅字母开头，字母数字和 - _，最多 32 位。留空则用 dsh-remote。"
                   />
                   <TextField
                     label="登录密钥"

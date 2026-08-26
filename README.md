@@ -27,7 +27,7 @@
 | `android/` | Android 壳 App：内嵌 frpc visitor + 证书锁定（见 [android/README.md](android/README.md)） |
 | `scripts/install-frps.sh` | VPS 一键安装 frps |
 | `scripts/smoke.mjs` | 冒烟测试（18 项） |
-| `docs/` | 架构决策、VPS 部署、安全模型 |
+| `docs/` | 架构决策、[版本与发布规范](docs/versioning.md)、VPS 部署、安全模型 |
 
 ## 快速开始
 
@@ -60,7 +60,8 @@ mkdir ~\.dsh-remote
     "enabled": true,
     "serverAddr": "<VPS 公网 IP>",
     "serverPort": 7000,
-    "mode": "xtcp"
+    "mode": "xtcp",
+    "name": "dsh-remote"
   }
 }
 '@ | Set-Content ~\.dsh-remote\config.json -Encoding utf8
@@ -74,6 +75,9 @@ node packages/gateway/src/cli.ts doctor   # 全链路体检
 > `frp.mode` 三选一：`"xtcp"`（推荐，P2P 打洞优先、失败自动回退中转，不开公网端口）、
 > `"stcp"`（固定走 VPS 中转，也不开公网端口）、`"entry"`（经典公网入口，
 > 需另配 `"remotePort": 8443`，任何人可扫到该端口）。
+>
+> `frp.name` 是写进 frps 的隧道名，缺省 `dsh-remote`。多人共用一台 VPS 时必须改成互不相同
+> （字母开头，字母数字和 `-` `_`，最多 32 位）；手机 App 填同一名字，扫码会自动带上。
 
 > `upstreamPort` 是 DSH Web GUI 的端口（本会话为 52392）。桌面端重启后端口若漂移，
 > 网关启动时会**自动探测并回写**（`autoFixUpstreamPort: true` 默认开启）；`doctor` 可手动体检。
@@ -91,7 +95,7 @@ node packages/gateway/src/cli.ts visitor --mode xtcp
   `powershell -File android\build.ps1` 即可出 APK），任意扫码器扫上面的
   二维码 → App 自动接管导入并自动建立隧道 → 直接进入 DSH；无可用后端时只显示本地连接状态，
   不会显示伪造的工作区或会话内容。证书指纹随码下发，无告警。
-  手机端移动界面（隐藏桌面 rail、鲸鱼侧栏入口、设置底部 sheet、状态栏沉浸避让）
+  手机端竖屏移动界面（隐藏桌面 rail、鲸鱼侧栏入口、设置底部 sheet、状态栏沉浸避让）；横屏走官方 DSH
   由 **App 注入的脚本完成，不依赖服务器端是否安装本插件**，连接官方 DSH Web 同样生效。
 - **PC/其他设备**：拿 `frpc-visitor.toml` 跑 `frpc -c`，访问 `https://127.0.0.1:<bindPort>`。
 
@@ -139,7 +143,7 @@ node scripts/uninstall.mjs      # 卸载
 插件已接入 DSH 官方的插件设置扩展点，重启 DSH 后在 **设置 → 插件** 页会出现
 「DSH Remote」卡片，可视化完成：
 
-- frp 隧道开关、VPS 地址、控制端口、**隧道形态**（xtcp / stcp / entry，入口端口仅 entry 需要；共享密钥不出面板，走 `secrets.json`）
+- frp 隧道开关、VPS 地址、控制端口、**隧道名**（写进 frps 的 proxy 名，缺省 `dsh-remote`；多人共用一台 VPS 时必须互不相同）、登录密钥、访客密钥（共享密钥仍走 `secrets.json`，面板可改）
 - 监听面切换（仅本机 / 局域网）、上游端口与自动跟随开关、随 DSH 自启开关
 - 网关状态实时展示（运行中/离线、已配对设备数）
 - 一键生成配对码、一键重启网关
@@ -168,6 +172,16 @@ pnpm test:plugin    # 插件模拟运行（假 ctx 拉起/回收网关）
 pnpm test:routes    # 插件宿主路由逻辑单测（9 项）
 pnpm -C packages/plugin build   # 构建设置卡片客户端 bundle
 node scripts/probe-ws.mjs [端口]   # 对运行中的网关+DSH 做 WS 直通探针
+```
+
+### 版本与发布
+
+版本号 = `<deepseek-harness 基线版本>.<发版号>`，发版号每次发布 +1，
+详见 [docs/versioning.md](docs/versioning.md)：
+
+```powershell
+pnpm ver:bump     # 发版号 +1 并同步 package.json；harness 升级用 --base <新版本>
+git tag v0.1.1-rc.2.6 && git push origin v0.1.1-rc.2.6   # 推 tag 即自动打包发布
 ```
 
 ### 部署 VPS 前的本地全链路自测（无需 VPS）

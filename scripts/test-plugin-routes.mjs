@@ -90,6 +90,24 @@ test("validateConfigPatch：frp.mode 白名单", () => {
 	assert.ok(bad.errors.some((e) => e.includes("frp.mode")));
 });
 
+test("validateConfigPatch：frp.name 白名单与归一化", () => {
+	const ok = validateConfigPatch({ frp: { name: " dsh-alice " } });
+	assert.equal(ok.ok, true);
+	assert.equal(ok.patch.frp.name, "dsh-alice");
+
+	const empty = validateConfigPatch({ frp: { name: "  " } });
+	assert.equal(empty.ok, true);
+	assert.equal(empty.patch.frp.name, "dsh-remote");
+
+	const badName = validateConfigPatch({ frp: { name: "我的电脑" } });
+	assert.equal(badName.ok, false);
+	assert.ok(badName.errors.some((e) => e.includes("隧道名")));
+
+	const unknown = validateConfigPatch({ frp: { tunnel: "x" } });
+	assert.equal(unknown.ok, false);
+	assert.ok(unknown.errors.some((e) => e.includes("未知 frp")));
+});
+
 test("mergeConfigFile：顶层浅覆盖 + frp 深合并", () => {
 	const current = { listenPort: 18443, upstreamPort: 52392, frp: { enabled: false, serverPort: 7000, remotePort: 8443 } };
 	const next = mergeConfigFile(current, { upstreamPort: 9999, frp: { enabled: true, serverAddr: "v.example" } });
@@ -317,6 +335,7 @@ test("DISPLAY_DEFAULTS 与网关 DEFAULT_CONFIG 对齐抽查", async () => {
 	assert.equal(DISPLAY_DEFAULTS.upstreamPort, DEFAULT_CONFIG.upstreamPort);
 	assert.equal(DISPLAY_DEFAULTS.frp.serverPort, DEFAULT_CONFIG.frp.serverPort);
 	assert.equal(DISPLAY_DEFAULTS.frp.mode, "xtcp", "插件面板缺省形态为 xtcp（访客密钥连入）");
+	assert.equal(DISPLAY_DEFAULTS.frp.name, "dsh-remote");
 	assert.equal(DEFAULT_CONFIG.frp.mode, "entry", "网关文件缺省仍为 entry，避免未写 mode 的历史部署被改写");
 	assert.equal(DISPLAY_DEFAULTS.autoFixUpstreamPort, DEFAULT_CONFIG.autoFixUpstreamPort);
 });

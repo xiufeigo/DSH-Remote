@@ -34,6 +34,11 @@ export interface FrpConfig {
 	remotePort: number;
 	/** 访客密钥（mode=stcp/xtcp）：proxy 与 visitor 必须一致；缺省自动生成并持久化 */
 	secretKey?: string;
+	/**
+	 * 写进 frps 的 proxy 名。多人共用一台 VPS 时必须互不相同，否则后连上的会把先连上的挤掉。
+	 * 缺省 `dsh-remote`；手机 App / visitor 二维码必须填同一名字。
+	 */
+	name?: string;
 }
 
 export interface GatewayConfig {

@@ -219,7 +219,8 @@ function DshRemoteSettingsCard() {
 					serverAddr: "",
 					serverPort: 7e3,
 					remotePort: 8443,
-					mode: "xtcp"
+					mode: "xtcp",
+					name: "dsh-remote"
 				},
 				...payload.config,
 				frp: {
@@ -228,6 +229,7 @@ function DshRemoteSettingsCard() {
 					serverPort: 7e3,
 					remotePort: 8443,
 					mode: "xtcp",
+					name: "dsh-remote",
 					...payload.config?.frp
 				}
 			};
@@ -275,7 +277,8 @@ function DshRemoteSettingsCard() {
 					enabled: form.frp.enabled,
 					serverAddr: String(form.frp.serverAddr ?? "").trim(),
 					serverPort: form.frp.serverPort,
-					mode: "xtcp"
+					mode: "xtcp",
+					name: String(form.frp.name ?? "").trim() || "dsh-remote"
 				}
 			};
 			if (form.frp.enabled) {
@@ -325,7 +328,9 @@ function DshRemoteSettingsCard() {
 	const tunnel = status?.tunnel ?? null;
 	const formAddr = String(form?.frp?.serverAddr ?? "").trim();
 	const formPort = Number(form?.frp?.serverPort ?? 0);
-	const tunnelMismatch = tunnel !== null && (formAddr !== String(tunnel.serverAddr ?? "") || formPort !== Number(tunnel.serverPort ?? 0));
+	const formName = String(form?.frp?.name ?? "").trim() || "dsh-remote";
+	const liveName = Array.isArray(tunnel?.proxies) ? tunnel.proxies.find((proxy) => proxy.type === "xtcp")?.name ?? tunnel.proxies[0]?.name : void 0;
+	const tunnelMismatch = tunnel !== null && (formAddr !== String(tunnel.serverAddr ?? "") || formPort !== Number(tunnel.serverPort ?? 0) || typeof liveName === "string" && liveName.length > 0 && liveName !== formName);
 	return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", {
 		className: `dshr-card${open ? " open" : ""}`,
 		children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
@@ -342,7 +347,7 @@ function DshRemoteSettingsCard() {
 					children: "DSH Remote"
 				}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
 					className: "dshr-desc",
-					children: ["手机远程访问本机 DSH：填写与 Android 端相同的四项即可连入。展开后可看到正在生效的 xtcp + stcp 双代理。", status !== void 0 && status !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+					children: ["手机远程访问本机 DSH：填写与 Android 端相同的 VPS、端口、隧道名和两把密钥即可连入。展开后可看到正在生效的 xtcp + stcp 双代理。", status !== void 0 && status !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
 						className: "dshr-desc-inline",
 						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: `dshr-dot${gatewayRunning ? " ok" : ""}` }), gatewayRunning ? `运行中 · ${String(status.deviceCount ?? "?")} 台设备` : "网关未运行"]
 					}) : null]
@@ -408,6 +413,18 @@ function DshRemoteSettingsCard() {
 							} });
 						},
 						hint: "必须与 VPS frps.toml 的 bindPort 完全一致，不是默认 7000"
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(TextField, {
+						label: "隧道名",
+						placeholder: "dsh-remote",
+						value: form.frp.name ?? "",
+						onChange: (v) => {
+							patchForm({ frp: {
+								...form.frp,
+								name: v
+							} });
+						},
+						hint: "写进 frps 的 proxy 名。多人共用一台 VPS 时必须互不相同；手机填同一名字（扫码会自动带上）。仅字母开头，字母数字和 - _，最多 32 位。留空则用 dsh-remote。"
 					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(TextField, {
 						label: "登录密钥",

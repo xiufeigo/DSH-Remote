@@ -17,6 +17,18 @@ export function normalizeFrpMode(mode: string | undefined): FrpMode {
 	return mode === "stcp" || mode === "xtcp" ? mode : "entry";
 }
 
+/** 写进 frps 的缺省 proxy 名；历史配置没有 `frp.name` 时沿用这个值。 */
+export const DEFAULT_TUNNEL_NAME = "dsh-remote";
+
+const TUNNEL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
+
+/** 空或非法字符回落缺省名，避免把空格/引号写进 toml。 */
+export function normalizeTunnelName(raw: unknown): string {
+	if (typeof raw !== "string") return DEFAULT_TUNNEL_NAME;
+	const trimmed = raw.trim();
+	return TUNNEL_NAME_RE.test(trimmed) ? trimmed : DEFAULT_TUNNEL_NAME;
+}
+
 /** 在约定位置寻找 frpc 可执行文件；找不到返回 undefined。 */
 export async function locateFrpcBinary(config: FrpConfig, store: Store): Promise<string | undefined> {
 	const candidates = [
@@ -47,7 +59,7 @@ export function renderFrpcToml(options: {
 	name?: string;
 }): string {
 	const mode = normalizeFrpMode(options.mode);
-	const proxyName = options.name ?? "dsh-remote";
+	const proxyName = normalizeTunnelName(options.name);
 	if (mode === "entry") {
 		return `# 由 dsh-remote 自动生成，手工修改会在下次 start 时被覆盖
 serverAddr = "${options.serverAddr}"
@@ -123,7 +135,7 @@ export function renderVisitorToml(options: {
 	serverAddr: string;
 	serverPort: number;
 	authToken: string;
-	/** 服务端 [[proxies]] 的 name（dsh-remote 固定用 dsh-remote） */
+	/** 服务端 [[proxies]] 的 name，须与电脑端 `frp.name` 一致 */
 	serverName?: string;
 	secretKey?: string;
 	mode?: string;
@@ -132,7 +144,7 @@ export function renderVisitorToml(options: {
 	name?: string;
 }): string {
 	const mode = normalizeFrpMode(options.mode);
-	const serverName = options.serverName ?? "dsh-remote";
+	const serverName = normalizeTunnelName(options.serverName);
 	const visitorName = options.name ?? `${serverName}-visitor`;
 	const common = `# 由 dsh-remote visitor 自动生成 —— 访客侧 frpc 配置
 # 用法：frpc -c frpc-visitor.toml 之后访问 https://127.0.0.1:${String(options.bindPort)}
@@ -195,7 +207,7 @@ export function visitorConnectionString(options: {
 		mode: normalizeFrpMode(options.mode),
 		server: options.serverAddr,
 		cport: String(options.serverPort),
-		name: options.serverName ?? "dsh-remote",
+		name: normalizeTunnelName(options.serverName),
 		sk: options.secretKey,
 		token: options.authToken,
 		bport: String(options.bindPort),

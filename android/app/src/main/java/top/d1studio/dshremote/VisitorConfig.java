@@ -10,7 +10,7 @@ import java.util.Locale;
  * 访客隧道配置 —— 与 PC 端网关生成的连接串一一对应：
  *
  *   dsh-remote://visitor?v=1&mode=xtcp&server=1.2.3.4&cport=7000
- *       &name=dsh-remote&sk=<访客密钥>&token=<frps登录密钥>&bport=18443&fp=<证书指纹>
+ *       &name=<隧道名，与电脑端 frp.name 一致>&sk=<访客密钥>&token=<frps登录密钥>&bport=18443&fp=<证书指纹>
  *
  * 字段语义与 packages/gateway/src/frp.ts 的 renderVisitorToml / visitorConnectionString
  * 保持一致，两端任何一侧调整都要同步。

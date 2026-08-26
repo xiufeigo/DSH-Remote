@@ -16,7 +16,7 @@ import process from "node:process";
 import { GatewayServer } from "./server.ts";
 import { Store } from "./store.ts";
 import type { GatewayConfig } from "./config.ts";
-import { normalizeFrpMode, renderVisitorToml, visitorConnectionString } from "./frp.ts";
+import { normalizeFrpMode, normalizeTunnelName, renderVisitorToml, visitorConnectionString } from "./frp.ts";
 
 interface CliArgs {
 	command: string;
@@ -196,6 +196,7 @@ async function cmdVisitor(store: Store, flags: Map<string, string | boolean>): P
 	const bindPort = Number.isInteger(rawBindPort) && rawBindPort >= 1 && rawBindPort <= 65535 ? rawBindPort : config.listenPort;
 
 	const secrets = await store.ensureSecrets();
+	const tunnelName = normalizeTunnelName(frp.name);
 	const toml = renderVisitorToml({
 		serverAddr: frp.serverAddr,
 		serverPort: frp.serverPort,
@@ -203,6 +204,7 @@ async function cmdVisitor(store: Store, flags: Map<string, string | boolean>): P
 		secretKey: secrets.frpVisitorKey,
 		mode,
 		bindPort,
+		serverName: tunnelName,
 	});
 	const out = typeof flags.get("out") === "string" ? String(flags.get("out")) : "frp/frpc-visitor.toml";
 	await store.writeAtomic(out, toml);
@@ -219,6 +221,7 @@ async function cmdVisitor(store: Store, flags: Map<string, string | boolean>): P
 		mode,
 		serverAddr: frp.serverAddr,
 		serverPort: frp.serverPort,
+		serverName: tunnelName,
 		secretKey: secrets.frpVisitorKey,
 		authToken: secrets.frpAuthToken,
 		bindPort,
@@ -227,6 +230,7 @@ async function cmdVisitor(store: Store, flags: Map<string, string | boolean>): P
 
 	console.log(`形态          ${mode}${mode === "xtcp" ? "（P2P 打洞优先，失败自动回退 stcp 中转）" : "（固定经 VPS 中转）"}`);
 	console.log(`frps          ${frp.serverAddr}:${String(frp.serverPort)}`);
+	console.log(`隧道名        ${tunnelName}（手机必须填同一名字；多人共用一台 VPS 时不要撞名）`);
 	console.log(`访客配置      ${store.path(out)}（frpc -c 该文件后访问 https://127.0.0.1:${String(bindPort)}）`);
 	await store.audit("visitor_config_exported", { mode, out });
 	try {
@@ -268,7 +272,7 @@ async function cmdStatus(store: Store): Promise<number> {
 		const shape = mode === "entry"
 			? ` → 公网入口:${String(config.frp.remotePort)}`
 			: ` 形态=${mode}（不开公网端口）`;
-		console.log(`frp           ${config.frp.serverAddr ?? "?"}:${String(config.frp.serverPort)}${shape} ${binary === undefined ? "[缺 frpc 二进制]" : "[frpc 就绪]"}`);
+		console.log(`frp           ${config.frp.serverAddr ?? "?"}:${String(config.frp.serverPort)}${shape} 隧道名=${normalizeTunnelName(config.frp.name)} ${binary === undefined ? "[缺 frpc 二进制]" : "[frpc 就绪]"}`);
 		if (mode === "entry") {
 			console.log(`公网入口      https://${config.frp.serverAddr ?? "?"}:${String(config.frp.remotePort)}`);
 		} else {
@@ -362,6 +366,11 @@ async function cmdDoctor(store: Store): Promise<number> {
 		}
 		const binary = await import("./frp.ts").then((mod) => mod.locateFrpcBinary(config.frp, store));
 		checks.push({ name: "frpc 二进制", ok: binary !== undefined, detail: binary ?? `缺失，放到 ${store.path("vendor", "frp")} 下` });
+		checks.push({
+			name: "隧道名",
+			ok: true,
+			detail: `${normalizeTunnelName(config.frp.name)}（写进 frps 的 proxy 名；多人共用一台 VPS 时必须互不相同）`,
+		});
 	}
 
 	let failed = 0;

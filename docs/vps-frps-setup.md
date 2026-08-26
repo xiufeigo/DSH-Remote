@@ -73,6 +73,7 @@ https://github.com/fatedier/frp/releases/tag/v0.61.1
     //   "stcp"   访客模式·加密中转：不开入口端口，流量固定走 VPS
     //   "xtcp"   访客模式·P2P 打洞（推荐）：优先直连，失败自动回退 stcp 中转
     "mode": "xtcp",
+    "name": "dsh-remote",        // 可选；多人共用一台 VPS 时改成互不相同，例如 dsh-zhangsan
     "remotePort": 8443          // 仅 entry 形态使用
     // authToken / 访客 secretKey 缺省读取 ~/.dsh-remote/state/secrets.json，
     // 需要与 VPS 的 token 一致：手动把 install-frps.sh 回显的值

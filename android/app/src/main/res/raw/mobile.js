@@ -3,20 +3,24 @@
  *
  * 设计目标：不依赖服务器端是否安装 dsh-remote-plugin。手机连接任何官方 DSH Web
  * （装或不装插件）都由本脚本完成移动适配：
- *   1. 依据视口宽度（<=1024px，与官方 SIDEBAR_AUTO_COLLAPSE 一致）启用移动模式；
+ *   1. 仅竖屏启用 hook（手机 + 平板）；平板横屏去掉适配类，走官方 DSH
+ *      桌面布局，侧栏/主栏背景延伸进状态栏，控件再各自避开系统栏，
+ *      并挡住误触。Android 壳竖屏仍不看 1024px（部分机型 layout viewport 虚高）；
  *   2. 桌面端收起后的 56px rail 压到 0，用左上角悬浮鲸鱼打开侧栏
  *      （不把官方按钮拖到顶栏，避免官方 Harness 布局在窄屏错位）；
  *   3. 用户直接点击官方按钮产生可信事件；展开侧栏时采用 DeepSeek App 式
  *      「侧栏在下、会话栏圆角浮层滑开」：中间列可跟手拖动，松手后吸附开/关；
- *      点浮层右侧细条/遮罩关闭；长按鲸鱼 = 打开 App 连接设置
+ *      点浮层右侧细条/主会话窗口/遮罩关闭；长按鲸鱼 = 打开 App 连接设置
  *      （优先 DshRemoteApp.openSettings，避免写入 WebView 历史）；
+ *      平板竖屏侧栏只划出约 1/3 宽，主会话窗口仍大块可见，不得铺满全屏；
  *   4. 设置弹窗改为全屏页：从设置入口盖住整屏（含侧栏浮层），不再先收起
  *      侧栏再弹设置，避免「闪回会话再打开」的卡顿；
  *   5. 顶部/底部系统栏避让：App 原生把状态栏/导航栏 inset 写入
  *      --dshr-inset-top / --dshr-inset-bottom，页面内容下移让出状态栏，
  *      状态栏透明后颜色与页面背景一致（沉浸模式）；虚拟键盘弹出时，
- *      Android 壳只由原生平移抬起整页（不改 WebView 高度，避免居中重排
- *      和字体抖动；interactive-widget=overlays-content）；非壳 PWA 仍用
+ *      Android 壳只由原生平移抬起（不改 WebView 高度，避免居中重排
+ *      和字体抖动；interactive-widget=overlays-content）；平移量按焦点
+ *      输入框位置计算，元素少时不得把输入框顶出屏幕；非壳 PWA 仍用
  *      resizes-content + visualViewport.resize 兜底；
  *   6. 会话头部适配：收起态下会话标题行/页签整体右移，不再被左上角
  *      鲸鱼按钮遮挡；官方「Session log」下载按钮在手机上收成纯图标
@@ -29,6 +33,11 @@
  *      不再向左或向右超出屏幕，过高时内部滚动。
  *  10. 与 dsh-explorer 共存：检测到 frame[data-dshx-overlay] 时让出第三列，
  *      不再把 grid 钉成 0|1fr|0 或把 details 整列 display:none，避免白屏。
+ *  11. 深浅色：表面色走 --dsw-alias-bg-base；同步 body[data-ds-dark-theme]
+ *      给原生状态栏。WebView 用 DayNight 让「跟随系统」吃到 prefers-color-scheme。
+ *  12. 前台通知：探测「停止生成」即智能体正在跑，把会话标题和当前用户
+ *      内容交给 DshRemoteApp.setSessionNotice；空闲则 running=false，
+ *      原生改走静默渠道，不再展示本机端口直通文案。
  *
  * 健壮性约定（本版本重点加固）：
  *   - 官方 DOM 结构探测带多级回退（overlay 父节点 → 侧栏开关按钮祖先链 →
@@ -68,9 +77,64 @@
 		// 首选：官方 frame 下移让出状态栏；状态栏透明后露出 frame 背景（沉浸一致）。
 		'html.' + ROOT_CLASS + ' {',
 		'  --dshr-drawer-peek: 52px;',
+		'  --dshr-drawer-width: calc(100% - 52px);',
 		'  --dshr-ime: 0px;',
+		'  color-scheme: light dark;',
 		'  -webkit-text-size-adjust: 100%;',
 		'  text-size-adjust: 100%;',
+		'}',
+		// 表面色必须走官方会随深浅切换的 token。`--dsw-specific-background` 在
+		// DSH 里经常不存在，写成它的 fallback 会把设置页钉死成白底，深色字就看不见。
+		'html.' + ROOT_CLASS + '[data-dshr-dark="1"] { color-scheme: dark; }',
+		'html.' + ROOT_CLASS + '[data-dshr-dark="0"] { color-scheme: light; }',
+		// 官方横屏：不要给整个 frame 垫一层白顶（会跟灰色侧栏错色）。
+		// 列自己 padding-top，背景画进 padding，状态栏后面左右颜色才能接上。
+		'html.dshr-official-inset {',
+		'  background: transparent;',
+		'}',
+		'html.dshr-official-inset [data-dshr-frame] {',
+		'  padding-top: 0 !important;',
+		'}',
+		'html.dshr-official-inset [data-dshr-sidebar-col] {',
+		'  box-sizing: border-box !important;',
+		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
+		'  background: var(--dsw-specific-sidebar-fill, var(--dsw-alias-bg-base, #f5f5f6)) !important;',
+		'}',
+		'html.dshr-official-inset [data-dshr-main-col],',
+		'html.dshr-official-inset [data-dshx-details-col] {',
+		'  box-sizing: border-box !important;',
+		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
+		'  background: var(--dsw-alias-bg-base, var(--dsw-specific-background, #ffffff)) !important;',
+		'}',
+		'html.dshr-official-inset[data-dshr-dark="1"] [data-dshr-sidebar-col] {',
+		'  background: var(--dsw-specific-sidebar-fill, var(--dsw-alias-bg-base, #1b1b1f)) !important;',
+		'}',
+		'html.dshr-official-inset[data-dshr-dark="1"] [data-dshr-main-col],',
+		'html.dshr-official-inset[data-dshr-dark="1"] [data-dshx-details-col] {',
+		'  background: var(--dsw-alias-bg-base, #111318) !important;',
+		'}',
+		'html.dshr-official-inset:not([data-dshr-ready="1"]) body {',
+		'  box-sizing: border-box !important;',
+		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
+		'}',
+		'#dshr-status-guard {',
+		'  display: none;',
+		'  position: fixed;',
+		'  top: 0;',
+		'  left: 0;',
+		'  right: 0;',
+		'  height: var(--dshr-inset-top, env(safe-area-inset-top, 0px));',
+		'  z-index: 2147483000;',
+		'  pointer-events: auto;',
+		'  touch-action: none;',
+		'  background: transparent;',
+		'}',
+		'html.dshr-official-inset #dshr-status-guard,',
+		'html.' + ROOT_CLASS + ' #dshr-status-guard { display: block; }',
+		// 平板竖屏：侧栏固定约 1/3 宽，主会话窗口留出可点/可滑的大块区域。
+		'html.' + ROOT_CLASS + '[data-dshr-tablet="1"] {',
+		'  --dshr-drawer-width: clamp(280px, 32vw, 380px);',
+		'  --dshr-drawer-peek: calc(100vw - var(--dshr-drawer-width));',
 		'}',
 		'html.' + ROOT_CLASS + '[data-dshr-ime="1"],',
 		'html.' + ROOT_CLASS + '[data-dshr-ime="1"] body {',
@@ -158,7 +222,7 @@
 		// 展开态：DeepSeek App 式 —— 侧栏铺在底层，中间会话列滑成圆角浮层。
 		// grid 列仍为 0（不挤压），侧栏 absolute 铺满左侧；主列 translate 右移。
 		'html.' + ROOT_CLASS + ' [data-dshr-frame]:not([data-sidebar-collapsed]) {',
-		'  background: var(--dsw-specific-sidebar-fill, #f5f5f6) !important;',
+		'  background: var(--dsw-specific-sidebar-fill, var(--dsw-alias-bg-base, #f5f5f6)) !important;',
 		'  overflow: hidden !important;',
 		'}',
 		'html.' + ROOT_CLASS + ' [data-dshr-frame]:not([data-sidebar-collapsed]) [data-dshr-sidebar-col] {',
@@ -168,12 +232,12 @@
 		'  top: 0 !important;',
 		'  left: 0 !important;',
 		'  bottom: 0 !important;',
-		'  width: calc(100% - var(--dshr-drawer-peek)) !important;',
+		'  width: var(--dshr-drawer-width) !important;',
 		'  min-width: 0 !important;',
 		'  max-width: none !important;',
 		'  box-sizing: border-box !important;',
 		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
-		'  background: var(--dsw-specific-sidebar-fill, #f5f5f6) !important;',
+		'  background: var(--dsw-specific-sidebar-fill, var(--dsw-alias-bg-base, #f5f5f6)) !important;',
 		'  visibility: visible !important;',
 		'  opacity: 1 !important;',
 		'  overflow: hidden !important;',
@@ -204,7 +268,7 @@
 		'  min-width: 0 !important;',
 		'  width: auto !important;',
 		'  box-sizing: border-box !important;',
-		'  background: var(--dsw-specific-background, #ffffff) !important;',
+		'  background: var(--dsw-alias-bg-base, var(--dsw-specific-background, #ffffff)) !important;',
 		'  border-radius: 0;',
 		'  box-shadow: none;',
 		'  transform: translateX(0);',
@@ -218,7 +282,7 @@
 		'  will-change: transform;',
 		'}',
 		'html.' + ROOT_CLASS + ' [data-dshr-frame]:not([data-sidebar-collapsed]) [data-dshr-main-col] {',
-		'  transform: translateX(calc(100% - var(--dshr-drawer-peek))) !important;',
+		'  transform: translateX(var(--dshr-drawer-width)) !important;',
 		'  border-radius: 18px !important;',
 		'  box-shadow: -14px 0 36px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(0, 0, 0, 0.04) !important;',
 		'  overflow: hidden !important;',
@@ -231,7 +295,7 @@
 		'}',
 		// 跟手拖动：用 --dshr-drawer-x / --dshr-drawer-p 驱动，关掉过渡。
 		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] [data-dshr-frame] {',
-		'  background: var(--dsw-specific-sidebar-fill, #f5f5f6) !important;',
+		'  background: var(--dsw-specific-sidebar-fill, var(--dsw-alias-bg-base, #f5f5f6)) !important;',
 		'  overflow: hidden !important;',
 		'}',
 		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] [data-dshr-sidebar-col],',
@@ -242,12 +306,12 @@
 		'  top: 0 !important;',
 		'  left: 0 !important;',
 		'  bottom: 0 !important;',
-		'  width: calc(100% - var(--dshr-drawer-peek)) !important;',
+		'  width: var(--dshr-drawer-width) !important;',
 		'  min-width: 0 !important;',
 		'  max-width: none !important;',
 		'  box-sizing: border-box !important;',
 		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
-		'  background: var(--dsw-specific-sidebar-fill, #f5f5f6) !important;',
+		'  background: var(--dsw-specific-sidebar-fill, var(--dsw-alias-bg-base, #f5f5f6)) !important;',
 		'  visibility: visible !important;',
 		'  opacity: 1 !important;',
 		'  overflow: hidden !important;',
@@ -374,7 +438,7 @@
 		'  box-sizing: border-box !important;',
 		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
 		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
-		'  background: var(--dsw-specific-background, #ffffff) !important;',
+		'  background: var(--dsw-alias-bg-base, var(--dsw-specific-background, #ffffff)) !important;',
 		'  animation: dshr-settings-rise 0.28s cubic-bezier(0.32, 0.72, 0, 1);',
 		'}',
 		'html.' + ROOT_CLASS + ' [data-dshr-sheet-nav] {',
@@ -733,11 +797,35 @@
 		}, 32);
 	}
 
+	function isEditableFocus(el) {
+		if (!el || el.nodeType !== 1 || el === document.body || el === document.documentElement) return false;
+		var tag = (el.tagName || '').toLowerCase();
+		if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;
+		if (el.isContentEditable) return true;
+		return false;
+	}
+
+	function reportImeFocusToNative() {
+		if (!isAndroidShell()) return;
+		try {
+			if (!window.DshRemoteApp || typeof window.DshRemoteApp.imeFocusRect !== 'function') return;
+			var el = document.activeElement;
+			if (!isEditableFocus(el)) {
+				window.DshRemoteApp.imeFocusRect(-1, -1);
+				return;
+			}
+			var r = el.getBoundingClientRect();
+			window.DshRemoteApp.imeFocusRect(r.top, r.bottom);
+		} catch (ignoredFocus) { /* 无 JS 桥时由原生按当前焦点 View 计算 */ }
+	}
+
 	function bindImeLift() {
 		if (window.__dshrImeBound) return;
 		window.__dshrImeBound = true;
-		if (isAndroidShell()) return;
-		var onChange = scheduleImeLift;
+		var onChange = function () {
+			reportImeFocusToNative();
+			scheduleImeLift();
+		};
 		var vv = window.visualViewport;
 		if (vv && vv.addEventListener) {
 			vv.addEventListener('resize', onChange);
@@ -751,16 +839,70 @@
 		});
 	}
 
-	// ── 宽度阈值：<=1024px 启用移动模式（与官方 SIDEBAR_AUTO_COLLAPSE 一致） ──
+	function isPortraitViewport() {
+		try {
+			if (window.matchMedia) {
+				var portraitMq = window.matchMedia('(orientation: portrait)');
+				if (portraitMq && typeof portraitMq.matches === 'boolean') return portraitMq.matches;
+			}
+		} catch (ignoredPortrait) { /* fall through */ }
+		return (window.innerHeight || 0) >= (window.innerWidth || 0);
+	}
+
+	function isTabletViewport() {
+		var w = window.innerWidth || 0;
+		var h = window.innerHeight || 0;
+		if (Math.min(w, h) >= 600) return true;
+		try {
+			if (window.matchMedia && window.matchMedia('(min-width: 600px) and (min-height: 600px)').matches) {
+				return true;
+			}
+		} catch (ignoredTablet) { /* ignore */ }
+		return false;
+	}
+
+	function syncDrawerMetrics() {
+		var root = document.documentElement;
+		var vw = window.innerWidth || 390;
+		if (root.getAttribute('data-dshr-tablet') === '1') {
+			var drawer = Math.round(Math.min(380, Math.max(280, vw * 0.32)));
+			var peek = Math.max(120, vw - drawer);
+			root.style.setProperty('--dshr-drawer-width', drawer + 'px');
+			root.style.setProperty('--dshr-drawer-peek', peek + 'px');
+		} else {
+			root.style.setProperty('--dshr-drawer-peek', '52px');
+			root.style.setProperty('--dshr-drawer-width', 'calc(100% - 52px)');
+		}
+	}
+
+	// ── 仅竖屏启用 hook；横屏（尤其平板）走官方 DSH ──
 	var mql = window.matchMedia('(max-width: 1024px)');
+	var portraitMql = null;
+	try { portraitMql = window.matchMedia('(orientation: portrait)'); } catch (ignoredO) { portraitMql = null; }
 	function applyWidthScope() {
-		// App WebView 必须始终走移动适配；部分机型会把 layout viewport 报成 >1024。
-		var on = isAndroidShell() || mql.matches;
-		document.documentElement.classList[on ? 'add' : 'remove'](ROOT_CLASS);
+		var portrait = isPortraitViewport();
+		var tablet = isTabletViewport();
+		// Android 壳竖屏始终 hook（部分机型 layout viewport > 1024）；横屏交给官方 DSH。
+		var on = portrait && (isAndroidShell() || mql.matches);
+		var root = document.documentElement;
+		root.classList[on ? 'add' : 'remove'](ROOT_CLASS);
+		root.classList[on ? 'remove' : 'add']('dshr-official-inset');
+		if (on && tablet) root.setAttribute('data-dshr-tablet', '1');
+		else root.removeAttribute('data-dshr-tablet');
+		if (on) syncDrawerMetrics();
+		else {
+			root.style.removeProperty('--dshr-drawer-width');
+			root.style.removeProperty('--dshr-drawer-peek');
+		}
 		applyImeLift();
+		reportImeFocusToNative();
 	}
 	if (mql.addEventListener) mql.addEventListener('change', applyWidthScope);
 	else if (mql.addListener) mql.addListener(applyWidthScope);
+	if (portraitMql) {
+		if (portraitMql.addEventListener) portraitMql.addEventListener('change', applyWidthScope);
+		else if (portraitMql.addListener) portraitMql.addListener(applyWidthScope);
+	}
 	applyWidthScope();
 	bindImeLift();
 
@@ -1067,6 +1209,7 @@
 		if (node.closest('textarea, input, select, [contenteditable="true"]')) return true;
 		if (node.closest('[data-composer-card]')) return true;
 		if (node.closest('#dshr-mobile-whale')) return true;
+		if (node.closest('#dshr-status-guard')) return true;
 		if (node.closest('[data-dshr-stats-line]')) return true;
 		return false;
 	}
@@ -1311,6 +1454,16 @@
 				settleDrawer(wantOpen);
 				return;
 			}
+			if (opened && isElement(start)) {
+				var frame = findFrame();
+				var main = frame ? findMainCol(frame) : null;
+				var inMain = !!(main && main.contains(start));
+				var onMask = start.id === 'dshr-mobile-drawer-mask';
+				if (inMain || onMask) {
+					settleDrawer(false);
+					return;
+				}
+			}
 			considerSwipe(startX, startY, endX, endY, start);
 		}
 
@@ -1365,6 +1518,7 @@
 	function isLayoutChrome(node) {
 		if (!isElement(node)) return true;
 		if (node.id === 'dshr-mobile-whale' || node.id === 'dshr-mobile-drawer-mask') return true;
+		if (node.id === 'dshr-status-guard') return true;
 		if (node.hasAttribute('data-dshr-frame')) return true;
 		if (node.hasAttribute('data-dshr-sidebar-col')) return true;
 		if (node.hasAttribute('data-dshr-main-col')) return true;
@@ -1605,6 +1759,13 @@
 			});
 			doc.body.appendChild(mask);
 		}
+		var guard = doc.getElementById('dshr-status-guard');
+		if (!guard) {
+			guard = doc.createElement('div');
+			guard.id = 'dshr-status-guard';
+			guard.setAttribute('aria-hidden', 'true');
+			doc.body.appendChild(guard);
+		}
 	}
 
 	function openAppSettings() {
@@ -1653,8 +1814,8 @@
 	 *     收起态下整体右移，为固定在左上角的鲸鱼按钮让位；
 	 *   - 文字恰为「Session log」且带图标的按钮 → data-dshr-session-log，
 	 *     手机上收成纯图标下载按钮（文字剪裁保留给读屏）。
-	 * 本脚本只由壳 App 注入（UA 含 DSHRemoteAndroid），CSS 又限定在
-	 * ≤1024px 的移动宽度内，桌面浏览器不受影响。
+	 * 本脚本只由壳 App 注入（UA 含 DSHRemoteAndroid），样式限定在
+	 * html.dshr-mobile（仅竖屏），桌面浏览器与平板横屏不受影响。
 	 */
 	function markSessionChrome() {
 		var headers = document.querySelectorAll('header');
@@ -1816,6 +1977,97 @@
 		}
 
 		if (document.querySelector('[data-dshr-stats-line]') === null) markStatsLineFallback();
+	}
+
+	var TITLE_SKIP = /^(对话|轨迹|子代理|Chat|Trajectory|Sub-?agents?|Session log|标准模式|计划模式|设置)$/i;
+
+	function clipNoticeText(text, max) {
+		var t = String(text || '').replace(/\s+/g, ' ').trim();
+		if (t.length <= max) return t;
+		return t.slice(0, max - 1) + '…';
+	}
+
+	function isAgentRunning() {
+		var buttons = document.querySelectorAll('button[aria-label], [data-dshr-composer-send]');
+		for (var i = 0; i < buttons.length; i++) {
+			var label = (buttons[i].getAttribute('aria-label') || '').trim();
+			if (label === '停止生成' || label === 'Stop generating') return true;
+			if (label === '停止响应' || label === 'Stop responding') return true;
+		}
+		return false;
+	}
+
+	function readSessionTitle() {
+		var header = document.querySelector('[data-dshr-session-header]') || document.querySelector('header');
+		if (!isElement(header)) return clipNoticeText(document.title, 48);
+		var named = header.querySelector('#session-title, [data-dshr-session-title]');
+		if (isElement(named)) {
+			var namedText = clipNoticeText(named.textContent, 48);
+			if (namedText) return namedText;
+		}
+		var nodes = header.querySelectorAll('div, span, a, p, h1, h2, h3');
+		for (var i = 0; i < nodes.length; i++) {
+			var el = nodes[i];
+			if (el.closest && el.closest('button')) continue;
+			if (el.querySelector && el.querySelector('button, svg, nav, textarea, input')) continue;
+			var t = clipNoticeText(el.textContent, 48);
+			if (!t || t.length < 2 || TITLE_SKIP.test(t)) continue;
+			return t;
+		}
+		return clipNoticeText(document.title, 48);
+	}
+
+	function readLastUserPrompt() {
+		var main = document.querySelector('[data-dshr-main-col]');
+		if (!isElement(main)) return '';
+		var nodes = main.querySelectorAll('div, p');
+		var last = '';
+		for (var i = 0; i < nodes.length; i++) {
+			var el = nodes[i];
+			if (el.closest && el.closest('[data-composer-card], [data-composer-seat], header, nav, [data-dshr-msg-actions], [data-dshr-stats-line]')) {
+				continue;
+			}
+			if (el.querySelector && el.querySelector('button, textarea, input, nav, header')) continue;
+			var style;
+			try { style = window.getComputedStyle(el); } catch (ignoredStyle) { continue; }
+			var isUser = style.alignSelf === 'flex-end' || style.textAlign === 'right' || el.id === 'user-msg';
+			if (!isUser) continue;
+			var t = clipNoticeText(el.textContent, 160);
+			if (t.length >= 2) last = t;
+		}
+		return last;
+	}
+
+	function collectSessionNotice() {
+		var running = isAgentRunning();
+		if (!running) return { title: '', text: '', running: false };
+		return {
+			title: readSessionTitle() || 'DSH 会话',
+			text: readLastUserPrompt() || '正在生成…',
+			running: true
+		};
+	}
+
+	var lastNoticeKey = null;
+	var noticeTimer = 0;
+	function reportSessionNotice() {
+		var notice = collectSessionNotice();
+		var key = (notice.running ? '1' : '0') + '\n' + notice.title + '\n' + notice.text;
+		if (key === lastNoticeKey) return;
+		lastNoticeKey = key;
+		try {
+			if (window.DshRemoteApp && typeof window.DshRemoteApp.setSessionNotice === 'function') {
+				window.DshRemoteApp.setSessionNotice(notice.title, notice.text, notice.running);
+			}
+		} catch (ignoredNotice) {}
+	}
+
+	function scheduleSessionNotice() {
+		if (noticeTimer) window.clearTimeout(noticeTimer);
+		noticeTimer = window.setTimeout(function () {
+			noticeTimer = 0;
+			reportSessionNotice();
+		}, 180);
 	}
 
 	function markComposerCard(card) {
@@ -2008,6 +2260,21 @@
 		ensureGestures();
 		maybeAutoCloseOnSessionChange();
 		scheduleClampFloats();
+		syncPageTheme();
+		scheduleSessionNotice();
+	}
+
+	var lastPageDark = null;
+	function syncPageTheme() {
+		var dark = !!(document.body && document.body.hasAttribute('data-ds-dark-theme'));
+		if (dark === lastPageDark) return;
+		lastPageDark = dark;
+		document.documentElement.setAttribute('data-dshr-dark', dark ? '1' : '0');
+		try {
+			if (window.DshRemoteApp && typeof window.DshRemoteApp.setPageDark === 'function') {
+				window.DshRemoteApp.setPageDark(dark);
+			}
+		} catch (ignoredTheme) {}
 	}
 
 	// 注入可能早于 body/React 首帧。观察器必须在 body 出现后补装，不能只在
@@ -2019,7 +2286,7 @@
 		observer = new MutationObserver(syncDom);
 		observer.observe(document.body, {
 			attributes: true,
-			attributeFilter: ['data-sidebar-collapsed', 'data-dshx-overlay', 'role', 'aria-modal', 'aria-current', 'data-state', 'aria-expanded'],
+			attributeFilter: ['data-sidebar-collapsed', 'data-dshx-overlay', 'data-ds-dark-theme', 'role', 'aria-modal', 'aria-current', 'data-state', 'aria-expanded', 'aria-label'],
 			childList: true,
 			subtree: true,
 		});
@@ -2047,7 +2314,24 @@
 	} else {
 		startObserver();
 	}
-	window.addEventListener('resize', syncDom);
+	window.addEventListener('resize', function () {
+		applyWidthScope();
+		syncDom();
+	});
+	if (portraitMql) {
+		var onOrient = function () {
+			applyWidthScope();
+			syncDom();
+		};
+		if (portraitMql.addEventListener) portraitMql.addEventListener('change', onOrient);
+		else if (portraitMql.addListener) portraitMql.addListener(onOrient);
+	}
+	try {
+		var themeMq = window.matchMedia('(prefers-color-scheme: dark)');
+		var onScheme = function () { window.setTimeout(syncPageTheme, 0); };
+		if (themeMq.addEventListener) themeMq.addEventListener('change', onScheme);
+		else if (themeMq.addListener) themeMq.addListener(onScheme);
+	} catch (ignoredMq) {}
 
 	// ── 壳 App 返回键桥接（与既有 MainActivity 契约保持一致） ──
 	window.__dshRemoteAndroidMobile = {
@@ -2087,7 +2371,12 @@
 		clearDrawerDrag: clearDrawerVisual,
 		settleDrawer: settleDrawer,
 		syncNow: syncDom,
+		syncViewport: function () {
+			applyWidthScope();
+			syncDom();
+		},
 		clampFloatingMenus: clampFloatingMenus,
 		applyImeLift: applyImeLift,
+		readSessionNotice: collectSessionNotice,
 	};
 })();

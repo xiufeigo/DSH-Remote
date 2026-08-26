@@ -81,7 +81,7 @@ export function validateConfigPatch(input) {
 					break;
 				}
 				const frpPatch = {};
-				const frpAllowed = new Set(["enabled", "serverAddr", "serverPort", "remotePort", "mode"]);
+				const frpAllowed = new Set(["enabled", "serverAddr", "serverPort", "remotePort", "mode", "name"]);
 				for (const frpKey of Object.keys(value)) {
 					if (!frpAllowed.has(frpKey)) {
 						errors.push(`未知 frp 配置项：${frpKey}`);
@@ -96,6 +96,19 @@ export function validateConfigPatch(input) {
 							errors.push("frp.mode 仅允许 entry / stcp / xtcp");
 						} else {
 							frpPatch.mode = frpValue;
+						}
+					} else if (frpKey === "name") {
+						if (typeof frpValue !== "string") {
+							errors.push("隧道名必须是字符串");
+						} else {
+							const trimmed = frpValue.trim();
+							if (trimmed === "") {
+								frpPatch.name = "dsh-remote";
+							} else if (!/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(trimmed)) {
+								errors.push("隧道名须以字母开头，仅含字母数字和 - _，最长 32 位");
+							} else {
+								frpPatch.name = trimmed;
+							}
 						}
 					} else if (frpKey === "serverAddr") {
 						if (frpValue === "") frpPatch.serverAddr = "";
@@ -135,5 +148,5 @@ export const DISPLAY_DEFAULTS = {
 	upstreamPort: 52392,
 	autoFixUpstreamPort: true,
 	autoStart: true,
-	frp: { enabled: false, serverPort: 7000, remotePort: 8443, mode: "xtcp" },
+	frp: { enabled: false, serverPort: 7000, remotePort: 8443, mode: "xtcp", name: "dsh-remote" },
 };

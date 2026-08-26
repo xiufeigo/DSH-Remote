@@ -62,8 +62,26 @@ function assertSourceContracts() {
 	if (!src.includes("[data-dshr-main-col]")) {
 		throw new Error("源码契约：缺少 [data-dshr-main-col]（DeepSeek 式浮层会话栏）");
 	}
-	if (!src.includes("translateX(calc(100% - var(--dshr-drawer-peek)))")) {
-		throw new Error("源码契约：缺少主栏 translateX 滑动展开");
+	if (!src.includes("translateX(var(--dshr-drawer-width))")) {
+		throw new Error("源码契约：缺少主栏 translateX(var(--dshr-drawer-width)) 滑动展开");
+	}
+	if (!src.includes("data-dshr-tablet")) {
+		throw new Error("源码契约：平板竖屏必须用 data-dshr-tablet 限制侧栏宽度");
+	}
+	if (!src.includes("function isPortraitViewport")) {
+		throw new Error("源码契约：缺少 isPortraitViewport，横屏会误用 hook");
+	}
+	if (!src.includes("dshr-official-inset")) {
+		throw new Error("源码契约：横屏官方界面必须 dshr-official-inset 让出状态栏");
+	}
+	if (!src.includes("html.dshr-official-inset [data-dshr-sidebar-col]")) {
+		throw new Error("源码契约：横屏必须把侧栏背景延伸进状态栏，不得整页垫白顶");
+	}
+	if (!src.includes("dshr-status-guard")) {
+		throw new Error("源码契约：缺少状态栏误触挡板 dshr-status-guard");
+	}
+	if (!src.includes("portrait && (isAndroidShell() || mql.matches)")) {
+		throw new Error("源码契约：Android hook 仅竖屏启用，横屏必须走官方 DSH");
 	}
 	if (!src.includes("grid-column: 2")) {
 		throw new Error("源码契约：主栏必须 grid-column:2，否则 absolute 侧栏后会掉进 0px 列");
@@ -132,8 +150,11 @@ function assertSourceContracts() {
 	if (!java.includes("IME_PAD_HYSTERESIS_DP")) {
 		throw new Error("源码契约：syncImeFromVisibleFrame 必须有平移滞回");
 	}
-	if (!java.includes("setTranslationY(-imePx)")) {
+	if (!java.includes("setTranslationY(-shift)")) {
 		throw new Error("源码契约：键盘必须用 translationY 抬起，不得改 WebView 高度");
+	}
+	if (!java.includes("computeImeShift") || !java.includes("imeFocusRect")) {
+		throw new Error("源码契约：键盘平移必须按焦点输入框位置计算，不得整页抬满 IME 高度");
 	}
 	if (java.includes("rootLayout.setPadding(0, 0, 0, imePx)")) {
 		throw new Error("源码契约：不得再用 padding 缩小 WebView（会重排字体）");
@@ -141,11 +162,41 @@ function assertSourceContracts() {
 	if (!java.includes("SOFT_INPUT_ADJUST_NOTHING")) {
 		throw new Error("源码契约：API 30+ 必须 adjustNothing，避免系统改窗口高度");
 	}
+	if (!java.includes("setStatusBarContrastEnforced(false)") || !java.includes("setNavigationBarContrastEnforced(false)")) {
+		throw new Error("源码契约：必须关掉系统栏对比度遮罩，否则小米等机会把状态栏涂成实色白");
+	}
+	if (!java.includes("dispatchConfigurationChanged")) {
+		throw new Error("源码契约：系统切换深浅时必须把 uiMode 派发给 WebView");
+	}
+	if (!java.includes("FORCE_DARK_OFF") && !java.includes("setAlgorithmicDarkeningAllowed(false)")) {
+		throw new Error("源码契约：禁止 WebView 算法反色，交给 DSH 自己的主题");
+	}
+	if (!java.includes("void setPageDark")) {
+		throw new Error("源码契约：缺少 DshRemoteApp.setPageDark");
+	}
+	if (!java.includes("void setSessionNotice")) {
+		throw new Error("源码契约：缺少 DshRemoteApp.setSessionNotice");
+	}
 	if (!src.includes('[data-dshr-dialog="1"] [data-dshr-main-col]')) {
 		throw new Error("源码契约：打开设置时必须压低主会话栏，避免盖住设置");
 	}
 	if (!src.includes("data-dshr-explorer-details")) {
 		throw new Error("源码契约：缺少与 dsh-explorer overlay 的握手 data-dshr-explorer-details");
+	}
+	if (!src.includes("var(--dsw-alias-bg-base, var(--dsw-specific-background, #ffffff))")) {
+		throw new Error("源码契约：会话/设置表面必须优先 --dsw-alias-bg-base，避免深色页白底浅字");
+	}
+	if (src.includes("background: var(--dsw-specific-background, #ffffff)")) {
+		throw new Error("源码契约：不得把可能不存在的 --dsw-specific-background 直接回落到 #ffffff");
+	}
+	if (!src.includes("data-ds-dark-theme")) {
+		throw new Error("源码契约：必须同步官方 body[data-ds-dark-theme]");
+	}
+	if (!src.includes("setPageDark")) {
+		throw new Error("源码契约：必须把页面深浅告诉原生状态栏 DshRemoteApp.setPageDark");
+	}
+	if (!src.includes('[data-dshr-dark="1"]')) {
+		throw new Error("源码契约：深色页必须设 color-scheme: dark");
 	}
 	if (!src.includes("data-dshx-overlay")) {
 		throw new Error("源码契约：必须侦听 Explorer 的 data-dshx-overlay");
@@ -169,7 +220,29 @@ function assertSourceContracts() {
 		throw new Error("源码契约：抽屉手势必须走 touch，PointerEvent 会在滚动时被取消");
 	}
 	if (!src.includes("DSHRemoteAndroid")) {
-		throw new Error("源码契约：Android WebView 必须强制启用移动适配，不得只看 1024px");
+		throw new Error("源码契约：Android 壳必须用 UA 识别，竖屏不得只看 1024px");
+	}
+	if (!src.includes("syncViewport")) {
+		throw new Error("源码契约：缺少 syncViewport，旋转横竖屏后无法切换 hook");
+	}
+	if (!src.includes("imeFocusRect") || !src.includes("reportImeFocusToNative")) {
+		throw new Error("源码契约：缺少把焦点输入框位置告诉原生的 imeFocusRect");
+	}
+	if (!src.includes("setSessionNotice") || !src.includes("function isAgentRunning") || !src.includes("readSessionNotice")) {
+		throw new Error("源码契约：前台通知必须探测正在运行的会话并交给 setSessionNotice");
+	}
+	const tunnel = readFileSync(
+		join(ROOT, "android/app/src/main/java/top/d1studio/dshremote/TunnelService.java"),
+		"utf8",
+	);
+	if (tunnel.includes("本机") && tunnel.includes("端口直通")) {
+		throw new Error("源码契约：前台通知不得再写本机端口直通文案");
+	}
+	if (!tunnel.includes("CHANNEL_KEEP") || !tunnel.includes("IMPORTANCE_MIN")) {
+		throw new Error("源码契约：没有正在运行的会话时必须走静默保活渠道");
+	}
+	if (!tunnel.includes("CHANNEL_SESSION")) {
+		throw new Error("源码契约：正在运行的会话必须走会话进度渠道");
 	}
 	console.log("  ok  源码契约");
 }
@@ -332,13 +405,123 @@ try {
 	await call("Page.navigate", { url: pageUrl });
 	await wait(2200);
 	const androidReport = await collectSelftest(call);
+
+	async function viewportProbe() {
+		const evaluated = await call("Runtime.evaluate", {
+			expression: `(function(){
+				var a = window.__dshRemoteAndroidMobile;
+				if (a && a.syncViewport) a.syncViewport();
+				var root = document.documentElement;
+				if (!root.style.getPropertyValue('--dshr-inset-top')) {
+					root.style.setProperty('--dshr-inset-top', '36px');
+				}
+				var frame = document.querySelector('[data-dshr-frame]') || document.querySelector('.frame');
+				var main = document.querySelector('[data-dshr-main-col]');
+				var side = document.querySelector('[data-dshr-sidebar-col]') || document.querySelector('.sidebar');
+				var guard = document.getElementById('dshr-status-guard');
+				var cs = getComputedStyle(root);
+				var opened = frame && !frame.hasAttribute('data-sidebar-collapsed');
+				return {
+					mobile: root.classList.contains('dshr-mobile'),
+					official: root.classList.contains('dshr-official-inset'),
+					tablet: root.getAttribute('data-dshr-tablet') === '1',
+					w: window.innerWidth,
+					h: window.innerHeight,
+					peek: cs.getPropertyValue('--dshr-drawer-peek').trim(),
+					drawer: cs.getPropertyValue('--dshr-drawer-width').trim(),
+					opened: !!opened,
+					mainLeft: main ? Math.round(main.getBoundingClientRect().left) : -1,
+					framePadTop: frame ? getComputedStyle(frame).paddingTop : '',
+					sidePadTop: side ? getComputedStyle(side).paddingTop : '',
+					mainPadTop: main ? getComputedStyle(main).paddingTop : '',
+					guard: !!guard,
+					guardH: guard ? Math.round(guard.getBoundingClientRect().height) : 0
+				};
+			})()`,
+			returnByValue: true,
+		});
+		return evaluated.result && evaluated.result.value;
+	}
+
+	await call("Emulation.setDeviceMetricsOverride", {
+		width: 1280,
+		height: 800,
+		deviceScaleFactor: 2,
+		mobile: true,
+		screenOrientation: { type: "landscapePrimary", angle: 90 },
+	});
+	await wait(400);
+	const landscapeProbe = await viewportProbe();
+
+	await call("Emulation.setDeviceMetricsOverride", {
+		width: 800,
+		height: 1280,
+		deviceScaleFactor: 2,
+		mobile: true,
+		screenOrientation: { type: "portraitPrimary", angle: 0 },
+	});
+	await wait(400);
+	const tabletClosed = await viewportProbe();
+	await call("Runtime.evaluate", {
+		expression: `(function(){
+			var frame = document.querySelector('[data-dshr-frame]') || document.querySelector('.frame');
+			if (frame) {
+				frame.style.width = '100%';
+				frame.style.maxWidth = 'none';
+				frame.style.margin = '0';
+			}
+			var a = window.__dshRemoteAndroidMobile;
+			if (a && a.syncViewport) a.syncViewport();
+			if (a && a.settleDrawer) a.settleDrawer(true);
+			return true;
+		})()`,
+		returnByValue: true,
+	});
+	await wait(500);
+	const tabletOpen = await viewportProbe();
 	ws.close();
+
+	const extra = [];
+	function extraCheck(name, ok, detail) {
+		extra.push({ name, ok: !!ok, detail: detail || "" });
+	}
+	extraCheck(
+		"landscape-no-hook",
+		landscapeProbe && landscapeProbe.mobile === false,
+		landscapeProbe ? `w=${landscapeProbe.w} h=${landscapeProbe.h} mobile=${landscapeProbe.mobile}` : "no probe",
+	);
+	extraCheck(
+		"landscape-status-inset",
+		landscapeProbe && landscapeProbe.official === true
+			&& landscapeProbe.framePadTop !== "36px"
+			&& landscapeProbe.sidePadTop === "36px"
+			&& landscapeProbe.mainPadTop === "36px",
+		landscapeProbe ? `official=${landscapeProbe.official} frame=${landscapeProbe.framePadTop} side=${landscapeProbe.sidePadTop} main=${landscapeProbe.mainPadTop}` : "no probe",
+	);
+	extraCheck(
+		"landscape-status-guard",
+		landscapeProbe && landscapeProbe.guard === true && landscapeProbe.guardH >= 30,
+		landscapeProbe ? `guard=${landscapeProbe.guard} h=${landscapeProbe.guardH}` : "no probe",
+	);
+	extraCheck(
+		"tablet-portrait-hook",
+		tabletClosed && tabletClosed.mobile === true && tabletClosed.tablet === true && tabletClosed.official === false,
+		tabletClosed ? `w=${tabletClosed.w} tablet=${tabletClosed.tablet} official=${tabletClosed.official}` : "no probe",
+	);
+	extraCheck(
+		"tablet-drawer-not-fullscreen",
+		tabletOpen && tabletOpen.opened && tabletOpen.mainLeft >= 240 && tabletOpen.mainLeft <= 420,
+		tabletOpen ? `opened=${tabletOpen.opened} mainLeft=${tabletOpen.mainLeft} drawer=${tabletOpen.drawer}` : "no probe",
+	);
 
 	console.log("  -- Chrome 390 视口 --");
 	printChecks(report);
 	console.log("  -- Android 壳 UA --");
 	printChecks(androidReport);
-	if (!report.ok || !androidReport.ok) {
+	console.log("  -- 横屏 / 平板竖屏 --");
+	printChecks({ checks: extra });
+	const extraOk = extra.every((c) => c.ok);
+	if (!report.ok || !androidReport.ok || !extraOk) {
 		process.exitCode = 1;
 		console.error("\nmobile chrome 自测失败");
 		console.error(`截图：${SCREENSHOT}`);

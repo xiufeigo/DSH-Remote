@@ -377,6 +377,7 @@ test("renderFrpcToml：stcp/xtcp 形态带 secretKey 且无 remotePort", async (
 	assert.match(xtcp, /type = "xtcp"/);
 	assert.match(xtcp, /type = "stcp"/, "xtcp 服务端必须同时挂 stcp 供 fallback");
 	assert.match(xtcp, /name = "dsh-remote-stcp"/);
+	assert.match(xtcp, /name = "dsh-remote"/);
 	assert.match(xtcp, /secretKey = "sk-1"/);
 	assert.ok(!xtcp.includes("remotePort"), "xtcp 不应监听任何 VPS 端口");
 	assert.equal((xtcp.match(/\[\[proxies\]\]/g) || []).length, 2);
@@ -483,6 +484,42 @@ test("visitorConnectionString：参数齐全、指纹归一化、URL 编码安�
 	assert.equal(url.searchParams.get("server"), "v.example");
 	assert.equal(url.searchParams.get("cport"), "7000");
 	assert.equal(url.searchParams.get("bport"), "18443");
+	assert.equal(url.searchParams.get("name"), "dsh-remote");
 	assert.equal(url.searchParams.get("fp"), "abcdef", "指纹应去冒号并小写");
 	assert.equal(url.searchParams.get("token"), "t&o", "特殊字符应被编码且可还原");
+});
+
+test("自定义隧道名：toml / visitor / 连接串一致，非法值回落缺省", async () => {
+	const { renderFrpcToml, renderVisitorToml, visitorConnectionString, normalizeTunnelName, DEFAULT_TUNNEL_NAME } =
+		await import("../packages/gateway/src/frp.ts");
+	assert.equal(DEFAULT_TUNNEL_NAME, "dsh-remote");
+	assert.equal(normalizeTunnelName(""), "dsh-remote");
+	assert.equal(normalizeTunnelName(" dsh-alice "), "dsh-alice");
+	assert.equal(normalizeTunnelName("dsh_alice-01"), "dsh_alice-01");
+	assert.equal(normalizeTunnelName("我的电脑"), "dsh-remote");
+	assert.equal(normalizeTunnelName("1abc"), "dsh-remote");
+	assert.equal(normalizeTunnelName("a".repeat(33)), "dsh-remote");
+
+	const xtcp = renderFrpcToml({
+		serverAddr: "v.example", serverPort: 7000, authToken: "tok",
+		localPort: 18443, remotePort: 9999, mode: "xtcp", secretKey: "sk-1",
+		name: "dsh-alice",
+	});
+	assert.match(xtcp, /name = "dsh-alice-stcp"/);
+	assert.match(xtcp, /name = "dsh-alice"/);
+	assert.ok(!/name = "dsh-remote(?:-stcp)?"/.test(xtcp), "自定义名不应再写缺省 dsh-remote proxy");
+
+	const toml = renderVisitorToml({
+		serverAddr: "v.example", serverPort: 7000, authToken: "tok",
+		mode: "xtcp", secretKey: "sk-1", bindPort: 18443, serverName: "dsh-alice",
+	});
+	assert.match(toml, /serverName = "dsh-alice"/);
+	assert.match(toml, /serverName = "dsh-alice-stcp"/);
+	assert.match(toml, /fallbackTo = "dsh-alice-stcp-visitor"/);
+
+	const url = new URL(visitorConnectionString({
+		mode: "xtcp", serverAddr: "v.example", serverPort: 7000,
+		serverName: "dsh-alice", secretKey: "sk", authToken: "tok", bindPort: 18443,
+	}).replace(/^dsh-remote:/, "https:"));
+	assert.equal(url.searchParams.get("name"), "dsh-alice");
 });
