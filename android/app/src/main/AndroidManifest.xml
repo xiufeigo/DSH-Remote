@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
 	package="top.d1studio.dshremote">
-	<!-- versionCode/versionName 不在此写死：android/build.ps1 从仓库根 package.json
-	     推导并通过 aapt2 link --version-code/--version-name 注入（规则见 docs/versioning.md） -->
+	<!-- versionCode/versionName 不在此写死：由 android/build.ps1 从仓库根 package.json
+	     推导，构建时经 aapt2 link 注入（规则见 docs/versioning.md）。 -->
 
 	<uses-permission android:name="android.permission.INTERNET" />
 	<!-- frpc visitor 前台服务（stcp/xtcp 隧道保活） -->
