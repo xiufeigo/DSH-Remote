@@ -5,9 +5,10 @@
 	     推导，构建时经 aapt2 link 注入（规则见 docs/versioning.md）。 -->
 
 	<uses-permission android:name="android.permission.INTERNET" />
-	<!-- frpc visitor 前台服务（stcp/xtcp 隧道保活） -->
+	<!-- frpc visitor 前台服务（stcp/xtcp 隧道保活）。
+	     AND-02：类型由 dataSync 改为 specialUse（dataSync 在 Android 14+ 有累计时长限制）。 -->
 	<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-	<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+	<uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 	<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
 	<application
@@ -22,7 +23,7 @@
 			android:exported="true"
 			android:launchMode="singleTask"
 			android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
-			android:windowSoftInputMode="adjustNothing">
+			android:windowSoftInputMode="adjustResize">
 			<intent-filter>
 				<action android:name="android.intent.action.MAIN" />
 				<category android:name="android.intent.category.LAUNCHER" />
@@ -36,9 +37,14 @@
 			</intent-filter>
 		</activity>
 
+		<!-- AND-02：specialUse 前台服务类型，必须随附用途声明（商店审核材料）。 -->
 		<service
 			android:name=".TunnelService"
 			android:exported="false"
-			android:foregroundServiceType="dataSync" />
+			android:foregroundServiceType="specialUse">
+			<property
+				android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+				android:value="远程访问用户自有 PC 的加密隧道代理" />
+		</service>
 	</application>
 </manifest>

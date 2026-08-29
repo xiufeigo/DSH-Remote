@@ -6,6 +6,9 @@ import android.text.TextUtils;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -13,11 +16,18 @@ import java.util.UUID;
 /**
  * Android 端配置组：与电脑插件面板相同的五项
  * （VPS / 控制端口 / 隧道名 / 登录密钥 / 访客密钥）。
- * 本地监听端口固定 18443，与网关 listenPort 对齐，无需用户填写。
+ * 本地监听端口首选 18443（与网关 listenPort 对齐），被占用时在
+ * 16225~16235 内协商首个空闲端口（AND-07），均无需用户填写。
  */
 public final class ProfileStore {
 
 	public static final int BIND_PORT = 18443;
+	/** AND-07：首选端口被占用时的回退探测范围（含端点）。 */
+	public static final int PORT_RANGE_MIN = 16225;
+	public static final int PORT_RANGE_MAX = 16235;
+	/** AND-07：本轮隧道实际绑定端口的持久化键（MainActivity/TunnelService 复用探测用）。 */
+	public static final String KEY_BOUND_PORT = "tunnel_bound_port";
+
 	public static final String DEFAULT_MODE = "xtcp";
 	public static final String DEFAULT_TUNNEL_NAME = "dsh-remote";
 	private static final java.util.regex.Pattern TUNNEL_NAME =
@@ -178,6 +188,38 @@ public final class ProfileStore {
 		if (raw == null) return true;
 		String trimmed = raw.trim();
 		return trimmed.length() == 0 || TUNNEL_NAME.matcher(trimmed).matches();
+	}
+
+	/**
+	 * AND-07：端口协商。首选 BIND_PORT；被占用时在
+	 * PORT_RANGE_MIN~PORT_RANGE_MAX 内探测首个可绑定端口；全部占用返回 -1。
+	 * 探测方式：对 127.0.0.1 真实 bind（与 frpc visitor 的 bindAddr 一致）。
+	 * 探测与 frpc 实际 bind 之间仍有极小竞态窗口，由 frpc 崩溃自重启兜底。
+	 */
+	public static int negotiateBindPort() {
+		if (isBindable(BIND_PORT)) return BIND_PORT;
+		for (int p = PORT_RANGE_MIN; p <= PORT_RANGE_MAX; p++) {
+			if (isBindable(p)) return p;
+		}
+		return -1;
+	}
+
+	private static boolean isBindable(int port) {
+		ServerSocket socket = null;
+		try {
+			socket = new ServerSocket();
+			socket.bind(new InetSocketAddress("127.0.0.1", port));
+			return true;
+		} catch (Exception ignored) {
+			return false;
+		} finally {
+			if (socket != null) {
+				try {
+					socket.close();
+				} catch (IOException ignored) {
+				}
+			}
+		}
 	}
 
 	public static Profile newProfile() {

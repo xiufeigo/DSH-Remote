@@ -6,10 +6,11 @@
  * - 不做任何网络魔法：frp 只是把流量原样搬到 127.0.0.1:<listenPort>。
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { access, constants } from "node:fs/promises";
 import { join } from "node:path";
-import type { FrpConfig, FrpMode } from "./config.ts";
+import { createInterface } from "node:readline";
+import { DEFAULT_VISITOR_BIND_PORT, type FrpConfig, type FrpMode } from "./config.ts";
 import type { Store } from "./store.ts";
 
 /** 归一化隧道形态：未知/缺省值一律回落为 entry（保持历史行为）。 */
@@ -31,9 +32,19 @@ export function normalizeTunnelName(raw: unknown): string {
 
 /** 在约定位置寻找 frpc 可执行文件；找不到返回 undefined。 */
 export async function locateFrpcBinary(config: FrpConfig, store: Store): Promise<string | undefined> {
+	return locateFrBinary("frpc", config, store);
+}
+
+/** 在约定位置寻找 frpc/frps 可执行文件：config.binaryPath（仅 frpc）→ <home>/vendor/frp/。 */
+export async function locateFrBinary(
+	kind: "frpc" | "frps",
+	config: FrpConfig,
+	store: Store,
+): Promise<string | undefined> {
+	const exe = process.platform === "win32" ? `${kind}.exe` : kind;
 	const candidates = [
-		config.binaryPath,
-		join(store.home, "vendor", "frp", process.platform === "win32" ? "frpc.exe" : "frpc"),
+		kind === "frpc" ? config.binaryPath : undefined,
+		join(store.home, "vendor", "frp", exe),
 	].filter((candidate): candidate is string => typeof candidate === "string" && candidate.length > 0);
 	for (const candidate of candidates) {
 		try {
@@ -44,6 +55,46 @@ export async function locateFrpcBinary(config: FrpConfig, store: Store): Promise
 		}
 	}
 	return undefined;
+}
+
+/** edge=visitor/frps 时 visitor 的本地绑定端口缺省值兜底。 */
+export function visitorBindPortOf(config: FrpConfig): number {
+	return typeof config.visitorBindPort === "number" && config.visitorBindPort > 0
+		? config.visitorBindPort
+		: DEFAULT_VISITOR_BIND_PORT;
+}
+
+/** TOML 基础字符串转义（token 等生成值虽是 base64url，仍防御手工注入）。 */
+function tomlString(value: string): string {
+	return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * 生成 frps 端配置（edge=frps 角色在容器/服务器本地跑 frps）。
+ * 只开控制口；入口端口由 allowPorts 限定，避免 PC 端把任意端口绑到公网。
+ */
+export function renderFrpsToml(options: {
+	bindAddr: string;
+	bindPort: number;
+	authToken: string;
+	allowPorts?: Array<{ start: number; end: number }>;
+}): string {
+	const allowLines = (options.allowPorts ?? [])
+		.filter((range) => Number.isInteger(range.start) && Number.isInteger(range.end))
+		.map((range) => `  { start = ${range.start}, end = ${range.end} }`)
+		.join(",\n");
+	const allowBlock = allowLines.length > 0
+		? `allowPorts = [\n${allowLines},\n]\n`
+		: "";
+	return `# 由 dsh-remote 自动生成，手工修改会在下次 start 时被覆盖
+bindAddr = "${options.bindAddr}"
+bindPort = ${options.bindPort}
+
+auth.token = ${tomlString(options.authToken)}
+transport.tls.force = true
+
+${allowBlock}webServer.addr = "127.0.0.1"
+`;
 }
 
 export function renderFrpcToml(options: {
@@ -226,6 +277,9 @@ export interface FrpSupervisorStatus {
 	configPath: string;
 }
 
+/** FRP-02：子进程“稳定运行”阈值——存活超过该时长后偶发崩溃不再吃累积退避。 */
+const STABLE_RUN_MS = 60_000;
+
 export class FrpSupervisor {
 	private readonly binary: string;
 	private readonly configPath: string;
@@ -235,6 +289,8 @@ export class FrpSupervisor {
 	private lastError?: string;
 	private stopping = false;
 	private backoffMs = 1_000;
+	/** FRP-02：最近一次 spawn 成功的时间戳，用于 exit 时判断是否稳定运行过 60s。 */
+	private lastSpawnAt = 0;
 
 	constructor(binary: string, configPath: string, onLog: (line: string) => void = () => {}) {
 		this.binary = binary;
@@ -249,15 +305,41 @@ export class FrpSupervisor {
 
 	private spawnChild(): void {
 		if (this.stopping) return;
-		this.onLog(`frpc 启动：${this.binary} -c ${this.configPath}`);
-		const child = spawn(this.binary, ["-c", this.configPath], {
-			stdio: ["ignore", "pipe", "pipe"],
-			windowsHide: true,
-		});
-		child.stdout?.on("data", (chunk: Buffer) => this.onLog(chunk.toString("utf8").trimEnd()));
-		child.stderr?.on("data", (chunk: Buffer) => this.onLog(chunk.toString("utf8").trimEnd()));
+		this.onLog(`${this.binary.split(/[\\/]/).pop()} 启动：${this.binary} -c ${this.configPath}`);
+		let child: ChildProcess;
+		try {
+			child = spawn(this.binary, ["-c", this.configPath], {
+				stdio: ["ignore", "pipe", "pipe"],
+				windowsHide: true,
+			});
+		} catch (error) {
+			// spawn 同步抛错（如二进制被安全软件拦截）：与退出同路径，退避重启
+			this.lastError = error instanceof Error ? error.message : String(error);
+			this.onLog(`spawn 失败（${this.lastError}），${this.backoffMs}ms 后重试`);
+			this.restarts += 1;
+			const delay = this.backoffMs;
+			this.backoffMs = Math.min(this.backoffMs * 2, 30_000);
+			setTimeout(() => this.spawnChild(), delay);
+			return;
+		}
+		// FRP-02：记录 spawn 成功时刻；下次 exit 时若已稳定运行 ≥60s，退避与计数归零
+		this.lastSpawnAt = Date.now();
+		// FRP-04：用 readline 按完整行切割输出——按 chunk 直接 toString 会在日志行
+		// 跨 chunk 时打印半行、单 chunk 含多行时把多行并进一条日志
+		if (child.stdout !== null) {
+			createInterface({ input: child.stdout }).on("line", (line) => this.onLog(line.trimEnd()));
+		}
+		if (child.stderr !== null) {
+			createInterface({ input: child.stderr }).on("line", (line) => this.onLog(line.trimEnd()));
+		}
 		child.on("exit", (code, signal) => {
 			if (this.stopping) return;
+			// FRP-02：长期稳定运行后的偶发崩溃视为孤立事件——先归零退避与重启计数，
+			// 避免稳定跑了几天后一次偶发崩溃仍吃 30s 退避延迟
+			if (Date.now() - this.lastSpawnAt >= STABLE_RUN_MS) {
+				this.backoffMs = 1_000;
+				this.restarts = 0;
+			}
 			this.lastError = `frpc 退出（code=${String(code)} signal=${String(signal)}）`;
 			this.onLog(`${this.lastError}，${this.backoffMs}ms 后重启`);
 			this.restarts += 1;
@@ -277,13 +359,32 @@ export class FrpSupervisor {
 		const child = this.child;
 		if (child === undefined || child.exitCode !== null) return;
 		await new Promise<void>((resolve) => {
-			child.once("exit", () => resolve());
-			child.kill();
-			setTimeout(() => {
+			// FRP-01：兜底定时器在 exit 触发时必须清理——否则优雅退出后事件循环上还挂 3s
+			const killTimer = setTimeout(() => {
 				child.kill("SIGKILL");
 				resolve();
 			}, 3_000);
+			child.once("exit", () => {
+				clearTimeout(killTimer);
+				resolve();
+			});
+			this.killChild(child);
 		});
+	}
+
+	/**
+	 * FRP-03：终止 frpc 子进程。
+	 * Windows 上 child.kill() 只作用于直接子进程；网关被硬杀（任务管理器/断电）后
+	 * frpc 会成为孤儿进程占住端口，因此改用 `taskkill /pid <pid> /T /F` 杀掉整个
+	 * 进程树，失败（如进程已退出）再回落到 child.kill()。
+	 * 注意：网关自身被硬杀时仍执行不到这里的清理（部署文档应注明该残留风险）。
+	 */
+	private killChild(child: ChildProcess): void {
+		if (process.platform === "win32" && child.pid !== undefined) {
+			const result = spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
+			if (result.status === 0) return;
+		}
+		child.kill();
 	}
 
 	status(): FrpSupervisorStatus {

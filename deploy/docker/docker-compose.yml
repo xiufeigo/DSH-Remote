@@ -1,0 +1,77 @@
+# ============================================================================
+# DSH-Remote Edge · docker-compose
+#
+# 拓扑：浏览器 ──HTTPS(Caddy 自动签发证书)──► 本 compose
+#         gateway：Token 门禁 + 移动 hook 注入 + 反代
+#         frp   ：DSHR_FRP_ROLE=frps（推荐，自包含）或 visitor（连已有 frps）
+#
+# 使用：
+#   1. cp .env.example .env 并按注释填写（域名、访问 Token 必填）
+#   2. cp Caddyfile.example Caddyfile
+#   3. mkdir data && sudo chown -R 1000:1000 data   # 容器内以 node 用户运行时
+#      （保持 root 运行可跳过 chown，见 Dockerfile 注释）
+#   4. docker compose up -d --build
+#   5. 云厂商安全组放行：80/tcp、443/tcp；FRP_ROLE=frps 时再放行 7000/tcp
+#
+# PC 端（家里跑 DSH 的电脑）对接见 docs/edge-deployment.md §PC 端配置。
+# ============================================================================
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: dsh-remote-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"    # ACME HTTP-01 + 跳转 HTTPS
+      - "443:443"  # 自动 HTTPS
+    environment:
+      DSHR_DOMAIN: ${DSHR_DOMAIN:?在 .env 中设置你的域名}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - gateway
+
+  gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: dsh-remote-edge:latest
+    container_name: dsh-remote-gateway
+    restart: unless-stopped
+    environment:
+      # ── 角色与监听 ──
+      DSHR_ROLE: edge
+      DSHR_LISTEN_HOST: 0.0.0.0        # 容器内需被 caddy 访问
+      DSHR_LISTEN_PORT: "18443"
+      # ── 前置认证（必填）──
+      DSHR_ACCESS_TOKEN: ${DSHR_ACCESS_TOKEN:?在 .env 中设置访问 Token}
+      DSHR_TOKEN_LOGIN_DAYS: ${DSHR_TOKEN_LOGIN_DAYS:-30}
+      # ── 移动 hook ──
+      DSHR_MOBILE_ENABLED: ${DSHR_MOBILE_ENABLED:-true}
+      DSHR_MOBILE_BREAKPOINT: ${DSHR_MOBILE_BREAKPOINT:-980}
+      # ── 上游（隧道对端 = PC 网关，自签 HTTPS）──
+      DSHR_UPSTREAM_TLS: ${DSHR_UPSTREAM_TLS:-true}
+      DSHR_VISITOR_BIND_PORT: ${DSHR_VISITOR_BIND_PORT:-18443}
+      DSHR_TRUST_PROXY_XFF: ${DSHR_TRUST_PROXY_XFF:-false}
+      # 受信代理 CIDR（逗号分隔，仅 XFF=true 时参与判定）。compose 桥接下 caddy→gateway
+      # 源地址是容器网段 IP，需覆盖该网段才能按真实客户端 IP 限流；见 .env.example。
+      DSHR_TRUST_PROXY_CIDRS: ${DSHR_TRUST_PROXY_CIDRS:-}
+      # ── frp 角色：frps（容器自带 frps）或 visitor（连已有外部 frps）──
+      DSHR_FRP_ROLE: ${DSHR_FRP_ROLE:-frps}
+      DSHR_FRP_SERVER_ADDR: ${DSHR_FRP_SERVER_ADDR:-}
+      DSHR_FRP_SERVER_PORT: ${DSHR_FRP_SERVER_PORT:-7000}
+      DSHR_FRP_NAME: ${DSHR_FRP_NAME:-dsh-remote}
+      DSHR_EDGE_CONSUME: ${DSHR_EDGE_CONSUME:-stcp}
+      DSHR_FRPS_ALLOW_PORTS: ${DSHR_FRPS_ALLOW_PORTS:-18400-18500}
+    volumes:
+      - ./data:/data
+    # FRP_ROLE=visitor（连外部 frps）时不需要对外端口，删除下面两行即可；
+    # FRP_ROLE=frps 时必须放行控制口给家里的 PC。
+    ports:
+      - "${DSHR_FRPS_CONTROL_EXPOSE:-7000}:7000"
+
+volumes:
+  caddy_data:
+  caddy_config:

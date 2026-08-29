@@ -37,7 +37,7 @@ sudo bash install-frps.sh --show-token
 ```bash
 systemctl status frps-dsh-remote
 journalctl -u frps-dsh-remote -f
-tail -f /etc/dsh-remote/frps.log
+tail -f /var/log/dsh-remote/frps.log
 ```
 
 ## 3. PC 侧：放置 frpc 二进制
@@ -48,6 +48,9 @@ tail -f /etc/dsh-remote/frps.log
 https://github.com/fatedier/frp/releases/tag/v0.61.1
 → frp_0.61.1_windows_amd64.zip → 解出 frpc.exe
 ```
+
+> frp 版本以根 `package.json` 的 `config.frpVersion` 为单一来源（OPS-05，当前 `0.61.1`）；
+> 安装脚本与 Docker 构建都从该字段取值，升级 frp 时只改这一处。
 
 放到约定位置（二选一）：
 
@@ -63,7 +66,7 @@ https://github.com/fatedier/frp/releases/tag/v0.61.1
 ```jsonc
 {
   "listenPort": 18443,          // 网关本机 HTTPS 端口（仅 127.0.0.1）
-  "upstreamPort": 52392,        // DSH Web GUI 实际端口
+  "upstreamPort": "<DSH 实际端口>",  // DSH Web GUI 实际端口（浏览器地址栏 127.0.0.1: 后的数字）
   "frp": {
     "enabled": true,
     "serverAddr": "<VPS 公网 IP>",
@@ -98,7 +101,7 @@ node packages/gateway/src/cli.ts doctor    # 各环节逐项检查
 `doctor` 全绿的标志（entry 形态）：
 
 ```
-✓ 上游 DSH GUI 127.0.0.1:52392 —— 端口可达
+✓ 上游 DSH GUI 127.0.0.1:<DSH 实际端口> —— 端口可达
 ✓ 上游指纹 —— 确认是 DSH Web 界面
 ✓ TLS 证书 —— SHA-256 …
 ✓ frps 控制端口 7000 —— 可达

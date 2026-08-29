@@ -1,0 +1,47 @@
+# DSH-Remote Edge · Caddy 配置
+#
+# 用法：cp Caddyfile.example Caddyfile，然后 docker compose up -d
+# Caddy 会自动向 Let's Encrypt 签发并续期证书（需 80/443 可达 + 域名已解析到本机）。
+# reverse_proxy 默认透传 WebSocket（DSH 的 events 流无需额外配置）。
+#
+# ── GW-03 反代信任约定（改本文件前必读，勿破坏）──────────────────────────────
+# 网关的按客户端限流/锁定依赖 X-Forwarded-For，但采信条件是双重的：仅当
+# DSHR_TRUST_PROXY_XFF=true **且** 直连来源是回环（127.0.0.1/::1，即同机可信反代）
+# 时，才取该头最左一跳作真实客户端 IP（实现见 gateway auth.ts 的 clientIp）。
+# 因此：
+#  1. Caddy 发给上游（网关）的 X-Forwarded-For 必须是由 Caddy 用真实客户端 IP
+#     **覆写**后的值——这是 reverse_proxy 的默认行为。禁止任何把外部直传的
+#     X-Forwarded-For 原样透传给网关的配置（例如
+#     `header_up X-Forwarded-For {header.X-Forwarded-For}`），否则攻击者可
+#     伪造限流键：既能让别人替他吃锁定，也能把自己伪装成白名单 IP。
+#  2. 下方全局块里的 `trusted_proxies static private_ranges` 声明的是
+#     「Caddy 自己信任的下层代理」：仅当 Caddy 前面还挂了 CDN/负载均衡，且来连
+#     的源地址落在私网网段内，Caddy 才从收到的 XFF 里还原真实客户端 IP；
+#     公网直连的客户端不在此列，它们提交的 XFF 一律被 Caddy 忽略。请保留该行。
+#  3. 拓扑差异（重要）：
+#     - 裸机部署（install-edge.sh + 宿主机 Caddy → 127.0.0.1:18443）：直连来源
+#       是回环，`DSHR_TRUST_PROXY_XFF=true` 即可让限流按真实客户端 IP 生效；
+#     - 本 compose 默认桥接网络：caddy→gateway 的源地址是容器 IP（非回环），
+#       需同时设 `DSHR_TRUST_PROXY_XFF=true` 与 `DSHR_TRUST_PROXY_CIDRS`
+#       （覆盖 caddy 所在容器网段，如 172.16.0.0/12；按 docker network inspect
+#       实际子网填写，只应填反代网段——配宽了伪造 XFF 可绕过限流）即可解决。
+#       两变量经 .env → compose environment 透传，详见 docs/edge-deployment.md §2。
+
+{
+	# 全局选项块：servers 只能写在这里（写进站点块是语法错误）
+	servers {
+		# Caddy 信任来自私网网段（含 compose 内网）的下层代理提交的 X-Forwarded-For；
+		# 若 Caddy 前面不挂任何代理，此行为无害的防御性配置
+		trusted_proxies static private_ranges
+	}
+}
+
+{$DSHR_DOMAIN} {
+	# 全部流量交给网关容器（Token 登录页、设备认证、反代都在网关内完成）
+	reverse_proxy gateway:18443
+
+	# （可选）隐藏 Caddy 版本指纹：
+	# header {
+	# 	-Server
+	# }
+}

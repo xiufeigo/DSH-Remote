@@ -11,7 +11,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import net from "node:net";
+// PLG-03：端口探活收敛到 scripts/test-harness.mjs（语义同原 waitPort）。
+import { waitForPort } from "./test-harness.mjs";
 
 const tempHome = await mkdtemp(join(tmpdir(), "dshr-panel-e2e-"));
 process.env.DSH_REMOTE_HOME = tempHome;
@@ -108,27 +109,6 @@ async function callRoute(path, req, timeoutMs = 12_000) {
 	return res;
 }
 
-async function waitPort(port, timeoutMs) {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		const open = await new Promise((resolve) => {
-			const socket = net.connect({ host: "127.0.0.1", port }, () => resolve(true));
-			socket.setTimeout(400, () => {
-				socket.destroy();
-				resolve(false);
-			});
-			socket.on("error", () => resolve(false));
-			socket.on("connect", () => {
-				socket.destroy();
-				resolve(true);
-			});
-		});
-		if (open) return true;
-		await new Promise((r) => setTimeout(r, 300));
-	}
-	return false;
-}
-
 // ── ① 初始 status：网关离线 ──
 {
 	const res = await callRoute("/dsh-remote/status", fakeReq());
@@ -154,7 +134,7 @@ async function waitPort(port, timeoutMs) {
 	assert.equal(persisted.frp.mode, "xtcp", "访客形态应写盘");
 	console.log("✓ 配置已写盘");
 
-	const up = await waitPort(LISTEN_PORT, 15000);
+	const up = await waitForPort(LISTEN_PORT, 15000);
 	assert.ok(up, "保存后网关应被自动拉起");
 	console.log("✓ 网关已随保存动作自动拉起");
 }
@@ -183,7 +163,7 @@ const { execSync } = await import("node:child_process");
 const deadline = Date.now() + 20_000;
 let freed = false;
 while (Date.now() < deadline) {
-	const open = await waitPort(LISTEN_PORT, 400);
+	const open = await waitForPort(LISTEN_PORT, 400);
 	if (!open) {
 		freed = true;
 		break;

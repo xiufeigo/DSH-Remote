@@ -28,6 +28,20 @@ async function fetchJson(path, init) {
 		}
 	})).json();
 }
+/** fetch 被 AbortController 中止时的拒绝原因；这类失败不应向用户报错。 */
+function isAbortError(error) {
+	return typeof error === "object" && error !== null && error.name === "AbortError";
+}
+/**
+* WEB-03：请求级 AbortController —— 发起新请求前先 abort 同一链路里的旧请求
+* （慢响应不得覆盖新输入），返回新请求的 signal；组件卸载时同样 abort。
+*/
+function beginRequest(ref) {
+	ref.current?.abort();
+	const controller = new AbortController();
+	ref.current = controller;
+	return controller.signal;
+}
 const CARD_CSS = `
 .dshr-card {
   list-style: none;
@@ -132,48 +146,70 @@ input.dshr-input[type="number"] { width: 130px; }
 .dshr-note { color: var(--dsw-alias-state-error-primary, #d5433e); font-size: 12px; margin-top: 6px; }
 .dshr-note.ok { color: var(--dsw-alias-state-success-primary, #2e9e5b); }
 `;
-/** 工厂物化时安装一次；loader dispose 时会一并清理插件样式标签。 */
+/**
+* 工厂物化时安装一次；loader dispose 时会一并清理插件样式标签。
+* PLG-07：另给固定 DOM id，apply() 里按 id 在 ctx dispose 时兜底移除，
+* 防 HMR 重载/插件卸载路径下重复注入。
+*/
 const STYLE_TAG_ID = "dsh-remote-plugin/card.css";
+const STYLE_TAG_DOM_ID = "dsh-remote-styles";
 if (typeof document !== "undefined" && document.querySelector(`style[data-plugin-css="${STYLE_TAG_ID}"]`) === null) {
 	const tag = document.createElement("style");
+	tag.id = STYLE_TAG_DOM_ID;
 	tag.dataset.plugin = "dsh-remote-plugin";
 	tag.dataset.pluginCss = STYLE_TAG_ID;
 	tag.textContent = CARD_CSS;
 	document.head.appendChild(tag);
 }
-function Toggle({ checked, onChange }) {
+/** WEB-06：role="switch" 语义 + 空格/回车键盘切换 + 可选无障碍名称。 */
+function Toggle({ checked, onChange, ariaLabel }) {
+	const toggle = () => {
+		onChange(!checked);
+	};
 	return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 		type: "button",
 		role: "switch",
 		"aria-checked": checked,
+		"aria-label": ariaLabel,
 		className: `dshr-toggle${checked ? " on" : ""}`,
-		onClick: () => {
-			onChange(!checked);
+		onClick: toggle,
+		onKeyDown: (event) => {
+			if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
+				event.preventDefault();
+				toggle();
+			}
 		},
 		children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: "dshr-toggle-thumb" })
 	});
 }
+/** WEB-06：label 用 htmlFor 与输入框关联，hint 走 aria-describedby。 */
 function TextField({ label, value, onChange, hint, placeholder, password }) {
+	const id = (0, react.useId)();
+	const hintId = hint !== void 0 ? `${id}-hint` : void 0;
 	return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 		className: "dshr-field",
 		children: [
-			/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+			/* @__PURE__ */ (0, react_jsx_runtime.jsx)("label", {
 				className: "dshr-label",
+				htmlFor: id,
 				children: label
 			}),
 			/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+				id,
 				className: "dshr-input",
 				type: password === true ? "password" : "text",
 				autoComplete: "off",
 				spellCheck: false,
 				placeholder,
 				value,
+				"aria-describedby": hintId,
 				onChange: (event) => {
 					onChange(event.target.value);
 				}
 			}),
 			hint !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 				className: "dshr-hint",
+				id: hintId,
 				children: hint
 			}) : null
 		]
@@ -199,15 +235,23 @@ function DshRemoteSettingsCard() {
 	const [open, setOpen] = (0, react.useState)(false);
 	const [form, setForm] = (0, react.useState)(null);
 	const [status, setStatus] = (0, react.useState)(null);
-	const [saving, setSaving] = (0, react.useState)(false);
+	const [busy, setBusy] = (0, react.useState)(null);
 	const [message, setMessage] = (0, react.useState)(null);
 	const [authToken, setAuthToken] = (0, react.useState)("");
 	const [visitorKey, setVisitorKey] = (0, react.useState)("");
+	const opAbortRef = (0, react.useRef)(null);
+	const statusAbortRef = (0, react.useRef)(null);
+	(0, react.useEffect)(() => () => {
+		opAbortRef.current?.abort();
+		statusAbortRef.current?.abort();
+	}, []);
 	const refreshStatus = (0, react.useCallback)(() => {
-		fetchJson("/dsh-remote/status").then(setStatus).catch(() => setStatus(null));
+		fetchJson("/dsh-remote/status", { signal: beginRequest(statusAbortRef) }).then(setStatus).catch((error) => {
+			if (!isAbortError(error)) setStatus(null);
+		});
 	}, []);
 	(0, react.useEffect)(() => {
-		fetchJson("/dsh-remote/config").then((payload) => {
+		fetchJson("/dsh-remote/config", { signal: beginRequest(opAbortRef) }).then((payload) => {
 			const merged = {
 				autoStart: true,
 				listenHost: "127.0.0.1",
@@ -236,19 +280,25 @@ function DshRemoteSettingsCard() {
 			setForm(merged);
 			setAuthToken(typeof payload.secrets?.authToken === "string" ? payload.secrets.authToken : "");
 			setVisitorKey(typeof payload.secrets?.visitorKey === "string" ? payload.secrets.visitorKey : "");
-		}).catch(() => setMessage({
-			kind: "err",
-			text: "读取配置失败（插件路由不可达）"
-		}));
+		}).catch((error) => {
+			if (!isAbortError(error)) setMessage({
+				kind: "err",
+				text: "读取配置失败（插件路由不可达）"
+			});
+		});
 		refreshStatus();
 	}, [refreshStatus]);
 	(0, react.useEffect)(() => {
-		if (!open) return void 0;
+		if (!open || busy !== null) return void 0;
 		const timer = setInterval(refreshStatus, 5e3);
 		return () => {
 			clearInterval(timer);
 		};
-	}, [open, refreshStatus]);
+	}, [
+		open,
+		busy,
+		refreshStatus
+	]);
 	const patchForm = (patch) => {
 		setForm((current) => ({
 			...current,
@@ -256,6 +306,7 @@ function DshRemoteSettingsCard() {
 		}));
 	};
 	const save = async () => {
+		if (busy !== null) return;
 		setMessage(null);
 		if (form.frp.enabled) {
 			if (!authToken.trim() || !visitorKey.trim() || !String(form.frp.serverAddr ?? "").trim()) {
@@ -266,7 +317,8 @@ function DshRemoteSettingsCard() {
 				return;
 			}
 		}
-		setSaving(true);
+		setBusy("save");
+		const signal = beginRequest(opAbortRef);
 		try {
 			const payload = {
 				autoStart: form.autoStart,
@@ -287,7 +339,8 @@ function DshRemoteSettingsCard() {
 			}
 			const result = await fetchJson("/dsh-remote/config", {
 				method: "POST",
-				body: JSON.stringify(payload)
+				body: JSON.stringify(payload),
+				signal
 			});
 			if (result.ok === true) {
 				setMessage({
@@ -300,28 +353,36 @@ function DshRemoteSettingsCard() {
 				text: Array.isArray(result.errors) ? result.errors.join("；") : "保存失败"
 			});
 		} catch (error) {
-			setMessage({
+			if (!isAbortError(error)) setMessage({
 				kind: "err",
 				text: `保存失败：${String(error)}`
 			});
 		} finally {
-			setSaving(false);
+			setBusy(null);
 		}
 	};
 	const restartGateway = async () => {
+		if (busy !== null) return;
 		setMessage(null);
+		setBusy("restart");
+		const signal = beginRequest(opAbortRef);
 		try {
-			await fetchJson("/dsh-remote/restart", { method: "POST" });
+			await fetchJson("/dsh-remote/restart", {
+				method: "POST",
+				signal
+			});
 			setMessage({
 				kind: "ok",
 				text: "重启指令已发出"
 			});
 			setTimeout(refreshStatus, 3e3);
 		} catch (error) {
-			setMessage({
+			if (!isAbortError(error)) setMessage({
 				kind: "err",
 				text: `重启失败：${String(error)}`
 			});
+		} finally {
+			setBusy(null);
 		}
 	};
 	const gatewayRunning = status?.gatewayRunning === true;
@@ -367,6 +428,7 @@ function DshRemoteSettingsCard() {
 					label: "DSH 启动时自动拉起网关",
 					children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(Toggle, {
 						checked: form.autoStart,
+						ariaLabel: "DSH 启动时自动拉起网关",
 						onChange: (v) => {
 							patchForm({ autoStart: v });
 						}
@@ -381,6 +443,7 @@ function DshRemoteSettingsCard() {
 					hint: "需要 VPS 上已部署 frps；手机凭访客密钥连入，无需扫码",
 					children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(Toggle, {
 						checked: form.frp.enabled,
+						ariaLabel: "启用 frp 隧道",
 						onChange: (v) => {
 							patchForm({ frp: {
 								...form.frp,
@@ -476,18 +539,19 @@ function DshRemoteSettingsCard() {
 					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 						type: "button",
 						className: "dshr-btn primary",
-						disabled: saving,
+						disabled: busy !== null,
 						onClick: () => {
 							save();
 						},
-						children: saving ? "保存中…" : "保存并重启网关"
+						children: busy === "save" ? "保存中…" : "保存并重启网关"
 					}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 						type: "button",
 						className: "dshr-btn",
+						disabled: busy !== null,
 						onClick: () => {
 							restartGateway();
 						},
-						children: "重启网关"
+						children: busy === "restart" ? "重启中…" : "重启网关"
 					})]
 				}),
 				message !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
@@ -502,6 +566,9 @@ function DshRemoteSettingsCard() {
 const inject = ["slots"];
 const name = "dsh-remote-plugin";
 function apply(ctx) {
+	ctx.effect?.(() => () => {
+		if (typeof document !== "undefined") document.getElementById(STYLE_TAG_DOM_ID)?.remove();
+	}, "dsh-remote-plugin: card styles");
 	try {
 		ctx.slots.inject("settings.plugin.item", () => {
 			try {

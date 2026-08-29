@@ -20,6 +20,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.text.InputType;
 import android.text.TextUtils;
+import android.util.Log;
 import android.view.ContextThemeWrapper;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -64,12 +65,16 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
 
 /**
  * DSH Remote Android 客户端。
  *
  * 配置组与电脑端插件面板对齐，只填四项：VPS 地址、控制端口、登录密钥、访客密钥。
- * 本地端口固定 18443（与网关 listenPort 一致），由插件侧自动透传，无需在手机上改。
+ * 本地端口首选 18443（与网关 listenPort 一致），被占用时在 16225~16235 内协商
+ * （AND-07），实际端口透传给 frpc visitor 与 WebView 加载 URL，无需在手机上改。
  * 点卡片切换远程配置；访客密钥与电脑端一致即可连入，不再扫码配对。
  */
 public class MainActivity extends Activity {
@@ -140,6 +145,19 @@ public class MainActivity extends Activity {
 	/** 会话页沉浸状态栏；注入失败时退回实色。 */
 	private boolean edgeToEdgeChrome = true;
 
+	/**
+	 * AND-06：统一后台线程池（单线程、命名、守护），替换原裸 new Thread 的
+	 * 端口探测/隧道等待轮询；onDestroy 时 shutdownNow() 取消在途任务。
+	 * 两个后台任务（返回会话探测、隧道就绪等待）由状态机保证不并发，单线程即可。
+	 */
+	private final ScheduledExecutorService bgExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+		Thread t = new Thread(r, "dshr-bg");
+		t.setDaemon(true);
+		return t;
+	});
+	/** AND-03/AND-06：Activity 已销毁——不再提交后台任务、不再执行 UI 回调。 */
+	private volatile boolean destroyed = false;
+
 	@Override
 	protected void onCreate(Bundle savedInstanceState) {
 		super.onCreate(savedInstanceState);
@@ -169,6 +187,31 @@ public class MainActivity extends Activity {
 	protected void onPause() {
 		super.onPause();
 		CookieManager.getInstance().flush();
+	}
+
+	@Override
+	protected void onDestroy() {
+		// AND-03/AND-06：先关统一线程池——中断在途的隧道就绪轮询与返回会话探测，
+		// 等待轮询线程不再持有 Activity 空转。
+		destroyed = true;
+		bgExecutor.shutdownNow();
+		dismissPendingHttpAuth();
+		if (webView != null) {
+			// AND-03：非静态内部类 AppBridge 经 addJavascriptInterface 被 WebView 持有，
+			// 不销毁则 Chromium 内核与 Activity Context 全部泄漏。顺序：摘 JS 桥
+			// → 移出视图树 → 停止加载 → 清历史 → destroy。
+			webView.removeJavascriptInterface("DshRemoteApp");
+			webView.setOnKeyListener(null);
+			webView.setWebViewClient(null);
+			webView.setWebChromeClient(null);
+			webView.setDownloadListener(null);
+			if (rootLayout != null) rootLayout.removeView(webView);
+			webView.stopLoading();
+			webView.clearHistory();
+			webView.destroy();
+			webView = null;
+		}
+		super.onDestroy();
 	}
 
 	private void configureSystemBars() {
@@ -567,17 +610,15 @@ public class MainActivity extends Activity {
 		}
 		final String target = resumeUrl;
 		clearResumeSession();
-		new Thread(() -> {
-			boolean up = false;
-			try {
-				java.net.Socket s = new java.net.Socket();
-				s.connect(new java.net.InetSocketAddress("127.0.0.1", ProfileStore.BIND_PORT), 600);
-				s.close();
-				up = true;
-			} catch (Exception ignored) {
-			}
+		// AND-06：端口探测走统一线程池，onDestroy 时随线程池一并取消。
+		runInBackground("resume-session", () -> {
+			// AND-07：隧道可能跑在协商端口上——先探上次记录的实际端口，回落首选端口。
+			int savedPort = prefs().getInt(ProfileStore.KEY_BOUND_PORT, ProfileStore.BIND_PORT);
+			boolean up = isLocalPortOpen(savedPort)
+				|| (savedPort != ProfileStore.BIND_PORT && isLocalPortOpen(ProfileStore.BIND_PORT));
 			final boolean ok = up;
 			runOnUiThread(() -> {
+				if (destroyed) return;
 				if (!ok) {
 					Toast.makeText(this, "隧道已断开，正在重新连接…", Toast.LENGTH_SHORT).show();
 					connectFromStoredTarget();
@@ -594,7 +635,7 @@ public class MainActivity extends Activity {
 				applyInsetsToPage(webView);
 				injectMobileAdaptation(webView);
 			});
-		}, "resume-session").start();
+		});
 	}
 
 	private void showEditor(ProfileStore.Profile existing) {
@@ -768,7 +809,6 @@ public class MainActivity extends Activity {
 	private void beginTunnel(final VisitorConfig cfg) {
 		clearResumeSession();
 		final int generation = ++connectionGeneration;
-		cfg.bindPort = ProfileStore.BIND_PORT;
 		if (!cfg.isValid()) {
 			Toast.makeText(this, "连接配置不完整，请检查配置组。", Toast.LENGTH_LONG).show();
 			showHome();
@@ -778,17 +818,39 @@ public class MainActivity extends Activity {
 			&& checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
 			requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQ_NOTIF_PERM);
 		}
-		if (isLocalPortOpen(cfg.bindPort)) {
-			String target = "https://127.0.0.1:" + cfg.bindPort + "/";
+		// AND-07：复用存活隧道——先探上次记录的实际绑定端口，再探首选端口。
+		int savedPort = prefs().getInt(ProfileStore.KEY_BOUND_PORT, 0);
+		int reusePort = 0;
+		if (savedPort >= 1 && savedPort <= 65535 && isLocalPortOpen(savedPort)) reusePort = savedPort;
+		else if (isLocalPortOpen(ProfileStore.BIND_PORT)) reusePort = ProfileStore.BIND_PORT;
+		if (reusePort > 0) {
+			cfg.bindPort = reusePort;
+			String target = "https://127.0.0.1:" + reusePort + "/";
 			if (tvTunnelState != null) tvTunnelState.setText("隧道已在运行，正在打开会话…");
 			if (resumeLiveSession(target)) return;
 			openGateway(target);
 			return;
 		}
+		// AND-07：端口协商——首选 BIND_PORT，被占用时在 16225~16235 取首个空闲端口；
+		// 实际端口传给 frpc visitor（Intent extra）与 WebView 加载 URL（cfg.bindPort）。
+		int port = ProfileStore.negotiateBindPort();
+		if (port < 0) {
+			Toast.makeText(this, "本地端口 " + ProfileStore.BIND_PORT + " 与回退范围 "
+				+ ProfileStore.PORT_RANGE_MIN + "-" + ProfileStore.PORT_RANGE_MAX
+				+ " 均被占用，无法启动隧道。", Toast.LENGTH_LONG).show();
+			showHome();
+			return;
+		}
+		cfg.bindPort = port;
+		prefs().edit().putInt(ProfileStore.KEY_BOUND_PORT, port).apply();
 		Intent svc = new Intent(this, TunnelService.class);
+		svc.putExtra(TunnelService.EXTRA_BIND_PORT, port);
 		if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc);
 		else startService(svc);
-		if (tvTunnelState != null) tvTunnelState.setText("隧道启动中（frpc 打洞/建联一般 3~10 秒）…");
+		if (tvTunnelState != null) {
+			tvTunnelState.setText("隧道启动中（frpc 打洞/建联一般 3~10 秒）…"
+				+ (port == ProfileStore.BIND_PORT ? "" : "（端口 " + port + "）"));
+		}
 		showLocalShell(
 			UiState.CONNECTING,
 			"connecting",
@@ -804,9 +866,11 @@ public class MainActivity extends Activity {
 
 	private void waitAndOpen(final VisitorConfig cfg, final int generation) {
 		final long deadline = System.currentTimeMillis() + TUNNEL_READY_TIMEOUT_MS;
-		new Thread(() -> {
+		// AND-06：就绪轮询走统一线程池；onDestroy 的 shutdownNow() 会中断该轮询。
+		runInBackground("tunnel-wait", () -> {
 			boolean up = false;
-			while (System.currentTimeMillis() < deadline) {
+			while (!destroyed && System.currentTimeMillis() < deadline) {
+				if (Thread.currentThread().isInterrupted()) break;
 				try {
 					Socket s = new Socket();
 					s.connect(new InetSocketAddress("127.0.0.1", cfg.bindPort), 600);
@@ -824,6 +888,7 @@ public class MainActivity extends Activity {
 			}
 			final boolean ok = up;
 			runOnUiThread(() -> {
+				if (destroyed) return;
 				if (generation != connectionGeneration || uiState != UiState.CONNECTING) return;
 				if (!ok) {
 					if (tvTunnelState != null) {
@@ -849,7 +914,27 @@ public class MainActivity extends Activity {
 				}
 				openGateway("https://127.0.0.1:" + cfg.bindPort + "/");
 			});
-		}, "tunnel-wait").start();
+		});
+	}
+
+	/**
+	 * AND-06：提交后台探测/轮询任务到统一线程池（替换裸 new Thread）。
+	 * Activity 销毁后静默丢弃；任务内异常只记日志，不上抛崩线程池。
+	 */
+	private void runInBackground(String name, Runnable work) {
+		if (destroyed) return;
+		try {
+			bgExecutor.execute(() -> {
+				Thread.currentThread().setName(name);
+				try {
+					work.run();
+				} catch (Exception e) {
+					Log.w("dshr-main", "后台任务 " + name + " 异常：" + e);
+				}
+			});
+		} catch (RejectedExecutionException ignored) {
+			// onDestroy 已 shutdownNow()，过期任务静默丢弃。
+		}
 	}
 
 	private void stopTunnel() {
@@ -1673,7 +1758,14 @@ public class MainActivity extends Activity {
 		try {
 			X509Certificate cert = error.getCertificate().getX509Certificate();
 			if (cert == null) {
+				// AND-08：个别实现会返回 null。不再静默 cancel——用户只见「校验失败」
+				// 却无原因。记录设备 API 级别便于排查，并给出含重试入口的明确错误。
+				Log.w("dshr-ssl", "SslError 无法提取 X.509 证书（getX509Certificate()=null）"
+					+ ", url=" + errorUrl
+					+ ", primaryError=" + error.getPrimaryError()
+					+ ", api=" + Build.VERSION.SDK_INT);
 				handler.cancel();
+				showCertificateExtractionFailure();
 				return;
 			}
 			byte[] digest = MessageDigest.getInstance("SHA-256").digest(cert.getEncoded());
@@ -1681,7 +1773,11 @@ public class MainActivity extends Activity {
 			for (byte b : digest) sb.append(String.format(Locale.US, "%02x", b));
 			fingerprint = sb.toString();
 		} catch (Exception e) {
+			// AND-08：指纹提取异常同样给可见提示，不再静默吞掉。
+			Log.w("dshr-ssl", "证书指纹提取失败：" + e
+				+ ", url=" + errorUrl + ", api=" + Build.VERSION.SDK_INT);
 			handler.cancel();
+			showCertificateExtractionFailure();
 			return;
 		}
 		if (TextUtils.isEmpty(activeUrl)) {
@@ -1726,6 +1822,23 @@ public class MainActivity extends Activity {
 				awaitingCertificateDecision = false;
 				showGatewayFailure("未信任服务器证书，已停止连接。");
 			})
+			.show();
+	}
+
+	/**
+	 * AND-08：无法从 SslError 提取证书时的明确错误。重试会重新发起加载、
+	 * 再次走证书校验流程；每次重试都需用户显式点击，不会自动循环。
+	 */
+	private void showCertificateExtractionFailure() {
+		new AlertDialog.Builder(this)
+			.setTitle("证书校验失败")
+			.setMessage("无法读取该服务器的证书，不能完成指纹核对。\n"
+				+ "可能是系统 WebView 实现的兼容性问题，请重试，或检查系统更新后再试。")
+			.setPositiveButton("重试", (dialog, which) -> {
+				if (webView != null && !TextUtils.isEmpty(activeUrl)) webView.loadUrl(activeUrl);
+			})
+			.setNegativeButton("取消", (dialog, which) -> showGatewayFailure("证书校验失败，已停止连接。"))
+			.setOnCancelListener(dialog -> showGatewayFailure("证书校验失败，已停止连接。"))
 			.show();
 	}
 

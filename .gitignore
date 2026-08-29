@@ -23,3 +23,12 @@ android/jniLibs/
 
 # ????????
 .omo/
+
+# Edge 部署运行时数据（deploy/docker/data）与本机链路测试日志
+deploy/docker/data/
+deploy/docker/.env
+deploy/docker/Caddyfile
+chain-log.txt
+
+# AgentTeams captain state (local tooling)
+.agent-teams/

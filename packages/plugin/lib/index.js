@@ -23,14 +23,37 @@ import { DISPLAY_DEFAULTS, mergeConfigFile, validateConfigPatch } from "./config
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
 
-/** 定位 gateway 包入口（workspace 内相对位置；junction 安装后同样成立）。 */
+/**
+ * 定位 gateway 包入口（PLG-05）。解析优先级：
+ *   1. env DSH_REMOTE_GATEWAY_CLI —— 显式覆盖（建议绝对路径），供 tarball/npm
+ *      独立分发或调试时指向任意位置的 gateway 入口；
+ *   2. workspace 相对位置（plugin 与 gateway 仓库内同级；junction 安装后同样成立）；
+ *   3. 裸包名 require.resolve 兜底（依赖共享农场 / profile 链接）。
+ * 全部失败时抛出带明确诊断的错误（期望的目录布局与环境变量用法），由调用方
+ * 决定降级方式（当前策略：打日志并跳过拉起，不拖垮宿主）。
+ */
 function locateGatewayCli() {
-	const candidate = join(PLUGIN_DIR, "..", "gateway", "src", "cli.ts");
-	if (existsSync(candidate)) return candidate;
+	const fromEnv = process.env.DSH_REMOTE_GATEWAY_CLI;
+	if (typeof fromEnv === "string" && fromEnv.trim().length > 0) {
+		const explicit = resolve(fromEnv.trim());
+		if (existsSync(explicit)) return explicit;
+		throw new Error(
+			`DSH_REMOTE_GATEWAY_CLI 指向的文件不存在：${explicit}\n`
+			+ "该环境变量应指向 dsh-remote 仓库的 packages/gateway/src/cli.ts（建议使用绝对路径）。",
+		);
+	}
+	const workspace = resolve(PLUGIN_DIR, "..", "gateway", "src", "cli.ts");
+	if (existsSync(workspace)) return workspace;
 	try {
 		return require.resolve("@dsh-remote/gateway/src/cli.ts");
 	} catch {
-		return undefined;
+		throw new Error(
+			"找不到网关入口 packages/gateway/src/cli.ts。期望布局（任一成立即可）：\n"
+			+ `  1. 与插件包同级的仓库目录：${workspace}\n`
+			+ "  2. Node 可按裸包名解析 @dsh-remote/gateway/src/cli.ts"
+			+ "（先运行 node packages/plugin/scripts/install.mjs 建立链接；链接断裂可用 --repair 体检重建）\n"
+			+ "  3. 或用环境变量显式指定：DSH_REMOTE_GATEWAY_CLI=/绝对路径/…/packages/gateway/src/cli.ts",
+		);
 	}
 }
 
@@ -292,17 +315,26 @@ var plugin_default = {
 				console.log(`${TAG} 网关子进程已在运行，跳过重复拉起`);
 				return;
 			}
-			const cliPath = locateGatewayCli();
-			if (cliPath === undefined) {
-				console.warn(`${TAG} 未找到 gateway 入口，跳过自动拉起`);
+			let cliPath;
+			try {
+				cliPath = locateGatewayCli();
+			} catch (error) {
+				console.warn(`${TAG} 未找到网关入口，跳过自动拉起。${String(error.message ?? error)}`);
 				return;
 			}
 			plannedStop = false;
-			const proc = spawn(process.execPath, [cliPath, "start"], {
-				env: { ...process.env, DSH_REMOTE_HOME: home },
-				stdio: ["ignore", "pipe", "pipe"],
-				windowsHide: true,
-			});
+			let proc;
+			try {
+				proc = spawn(process.execPath, [cliPath, "start"], {
+					env: { ...process.env, DSH_REMOTE_HOME: home },
+					stdio: ["ignore", "pipe", "pipe"],
+					windowsHide: true,
+				});
+			} catch (error) {
+				// spawn 同步失败（如权限/沙箱限制）：不拖垮宿主，记录后放弃本轮拉起
+				console.warn(`${TAG} 拉起网关子进程失败：${String(error.message ?? error)}`);
+				return;
+			}
 			child = proc;
 			const forward = (chunk) => {
 				for (const line of chunk.toString("utf8").split("\n")) {
@@ -313,6 +345,11 @@ var plugin_default = {
 			};
 			proc.stdout?.on("data", forward);
 			proc.stderr?.on("data", forward);
+			proc.on("error", (error) => {
+				// spawn 异步失败（如入口不可执行）：清掉子进程引用，避免未处理错误
+				console.warn(`${TAG} 网关子进程错误：${String(error.message ?? error)}`);
+				if (child === proc) child = null;
+			});
 			proc.on("exit", (code, signal) => {
 				if (child === proc) child = null;
 				if (disposed || plannedStop) return;
@@ -375,6 +412,9 @@ var plugin_default = {
 		}, "dsh-remote: gateway lifecycle");
 
 		// ── 设置页路由（webServer 存在时才注册） ────────────────────
+		// PLG-01：webServer 缺失或路由注册失败通常意味着安装链接断裂/宿主升级
+		// 重置了 profile，日志提示运行 install.mjs --repair 体检。
+		const REPAIR_HINT = "可运行 node packages/plugin/scripts/install.mjs --repair 体检并修复安装（patch 行 / node_modules 链接）";
 		const webServer = typeof ctx.get === "function" ? ctx.get("webServer") : undefined;
 		if (webServer !== undefined && typeof webServer.register === "function") {
 			const handlers = createRouteHandlers({
@@ -441,6 +481,7 @@ var plugin_default = {
 					}), label);
 				} catch (error) {
 					console.error(`${TAG} 路由注册失败 ${path}`, error);
+					console.warn(`${TAG} ${REPAIR_HINT}`);
 				}
 			};
 
@@ -451,6 +492,8 @@ var plugin_default = {
 			registerRoute("/dsh-remote/status", handlers.handleStatusGet, "dsh-remote: status route");
 			registerRoute("/dsh-remote/restart", handlers.handleRestartPost, "dsh-remote: restart route");
 			registerRoute("/dsh-remote/pair-code", handlers.handlePairCodePost, "dsh-remote: pair-code route");
+		} else {
+			console.warn(`${TAG} 未检测到宿主 webServer 服务，设置页路由未注册。${REPAIR_HINT}`);
 		}
 
 		// ── 设置命名空间（settings 服务存在时才注册） ────────────────
@@ -472,13 +515,52 @@ function sendJsonSafe(res, payload, status) {
 	} catch {}
 }
 
-/** settings.register 需要的可调用 schema（parse + toJSON + ~standard）。 */
+/**
+ * settings.register 需要的可调用 schema（parse + toJSON + ~standard）。
+ *
+ * PLG-02：字段与真实 GatewayConfig 的面板可编辑项对齐（参照
+ * src/client/index.tsx 表单）：autoStart / listenHost / upstreamPort /
+ * autoFixUpstreamPort / frp.{enabled,serverAddr,serverPort,mode,name}。
+ * 历史残留的 frpEnabled/serverAddr 扁平字段不再存在，但输入里出现时做
+ * 向后兼容归一化到 frp.*。校验与 config-schema.js 的 validateConfigPatch
+ * 共用单一真相源（该文件与网关 config.ts/frp.ts 规则同步，见其头注）。
+ * 协议结构（可调用 parse / ~standard.validate / toJSON）为宿主 dsh-settings
+ * 的硬依赖，不得改动。
+ */
 function buildSettingsSchema() {
+	const defaults = DISPLAY_DEFAULTS;
 	const parse = (input) => {
-		const raw = input !== null && typeof input === "object" ? input : {};
+		const raw = input !== null && typeof input === "object" && !Array.isArray(input) ? input : {};
+		// 向后兼容：旧版扁平字段归一化进 frp.*（仅在未提供新结构时生效）
+		const normalized = { ...raw };
+		if (normalized.frp === undefined && (normalized.frpEnabled !== undefined || normalized.serverAddr !== undefined)) {
+			normalized.frp = {};
+			if (typeof normalized.frpEnabled === "boolean") normalized.frp.enabled = normalized.frpEnabled;
+			if (typeof normalized.serverAddr === "string") normalized.frp.serverAddr = normalized.serverAddr;
+		}
+		delete normalized.frpEnabled;
+		delete normalized.serverAddr;
+		// 密钥（authToken/visitorKey）存 state/secrets.json，不进设置命名空间
+		delete normalized.authToken;
+		delete normalized.visitorKey;
+		// 单一真相源校验；非法输入不抛错，逐字段回落面板默认值
+		const verdict = validateConfigPatch(normalized);
+		const patch = verdict.ok ? verdict.patch : {};
+		const frpPatch = patch.frp ?? {};
 		return {
-			frpEnabled: raw.frpEnabled === true,
-			serverAddr: typeof raw.serverAddr === "string" ? raw.serverAddr : "",
+			autoStart: typeof patch.autoStart === "boolean" ? patch.autoStart : defaults.autoStart,
+			listenHost: typeof patch.listenHost === "string" ? patch.listenHost : defaults.listenHost,
+			upstreamPort: Number.isInteger(patch.upstreamPort) ? patch.upstreamPort : defaults.upstreamPort,
+			autoFixUpstreamPort: typeof patch.autoFixUpstreamPort === "boolean"
+				? patch.autoFixUpstreamPort
+				: defaults.autoFixUpstreamPort,
+			frp: {
+				enabled: typeof frpPatch.enabled === "boolean" ? frpPatch.enabled : defaults.frp.enabled,
+				serverAddr: typeof frpPatch.serverAddr === "string" ? frpPatch.serverAddr : "",
+				serverPort: Number.isInteger(frpPatch.serverPort) ? frpPatch.serverPort : defaults.frp.serverPort,
+				mode: typeof frpPatch.mode === "string" ? frpPatch.mode : defaults.frp.mode,
+				name: typeof frpPatch.name === "string" ? frpPatch.name : defaults.frp.name,
+			},
 		};
 	};
 	return Object.assign(parse, {
@@ -492,8 +574,26 @@ function buildSettingsSchema() {
 		toJSON: () => ({
 			type: "object",
 			properties: {
-				frpEnabled: { type: "boolean", default: false, title: "启用 frp 隧道" },
-				serverAddr: { type: "string", default: "", title: "VPS 地址" },
+				autoStart: { type: "boolean", default: defaults.autoStart, title: "DSH 启动时自动拉起网关" },
+				listenHost: {
+					type: "string",
+					enum: ["127.0.0.1", "0.0.0.0", "::1"],
+					default: defaults.listenHost,
+					title: "网关监听地址",
+				},
+				upstreamPort: { type: "integer", minimum: 1, maximum: 65535, default: defaults.upstreamPort, title: "上游 DSH 端口" },
+				autoFixUpstreamPort: { type: "boolean", default: defaults.autoFixUpstreamPort, title: "上游端口失配时自动探测回写" },
+				frp: {
+					type: "object",
+					title: "frp 隧道",
+					properties: {
+						enabled: { type: "boolean", default: defaults.frp.enabled, title: "启用 frp 隧道" },
+						serverAddr: { type: "string", default: "", title: "VPS 地址" },
+						serverPort: { type: "integer", minimum: 1, maximum: 65535, default: defaults.frp.serverPort, title: "控制端口" },
+						mode: { type: "string", enum: ["entry", "stcp", "xtcp"], default: defaults.frp.mode, title: "隧道形态" },
+						name: { type: "string", default: defaults.frp.name, title: "隧道名" },
+					},
+				},
 			},
 		}),
 	});

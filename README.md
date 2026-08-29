@@ -22,11 +22,16 @@
 
 | 路径 | 说明 |
 |---|---|
-| `packages/gateway/` | 网关核心（TypeScript，Node ≥24 原生 TS 运行，无构建步骤） |
+| `packages/gateway/` | 网关核心（TypeScript，Node ≥24 原生 TS 运行，无构建步骤）；支持 desktop（PC 侧）与 edge（服务器侧）两种角色 |
 | `packages/plugin/` | cordis 插件：随 DSH web profile 自启网关 |
 | `android/` | Android 壳 App：内嵌 frpc visitor + 证书锁定（见 [android/README.md](android/README.md)） |
+| `deploy/docker/` | Edge 部署：Dockerfile + docker-compose（Caddy 自动 HTTPS）+ `.env.example` |
+| `docs/edge-deployment.md` | **Edge 部署指南**：VPS 上 Docker/裸机部署，iPhone/iPad 浏览器直达 |
 | `scripts/install-frps.sh` | VPS 一键安装 frps |
-| `scripts/smoke.mjs` | 冒烟测试（18 项） |
+| `scripts/install-edge.sh` | VPS 一键裸机部署 edge 网关（Node+frp+systemd 全套） |
+| `scripts/smoke.mjs` | 冒烟测试（desktop 角色） |
+| `scripts/smoke-edge.mjs` | edge 角色冒烟（Token 门禁 / 移动 hook 注入 / frps 配置生成） |
+| `scripts/smoke-edge-frp.mjs` | edge 全链路冒烟（本机 frp 二进制模拟 VPS↔PC 拓扑，无二进制自动跳过） |
 | `docs/` | 架构决策、[版本与发布规范](docs/versioning.md)、VPS 部署、安全模型 |
 
 ## 快速开始
@@ -55,7 +60,7 @@ mkdir ~\.dsh-remote
 @'
 {
   "listenPort": 18443,
-  "upstreamPort": 52392,
+  "upstreamPort": "<DSH 实际端口>",
   "frp": {
     "enabled": true,
     "serverAddr": "<VPS 公网 IP>",
@@ -79,7 +84,8 @@ node packages/gateway/src/cli.ts doctor   # 全链路体检
 > `frp.name` 是写进 frps 的隧道名，缺省 `dsh-remote`。多人共用一台 VPS 时必须改成互不相同
 > （字母开头，字母数字和 `-` `_`，最多 32 位）；手机 App 填同一名字，扫码会自动带上。
 
-> `upstreamPort` 是 DSH Web GUI 的端口（本会话为 52392）。桌面端重启后端口若漂移，
+> `upstreamPort` 是 DSH Web GUI 的端口（`<DSH 实际端口>`：打开本机 DSH Web 页面，
+> 浏览器地址栏 `127.0.0.1:` 后面的数字即是）。桌面端重启后端口若漂移，
 > 网关启动时会**自动探测并回写**（`autoFixUpstreamPort: true` 默认开启）；`doctor` 可手动体检。
 
 ### 3.5 访客模式 + Android 壳 App（推荐，不开公网入口）
@@ -112,6 +118,20 @@ xtcp 打洞成功时数据手机 ⇄ PC 直连不过 VPS；失败自动回退 st
 
 并在 Windows 防火墙放行该端口。手机浏览器打开 `https://<电脑局域网IP>:18443` 配对即可。
 认证门对所有来源生效，但请仅在可信家庭网络使用此模式；出门在外请走 frp 通道。
+
+### Edge 部署（服务器侧，iPhone/iPad 浏览器直达）
+
+把网关搬到公网 VPS 上跑（Docker 或裸机一键脚本）：自带 frpc/frps、前置访问 Token
+认证（登录即自动配对设备）、窄视口自动套 Android 端同款移动 hook 布局——
+iOS 无需任何 App：
+
+```bash
+cd deploy/docker && cp .env.example .env   # 填域名与访问 Token
+docker compose up -d --build
+# 或裸机：sudo bash scripts/install-edge.sh --token <访问Token>
+```
+
+详见 [docs/edge-deployment.md](docs/edge-deployment.md)。
 
 ### 3. 手机配对
 
@@ -205,5 +225,6 @@ VPS 上唯一要验证的只剩网络可达性。
 - [x] cordis 插件自启
 - [x] frp 访客模式（stcp/xtcp）：VPS 不开公网入口，`dsh-remote visitor` 出码导入
 - [x] Android 壳 App：内嵌 frpc visitor + 证书锁定 + 扫码导入
+- [x] Edge Web 服务：Docker/裸机部署，iPhone/iPad 浏览器直达（Token 门禁 + 移动 hook 布局 + 可选容器内 frps）
 - [ ] tsnet 传输适配器（无 VPS 备选）
-- [ ] iOS 壳 App（需开发者账号分发）
+- [ ] iOS 壳 App（需开发者账号分发；Edge Web 服务已覆盖浏览器场景）

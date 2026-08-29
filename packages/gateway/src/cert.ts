@@ -16,7 +16,11 @@ export interface GatewayCert {
 	fingerprintSha256: string;
 }
 
-function fingerprintOf(certPem: string): string {
+/**
+ * PEM 证书 → SHA-256 指纹（大写 hex，与 GatewayCert.fingerprintSha256 同一口径）。
+ * CLI-06：网关与测试脚本（scripts/test-harness.mjs）共用此单一实现，不再各自复刻正则。
+ */
+export function fingerprintOf(certPem: string): string {
 	const der = Buffer.from(
 		certPem
 			.split(/-----[^-]+-----/)
@@ -64,4 +68,10 @@ export async function ensureCert(certsDir: string): Promise<GatewayCert> {
 	await writeFile(keyPath, pems.private, { encoding: "utf8", mode: 0o600 });
 	await writeFile(certPath, pems.cert, "utf8");
 	return { keyPem: pems.private, certPem: pems.cert, fingerprintSha256: fingerprintOf(pems.cert) };
+}
+
+/** 加载手工提供的 PEM 证书（config.tls.certPath/keyPath），指纹口径与自签一致。 */
+export async function loadManualCert(certPath: string, keyPath: string): Promise<GatewayCert> {
+	const [certPem, keyPem] = await Promise.all([readFile(certPath, "utf8"), readFile(keyPath, "utf8")]);
+	return { certPem, keyPem, fingerprintSha256: fingerprintOf(certPem) };
 }

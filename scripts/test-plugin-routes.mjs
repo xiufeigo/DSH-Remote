@@ -7,37 +7,21 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createRouteHandlers, readTunnelSnapshot, resolveRemoteHome } from "../packages/plugin/lib/index.js";
 import { validateConfigPatch, mergeConfigFile, DISPLAY_DEFAULTS } from "../packages/plugin/lib/config-schema.js";
+// PLG-03：假 req/res 与临时目录收敛到 scripts/test-harness.mjs。
+import { fakeHttpRequest, fakeHttpResponse, makeTempHome } from "./test-harness.mjs";
 
-/** 捕获 writeHead/end 的假 res。 */
+/** 兼容旧断言结构（status/body/headers 挂在 .calls 上），实现委托 harness fakeHttpResponse。 */
 function fakeRes() {
-	const calls = { status: 0, body: "", headers: null };
-	return {
-		calls,
-		writeHead(status, headers) {
-			calls.status = status;
-			calls.headers = headers;
-			return this;
-		},
-		end(body = "") {
-			calls.body = body;
-			return this;
-		},
-	};
+	const res = fakeHttpResponse();
+	return { calls: res, writeHead: res.writeHead, end: res.end };
 }
 
 function fakeReq(body) {
-	return {
-		async *[Symbol.asyncIterator]() {
-			if (body !== undefined) yield Buffer.from(body);
-		},
-		headers: {},
-		method: "POST",
-	};
+	return fakeHttpRequest(body);
 }
 
 test("validateConfigPatch：白名单与类型校验", () => {
@@ -119,7 +103,7 @@ test("mergeConfigFile：顶层浅覆盖 + frp 深合并", () => {
 });
 
 test("handleConfigPost：合法补丁 → 写盘 + 重启联动", async () => {
-	const home = await mkdtemp(join(tmpdir(), "dshr-routes-"));
+	const home = await makeTempHome("dshr-routes-");
 	let written = null;
 	let restarts = 0;
 	const handlers = createRouteHandlers({
@@ -247,7 +231,7 @@ test("handleStatusGet：网关在线时聚合数据", async () => {
 });
 
 test("readTunnelSnapshot：解析 xtcp + stcp 双 proxy", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "dshr-tun-"));
+	const dir = await makeTempHome("dshr-tun-");
 	await mkdir(join(dir, "frp"), { recursive: true });
 	await writeFile(join(dir, "frp", "frpc.toml"), `# generated
 serverAddr = "8.138.19.15"
@@ -271,7 +255,7 @@ type = "xtcp"
 });
 
 test("handleStatusGet：附带磁盘上的 tunnel 快照", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "dshr-st-"));
+	const dir = await makeTempHome("dshr-st-");
 	await mkdir(join(dir, "frp"), { recursive: true });
 	await writeFile(join(dir, "frp", "frpc.toml"), `serverAddr = "1.2.3.4"
 serverPort = 7100

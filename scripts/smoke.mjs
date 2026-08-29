@@ -14,85 +14,37 @@
  */
 
 import assert from "node:assert/strict";
-import https from "node:https";
-import http from "node:http";
-import tls from "node:tls";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { rm } from "node:fs/promises";
 import { test, before, after } from "node:test";
+// PLG-03：公共夹具收敛到 scripts/test-harness.mjs（本文件不再复刻请求/WS/假上游实现）。
+import { startFakeUpstream, requestTls, wsConnect, makeTempHome } from "./test-harness.mjs";
 
 // ---------- 测试夹具状态 ----------
 
 const fixture = {
 	homeDir: "",
-	upstream: /** @type {http.Server | undefined} */ (undefined),
+	upstream: /** @type {import("node:http").Server | undefined} */ (undefined),
 	upstreamPort: 0,
+	closeUpstream: /** @type {(() => Promise<void>) | undefined} */ (undefined),
 	gateway: undefined,
 	gatewayPort: 0,
 	deviceCookie: "",
 	seenByUpstream: /** @type {Record<string, string | undefined>} */ ({}),
 };
 
-/** 假上游：记录寻址头/Cookie 泄露；GET / 返回带 __dsh_boot__ 标记的 HTML；upgrade 原样回声。 */
-async function startFakeUpstream() {
-	const server = http.createServer((req, res) => {
-		fixture.seenByUpstream.host = req.headers.host;
-		fixture.seenByUpstream.origin = req.headers.origin;
-		fixture.seenByUpstream.cookie = req.headers.cookie;
-		res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-		res.end("<!doctype html><html><head><title>fake dsh</title></head><body>__dsh_boot__ ok</body></html>");
-	});
-	server.on("upgrade", (req, socket, head) => {
-		fixture.seenByUpstream.upgradeHost = req.headers.host;
-		socket.write("HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\r\n");
-		if (head.length > 0) socket.write(head);
-		socket.pipe(socket); // 原始字节回声：只验证管道保真，不实现 WS 协议
-	});
-	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-	fixture.upstream = server;
-	fixture.upstreamPort = server.address().port;
-	return server;
-}
-
-/** 用自签证书场景下的 https.request 封装（rejectUnauthorized:false）。 */
-function callGateway(pathname, { method = "GET", headers = {}, body } = {}) {
-	return new Promise((resolve, reject) => {
-		const req = https.request(
-			{
-				host: "127.0.0.1",
-				port: fixture.gatewayPort,
-				path: pathname,
-				method,
-				headers,
-				rejectUnauthorized: false,
-			},
-			(res) => {
-				const chunks = [];
-				res.on("data", (chunk) => chunks.push(chunk));
-				res.on("end", () => {
-					const raw = Buffer.concat(chunks);
-					resolve({
-						status: res.statusCode,
-						headers: res.headers,
-						body: raw.toString("utf8"),
-						raw,
-						setCookie: res.headers["set-cookie"]?.join("; ") ?? "",
-					});
-				});
-			},
-		);
-		req.on("error", reject);
-		if (body !== undefined) req.write(body);
-		req.end();
-	});
+/** 自签证书场景下的网关请求：拼 URL 后走 harness requestTls（返回形态与原实现一致）。 */
+function callGateway(pathname, options = {}) {
+	return requestTls(`https://127.0.0.1:${String(fixture.gatewayPort)}${pathname}`, options);
 }
 
 before(async () => {
-	fixture.homeDir = await mkdtemp(join(tmpdir(), "dsh-remote-smoke-"));
+	fixture.homeDir = await makeTempHome("dsh-remote-smoke-");
 	process.env.DSH_REMOTE_HOME = fixture.homeDir;
 
-	await startFakeUpstream();
+	const upstream = await startFakeUpstream({ seen: fixture.seenByUpstream });
+	fixture.upstream = upstream.server;
+	fixture.upstreamPort = upstream.port;
+	fixture.closeUpstream = upstream.close;
 
 	const [{ Store }, { DEFAULT_CONFIG }, { GatewayServer }] = await Promise.all([
 		import("../packages/gateway/src/store.ts"),
@@ -114,7 +66,7 @@ before(async () => {
 
 after(async () => {
 	await fixture.gateway?.stop();
-	await new Promise((resolve) => fixture.upstream?.close(resolve));
+	await fixture.closeUpstream?.();
 	await rm(fixture.homeDir, { recursive: true, force: true });
 });
 
@@ -254,63 +206,31 @@ test("认证后请求代理到上游：Host 改写、Cookie 剥离、HTML 注入
 
 test("WS 升级：无 Cookie 被拒；有 Cookie 字节级双向透传", async () => {
 	// 无 Cookie → 401 后断开
-	const rejected = await new Promise((resolve) => {
-		const socket = tls.connect({
-			host: "127.0.0.1",
-			port: fixture.gatewayPort,
-			rejectUnauthorized: false,
-		}, () => {
-			socket.write("GET /ws HTTP/1.1\r\nhost: x\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: aAA=\r\nsec-websocket-version: 13\r\n\r\n");
-		});
-		let data = "";
-		socket.on("data", (chunk) => {
-			data += chunk.toString("latin1");
-			resolve(data);
-			socket.destroy();
-		});
-		socket.on("error", () => resolve(data));
-	});
+	const denied = wsConnect(`wss://127.0.0.1:${String(fixture.gatewayPort)}/ws`);
+	const rejected = await denied.headersText;
+	denied.close();
 	assert.match(rejected, /^HTTP\/1\.1 401/);
 
 	// 有 Cookie → 101 + 原始字节回声
-	const echoed = await new Promise((resolve, reject) => {
-		const socket = tls.connect({
-			host: "127.0.0.1",
-			port: fixture.gatewayPort,
-			rejectUnauthorized: false,
-		}, () => {
-			socket.write([
-				"GET /ws HTTP/1.1",
-				`cookie: ${fixture.deviceCookie}`,
-				"upgrade: websocket",
-				"connection: Upgrade",
-				"sec-websocket-key: aAA=",
-				"sec-websocket-version: 13",
-				"\r\n",
-			].join("\r\n"));
-		});
-		const payload = Buffer.from([0x81, 0x85, 0x11, 0x22, 0x33, 0x44, 0xde, 0xad, 0xbe, 0xef]);
-		let received = [];
-		let got101 = false;
-		socket.on("data", (chunk) => {
-			if (!got101) {
-				received.push(chunk);
-				const text = Buffer.concat(received).toString("latin1");
-				if (!text.includes("\r\n\r\n")) return;
-				got101 = true;
-				assert.match(text, /^HTTP\/1\.1 101/);
-				assert.equal(fixture.seenByUpstream.upgradeHost, `127.0.0.1:${String(fixture.upstreamPort)}`);
-				socket.write(payload);
-				return;
-			}
-			if (chunk.equals(payload)) {
-				resolve(true);
-				socket.destroy();
-			}
-		});
-		socket.on("error", reject);
-		setTimeout(() => reject(new Error("WS 回声超时")), 4000);
+	const ws = wsConnect(`wss://127.0.0.1:${String(fixture.gatewayPort)}/ws`, {
+		headers: { cookie: fixture.deviceCookie },
 	});
+	const handshake = await ws.headersText;
+	assert.match(handshake, /^HTTP\/1\.1 101/);
+	assert.equal(fixture.seenByUpstream.upgradeHost, `127.0.0.1:${String(fixture.upstreamPort)}`);
+	const payload = Buffer.from([0x81, 0x85, 0x11, 0x22, 0x33, 0x44, 0xde, 0xad, 0xbe, 0xef]);
+	const echoed = await new Promise((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error("WS 回声超时")), 4000);
+		ws.socket.on("error", (error) => { clearTimeout(timer); reject(error); });
+		ws.socket.on("data", (chunk) => {
+			if (chunk.equals(payload)) {
+				clearTimeout(timer);
+				resolve(true);
+			}
+		});
+		ws.socket.write(payload);
+	});
+	ws.close();
 	assert.ok(echoed);
 });
 
@@ -431,7 +351,7 @@ test("xtcp 形态未配对即可访问上游（访客密钥即准入）", async 
 	const { Store } = await import("../packages/gateway/src/store.ts");
 	const { DEFAULT_CONFIG } = await import("../packages/gateway/src/config.ts");
 	const { GatewayServer } = await import("../packages/gateway/src/server.ts");
-	const homeDir = await mkdtemp(join(tmpdir(), "dshr-xtcp-"));
+	const homeDir = await makeTempHome("dshr-xtcp-");
 	const store = await Store.open(homeDir);
 	const gateway = new GatewayServer({
 		store,
@@ -446,24 +366,11 @@ test("xtcp 形态未配对即可访问上游（访客密钥即准入）", async 
 	await gateway.start();
 	try {
 		const port = gateway.actualPort;
-		const response = await new Promise((resolve, reject) => {
-			const req = https.request({
-				host: "127.0.0.1", port, path: "/", method: "GET",
-				headers: { accept: "text/html" }, rejectUnauthorized: false,
-			}, (res) => {
-				const chunks = [];
-				res.on("data", (chunk) => chunks.push(chunk));
-				res.on("end", () => resolve({
-					status: res.statusCode,
-					location: res.headers.location ?? "",
-					body: Buffer.concat(chunks).toString("utf8"),
-				}));
-			});
-			req.on("error", reject);
-			req.end();
+		const response = await requestTls(`https://127.0.0.1:${String(port)}/`, {
+			headers: { accept: "text/html" },
 		});
 		assert.equal(response.status, 200, "不应再 302 到配对页");
-		assert.equal(response.location, "");
+		assert.equal(response.headers.location ?? "", "");
 		assert.match(response.body, /__dsh_boot__/);
 	} finally {
 		await gateway.stop();

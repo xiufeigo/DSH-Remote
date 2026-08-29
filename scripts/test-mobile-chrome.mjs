@@ -89,6 +89,32 @@ function assertSourceContracts() {
 	if (!src.includes("function findMainCol")) {
 		throw new Error("源码契约：缺少 findMainCol");
 	}
+	// ── WEB-02 单一源（t9/t10）：分发副本必须与网关资产逐字节一致 ──
+	{
+		const singleBytes = readFileSync(join(ROOT, "packages/gateway/assets/mobile-web.js"));
+		const rawBytes = readFileSync(join(ROOT, "android/app/src/main/res/raw/mobile.js"));
+		if (!singleBytes.equals(rawBytes)) {
+			throw new Error("源码契约：WEB-02 单一源漂移——res/raw/mobile.js ≠ packages/gateway/assets/mobile-web.js（跑 android/build.ps1 的同步步骤，字节级复制）");
+		}
+	}
+	// ── WEB-04：标准事件分发是首选通道，React 闭包仅作兜底 ──
+	if (!src.includes("var dispatched = dispatchNativeClick(button);")) {
+		throw new Error("源码契约：WEB-04 dispatchNativeClick 必须是 toggleSidebar 首选点击通道");
+	}
+	// ── WEB-05：抽屉接管接入横向滚动容器豁免 ──
+	if (!src.includes("if (isInHorizontallyScrollableContainer(target)) return false;")) {
+		throw new Error("源码契约：WEB-05 canStartDrawerTrack 必须接入横向可滚容器豁免");
+	}
+	// ── WEB-07：hook 幂等——脚本自带重复执行护栏，注入端按标记幂等 ──
+	if (!src.includes("window.__dshRemoteMobileInstalled")) {
+		throw new Error("源码契约：WEB-07 缺重复执行护栏 __dshRemoteMobileInstalled（壳内+edge 双注入会叠 hook）");
+	}
+	{
+		const pwaSrc = readFileSync(join(ROOT, "packages/gateway/src/pwa.ts"), "utf8");
+		if (!pwaSrc.includes("!text.includes(MANIFEST_PATH)") || !pwaSrc.includes('!text.includes("/__dsh_remote__/mobile.js")')) {
+			throw new Error("源码契约：WEB-07 PWA/移动注入必须按标记各自幂等（上游已注入或重注入场景不得二次插标签）");
+		}
+	}
 	if (!src.includes("data-dshr-dragging")) {
 		throw new Error("源码契约：缺少跟手拖动 data-dshr-dragging");
 	}

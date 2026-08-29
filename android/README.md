@@ -35,12 +35,23 @@ powershell -File android\build.ps1
 脚本行为：
 
 1. 缺少 `android/jniLibs/arm64-v8a/libfrpc.so` 时自动从 GitHub Releases
-   下载 frp v0.61.1 android_arm64（失败走 ghproxy 镜像）；
+   下载 frp android_arm64（版本取根 `package.json` 的 `config.frpVersion`，
+   读取失败回落内置版本并告警；失败走 ghproxy 镜像）；
 2. aapt2 → javac(Java 8 语法) → d8 → 打包 dex 与 `lib/arm64-v8a/libfrpc.so`
    （安装后系统解压到 nativeLibraryDir——Android 只允许执行该目录，
    这就是 frpc 必须伪装成 `lib*.so` 的原因）→ zipalign → apksigner；
-3. 签名密钥 `%USERPROFILE%\.android\dsh-remote.jks` 首次构建自动生成
-   （PKCS12 / 口令 `dsh-remote-2026`）。**升级安装必须沿用同一密钥，请备份。**
+3. 签名两种模式：
+   - **开发构建（默认）**：`%USERPROFILE%\.android\dsh-remote.jks` 首次构建
+     自动生成（PKCS12），口令随机生成并写入同目录 `dsh-remote.pass`。
+     **升级安装必须沿用同一密钥与口令文件，请一并备份。**
+     旧版本（固定口令时代）的存量密钥若缺 `dsh-remote.pass`，构建脚本会
+     自动尝试找回口令（`DSH_KEYSTORE_PASS` 环境变量 → 旧固定口令），找回后
+     补写口令文件并**沿用原密钥签名**——已安装设备的覆盖升级不受影响。
+   - **发布构建（`DSH_RELEASE=1`）**：要求 `~/.android/dsh-remote.jks` 已就位，
+     口令来自环境变量 `DSH_KEYSTORE_PASS` / `DSH_KEY_PASS`（可选
+     `DSH_KEY_ALIAS`）；缺失立即报错，绝不生成临时密钥。CI 发版由
+     `release.yml` 解码 GitHub secret 写入（保证历次发版 APK 签名一致、
+     可覆盖升级）。
 
 无 Gradle、零 npm/maven 依赖；CI（GitHub Actions ubuntu runner）用同一条
 脚本构建，见 `.github/workflows/android.yml`。
@@ -76,7 +87,7 @@ node packages/gateway/src/cli.ts visitor --mode xtcp   # 出码
 - 会话头部适配：官方 header（含会话面包屑标题）在收起态整体右移 62px，不再被固定在左上角的鲸鱼按钮遮挡；官方「Session log」下载按钮在手机宽度下收成 32px 纯图标按钮（文字用 sr-only 剪裁，读屏仍可读，`aria-label` 同步补齐）。两者都按结构特征定位（`header` 内含 `nav`；按钮内 `span` 文本恰为 `Session log` 且带图标），不依赖 CSS Module 哈希类名。
 - 系统栏沉浸：App 保持透明状态栏 edge-to-edge，并把真实的状态栏/导航栏 inset（CSS px）写入页面变量 `--dshr-inset-top` / `--dshr-inset-bottom`；页面内容下移让出状态栏，状态栏颜色与页面背景一致（`viewport-fit=cover` 与 `env(safe-area-inset-*)` 仅作兜底）。即使官方 frame 结构探测失败，body 兜底 padding 也保证内容不顶进时钟/挖孔区域。**虚拟键盘**弹出时，原生按焦点输入框位置平移，只抬到输入框露在键盘上方（空会话/设置页元素少时不会把输入框顶出屏幕）；页面侧再用 `interactive-widget=overlays-content` 与 `visualViewport` 把焦点矩形告诉原生。Android 返回键会优先关闭设置弹窗或收起已展开的 DSH 侧栏。
 - 适配脚本只依赖官方 DOM 的稳定结构特征（`data-shell-overlay`、`data-sidebar-collapsed`、`aria-label`、`role="dialog"` 等），不依赖 CSS Module 哈希类名，也不往 React 管理的容器里插入节点。
-- 连接失败、隧道超时或 PC 端 DSH Web 不可达时，远端页面会换成本地失败页，可点「重新连接」；改连接配置请长按鲸鱼。已在跑的隧道不会因返回键或误报断线被拆掉，再点「连接」会复用本机 18443，不必清后台。
+- 连接失败、隧道超时或 PC 端 DSH Web 不可达时，远端页面会换成本地失败页，可点「重新连接」；改连接配置请长按鲸鱼。已在跑的隧道不会因返回键或误报断线被拆掉，再点「连接」会复用本机隧道端口（首选 18443，被占用时自动在 16225~16235 协商），不必清后台。
 - 连接设置（配置组卡片页）**只通过长按小鲸鱼进入**。系统返回键不会打开该页：会话内先关官方弹层/侧栏再回上一页，到根则把 App 放到后台。点「连接」若隧道仍在，会直接恢复已注入移动适配的会话，不会重载成官方 DeepSeek Harness 桌面栏。
 - 连接设置为卡片式布局（安全隧道 / 直连入口或局域网 / 连接维护三张卡片，圆角 + 浅灰页面底），并让出状态栏/导航栏 inset。「隧道形态」选择器提供 xtcp（P2P 打洞，推荐）与 stcp（加密中转）两项，文案与电脑端插件面板一致；entry（公网入口）形态是电脑端服务侧配置，手机上用「直连入口或局域网」即可，无需访客隧道。手动填写时按电脑端面板逐项对照：VPS 地址、控制端口、隧道形态、隧道名（默认 `dsh-remote`）、访客密钥、frps 登录密钥。
 

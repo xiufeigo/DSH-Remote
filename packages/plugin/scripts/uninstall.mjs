@@ -1,7 +1,13 @@
 #!/usr/bin/env node
-/** dsh-remote-plugin 卸载器：移除 junction 与 patch 行（幂等）。 */
+/**
+ * dsh-remote-plugin 卸载器：移除 junction 与 patch 行（幂等）。
+ *
+ * PLG-01：删除 patch 行前先把原文件备份为 cordis.patch.yml.bak-<时间戳>
+ * （与 install.mjs 同一备份约定，误卸载可回滚）；同时清理安装标记
+ * .dsh-remote-plugin.json。
+ */
 
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const argv = process.argv.slice(2);
@@ -14,19 +20,64 @@ const PROFILE = opt("--profile") ?? "web";
 const DSH_HOME = process.env.DSH_HOME || join(process.env.USERPROFILE || process.env.HOME || "", ".dsh");
 const PATCH_PATH = join(DSH_HOME, "profiles", PROFILE, "cordis.patch.yml");
 const FARM_DIR = join(DSH_HOME, "profiles", "node_modules");
+const MARKER_PATH = join(DSH_HOME, "profiles", PROFILE, ".dsh-remote-plugin.json");
+
+/** PLG-01：修改 profile 的 cordis.patch.yml 前备份原文件（含时间戳）；返回备份路径。 */
+function backupFile(filePath) {
+	if (!existsSync(filePath)) return undefined;
+	const now = new Date();
+	const pad = (n, w = 2) => String(n).padStart(w, "0");
+	const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`
+		+ `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+		+ `-${pad(now.getMilliseconds(), 3)}`;
+	const backupPath = `${filePath}.bak-${stamp}`;
+	copyFileSync(filePath, backupPath);
+	return backupPath;
+}
+
+/** 链接位点是否存在（lstat 不跟随目标：悬空链接也算存在，需要清理）。 */
+function existsLoose(linkPath) {
+	try {
+		lstatSync(linkPath);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** 移除链接位点：链接/联接只删链接本身（绝不递归进目标内容），普通目录才递归删。 */
+function removeLinkLike(linkPath) {
+	let isLink = false;
+	try {
+		lstatSync(linkPath);
+		try {
+			readlinkSync(linkPath);
+			isLink = true;
+		} catch { /* 普通目录/文件占用 */ }
+	} catch {
+		return; // 不存在
+	}
+	if (isLink) {
+		try {
+			rmSync(linkPath, { recursive: false, force: true });
+			return;
+		} catch { /* 落到下方递归兜底 */ }
+	}
+	rmSync(linkPath, { recursive: true, force: true });
+}
 
 for (const name of ["gateway", "plugin"]) {
 	const linkPath = join(FARM_DIR, "@dsh-remote", name);
-	if (existsSync(linkPath)) {
+	if (existsLoose(linkPath)) {
 		console.log(`- 移除 ${linkPath}`);
-		if (!DRY) rmSync(linkPath, { recursive: true, force: true });
+		if (!DRY) removeLinkLike(linkPath);
 	}
 }
 
 const profilePluginLink = join(DSH_HOME, "profiles", PROFILE, "node_modules", "dsh-remote-plugin");
-if (existsSync(profilePluginLink)) {
+if (existsLoose(profilePluginLink)) {
 	console.log(`- 移除 ${profilePluginLink}`);
-	if (!DRY) rmSync(profilePluginLink, { recursive: true, force: true });
+	if (!DRY) removeLinkLike(profilePluginLink);
 }
 
 if (existsSync(PATCH_PATH)) {
@@ -62,8 +113,17 @@ if (existsSync(PATCH_PATH)) {
 
 		const kept = [...lines.slice(0, start), ...lines.slice(end + 1)];
 		console.log(`- 从 ${PATCH_PATH} 移除第 ${String(start + 1)}~${String(end + 1)} 行`);
-		if (!DRY) writeFileSync(PATCH_PATH, kept.join("\n"), "utf8");
+		if (!DRY) {
+			const backupPath = backupFile(PATCH_PATH);
+			writeFileSync(PATCH_PATH, kept.join("\n"), "utf8");
+			if (backupPath !== undefined) console.log(`  原 patch 已备份 → ${backupPath}`);
+		}
 	}
+}
+
+if (existsSync(MARKER_PATH)) {
+	console.log(`- 移除安装标记 ${MARKER_PATH}`);
+	if (!DRY) rmSync(MARKER_PATH, { force: true });
 }
 
 console.log(DRY ? "\n[dry-run] 未做任何修改" : "\n✅ 卸载完成。重启 DSH Desktop 生效。");

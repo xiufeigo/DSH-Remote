@@ -59,6 +59,45 @@ function writeAll({ version, dshVersion }) {
 	}
 }
 
+// OPS-07：bump 后自动同步 docs/versioning.md「当前状态」快照表，
+// 避免状态表与根 package.json 漂移。定位不到对应行时降级为手动义务提示。
+const VERSIONING_DOC = path.join(root, "docs", "versioning.md");
+
+function syncVersioningDoc(version, nextVersion) {
+	let text;
+	try {
+		text = readFileSync(VERSIONING_DOC, "utf8");
+	} catch {
+		console.warn(`⚠ 无法读取 ${path.relative(root, VERSIONING_DOC)}，跳过状态表自动同步`);
+		return;
+	}
+	// 注意：行尾用 [ \t]* 而非 \s*——\s 会吞掉换行，空行相邻时会破坏文档结构
+	const rows = [
+		{
+			label: "当前已发布版本",
+			re: /^\|[ \t]*当前已发布版本[ \t]*\|.*\|[ \t]*$/m,
+			to: `| 当前已发布版本 | \`${version}\`（tag \`v${version}\`） |`,
+		},
+		{
+			label: "下一次发布",
+			re: /^\|[ \t]*下一次发布[ \t]*\|.*\|[ \t]*$/m,
+			to: `| 下一次发布 | \`${nextVersion}\` |`,
+		},
+	];
+	let updated = text;
+	for (const row of rows) {
+		if (!row.re.test(updated)) {
+			console.warn(`⚠ docs/versioning.md 未找到「${row.label}」行，请手动更新当前状态表`);
+			continue;
+		}
+		updated = updated.replace(row.re, row.to);
+	}
+	if (updated !== text) {
+		writeFileSync(VERSIONING_DOC, updated);
+		console.log(`  已同步 ${path.relative(root, VERSIONING_DOC)} 当前状态表`);
+	}
+}
+
 const [, , cmd = "show", ...rest] = process.argv;
 const flagOf = (name) => {
 	const i = rest.indexOf(name);
@@ -90,6 +129,8 @@ switch (cmd) {
 		writeAll(next);
 		console.log(`✓ ${s.version} → ${next.version}`);
 		for (const f of pkgFiles) console.log(`  已更新 ${path.relative(root, f)}`);
+		const nextRelease = Number(next.version.slice(next.dshVersion.length + 1));
+		syncVersioningDoc(next.version, `${next.dshVersion}.${nextRelease + 1}`);
 		const tag = `v${next.version}`;
 		console.log(`
 下一步发布：

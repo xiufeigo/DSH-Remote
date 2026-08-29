@@ -12,17 +12,28 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.util.Log;
 
 /**
  * 隧道前台服务：保活 frpc visitor（stcp/xtcp）。
  * 配置从 SharedPreferences 读取；MainActivity 负责写入并 startForegroundService。
  * 启停 frpc 放在后台线程，避免主线程等进程退出导致 ANR。
  *
+ * FGS 类型：specialUse（AND-02）。dataSync 在 Android 14+ 有累计时长限制、
+ * 系统可随时杀，不适合长时隧道代理；用途在 Manifest 的 property 里声明。
+ *
  * 通知：Android 要求前台服务必须挂一条通知。有智能体任务在跑时，通知显示
  * 会话标题和当前内容；空闲时改到静默渠道（尽量不进通知栏）。旧的「隧道」
  * 渠道一旦创建就降不了重要性，空闲必须换新渠道 id。
+ * 通知带「断开」操作（AND-02），不进 App 即可停隧道。
  */
 public class TunnelService extends Service {
+
+	/** 通知「断开」操作（AND-02）。 */
+	public static final String ACTION_STOP = "top.d1studio.dshremote.action.STOP_TUNNEL";
+	/** MainActivity 传入协商后的本地绑定端口（AND-07）；缺省时服务侧自行协商。 */
+	public static final String EXTRA_BIND_PORT = "dshr_bind_port";
+	private static final String TAG = "dshr-svc";
 
 	private static final String CHANNEL_SESSION = "session_progress";
 	private static final String CHANNEL_KEEP = "tunnel_keep";
@@ -75,14 +86,42 @@ public class TunnelService extends Service {
 
 	@Override
 	public int onStartCommand(Intent intent, int flags, int startId) {
+		// AND-02：通知「断开」操作，不进 App 直接停隧道。
+		// 同样先解除前台状态再退出，覆盖尚未 publishForeground 的启动时序。
+		if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+			Log.i(TAG, "收到通知断开操作，停止隧道");
+			stopForegroundCompat();
+			stopSelf();
+			return START_NOT_STICKY;
+		}
 		ProfileStore.migrateLegacy(getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE));
 		ProfileStore.Profile profile = ProfileStore.getActive(
 			getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE));
 		if (profile == null || !profile.isValid()) {
+			// AND-01：本次启动若经由 startForegroundService()，必须先解除前台状态
+			// 再退出，否则 Android 8+ 因 5 秒内未调 startForeground() 抛
+			// "did not then call Service.startForeground()" 崩溃/ANR。
+			stopForegroundCompat();
 			stopSelf();
 			return START_NOT_STICKY;
 		}
 		VisitorConfig cfg = profile.toVisitorConfig();
+
+		// AND-07：端口协商。优先采用 MainActivity 协商后经 Intent 传入的端口；
+		// 缺失时（如进程被杀后 START_STICKY 以 null intent 重启）就地协商，
+		// 并把实际端口落盘，供 MainActivity 下次复用探测。
+		int requested = intent == null ? -1 : intent.getIntExtra(EXTRA_BIND_PORT, -1);
+		int port = (requested >= 1 && requested <= 65535) ? requested : ProfileStore.negotiateBindPort();
+		if (port < 0) {
+			Log.e(TAG, "端口协商失败：首选 " + ProfileStore.BIND_PORT + " 与回退范围 "
+				+ ProfileStore.PORT_RANGE_MIN + "-" + ProfileStore.PORT_RANGE_MAX + " 均被占用");
+			stopForegroundCompat();
+			stopSelf();
+			return START_NOT_STICKY;
+		}
+		cfg.bindPort = port;
+		getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
+			.putInt(ProfileStore.KEY_BOUND_PORT, port).apply();
 
 		publishForeground();
 
@@ -105,10 +144,26 @@ public class TunnelService extends Service {
 			return;
 		}
 		Notification n = buildNotification();
-		if (Build.VERSION.SDK_INT >= 29) {
-			startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+		if (Build.VERSION.SDK_INT >= 34) {
+			// AND-02：Android 14+ 以 specialUse 类型启动（与 Manifest 声明一致）。
+			// dataSync 有累计时长限制（默认 6 小时内系统可杀），不适合长时隧道。
+			// 34 以下无 FGS 类型强约束，直接无类型启动。
+			startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
 		} else {
 			startForeground(NOTIFICATION_ID, n);
+		}
+	}
+
+	/**
+	 * AND-01：退出前必须先解除前台状态。若本次启动经由 startForegroundService()
+	 * 而未调用 startForeground() 就 stopSelf()，Android 8+ 会抛
+	 * "did not then call Service.startForeground()"。
+	 */
+	private void stopForegroundCompat() {
+		if (Build.VERSION.SDK_INT >= 24) {
+			stopForeground(STOP_FOREGROUND_REMOVE);
+		} else {
+			stopForeground(true);
 		}
 	}
 
@@ -127,6 +182,9 @@ public class TunnelService extends Service {
 			.setOnlyAlertOnce(true)
 			.setShowWhen(running)
 			.setContentIntent(launchIntent());
+		// AND-02：通知直达「断开」，不必先进 App 再停隧道。
+		b.addAction(new Notification.Action.Builder(
+			R.drawable.ic_stat_tunnel, "断开", stopIntent()).build());
 		if (Build.VERSION.SDK_INT >= 21) {
 			b.setVisibility(running ? Notification.VISIBILITY_PUBLIC : Notification.VISIBILITY_SECRET);
 			b.setCategory(running ? Notification.CATEGORY_PROGRESS : Notification.CATEGORY_SERVICE);
@@ -154,6 +212,14 @@ public class TunnelService extends Service {
 		int flags = PendingIntent.FLAG_UPDATE_CURRENT;
 		if (Build.VERSION.SDK_INT >= 23) flags |= PendingIntent.FLAG_IMMUTABLE;
 		return PendingIntent.getActivity(this, 0, launch, flags);
+	}
+
+	private PendingIntent stopIntent() {
+		Intent stop = new Intent(this, TunnelService.class);
+		stop.setAction(ACTION_STOP);
+		int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+		if (Build.VERSION.SDK_INT >= 23) flags |= PendingIntent.FLAG_IMMUTABLE;
+		return PendingIntent.getService(this, 1, stop, flags);
 	}
 
 	private static String clip(String text, int max) {

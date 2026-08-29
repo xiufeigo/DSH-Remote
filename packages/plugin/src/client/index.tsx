@@ -15,7 +15,7 @@
  * 颜色全部走 --dsw-alias-* 主题变量，深浅色自适应。
  */
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useId, useRef, useState } from 'react'
 
 interface SlotsLike {
   inject(name: string, callback: () => unknown): void
@@ -24,6 +24,8 @@ interface SlotsLike {
 
 interface ClientContext {
   slots: SlotsLike
+  /** cordis 生命周期钩子：setup 在 apply 时执行，返回的清理函数随 ctx dispose 运行。 */
+  effect?: (setup: () => void | (() => void), label?: string) => () => void
 }
 
 async function fetchJson(path: string, init?: RequestInit): Promise<any> {
@@ -32,6 +34,22 @@ async function fetchJson(path: string, init?: RequestInit): Promise<any> {
     headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
   })
   return await response.json()
+}
+
+/** fetch 被 AbortController 中止时的拒绝原因；这类失败不应向用户报错。 */
+function isAbortError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { name?: unknown }).name === 'AbortError'
+}
+
+/**
+ * WEB-03：请求级 AbortController —— 发起新请求前先 abort 同一链路里的旧请求
+ * （慢响应不得覆盖新输入），返回新请求的 signal；组件卸载时同样 abort。
+ */
+function beginRequest(ref: { current: AbortController | null }): AbortSignal {
+  ref.current?.abort()
+  const controller = new AbortController()
+  ref.current = controller
+  return controller.signal
 }
 
 // ── 卡片样式表（对齐原生 PluginCard 观感） ──────────────────────────
@@ -141,10 +159,16 @@ input.dshr-input[type="number"] { width: 130px; }
 .dshr-note.ok { color: var(--dsw-alias-state-success-primary, #2e9e5b); }
 `
 
-/** 工厂物化时安装一次；loader dispose 时会一并清理插件样式标签。 */
+/**
+ * 工厂物化时安装一次；loader dispose 时会一并清理插件样式标签。
+ * PLG-07：另给固定 DOM id，apply() 里按 id 在 ctx dispose 时兜底移除，
+ * 防 HMR 重载/插件卸载路径下重复注入。
+ */
 const STYLE_TAG_ID = 'dsh-remote-plugin/card.css'
+const STYLE_TAG_DOM_ID = 'dsh-remote-styles'
 if (typeof document !== 'undefined' && document.querySelector(`style[data-plugin-css="${STYLE_TAG_ID}"]`) === null) {
   const tag = document.createElement('style')
+  tag.id = STYLE_TAG_DOM_ID
   tag.dataset.plugin = 'dsh-remote-plugin'
   tag.dataset.pluginCss = STYLE_TAG_ID
   tag.textContent = CARD_CSS
@@ -153,36 +177,51 @@ if (typeof document !== 'undefined' && document.querySelector(`style[data-plugin
 
 // ── 基础控件 ────────────────────────────────────────────────────────
 
-function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+/** WEB-06：role="switch" 语义 + 空格/回车键盘切换 + 可选无障碍名称。 */
+function Toggle({ checked, onChange, ariaLabel }: { checked: boolean; onChange: (v: boolean) => void; ariaLabel?: string }) {
+  const toggle = (): void => { onChange(!checked) }
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
+      aria-label={ariaLabel}
       className={`dshr-toggle${checked ? ' on' : ''}`}
-      onClick={() => { onChange(!checked) }}
+      onClick={toggle}
+      onKeyDown={(event) => {
+        // 显式键盘切换；preventDefault 抑制按钮原生激活，避免一次按键触发两下
+        if (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar') {
+          event.preventDefault()
+          toggle()
+        }
+      }}
     >
       <span className="dshr-toggle-thumb" />
     </button>
   )
 }
 
+/** WEB-06：label 用 htmlFor 与输入框关联，hint 走 aria-describedby。 */
 function TextField({ label, value, onChange, hint, placeholder, password }: {
   label: string; value: string; onChange: (v: string) => void; hint?: string; placeholder?: string; password?: boolean
 }) {
+  const id = useId()
+  const hintId = hint !== undefined ? `${id}-hint` : undefined
   return (
     <div className="dshr-field">
-      <span className="dshr-label">{label}</span>
+      <label className="dshr-label" htmlFor={id}>{label}</label>
       <input
+        id={id}
         className="dshr-input"
         type={password === true ? 'password' : 'text'}
         autoComplete="off"
         spellCheck={false}
         placeholder={placeholder}
         value={value}
+        aria-describedby={hintId}
         onChange={event => { onChange(event.target.value) }}
       />
-      {hint !== undefined ? <span className="dshr-hint">{hint}</span> : null}
+      {hint !== undefined ? <span className="dshr-hint" id={hintId}>{hint}</span> : null}
     </div>
   )
 }
@@ -204,17 +243,34 @@ export function DshRemoteSettingsCard() {
   const [open, setOpen] = useState(false)
   const [form, setForm] = useState<any>(null)
   const [status, setStatus] = useState<any>(null)
-  const [saving, setSaving] = useState(false)
+  // WEB-03：统一忙碌锁，覆盖全部操作按钮（保存 与 重启网关）；
+  // 值为在途操作类别，用于按钮文案与禁用判定。
+  const [busy, setBusy] = useState<'save' | 'restart' | null>(null)
   const [message, setMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
   const [authToken, setAuthToken] = useState('')
   const [visitorKey, setVisitorKey] = useState('')
 
+  // WEB-03：两条请求链路各持一个 AbortController——
+  // opAbortRef：配置读取 + 保存/重启（互斥操作）；
+  // statusAbortRef：状态轮询。新请求发起时 abort 本链路旧请求；卸载时全断。
+  const opAbortRef = useRef<AbortController | null>(null)
+  const statusAbortRef = useRef<AbortController | null>(null)
+
+  useEffect(() => () => {
+    opAbortRef.current?.abort()
+    statusAbortRef.current?.abort()
+  }, [])
+
   const refreshStatus = useCallback(() => {
-    fetchJson('/dsh-remote/status').then(setStatus).catch(() => setStatus(null))
+    const signal = beginRequest(statusAbortRef)
+    fetchJson('/dsh-remote/status', { signal })
+      .then(setStatus)
+      .catch((error: unknown) => { if (!isAbortError(error)) setStatus(null) })
   }, [])
 
   useEffect(() => {
-    fetchJson('/dsh-remote/config')
+    const signal = beginRequest(opAbortRef)
+    fetchJson('/dsh-remote/config', { signal })
       .then((payload) => {
         // 文件里可能只有部分键；用展示默认值补齐，避免受控组件抖动
         const merged = {
@@ -230,21 +286,26 @@ export function DshRemoteSettingsCard() {
         setAuthToken(typeof payload.secrets?.authToken === 'string' ? payload.secrets.authToken : '')
         setVisitorKey(typeof payload.secrets?.visitorKey === 'string' ? payload.secrets.visitorKey : '')
       })
-      .catch(() => setMessage({ kind: 'err', text: '读取配置失败（插件路由不可达）' }))
+      .catch((error: unknown) => {
+        if (!isAbortError(error)) setMessage({ kind: 'err', text: '读取配置失败（插件路由不可达）' })
+      })
     refreshStatus()
   }, [refreshStatus])
 
   useEffect(() => {
-    if (!open) return undefined
+    // 忙碌期间暂停轮询：既避免轮询请求打断在途保存/重启，
+    // 也避免重启过程中拿到的过渡态状态刷屏。
+    if (!open || busy !== null) return undefined
     const timer = setInterval(refreshStatus, 5000)
     return () => { clearInterval(timer) }
-  }, [open, refreshStatus])
+  }, [open, busy, refreshStatus])
 
   const patchForm = (patch: any): void => {
     setForm((current: any) => ({ ...current, ...patch }))
   }
 
   const save = async (): Promise<void> => {
+    if (busy !== null) return
     setMessage(null)
     if (form.frp.enabled) {
       if (!authToken.trim() || !visitorKey.trim() || !String(form.frp.serverAddr ?? '').trim()) {
@@ -252,7 +313,8 @@ export function DshRemoteSettingsCard() {
         return
       }
     }
-    setSaving(true)
+    setBusy('save')
+    const signal = beginRequest(opAbortRef)
     try {
       const payload: Record<string, unknown> = {
         autoStart: form.autoStart,
@@ -271,7 +333,7 @@ export function DshRemoteSettingsCard() {
         payload.authToken = authToken.trim()
         payload.visitorKey = visitorKey.trim()
       }
-      const result = await fetchJson('/dsh-remote/config', { method: 'POST', body: JSON.stringify(payload) })
+      const result = await fetchJson('/dsh-remote/config', { method: 'POST', body: JSON.stringify(payload), signal })
       if (result.ok === true) {
         setMessage({ kind: 'ok', text: '已保存并重启网关（几秒后生效）' })
         setTimeout(refreshStatus, 2500)
@@ -279,20 +341,25 @@ export function DshRemoteSettingsCard() {
         setMessage({ kind: 'err', text: Array.isArray(result.errors) ? result.errors.join('；') : '保存失败' })
       }
     } catch (error) {
-      setMessage({ kind: 'err', text: `保存失败：${String(error)}` })
+      if (!isAbortError(error)) setMessage({ kind: 'err', text: `保存失败：${String(error)}` })
     } finally {
-      setSaving(false)
+      setBusy(null)
     }
   }
 
   const restartGateway = async (): Promise<void> => {
+    if (busy !== null) return
     setMessage(null)
+    setBusy('restart')
+    const signal = beginRequest(opAbortRef)
     try {
-      await fetchJson('/dsh-remote/restart', { method: 'POST' })
+      await fetchJson('/dsh-remote/restart', { method: 'POST', signal })
       setMessage({ kind: 'ok', text: '重启指令已发出' })
       setTimeout(refreshStatus, 3000)
     } catch (error) {
-      setMessage({ kind: 'err', text: `重启失败：${String(error)}` })
+      if (!isAbortError(error)) setMessage({ kind: 'err', text: `重启失败：${String(error)}` })
+    } finally {
+      setBusy(null)
     }
   }
 
@@ -335,12 +402,12 @@ export function DshRemoteSettingsCard() {
           <div className="dshr-body">
             <div className="dshr-section">常规</div>
             <Row label="DSH 启动时自动拉起网关">
-              <Toggle checked={form.autoStart} onChange={v => { patchForm({ autoStart: v }) }} />
+              <Toggle checked={form.autoStart} ariaLabel="DSH 启动时自动拉起网关" onChange={v => { patchForm({ autoStart: v }) }} />
             </Row>
 
             <div className="dshr-section">远程隧道</div>
             <Row label="启用 frp 隧道" hint="需要 VPS 上已部署 frps；手机凭访客密钥连入，无需扫码">
-              <Toggle checked={form.frp.enabled} onChange={v => { patchForm({ frp: { ...form.frp, enabled: v } }) }} />
+              <Toggle checked={form.frp.enabled} ariaLabel="启用 frp 隧道" onChange={v => { patchForm({ frp: { ...form.frp, enabled: v } }) }} />
             </Row>
             {form.frp.enabled
               ? (
@@ -409,11 +476,11 @@ export function DshRemoteSettingsCard() {
               : null}
 
             <div className="dshr-actions">
-              <button type="button" className="dshr-btn primary" disabled={saving} onClick={() => { void save() }}>
-                {saving ? '保存中…' : '保存并重启网关'}
+              <button type="button" className="dshr-btn primary" disabled={busy !== null} onClick={() => { void save() }}>
+                {busy === 'save' ? '保存中…' : '保存并重启网关'}
               </button>
-              <button type="button" className="dshr-btn" onClick={() => { void restartGateway() }}>
-                重启网关
+              <button type="button" className="dshr-btn" disabled={busy !== null} onClick={() => { void restartGateway() }}>
+                {busy === 'restart' ? '重启中…' : '重启网关'}
               </button>
             </div>
 
@@ -430,6 +497,11 @@ export const inject = ['slots']
 export const name = 'dsh-remote-plugin'
 
 export function apply(ctx: ClientContext): void {
+  // PLG-07：ctx dispose（HMR 重载/插件卸载）时移除本插件注入的卡片样式，
+  // 防重复注入。loader 侧对 data-plugin 标签已有清理，按 id 移除幂等兜底。
+  ctx.effect?.(() => () => {
+    if (typeof document !== 'undefined') document.getElementById(STYLE_TAG_DOM_ID)?.remove()
+  }, 'dsh-remote-plugin: card styles')
   try {
     ctx.slots.inject('settings.plugin.item', () => {
       try {

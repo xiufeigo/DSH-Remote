@@ -1,4 +1,13 @@
 # 与 DSH Desktop 一致：推送 v* tag 即构建并发布 GitHub Release。
+#
+# CI-01：APK 签名连续性——发布构建必须使用仓库固定的签名 keystore，
+# 由 GitHub Secrets 提供（仓库管理员在 Settings → Secrets and variables → Actions 配置）：
+#   RELEASE_KEYSTORE_B64  = base64 编码的 keystore 文件（base64 -w0 dsh-remote.jks）
+#   RELEASE_KEYSTORE_PASS = keystore/私钥密码（两者相同最省事）
+#   RELEASE_KEY_ALIAS     = 密钥别名
+# 与 android/build.ps1 的合约：CI 解码 keystore 到 ~/.android/dsh-remote.jks，
+# 并以 DSH_RELEASE=1 + DSH_KEYSTORE_PASS + DSH_KEY_ALIAS 环境变量调用构建脚本；
+# 发布模式下缺 keystore 时 build.ps1 直接失败（不再就地生成一次性密钥）。
 name: release
 
 on:
@@ -40,18 +49,41 @@ jobs:
           sdkmanager --install "platforms;android-36" "build-tools;35.0.0" >/dev/null
           yes | sdkmanager --licenses >/dev/null || true
 
-      - name: 构建签名 APK
+      # CI-01：从 Secrets 解码固定 keystore；缺失时（fork、无 Secrets 的手动触发）
+      # 跳过发布签名构建并给出提示，而不是生成一次性密钥污染签名链。
+      - name: 准备发布签名 keystore（Secrets 缺失则跳过发布构建）
+        env:
+          RELEASE_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$RELEASE_KEYSTORE_B64" ]; then
+            echo "::notice::未配置 RELEASE_KEYSTORE_B64/RELEASE_KEYSTORE_PASS/RELEASE_KEY_ALIAS（常见于 fork 或手动触发）：跳过发布签名构建。仓库管理员请配置 Secrets 后重跑，保证 APK 签名可覆盖升级。"
+            echo "DSH_HAS_RELEASE_KEYSTORE=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          mkdir -p "$HOME/.android"
+          printf '%s' "$RELEASE_KEYSTORE_B64" | base64 -d > "$HOME/.android/dsh-remote.jks"
+          chmod 600 "$HOME/.android/dsh-remote.jks"
+          echo "DSH_HAS_RELEASE_KEYSTORE=1" >> "$GITHUB_ENV"
+          echo "keystore 已写入 ~/.android/dsh-remote.jks"
+
+      - name: 构建签名 APK（发布路径：必须使用仓库 keystore）
+        if: env.DSH_HAS_RELEASE_KEYSTORE == '1'
         working-directory: android
         env:
           ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+          DSH_RELEASE: "1"
+          DSH_KEYSTORE_PASS: ${{ secrets.RELEASE_KEYSTORE_PASS }}
+          DSH_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
         run: pwsh -NoProfile -File ./build.ps1
 
       - name: 按 tag 重命名产物
+        if: env.DSH_HAS_RELEASE_KEYSTORE == '1'
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           cp android/dist/dsh-remote.apk "android/dist/dsh-remote-${TAG}.apk"
 
       - name: 上传 APK
+        if: env.DSH_HAS_RELEASE_KEYSTORE == '1'
         uses: actions/upload-artifact@v4
         with:
           name: dsh-remote-apk
@@ -59,7 +91,7 @@ jobs:
           if-no-files-found: error
 
       - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && env.DSH_HAS_RELEASE_KEYSTORE == '1'
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true

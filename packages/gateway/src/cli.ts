@@ -11,12 +11,14 @@
  *   dsh-remote doctor             体检：证书/端口/上游指纹/frp 配置
  */
 
+import { open, readFile, unlink } from "node:fs/promises";
 import { connect } from "node:net";
+import { join } from "node:path";
 import process from "node:process";
 import { GatewayServer } from "./server.ts";
 import { Store } from "./store.ts";
-import type { GatewayConfig } from "./config.ts";
-import { normalizeFrpMode, normalizeTunnelName, renderVisitorToml, visitorConnectionString } from "./frp.ts";
+import { applyEnvOverrides, type GatewayConfig, normalizeEdgeFrpRole } from "./config.ts";
+import { normalizeFrpMode, normalizeTunnelName, renderVisitorToml, visitorBindPortOf, visitorConnectionString } from "./frp.ts";
 
 interface CliArgs {
 	command: string;
@@ -31,13 +33,19 @@ function parseArgs(argv: string[]): CliArgs {
 	for (let i = 0; i < tokens.length; i += 1) {
 		const token = tokens[i];
 		if (token.startsWith("--")) {
-			const key = token.slice(2);
-			const next = tokens[i + 1];
-			if (next !== undefined && !next.startsWith("--")) {
-				flags.set(key, next);
-				i += 1;
+			const body = token.slice(2);
+			const eq = body.indexOf("=");
+			if (eq >= 0) {
+				// CLI-03：支持 --flag=value；只按第一个 = 拆分，值本身可含 =
+				flags.set(body.slice(0, eq), body.slice(eq + 1));
 			} else {
-				flags.set(key, true);
+				const next = tokens[i + 1];
+				if (next !== undefined && !next.startsWith("--")) {
+					flags.set(body, next);
+					i += 1;
+				} else {
+					flags.set(body, true);
+				}
 			}
 		} else {
 			rest.push(token);
@@ -60,7 +68,11 @@ const USAGE = `dsh-remote —— DSH Desktop 远程控制网关
   dsh-remote doctor               全面体检
 
 环境变量：
-  DSH_REMOTE_HOME                 数据目录（默认 ~/.dsh-remote）`;
+  DSH_REMOTE_HOME                 数据目录（默认 ~/.dsh-remote）
+  DSHR_ROLE=edge                  切换 edge 部署角色（服务器侧网关）
+  DSHR_ACCESS_TOKEN               前置访问 Token（明文仅用于首启哈希持久化）
+  DSHR_FRP_ROLE=off|visitor|frps  edge 的 frp 形态
+  其余 DSHR_* 见 docs/edge-deployment.md`;
 
 async function main(): Promise<number> {
 	const { command, flags, rest } = parseArgs(process.argv.slice(2));
@@ -103,28 +115,110 @@ async function main(): Promise<number> {
 
 // ---------- start ----------
 
+/** 锁文件里的 pid 是否还活着（信号 0 探测；EPERM 说明进程存在但无权发信号）。 */
+function isPidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+/**
+ * CLI-01：获取单实例排他锁 <home>/gateway.lock（'wx' 新建并写入 pid）。
+ * - 拿到返回锁文件路径（调用方负责退出时清理）；冲突返回 undefined。
+ * - 陈旧锁（上次崩溃/硬杀残留、记录 pid 已不存在）自动清除并重抢一次；
+ *   pid 复用导致误判存活时，按提示手工删除锁文件即可恢复。
+ */
+async function acquireInstanceLock(store: Store): Promise<string | undefined> {
+	const lockPath = join(store.home, "gateway.lock");
+	try {
+		const fd = await open(lockPath, "wx");
+		await fd.writeFile(`${String(process.pid)}\n`);
+		await fd.close();
+		return lockPath;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+	}
+	let stalePid = Number.NaN;
+	try {
+		stalePid = Number.parseInt((await readFile(lockPath, "utf8")).trim(), 10);
+	} catch {
+		// 读不出来按陈旧锁处理，尝试清除重抢
+	}
+	if (Number.isInteger(stalePid) && stalePid > 0 && isPidAlive(stalePid)) {
+		console.error(`已有网关实例在运行（pid=${String(stalePid)}，锁文件 ${lockPath}）。`);
+		return undefined;
+	}
+	await unlink(lockPath).catch(() => {});
+	try {
+		const fd = await open(lockPath, "wx");
+		await fd.writeFile(`${String(process.pid)}\n`);
+		await fd.close();
+		console.error(`[dsh-remote] 已清除陈旧锁文件（原 pid=${Number.isInteger(stalePid) ? String(stalePid) : "不可读"}）`);
+		return lockPath;
+	} catch {
+		console.error(`已有网关实例在运行（锁文件 ${lockPath}）。`);
+		return undefined;
+	}
+}
+
 async function cmdStart(store: Store, flags: Map<string, string | boolean>): Promise<number> {
 	if (flags.get("daemon") === true) {
 		console.error("后台化请交给 cordis 插件或系统服务管理；本命令保持前台。");
 		return 1;
 	}
-	const config = await store.loadConfig();
-	const server = new GatewayServer({
-		store,
-		config,
-		log: (line) => console.log(`[dsh-remote] ${line}`),
-	});
+	// CLI-01：单实例排他锁——防止双开网关并发写 state/ 文件
+	const lockPath = await acquireInstanceLock(store);
+	if (lockPath === undefined) return 1;
+	try {
+		const config = applyEnvOverrides(await store.loadConfig());
+		const server = new GatewayServer({
+			store,
+			config,
+			log: (line) => console.log(`[dsh-remote] ${line}`),
+		});
 
-	const quit = () => {
-		void (async () => {
-			await server.stop();
-			process.exit(0);
-		})();
-	};
-	process.on("SIGINT", quit);
-	process.on("SIGTERM", quit);
-	await server.start();
+		let isStopping = false;
+		const quit = () => {
+			// CLI-02：连按 Ctrl-C 防重入——重复进入会让 server.stop() 二次
+			// close() 抛 ERR_SERVER_NOT_RUNNING 成为未捕获 rejection
+			if (isStopping) return;
+			isStopping = true;
+			void (async () => {
+				await server.stop();
+			})()
+				.catch((error: unknown) => {
+					console.error(`[dsh-remote] 关闭时出错：${error instanceof Error ? error.message : String(error)}`);
+				})
+				.finally(() => {
+					// CLI-01：正常退出删除锁文件
+					void unlink(lockPath).catch(() => {}).finally(() => process.exit(0));
+				});
+		};
+		process.on("SIGINT", quit);
+		process.on("SIGTERM", quit);
+		await server.start();
 
+		if (config.role === "edge") {
+			printEdgeBanner(config, server.actualPort ?? config.listenPort);
+		} else {
+			printDesktopBanner(config, server);
+		}
+
+		// 守护模式：挂住事件循环直到收到信号（server 句柄本身不会让 main 结束，
+		// 必须显式永不 resolve，否则上方的 process.exit 会立即杀掉网关）
+		await new Promise<never>(() => {});
+		return 0;
+	} catch (error) {
+		// CLI-01：启动失败路径同样清理锁文件，否则需手工删除才能重启
+		await unlink(lockPath).catch(() => {});
+		throw error;
+	}
+}
+
+function printDesktopBanner(config: GatewayConfig, server: { actualPort?: number }): void {
 	const frpMode = normalizeFrpMode(config.frp.mode);
 	const frpEntry = config.frp.enabled && typeof config.frp.serverAddr === "string" && frpMode === "entry";
 	const entry = frpEntry
@@ -136,11 +230,18 @@ async function cmdStart(store: Store, flags: Map<string, string | boolean>): Pro
 	}
 	console.log(`[dsh-remote] 上游：http://127.0.0.1:${String(config.upstreamPort)}（DSH Web GUI）`);
 	if (!config.frp.enabled) console.log("[dsh-remote] 提示：config.json 里 frp.enabled=true 后将自动托管 frpc");
+}
 
-	// 守护模式：挂住事件循环直到收到信号（server 句柄本身不会让 main 结束，
-	// 必须显式永不 resolve，否则上方的 process.exit 会立即杀掉网关）
-	await new Promise<never>(() => {});
-	return 0;
+function printEdgeBanner(config: GatewayConfig, port: number): void {
+	const role = normalizeEdgeFrpRole(config.frp.edge);
+	const upstream = config.upstreamHost ?? "127.0.0.1";
+	const bind = visitorBindPortOf(config.frp);
+	const upstreamText = role === "off"
+		? `http://${upstream}:${String(config.upstreamPort)}`
+		: `http://127.0.0.1:${String(bind)}（visitor 本地绑定口）`;
+	console.log(`[dsh-remote] edge 角色：frp=${role}；上游：${upstreamText}`);
+	console.log(`[dsh-remote] 监听：https://${config.listenHost}:${String(port)}（请用 Caddy/nginx 反代并签发正式证书后对外）`);
+	console.log("[dsh-remote] 认证：访问 Token 登录 → 自动配对设备；未配置 Token 时退化为配对码认证");
 }
 
 // ---------- pair ----------
@@ -289,7 +390,8 @@ async function cmdStatus(store: Store): Promise<number> {
 // ---------- doctor ----------
 
 async function cmdDoctor(store: Store): Promise<number> {
-	const config = await store.loadConfig();
+	const config = applyEnvOverrides(await store.loadConfig());
+	if (config.role === "edge") return cmdDoctorEdge(store, config);
 	const { hasDshFingerprint, listLoopbackListeners, resolveUpstreamPort } = await import("./upstream.ts");
 	const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
 
@@ -383,6 +485,84 @@ async function cmdDoctor(store: Store): Promise<number> {
 }
 
 // ---------- 工具 ----------
+
+/** edge 角色体检：Token 门禁 / frp 角色 / 二进制与端口。 */
+async function cmdDoctorEdge(store: Store, config: GatewayConfig): Promise<number> {
+	const { ensureAccessTokenHash } = await import("./auth.ts");
+	const { locateFrBinary } = await import("./frp.ts");
+	const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
+
+	const tokenHash = await ensureAccessTokenHash(store);
+	checks.push({
+		name: "访问 Token 门禁",
+		ok: tokenHash !== undefined,
+		detail: tokenHash !== undefined
+			? `已配置（SHA-256 ${tokenHash.slice(0, 12)}…；轮换 = 修改 DSHR_ACCESS_TOKEN 后重启）`
+			: "未配置 —— 公网入口退化为配对码认证，强烈建议设置 DSHR_ACCESS_TOKEN",
+	});
+
+	const role = normalizeEdgeFrpRole(config.frp.edge);
+	checks.push({
+		name: "frp 角色",
+		ok: true,
+		detail: role === "off"
+			? "off —— 上游直连（调试/局域网用）"
+			: role === "visitor"
+				? `visitor → ${config.frp.serverAddr ?? "(缺 serverAddr)"}:${String(config.frp.serverPort)}`
+				: `frps（控制口 ${String(config.frp.serverPort)}，${config.frp.edgeConsume === "entry-port" ? "entry-port 消费" : "stcp 回环消费"}）`,
+	});
+
+	if (role !== "off" && typeof config.frp.serverAddr === "string") {
+		const controlOk = await probeTcp(config.frp.serverAddr, config.frp.serverPort);
+		checks.push({
+			name: `frps 控制端口 ${config.frp.serverAddr}:${String(config.frp.serverPort)}`,
+			ok: controlOk,
+			detail: controlOk ? "可达" : "不可达（frps 未启动或防火墙拦截）",
+		});
+	}
+	if (role === "visitor" || role === "frps") {
+		const frpcBin = await locateFrBinary("frpc", config.frp, store);
+		checks.push({
+			name: "frpc 二进制（visitor 用）",
+			ok: frpcBin !== undefined,
+			detail: frpcBin ?? `缺失，放到 ${store.path("vendor", "frp")} 下`,
+		});
+	}
+	if (role === "frps") {
+		const frpsBin = await locateFrBinary("frps", config.frp, store);
+		checks.push({
+			name: "frps 二进制",
+			ok: frpsBin !== undefined,
+			detail: frpsBin ?? `缺失，放到 ${store.path("vendor", "frp")} 下`,
+		});
+	}
+	if (role !== "off") {
+		const bindPort = visitorBindPortOf(config.frp);
+		const bindBusy = await probeTcp("127.0.0.1", bindPort, 800);
+		checks.push({
+			name: `visitor 绑定口 127.0.0.1:${String(bindPort)}`,
+			ok: true,
+			detail: bindBusy ? "已有监听（网关/visitor 运行中）" : "空闲（网关未运行或 visitor 未连上）",
+		});
+	}
+
+	const listenLoopback = config.listenHost === "127.0.0.1" || config.listenHost === "::1";
+	checks.push({
+		name: "网关监听面",
+		ok: listenLoopback,
+		detail: listenLoopback
+			? `${config.listenHost}:${String(config.listenPort)}（仅本机——由反代对外）`
+			: `${config.listenHost}:${String(config.listenPort)} —— 容器/内网监听；务必置于 Caddy/nginx 之后再暴露公网`,
+	});
+
+	let failed = 0;
+	for (const check of checks) {
+		if (!check.ok) failed += 1;
+		console.log(`${check.ok ? "✓" : "✗"} ${check.name} —— ${check.detail}`);
+	}
+	console.log(failed === 0 ? "\n体检通过 ✅" : `\n${failed} 项未过 ❌`);
+	return failed === 0 ? 0 : 1;
+}
 
 function entryUrl(config: GatewayConfig, port: number): string {
 	return `https://${typeof config.frp.serverAddr === "string" && config.frp.enabled ? config.frp.serverAddr : config.listenHost}:${String(port)}/`;
