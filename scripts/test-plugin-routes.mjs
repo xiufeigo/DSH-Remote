@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createRouteHandlers, readTunnelSnapshot, resolveRemoteHome } from "../packages/plugin/lib/index.js";
 import { validateConfigPatch, mergeConfigFile, DISPLAY_DEFAULTS } from "../packages/plugin/lib/config-schema.js";
@@ -160,6 +160,63 @@ test("handleConfigPost：密钥写入 secrets.json 且不进 config", async () =
 	assert.equal(writtenConfig.frp.serverAddr, "9.9.9.9");
 	assert.equal(writtenConfig.authToken, undefined);
 	assert.deepEqual(writtenSecrets, { frpAuthToken: "login-key", frpVisitorKey: "visit-key" });
+});
+
+test("handleConfigPost：写密钥时保留 secrets.json 的未知字段（adminToken/accessTokenHash）", async () => {
+	// P0-2 联动：网关把 adminToken（管理端点共享密钥）与 accessTokenHash
+	// （edge 门禁哈希）也存在 state/secrets.json。插件保存密钥时整体重写
+	// 只留两个 frp 键会把它们抹掉 —— 重启前插件自己就 403，edge 门禁哈希丢失。
+	let writtenSecrets = null;
+	const handlers = createRouteHandlers({
+		home: ".",
+		log: () => {},
+		readConfig: () => ({ frp: { enabled: false } }),
+		writeConfig: async () => {},
+		readSecrets: () => ({
+			frpAuthToken: "old-login",
+			frpVisitorKey: "old-visit",
+			adminToken: "gw-admin-shared-secret",
+			accessTokenHash: "sha256hex",
+		}),
+		writeSecrets: async (next) => { writtenSecrets = next; },
+		restartGateway: () => {},
+		adminRequest: async () => undefined,
+	});
+	const res = fakeRes();
+	await handlers.handleConfigPost(
+		fakeReq(JSON.stringify({
+			frp: { enabled: true, serverAddr: "9.9.9.9", serverPort: 7000, mode: "xtcp" },
+			authToken: "login-key",
+			visitorKey: "visit-key",
+		})),
+		res,
+	);
+	assert.equal(res.calls.status, 200);
+	assert.equal(writtenSecrets.frpAuthToken, "login-key", "提交的登录密钥生效");
+	assert.equal(writtenSecrets.frpVisitorKey, "visit-key", "提交的访客密钥生效");
+	assert.equal(writtenSecrets.adminToken, "gw-admin-shared-secret",
+		"P0-2 adminToken 必须原样保留（整体重写会抹掉网关门禁密钥 → 保存后插件请求全 403）");
+	assert.equal(writtenSecrets.accessTokenHash, "sha256hex", "accessTokenHash 必须原样保留（edge 门禁哈希）");
+});
+
+test("writeJsonAtomic：tab 缩进落盘 + 0600 + 无 tmp 残留（P2-7/GW-07）", async () => {
+	const { writeJsonAtomic } = await import("../packages/plugin/lib/index.js");
+	assert.equal(typeof writeJsonAtomic, "function", "writeJsonAtomic 应作为模块导出（便于单测）");
+	const dir = await makeTempHome("dshr-atomic-");
+	const target = join(dir, "state", "secrets.json");
+	await writeJsonAtomic(target, { a: 1, nested: { b: 2 } });
+	assert.equal(
+		await readFile(target, "utf8"),
+		`${JSON.stringify({ a: 1, nested: { b: 2 } }, null, "\t")}\n`,
+		"落盘格式必须与网关 Store.writeAtomic 一致（tab 缩进 + 尾随换行）",
+	);
+	const stateEntries = await readdir(join(dir, "state"));
+	assert.deepEqual(stateEntries, ["secrets.json"], "成功路径不得残留 .tmp-* 临时文件（GW-01）");
+	if (process.platform !== "win32") {
+		const mode = (await stat(target)).mode & 0o777;
+		assert.equal(mode, 0o600, "POSIX 敏感文件必须 0600（rename 不得回退 umask 默认 0644）");
+	}
+	await rm(dir, { recursive: true, force: true });
 });
 
 test("handleConfigPost：非法补丁 → 400 且不写盘不重启", async () => {

@@ -269,6 +269,72 @@ test("delivery：下发成功；网关未就绪时重试并放弃；令牌更换
 	assert.equal(sent[0].port, 18443);
 });
 
+test("delivery：在途请求返回成功瞬间令牌已被顶替 → 新令牌必须重新投递（P1-4 回归）", async () => {
+	// PoC 场景：旧值送达成功那一刻新令牌已就位。旧代码 deliver() 首行快照
+	// value，setToken(tok-2) 的 deliver() 因 delivering 互斥直接 return false，
+	// 旧值 200 后整轮结束 —— tok-2 永不投递，会话永不自愈。
+	const sent = [];
+	let releaseFirst;
+	const gate = new Promise((resolve) => { releaseFirst = resolve; });
+	let first = true;
+	const delivery = createLaunchTokenDelivery({
+		port: () => 18443,
+		requestAdmin: async (port, path, method, body) => {
+			sent.push(body);
+			if (first) {
+				first = false;
+				await gate; // 首次请求挂在途：构造「网关未响应期间 DSH 重启换令牌」窗口
+			}
+			return { status: 200, body: '{"ok":true}' };
+		},
+		retryDelayMs: 1,
+		attempts: 5,
+	});
+	delivery.setToken("tok-1");
+	await waitFor("tok-1 首次下发请求已发出", () => sent.length >= 1);
+	delivery.setToken("tok-2");
+	releaseFirst();
+	await waitFor("被顶替的新令牌 tok-2 完成投递", () => sent.some((body) => body?.includes("tok-2")), 5_000);
+	assert.equal(delivery.token, "tok-2");
+});
+
+test("delivery：重试等待期间令牌被顶替 → 放弃旧值以新值重开（P1-4 回归·重试路径）", async () => {
+	// 网关持续 502 的重试循环中途换令牌：旧代码旧值耗尽预算（或先一步 200）
+	// 后整轮结束，新令牌因互斥早被丢弃。新代码重试循环顶检测到顶替即放弃
+	// 旧值、以新令牌重开（含全新重试预算）。
+	const sent = [];
+	let releaseFirst;
+	const gate = new Promise((resolve) => { releaseFirst = resolve; });
+	let mode = "down";
+	let calls = 0;
+	const delivery = createLaunchTokenDelivery({
+		port: () => 18443,
+		requestAdmin: async (port, path, method, body) => {
+			calls += 1;
+			sent.push(body);
+			if (calls === 1) {
+				await gate; // tok-1 首次请求挂在途，返回 502 进入重试
+				return { status: 502, body: "nope" };
+			}
+			return mode === "down" ? { status: 502, body: "nope" } : { status: 200, body: '{"ok":true}' };
+		},
+		retryDelayMs: 1,
+		attempts: 5,
+	});
+	delivery.setToken("tok-1");
+	await waitFor("tok-1 首次下发请求已发出", () => sent.length >= 1);
+	// 在途期间：换令牌 + 网关恢复。旧代码 tok-1 的 attempt-2 会以 200 成功
+	// 结束整轮（tok-2 丢失）；新代码 attempt-2 循环顶检测顶替后投 tok-2。
+	mode = "ok";
+	delivery.setToken("tok-2");
+	releaseFirst();
+	await waitFor("重试中被顶替的 tok-2 完成投递", () => sent.some((body) => body?.includes("tok-2")), 5_000);
+	assert.ok(
+		sent.filter((body) => body?.includes("tok-1")).length <= 5,
+		"旧令牌不因顶替重置预算被放大投递",
+	);
+});
+
 // ---------- Part 5：集成 —— 真实网关 + 假上游 ----------
 
 const TOKEN = "e2e-launch-token";
@@ -430,4 +496,20 @@ test("集成：上游 401 → 网关重铸会话 cookie → 自愈", async () =>
 		return again.status === 200;
 	}, 15_000);
 	assert.equal(upstreamSeen.cookie, "dsh-auth-e2e=e2eCookieV1");
+});
+
+test("集成：插件 requestAdmin 携带 x-dshr-admin-token 通过网关三重门（P0-2 配接）", async () => {
+	// 插件真实接线 × 网关真实门禁：不带密钥头的 admin 请求一律 403（P0-2）。
+	// 三态断言与网关侧 test:fixes 的 P0-2 用例同形态：正确头 200 / 无头 403 / 错头 403。
+	const { requestAdmin, readAdminToken } = await import("../packages/plugin/lib/index.js");
+	// 插件读法：从网关 home 的 state/secrets.json 现读 adminToken（每请求现读，
+	// 网关重启轮换后插件无须重启即可跟上）
+	const token = readAdminToken(gw.home);
+	assert.equal(token, adminToken, "插件读出的 adminToken 必须与网关 ensureSecrets 落盘一致");
+	const allowed = await requestAdmin(gw.port, "/__dsh_remote__/admin/status", "GET", undefined, token);
+	assert.equal(allowed?.status, 200, `正确密钥头必须放行：${allowed?.body ?? ""}`);
+	const noHeader = await requestAdmin(gw.port, "/__dsh_remote__/admin/status", "GET", undefined, undefined);
+	assert.equal(noHeader?.status, 403, "无 x-dshr-admin-token 头必须 403（读不到密钥不发头：旧版网关兼容）");
+	const wrongHeader = await requestAdmin(gw.port, "/__dsh_remote__/admin/status", "GET", undefined, "wrong-token");
+	assert.equal(wrongHeader?.status, 403, "错误密钥头必须 403");
 });

@@ -97,9 +97,34 @@ export function readTunnelSnapshot(home) {
 	}
 }
 
-function requestAdmin(port, path, method = "GET", body) {
+/**
+ * P0-2：读网关共享管理密钥（home 下 state/secrets.json 的 adminToken）。
+ * 每次请求现读而非启动缓存（readFileSync 开销可忽略）：网关重启轮换
+ * adminToken 后插件无须重启即可跟上，避免「插件持旧密钥 + 网关已轮换」
+ * 的 403 悬挂。读不到（旧版网关未写该键 / 文件缺失）返回 undefined。
+ */
+export function readAdminToken(home) {
+	try {
+		const value = JSON.parse(readFileSync(join(home, "state", "secrets.json"), "utf8")).adminToken;
+		return typeof value === "string" && value.length > 0 ? value : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * 请求网关管理端点。P0-2 起网关对 /__dsh_remote__/admin/* 加了三重门
+ * （回环 + 同源 + 共享密钥），adminToken 非空时随请求携带
+ * x-dshr-admin-token 头（头名与网关 auth.ts ADMIN_TOKEN_HEADER 一致）；
+ * 不携带该头的请求一律 403。读不到密钥时不发该头 —— 对无此门禁的
+ * 旧版网关零影响。
+ */
+export function requestAdmin(port, path, method = "GET", body, adminToken) {
 	return new Promise((resolveRequest) => {
 		const headers = {};
+		if (typeof adminToken === "string" && adminToken.length > 0) {
+			headers["x-dshr-admin-token"] = adminToken;
+		}
 		if (typeof body === "string" && body.length > 0) {
 			headers["content-type"] = "application/json";
 			headers["content-length"] = Buffer.byteLength(body);
@@ -140,6 +165,28 @@ function readConfigFile(home) {
 		return JSON.parse(readFileSync(configPath(home), "utf8"));
 	} catch {
 		return {};
+	}
+}
+
+/**
+ * 原子写 JSON（tab 缩进 + 尾随换行，与网关 Store.writeAtomic 同格式）。
+ *  - tmp → rename：读者永远看不到半截文件；
+ *  - mode 0o600：POSIX 上敏感文件（config.json / state/secrets.json）一律
+ *    0600 落盘（GW-07 对齐，Windows 忽略 mode 无副作用）——若省略 mode，
+ *    tmp 按默认 0644 创建，rename 会把网关收敛好的 0600 悄悄翻回 0644；
+ *  - 失败时清理残留 tmp（GW-01 对齐）。
+ * 惰性 import fs/promises，保持模块加载零 fs/promises 依赖。
+ */
+export async function writeJsonAtomic(target, obj) {
+	const { writeFile, rename, mkdir, unlink } = await import("node:fs/promises");
+	await mkdir(dirname(target), { recursive: true });
+	const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
+	await writeFile(tmp, `${JSON.stringify(obj, null, "\t")}\n`, { encoding: "utf8", mode: 0o600 });
+	try {
+		await rename(tmp, target);
+	} finally {
+		// 成功时 tmp 已被 rename 走（unlink ENOENT 静默）；失败时清残留
+		await unlink(tmp).catch(() => {});
 	}
 }
 
@@ -236,7 +283,11 @@ export function createRouteHandlers(deps) {
 			if (typeof verdict.secrets?.visitorKey === "string") secretsPatch.frpVisitorKey = verdict.secrets.visitorKey;
 			if (Object.keys(secretsPatch).length > 0) {
 				const currentSecrets = readSecrets() ?? {};
+				// 仅覆盖本插件托管的两个 frp 键，其余字段（网关侧的 adminToken /
+				// accessTokenHash，以及未来新增键）原样保留 —— 整体重写会把
+				// P0-2 管理密钥抹掉，保存后插件自己的 admin 请求全 403。
 				await writeSecrets({
+					...currentSecrets,
 					frpAuthToken: secretsPatch.frpAuthToken ?? currentSecrets.frpAuthToken ?? "",
 					frpVisitorKey: secretsPatch.frpVisitorKey ?? currentSecrets.frpVisitorKey ?? "",
 				});
@@ -318,6 +369,10 @@ export function createRouteHandlers(deps) {
  * }}
  * 网关可能尚未监听（拉起中/重启中），故带有限次退避重试；令牌更换
  * （DSH 进程重启）时重新调用 setToken 即可，网关侧按幂等处理。
+ * P1-4：投递期间令牌被 setToken 顶替时（delivering 互斥使新调直接
+ * 返回 false），在途轮次必须在重试循环顶与送达成功点双重检测顶替并
+ * 放弃旧值、以新令牌重开一轮（含全新重试预算）——否则新令牌会被
+ * 静默丢弃，会话永不自愈。
  */
 export function createLaunchTokenDelivery(deps) {
 	const send = typeof deps.requestAdmin === "function" ? deps.requestAdmin : async () => undefined;
@@ -331,21 +386,35 @@ export function createLaunchTokenDelivery(deps) {
 	let delivering = false;
 
 	async function deliver() {
-		const value = token;
-		if (typeof value !== "string" || isDisposed() || delivering) return false;
+		if (typeof token !== "string" || isDisposed() || delivering) return false;
 		delivering = true;
 		try {
-			for (let attempt = 0; attempt < attempts; attempt += 1) {
-				if (isDisposed()) return false;
-				const response = await send(portOf(), "/__dsh_remote__/admin/launch-token", "POST", JSON.stringify({ token: value }));
-				if (response !== undefined && response.status === 200) {
-					log("已向网关下发 DSH 启动令牌（浏览器会话适配）");
-					return true;
+			for (;;) {
+				const value = token;
+				if (typeof value !== "string" || isDisposed()) return false;
+				let superseded = false;
+				for (let attempt = 0; attempt < attempts; attempt += 1) {
+					if (isDisposed()) return false;
+					if (token !== value) {
+						superseded = true;
+						break;
+					}
+					const response = await send(portOf(), "/__dsh_remote__/admin/launch-token", "POST", JSON.stringify({ token: value }));
+					// 送达成功瞬间也可能已被顶替：此刻必须继续投新值而非收工
+					if (token !== value) {
+						superseded = true;
+						break;
+					}
+					if (response !== undefined && response.status === 200) {
+						log("已向网关下发 DSH 启动令牌（浏览器会话适配）");
+						return true;
+					}
+					await new Promise((resolveWait) => setTimeout(resolveWait, retryDelayMs));
 				}
-				await new Promise((resolveWait) => setTimeout(resolveWait, retryDelayMs));
+				if (superseded || token !== value) continue; // 以新令牌重开一轮（全新预算）
+				warn("网关持续未就绪，本轮启动令牌下发放弃；下次网关拉起后自动重试");
+				return false;
 			}
-			warn("网关持续未就绪，本轮启动令牌下发放弃；下次网关拉起后自动重试");
-			return false;
 		} finally {
 			delivering = false;
 		}
@@ -457,7 +526,9 @@ var plugin_default = {
 				const cfg = readConfigFile(home);
 				return Number.isInteger(cfg.listenPort) ? cfg.listenPort : 18443;
 			},
-			requestAdmin,
+			// P0-2：每次投递现读 adminToken（网关重启轮换后重试自动跟上）
+			requestAdmin: (port, path, method, body) =>
+				requestAdmin(port, path, method, body, readAdminToken(home)),
 			log: (line) => console.log(`${TAG} ${line}`),
 			warn: (line) => console.warn(`${TAG} ${line}`),
 			isDisposed: () => disposed,
@@ -487,7 +558,8 @@ var plugin_default = {
 					const listenPort = Number.isInteger(cfg.listenPort) ? cfg.listenPort : 18443;
 					if (await isPortBound("127.0.0.1", listenPort)) {
 						console.log(`${TAG} 端口 ${String(listenPort)} 仍被占用，请求已有网关退出后重拉`);
-						await requestAdmin(listenPort, "/__dsh_remote__/admin/shutdown", "POST");
+						// P0-2：现读 adminToken —— 若面板刚保存过 secrets，读到的必然是写盘后的新值
+						await requestAdmin(listenPort, "/__dsh_remote__/admin/shutdown", "POST", undefined, readAdminToken(home));
 						for (let i = 0; i < 25; i += 1) {
 							if (!(await isPortBound("127.0.0.1", listenPort))) break;
 							await new Promise((resolveWait) => setTimeout(resolveWait, 200));
@@ -530,14 +602,7 @@ var plugin_default = {
 				home,
 				log: (line) => console.log(`${TAG} ${line}`),
 				readConfig: () => readConfigFile(home),
-				writeConfig: async (next) => {
-					const { writeFile, rename, mkdir } = await import("node:fs/promises");
-					const target = configPath(home);
-					await mkdir(dirname(target), { recursive: true });
-					const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
-					await writeFile(tmp, `${JSON.stringify(next, null, "\t")}\n`, "utf8");
-					await rename(tmp, target);
-				},
+				writeConfig: (next) => writeJsonAtomic(configPath(home), next),
 				readSecrets: () => {
 					try {
 						return JSON.parse(readFileSync(join(home, "state", "secrets.json"), "utf8"));
@@ -545,19 +610,13 @@ var plugin_default = {
 						return {};
 					}
 				},
-				writeSecrets: async (next) => {
-					const { writeFile, rename, mkdir } = await import("node:fs/promises");
-					const target = join(home, "state", "secrets.json");
-					await mkdir(dirname(target), { recursive: true });
-					const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
-					await writeFile(tmp, `${JSON.stringify(next, null, "\t")}\n`, "utf8");
-					await rename(tmp, target);
-				},
+				writeSecrets: (next) => writeJsonAtomic(join(home, "state", "secrets.json"), next),
 				restartGateway,
 				adminRequest: async (path, method = "GET") => {
 					const cfg = readConfigFile(home);
 					const port = Number.isInteger(cfg.listenPort) ? cfg.listenPort : 18443;
-					return await requestAdmin(port, path, method);
+					// P0-2：现读 adminToken 随请求携带（读不到不发头，兼容旧版网关）
+					return await requestAdmin(port, path, method, undefined, readAdminToken(home));
 				},
 			});
 
