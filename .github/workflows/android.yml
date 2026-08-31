@@ -6,6 +6,9 @@ on:
   push:
     paths:
       - "android/**"
+      # WEB-02：APK 内嵌的 res/raw/mobile.js 由 packages/gateway/assets/mobile-web.js
+      # 字节级同步（build.ps1），单一源变更也必须触发 Android 构建。
+      - "packages/gateway/assets/**"
       - ".github/workflows/android.yml"
   workflow_dispatch:
 

@@ -33,7 +33,6 @@ public class FrpcManager {
 	private Thread watcher;
 	private long backoffMs = 1000;
 	private final StringBuilder tail = new StringBuilder();
-	private String configPathForDebug = "";
 
 	public FrpcManager(Context context) {
 		workDir = context.getFilesDir();
@@ -58,7 +57,6 @@ public class FrpcManager {
 			OutputStream os = new FileOutputStream(conf);
 			os.write(cfg.toToml().getBytes(StandardCharsets.UTF_8));
 			os.close();
-			configPathForDebug = conf.getAbsolutePath();
 
 			ProcessBuilder pb = new ProcessBuilder(binFile.getAbsolutePath(), "-c", conf.getAbsolutePath());
 			pb.redirectErrorStream(true);
@@ -167,10 +165,6 @@ public class FrpcManager {
 		}
 	}
 
-	public boolean isRunning() {
-		return isProcessAlive(process);
-	}
-
 	/** 尾部日志（调试用）。 */
 	public synchronized String tailLog() {
 		return tail.toString();
@@ -185,7 +179,4 @@ public class FrpcManager {
 		}
 	}
 
-	public String getConfigPathForDebug() {
-		return configPathForDebug;
-	}
 }
