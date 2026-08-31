@@ -1,5 +1,6 @@
 /**
- * 移动 hook 资产：`assets/mobile-web.js`（Android 壳 mobile.js 的宽度断点 fork）。
+ * 移动 hook 资产：`assets/mobile-web.js`（WEB-02 单一源——与 Android 壳
+ * `res/raw/mobile.js` 由 android/build.ps1 字节同步，禁止手改 res/raw 副本）。
  *
  * - edge 角色把 `<script>` 标记注入上游 HTML；脚本按视口宽度自行启停 hook：
  *   窄视口（≤ 断点，缺省 980px）套移动布局，宽视口走官方 DSH 桌面布局；
@@ -10,6 +11,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_MOBILE_BREAKPOINT } from "./config.ts";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const ASSET_PATH = join(MODULE_DIR, "..", "assets", "mobile-web.js");
@@ -41,7 +43,7 @@ export async function loadMobileScript(): Promise<MobileScriptAsset | undefined>
 
 /** 注入 <head> 的移动 hook 标记块：断点经内联变量下发，脚本本体走独立路由（带 ETag 缓存）。 */
 export function mobileHeadTags(breakpointPx: number): string {
-	const breakpoint = Number.isFinite(breakpointPx) ? Math.round(breakpointPx) : 980;
+	const breakpoint = Number.isFinite(breakpointPx) ? Math.round(breakpointPx) : DEFAULT_MOBILE_BREAKPOINT;
 	return (
 		`<script>window.__DSHR_MOBILE__={breakpoint:${String(breakpoint)}};</script>` +
 		`<script src="/__dsh_remote__/mobile.js" defer></script>`

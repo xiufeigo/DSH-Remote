@@ -244,12 +244,6 @@ export async function checkRequest(
 	return { ok: true, deviceId: device.id };
 }
 
-/** WebSocket 升级请求同样必须带有效设备 Cookie。 */
-export async function checkUpgrade(req: IncomingMessage, deps: AuthDeps): Promise<boolean> {
-	const result = await checkRequest(req, deps);
-	return result.ok;
-}
-
 // ---------- 配对码 ----------
 
 export function generatePairingCode(): string {

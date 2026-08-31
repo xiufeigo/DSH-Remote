@@ -116,7 +116,7 @@ export function renderFrpcToml(options: {
 serverAddr = "${options.serverAddr}"
 serverPort = ${options.serverPort}
 
-auth.token = "${options.authToken}"
+auth.token = ${tomlString(options.authToken)}
 transport.tls.enable = true
 
 [[proxies]]
@@ -135,13 +135,13 @@ transport.useCompression = false
 serverAddr = "${options.serverAddr}"
 serverPort = ${options.serverPort}
 
-auth.token = "${options.authToken}"
+auth.token = ${tomlString(options.authToken)}
 transport.tls.enable = true
 
 [[proxies]]
 name = "${proxyName}"
 type = "stcp"
-secretKey = "${options.secretKey ?? ""}"
+secretKey = ${tomlString(options.secretKey ?? "")}
 localIP = "127.0.0.1"
 localPort = ${options.localPort}
 transport.useEncryption = false
@@ -155,13 +155,13 @@ transport.useCompression = false
 serverAddr = "${options.serverAddr}"
 serverPort = ${options.serverPort}
 
-auth.token = "${options.authToken}"
+auth.token = ${tomlString(options.authToken)}
 transport.tls.enable = true
 
 [[proxies]]
 name = "${proxyName}-stcp"
 type = "stcp"
-secretKey = "${options.secretKey ?? ""}"
+secretKey = ${tomlString(options.secretKey ?? "")}
 localIP = "127.0.0.1"
 localPort = ${options.localPort}
 transport.useEncryption = false
@@ -170,7 +170,7 @@ transport.useCompression = false
 [[proxies]]
 name = "${proxyName}"
 type = "xtcp"
-secretKey = "${options.secretKey ?? ""}"
+secretKey = ${tomlString(options.secretKey ?? "")}
 localIP = "127.0.0.1"
 localPort = ${options.localPort}
 transport.useEncryption = false
@@ -202,7 +202,7 @@ export function renderVisitorToml(options: {
 serverAddr = "${options.serverAddr}"
 serverPort = ${options.serverPort}
 
-auth.token = "${options.authToken}"
+auth.token = ${tomlString(options.authToken)}
 transport.tls.enable = true
 `;
 	if (mode !== "xtcp") {
@@ -211,7 +211,7 @@ transport.tls.enable = true
 name = "${visitorName}"
 type = "stcp"
 serverName = "${serverName}"
-secretKey = "${options.secretKey ?? ""}"
+secretKey = ${tomlString(options.secretKey ?? "")}
 bindAddr = "${options.bindAddr ?? "127.0.0.1"}"
 bindPort = ${options.bindPort}
 `;
@@ -222,14 +222,14 @@ bindPort = ${options.bindPort}
 name = "${stcpVisitor}"
 type = "stcp"
 serverName = "${serverName}-stcp"
-secretKey = "${options.secretKey ?? ""}"
+secretKey = ${tomlString(options.secretKey ?? "")}
 bindPort = -1
 
 [[visitors]]
 name = "${visitorName}"
 type = "xtcp"
 serverName = "${serverName}"
-secretKey = "${options.secretKey ?? ""}"
+secretKey = ${tomlString(options.secretKey ?? "")}
 bindAddr = "${options.bindAddr ?? "127.0.0.1"}"
 bindPort = ${options.bindPort}
 keepTunnelOpen = true

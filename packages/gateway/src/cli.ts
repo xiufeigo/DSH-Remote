@@ -18,7 +18,10 @@ import process from "node:process";
 import { GatewayServer } from "./server.ts";
 import { Store } from "./store.ts";
 import { applyEnvOverrides, type GatewayConfig, normalizeEdgeFrpRole } from "./config.ts";
-import { normalizeFrpMode, normalizeTunnelName, renderVisitorToml, visitorBindPortOf, visitorConnectionString } from "./frp.ts";
+import { locateFrBinary, locateFrpcBinary, normalizeFrpMode, normalizeTunnelName, renderVisitorToml, visitorBindPortOf, visitorConnectionString } from "./frp.ts";
+import { ensureAccessTokenHash, generatePairingCode } from "./auth.ts";
+import { ensureCert } from "./cert.ts";
+import { hasDshFingerprint, listLoopbackListeners, resolveUpstreamPort } from "./upstream.ts";
 
 interface CliArgs {
 	command: string;
@@ -248,7 +251,6 @@ function printEdgeBanner(config: GatewayConfig, port: number): void {
 
 async function cmdPair(store: Store, flags: Map<string, string | boolean>): Promise<number> {
 	const config = await store.loadConfig();
-	const { generatePairingCode } = await import("./auth.ts");
 	const code = generatePairingCode();
 	const pending = await store.putPendingCode(code, config.pairingCodeMinutes);
 
@@ -313,7 +315,7 @@ async function cmdVisitor(store: Store, flags: Map<string, string | boolean>): P
 	// 网关证书指纹进连接串：App 扫码即完成证书锁定
 	let fingerprint: string | undefined;
 	try {
-		const cert = await (await import("./cert.ts")).ensureCert(store.path("certs"));
+		const cert = await ensureCert(store.path("certs"));
 		fingerprint = cert.fingerprintSha256;
 	} catch {
 		// 拿不到指纹就不放进连接串（App 端退化为不锁定，仅提示）
@@ -368,7 +370,7 @@ async function cmdStatus(store: Store): Promise<number> {
 	console.log(`网关监听      ${config.listenHost}:${String(config.listenPort)} ${await probeTcp(config.listenHost, config.listenPort) ? "[监听中]" : "[未运行]"}`);
 	console.log(`上游 DSH      127.0.0.1:${String(config.upstreamPort)} ${await probeTcp("127.0.0.1", config.upstreamPort) ? "[可达]" : "[不可达]"}`);
 	if (config.frp.enabled) {
-		const binary = await import("./frp.ts").then((mod) => mod.locateFrpcBinary(config.frp, store));
+		const binary = await locateFrpcBinary(config.frp, store);
 		const mode = normalizeFrpMode(config.frp.mode);
 		const shape = mode === "entry"
 			? ` → 公网入口:${String(config.frp.remotePort)}`
@@ -392,8 +394,7 @@ async function cmdStatus(store: Store): Promise<number> {
 async function cmdDoctor(store: Store): Promise<number> {
 	const config = applyEnvOverrides(await store.loadConfig());
 	if (config.role === "edge") return cmdDoctorEdge(store, config);
-	const { hasDshFingerprint, listLoopbackListeners, resolveUpstreamPort } = await import("./upstream.ts");
-	const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
+	const checks: DoctorCheck[] = [];
 
 	const upstreamOk = await hasDshFingerprint(config.upstreamPort);
 	checks.push({
@@ -434,15 +435,12 @@ async function cmdDoctor(store: Store): Promise<number> {
 		detail: listenBusy ? "已被占用（网关可能正在运行）" : "空闲",
 	});
 
-	const certsOk = await import("./cert.ts")
-		.then(async (mod) => {
-			try {
-				const cert = await mod.ensureCert(store.path("certs"));
-				return cert.fingerprintSha256;
-			} catch {
-				return undefined;
-			}
-		});
+	let certsOk: string | undefined;
+	try {
+		certsOk = (await ensureCert(store.path("certs"))).fingerprintSha256;
+	} catch {
+		// 生成失败按「TLS 证书未过」处理
+	}
 	checks.push({
 		name: "TLS 证书",
 		ok: typeof certsOk === "string",
@@ -466,7 +464,7 @@ async function cmdDoctor(store: Store): Promise<number> {
 				checks.push({ name: "公网入口端口", ok: true, detail: `${frpMode} 形态不开入口端口，VPS 暴露面仅剩控制口 + 访客密钥` });
 			}
 		}
-		const binary = await import("./frp.ts").then((mod) => mod.locateFrpcBinary(config.frp, store));
+		const binary = await locateFrpcBinary(config.frp, store);
 		checks.push({ name: "frpc 二进制", ok: binary !== undefined, detail: binary ?? `缺失，放到 ${store.path("vendor", "frp")} 下` });
 		checks.push({
 			name: "隧道名",
@@ -488,9 +486,7 @@ async function cmdDoctor(store: Store): Promise<number> {
 
 /** edge 角色体检：Token 门禁 / frp 角色 / 二进制与端口。 */
 async function cmdDoctorEdge(store: Store, config: GatewayConfig): Promise<number> {
-	const { ensureAccessTokenHash } = await import("./auth.ts");
-	const { locateFrBinary } = await import("./frp.ts");
-	const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
+	const checks: DoctorCheck[] = [];
 
 	const tokenHash = await ensureAccessTokenHash(store);
 	checks.push({
@@ -555,6 +551,17 @@ async function cmdDoctorEdge(store: Store, config: GatewayConfig): Promise<numbe
 			: `${config.listenHost}:${String(config.listenPort)} —— 容器/内网监听；务必置于 Caddy/nginx 之后再暴露公网`,
 	});
 
+	return reportChecks(checks);
+}
+
+interface DoctorCheck {
+	name: string;
+	ok: boolean;
+	detail: string;
+}
+
+/** 打印体检结果并返回退出码（全部通过为 0）。 */
+function reportChecks(checks: DoctorCheck[]): number {
 	let failed = 0;
 	for (const check of checks) {
 		if (!check.ok) failed += 1;

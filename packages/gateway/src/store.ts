@@ -118,11 +118,6 @@ export class Store {
 		return mergeConfig(DEFAULT_CONFIG, patch);
 	}
 
-	async saveConfig(config: GatewayConfig): Promise<void> {
-		this.diskConfigPatch = { ...config };
-		await this.writeAtomic("config.json", `${JSON.stringify(config, null, "\t")}\n`);
-	}
-
 	/**
 	 * GW-09：增量回写——仅在磁盘原始补丁上更新给定字段后整体写回。
 	 * 典型场景：autoFixUpstreamPort 只回写 `upstreamPort`，
