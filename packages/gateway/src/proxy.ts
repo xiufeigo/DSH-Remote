@@ -215,10 +215,15 @@ export function proxyHttp(
 				total += chunk.length;
 				if (total > INJECT_MAX_BYTES && !overflow) {
 					overflow = true;
-					chunks.length = 0;
+					// P1-3（GW-16 补全）：未声明长度（chunked）路径超限时，必须先把
+					// 「已缓冲前缀 + 触发超限的当前块」写出再切直通 —— 旧实现清空
+					// chunks 直接 pipe，上游 3MB 手机端只收到 1MB（静默截断无标记）。
 					delete outHeaders["content-length"];
 					outHeaders["transfer-encoding"] = "chunked";
 					res.writeHead(status, outHeaders);
+					for (const buffered of chunks) res.write(buffered);
+					chunks.length = 0;
+					res.write(chunk);
 					upstreamRes.pipe(res);
 					return;
 				}

@@ -67,6 +67,19 @@ const behavior = http.createServer((req, res) => {
 		res.end(body);
 		return;
 	}
+	if (url.startsWith("/chunked-big")) {
+		// P1-3：无 content-length（chunked）的 3MB HTML —— 缓冲途中超限切直通时
+		// 不得丢弃已缓冲前缀（旧实现静默截断：3MB 只送达 1MB）。
+		// 前缀必须避开更靠前的 /big（声明长度路径）匹配。
+		res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+		const size = 3 * 1024 * 1024;
+		const block = Buffer.alloc(64 * 1024, 0x61); // "a"
+		for (let written = 0; written < size; written += block.length) {
+			res.write(written + block.length <= size ? block : block.subarray(0, size - written));
+		}
+		res.end();
+		return;
+	}
 	res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
 	res.end("<!doctype html><html><head><title>fx</title></head><body>__dsh_boot__ fx</body></html>");
 });
@@ -288,6 +301,18 @@ test("P0-1：畸形绝对形式请求行回 4xx 且不击杀网关进程", async
 	// 网关必须仍然存活（同一子进程继续服务）
 	const health = await requestTls(gwUrl("/__dsh_remote__/health"));
 	assert.equal(health.status, 200, "网关不得因畸形请求行死亡");
+});
+
+test("P1-3：>2MB 无长度声明（chunked）的 HTML 直通不丢已缓冲前缀", async () => {
+	// 注意路由前缀：必须避开 behavior 里更靠前的 /big（声明长度路径）匹配
+	const r = await requestTls(gwUrl("/chunked-big"), {
+		headers: { ...authHeaders, accept: "text/html" },
+		timeoutMs: 30_000,
+	});
+	assert.equal(r.status, 200);
+	assert.equal(r.raw.length, 3 * 1024 * 1024, "chunked 3MB 正文必须字节完整（旧实现静默截断为 1MB）");
+	assert.ok(!r.body.includes("manifest.webmanifest"), "直通路径不得注入");
+	assert.equal(r.headers["content-type"], "text/html; charset=utf-8");
 });
 
 test("P3-10：WS 升级 head > 4KB 回 413（不再裸断连）", async () => {
