@@ -387,8 +387,8 @@
 		'  position: fixed;',
 		'  top: calc(var(--dshr-inset-top, env(safe-area-inset-top, 0px)) + 5px);',
 		'  left: 10px;',
-		'  width: 44px;',
-		'  height: 44px;',
+		'  width: 48px;',
+		'  height: 48px;',
 		'  padding: 9px;',
 		'  border: 0;',
 		'  border-radius: 10px;',
@@ -414,6 +414,30 @@
 		'  background: transparent;',
 		'}',
 		'html.' + ROOT_CLASS + '[data-dshr-expanded="1"] #dshr-mobile-drawer-mask { display: block; }',
+		// ── MD3 抽屉 drag handle：4×32dp 圆头指示条，钉在抽屉与会话浮层交界 ──
+		// 纯视觉指示（pointer-events:none，拖动手势由整个会话浮层接管），
+		// 仅手机/平板竖屏抽屉展开时可见；跟手拖动、设置全屏、Explorer 替换
+		// 模式下隐藏。颜色走官方 label token 自动适配深浅主题。
+		'#dshr-drawer-handle {',
+		'  display: none;',
+		'  position: fixed;',
+		'  top: 50%;',
+		'  left: var(--dshr-drawer-width);',
+		'  transform: translate(-50%, -50%);',
+		'  width: 4px;',
+		'  height: 32px;',
+		'  border-radius: 2px;',
+		'  background: var(--dsw-alias-label-primary, #1b1b1f);',
+		'  opacity: 0.35;',
+		'  z-index: 35;',
+		'  pointer-events: none;',
+		'}',
+		'html.' + ROOT_CLASS + '[data-dshr-expanded="1"] #dshr-drawer-handle { display: block; }',
+		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] #dshr-drawer-handle,',
+		'html.' + ROOT_CLASS + '[data-dshr-dialog="1"] #dshr-drawer-handle,',
+		'html.' + ROOT_CLASS + '[data-dshr-explorer-details="1"] #dshr-drawer-handle {',
+		'  display: none !important;',
+		'}',
 		// ── 设置弹窗 → 全屏页（盖住侧栏与会话，带进入动画） ──
 		'@keyframes dshr-settings-fade {',
 		'  from { opacity: 0; }',
@@ -496,7 +520,7 @@
 		'html.' + ROOT_CLASS + ' [data-dshr-sheet-nav-list]::-webkit-scrollbar { display: none; }',
 		'html.' + ROOT_CLASS + ' [data-dshr-sheet-nav-list] > button {',
 		'  flex: 0 0 auto;',
-		'  height: 36px !important;',
+		'  height: 48px !important;',
 		'  padding: 7px 12px !important;',
 		'  white-space: nowrap;',
 		'}',
@@ -528,11 +552,13 @@
 		'html.' + ROOT_CLASS + ' [data-dshr-frame][data-sidebar-collapsed] header {',
 		'  padding-left: 72px !important;',
 		'}',
-		// ── Session log 按钮：手机端只保留下载图标 ──
+		// ── Session log 按钮：手机端只保留下载图标（MD3 icon button 48×48dp/24dp 图标）──
 		'html.' + ROOT_CLASS + ' button[data-dshr-session-log] {',
-		'  min-width: 0 !important;',
-		'  width: 32px !important;',
-		'  max-width: 32px !important;',
+		'  min-width: 48px !important;',
+		'  width: 48px !important;',
+		'  max-width: 48px !important;',
+		'  min-height: 48px !important;',
+		'  height: 48px !important;',
 		'  flex: none !important;',
 		'  padding: 0 !important;',
 		'  gap: 0 !important;',
@@ -555,8 +581,8 @@
 		'}',
 		'html.' + ROOT_CLASS + ' button[data-dshr-session-log] svg {',
 		'  display: block !important;',
-		'  width: 16px !important;',
-		'  height: 16px !important;',
+		'  width: 24px !important;',
+		'  height: 24px !important;',
 		'  flex: none !important;',
 		'}',
 		// ── 窄屏会话条：只收缩已标记的操作行/输入底栏/统计，不改官方布局变量 ──
@@ -574,6 +600,16 @@
 		'  min-width: 22px !important;',
 		'  padding: 3px !important;',
 		'  flex: none !important;',
+		'  position: relative !important;',
+		'}',
+		// MD3 触控目标：视觉保持 22px 图标钮，命中区用透明 ::after 外扩 13px
+		// 到 48dp（MD3 允许视觉小于 48dp，交互目标不得小于）。相邻按钮的扩展
+		// 命中区在 ±13px 内互叠、按绘制顺序后者优先，中心区不受影响；命中区
+		// 无背景无内容，不产生任何视觉溢出。
+		'html.' + ROOT_CLASS + ' [data-dshr-msg-actions] button::after {',
+		'  content: "";',
+		'  position: absolute;',
+		'  inset: -13px;',
 		'}',
 		'html.' + ROOT_CLASS + ' [data-dshr-msg-actions] button svg {',
 		'  width: 13px !important;',
@@ -1653,7 +1689,7 @@
 	function isLayoutChrome(node) {
 		if (!isElement(node)) return true;
 		if (node.id === 'dshr-mobile-whale' || node.id === 'dshr-mobile-drawer-mask') return true;
-		if (node.id === 'dshr-status-guard') return true;
+		if (node.id === 'dshr-status-guard' || node.id === 'dshr-drawer-handle') return true;
 		if (node.hasAttribute('data-dshr-frame')) return true;
 		if (node.hasAttribute('data-dshr-sidebar-col')) return true;
 		if (node.hasAttribute('data-dshr-main-col')) return true;
@@ -1900,6 +1936,15 @@
 			guard.id = 'dshr-status-guard';
 			guard.setAttribute('aria-hidden', 'true');
 			doc.body.appendChild(guard);
+		}
+		// MD3 抽屉 drag handle：抽屉展开时钉在交界的 4×32dp 指示条
+		// （纯视觉、pointer-events:none，样式见 MOBILE_CSS）。
+		var drawerHandle = doc.getElementById('dshr-drawer-handle');
+		if (!drawerHandle) {
+			drawerHandle = doc.createElement('div');
+			drawerHandle.id = 'dshr-drawer-handle';
+			drawerHandle.setAttribute('aria-hidden', 'true');
+			doc.body.appendChild(drawerHandle);
 		}
 	}
 
