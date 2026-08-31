@@ -11,6 +11,11 @@
  *   - GW-06   上游收到 accept-encoding: identity
  *   - GW-12   注入路径剥离 CSP 双头；直通路径保留上游 CSP
  *   - GW-16   声明长度 > 2MB 的 HTML 流式直通（不注入、正文完整）
+ *   - P1-3   无长度声明（chunked）> 2MB 的 HTML 直通不丢已缓冲前缀
+ *   - P0-1   畸形绝对形式请求行不再击杀网关进程（URL 解析入 try）
+ *   - P0-2   admin 门禁三重门（回环 + 同源 + secrets 管理密钥）
+ *   - P3-10  WS 升级 head > 4KB 回 413（不再裸断连）
+ *   - P3-8   POSIX 监听枚举解析器（ss/netstat/lsof）
  *   - GW-14   请求体超 64KB → 413（不再裸 destroy）
  *   - SEC-02/GW-15 畸形 JSON → 400（不再 500）
  *   - WEB-01  sw.js 内部路由：免认证 200 + service-worker-allowed + no-cache
