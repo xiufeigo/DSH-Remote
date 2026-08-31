@@ -87,22 +87,18 @@ public class TunnelService extends Service {
 	@Override
 	public int onStartCommand(Intent intent, int flags, int startId) {
 		// AND-02：通知「断开」操作，不进 App 直接停隧道。
-		// 同样先解除前台状态再退出，覆盖尚未 publishForeground 的启动时序。
+		// 早停同样走 stopSelfHonoringForegroundContract，覆盖尚未
+		// publishForeground 的启动时序（见该方法注释）。
 		if (intent != null && ACTION_STOP.equals(intent.getAction())) {
 			Log.i(TAG, "收到通知断开操作，停止隧道");
-			stopForegroundCompat();
-			stopSelf();
+			stopSelfHonoringForegroundContract();
 			return START_NOT_STICKY;
 		}
 		ProfileStore.migrateLegacy(getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE));
 		ProfileStore.Profile profile = ProfileStore.getActive(
 			getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE));
 		if (profile == null || !profile.isValid()) {
-			// AND-01：本次启动若经由 startForegroundService()，必须先解除前台状态
-			// 再退出，否则 Android 8+ 因 5 秒内未调 startForeground() 抛
-			// "did not then call Service.startForeground()" 崩溃/ANR。
-			stopForegroundCompat();
-			stopSelf();
+			stopSelfHonoringForegroundContract();
 			return START_NOT_STICKY;
 		}
 		VisitorConfig cfg = profile.toVisitorConfig();
@@ -115,8 +111,7 @@ public class TunnelService extends Service {
 		if (port < 0) {
 			Log.e(TAG, "端口协商失败：首选 " + ProfileStore.BIND_PORT + " 与回退范围 "
 				+ ProfileStore.PORT_RANGE_MIN + "-" + ProfileStore.PORT_RANGE_MAX + " 均被占用");
-			stopForegroundCompat();
-			stopSelf();
+			stopSelfHonoringForegroundContract();
 			return START_NOT_STICKY;
 		}
 		cfg.bindPort = port;
@@ -152,6 +147,32 @@ public class TunnelService extends Service {
 		} else {
 			startForeground(NOTIFICATION_ID, n);
 		}
+	}
+
+	/**
+	 * AND-01：早停路径退出前必须满足 startForegroundService 的 5 秒契约——
+	 * 本次启动若经 startForegroundService() 拉起，却从未调 startForeground()
+	 * 就 stopSelf()，Android 8+ 会抛 "did not then call Service.startForeground()"。
+	 * 单纯 stopForegroundCompat 无法补上该契约（从未 publish 过时解除是空操作），
+	 * 因此先用当前通知补一次 startForeground，再解除前台并退出。已在前台时
+	 * 该调用仅刷新通知，无副作用；通知 PendingIntent 触发的重启场景受系统
+	 * 临时豁免保护，try/catch 兜底任何厂商差异。
+	 */
+	private void stopSelfHonoringForegroundContract() {
+		if (Build.VERSION.SDK_INT >= 26) {
+			try {
+				if (Build.VERSION.SDK_INT >= 34) {
+					startForeground(NOTIFICATION_ID, buildNotification(),
+						ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+				} else {
+					startForeground(NOTIFICATION_ID, buildNotification());
+				}
+			} catch (Exception e) {
+				Log.w(TAG, "早停前补 startForeground 失败（继续退出）：" + e);
+			}
+		}
+		stopForegroundCompat();
+		stopSelf();
 	}
 
 	/**

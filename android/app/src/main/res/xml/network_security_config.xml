@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- DSH-Remote 安全基线：默认禁止明文 HTTP（收窄原 usesCleartextTraffic="true"
+     的全局放行）。隧道会话固定 https://127.0.0.1（自签证书锁定）；直连模式按
+     文档契约要求 https://（README：明文 HTTP 会泄露 Basic Auth 密码）；frpc 与
+     VPS 的控制连接是 native socket，本就脱离平台 HTTP 栈，不受此配置约束。
+     未来确需明文的场景按域名精确放行，不再全局放开。 -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

@@ -15,7 +15,7 @@
 		android:label="DSH Remote"
 		android:icon="@mipmap/ic_launcher"
 		android:allowBackup="false"
-		android:usesCleartextTraffic="true"
+		android:networkSecurityConfig="@xml/network_security_config"
 		android:forceDarkAllowed="false"
 		android:theme="@style/AppTheme">
 		<activity
@@ -33,6 +33,7 @@
 			<intent-filter>
 				<action android:name="android.intent.action.VIEW" />
 				<category android:name="android.intent.category.DEFAULT" />
+				<category android:name="android.intent.category.BROWSABLE" />
 				<data android:scheme="dsh-remote" android:host="visitor" />
 			</intent-filter>
 		</activity>

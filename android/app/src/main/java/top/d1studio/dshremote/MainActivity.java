@@ -44,6 +44,7 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.webkit.WebViewDatabase;
+import android.webkit.WebStorage;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
@@ -196,21 +197,28 @@ public class MainActivity extends Activity {
 		destroyed = true;
 		bgExecutor.shutdownNow();
 		dismissPendingHttpAuth();
+		fileCallback = null;
 		if (webView != null) {
 			// AND-03：非静态内部类 AppBridge 经 addJavascriptInterface 被 WebView 持有，
 			// 不销毁则 Chromium 内核与 Activity Context 全部泄漏。顺序：摘 JS 桥
-			// → 移出视图树 → 停止加载 → 清历史 → destroy。
+			// → 移出视图树 → 清子视图（Chromium 全屏视频/下拉等宿主子 View）
+			// → 停止加载 → 清历史 → destroy。
 			webView.removeJavascriptInterface("DshRemoteApp");
 			webView.setOnKeyListener(null);
 			webView.setWebViewClient(null);
 			webView.setWebChromeClient(null);
 			webView.setDownloadListener(null);
 			if (rootLayout != null) rootLayout.removeView(webView);
+			webView.removeAllViews();
 			webView.stopLoading();
 			webView.clearHistory();
 			webView.destroy();
 			webView = null;
 		}
+		// DOM Storage（localStorage/sessionStorage/indexedDB）由 WebView 全局
+		// profile 持有，不随 webView.destroy() 释放——Activity 销毁时残留的
+		// 远端页面数据会跨启动存活。本 App 是远程访问壳，退出即清，不留痕迹。
+		WebStorage.getInstance().deleteAllData();
 		super.onDestroy();
 	}
 
@@ -818,50 +826,63 @@ public class MainActivity extends Activity {
 			&& checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
 			requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQ_NOTIF_PERM);
 		}
-		// AND-07：复用存活隧道——先探上次记录的实际绑定端口，再探首选端口。
-		int savedPort = prefs().getInt(ProfileStore.KEY_BOUND_PORT, 0);
-		int reusePort = 0;
-		if (savedPort >= 1 && savedPort <= 65535 && isLocalPortOpen(savedPort)) reusePort = savedPort;
-		else if (isLocalPortOpen(ProfileStore.BIND_PORT)) reusePort = ProfileStore.BIND_PORT;
-		if (reusePort > 0) {
-			cfg.bindPort = reusePort;
-			String target = "https://127.0.0.1:" + reusePort + "/";
-			if (tvTunnelState != null) tvTunnelState.setText("隧道已在运行，正在打开会话…");
-			if (resumeLiveSession(target)) return;
-			openGateway(target);
-			return;
-		}
-		// AND-07：端口协商——首选 BIND_PORT，被占用时在 16225~16235 取首个空闲端口；
-		// 实际端口传给 frpc visitor（Intent extra）与 WebView 加载 URL（cfg.bindPort）。
-		int port = ProfileStore.negotiateBindPort();
-		if (port < 0) {
-			Toast.makeText(this, "本地端口 " + ProfileStore.BIND_PORT + " 与回退范围 "
-				+ ProfileStore.PORT_RANGE_MIN + "-" + ProfileStore.PORT_RANGE_MAX
-				+ " 均被占用，无法启动隧道。", Toast.LENGTH_LONG).show();
-			showHome();
-			return;
-		}
-		cfg.bindPort = port;
-		prefs().edit().putInt(ProfileStore.KEY_BOUND_PORT, port).apply();
-		Intent svc = new Intent(this, TunnelService.class);
-		svc.putExtra(TunnelService.EXTRA_BIND_PORT, port);
-		if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc);
-		else startService(svc);
-		if (tvTunnelState != null) {
-			tvTunnelState.setText("隧道启动中（frpc 打洞/建联一般 3~10 秒）…"
-				+ (port == ProfileStore.BIND_PORT ? "" : "（端口 " + port + "）"));
-		}
-		showLocalShell(
-			UiState.CONNECTING,
-			"connecting",
-			"正在连接 DSH",
-			"正在建立安全隧道。",
-			"dsh-remote://app/retry",
-			"重新连接",
-			"",
-			""
-		);
-		waitAndOpen(cfg, generation);
+		if (tvTunnelState != null) tvTunnelState.setText("正在检测隧道状态…");
+		// AND-07/AND-06：端口探测与协商必须在后台线程做——主线程 socket connect
+		// 会抛 NetworkOnMainThreadException 并被 isLocalPortOpen 吞掉（探测恒
+		// false，复用逻辑整段失效：每次重连都杀掉存活隧道换端口重启），且 400ms
+		// 超时本身也会阻塞主线程。结论统一回到 UI 线程后按 generation 过期丢弃。
+		runInBackground("tunnel-probe", () -> {
+			int savedPort = prefs().getInt(ProfileStore.KEY_BOUND_PORT, 0);
+			int reusePort = 0;
+			if (savedPort >= 1 && savedPort <= 65535 && isLocalPortOpen(savedPort)) reusePort = savedPort;
+			else if (isLocalPortOpen(ProfileStore.BIND_PORT)) reusePort = ProfileStore.BIND_PORT;
+			// AND-07：复用存活隧道——先探上次记录的实际绑定端口，再探首选端口。
+			final int reused = reusePort;
+			// AND-07：端口协商——首选 BIND_PORT，被占用时在 16225~16235 取首个空闲端口；
+			// 实际端口传给 frpc visitor（Intent extra）与 WebView 加载 URL（cfg.bindPort）。
+			final int negotiated = reused > 0 ? reused : ProfileStore.negotiateBindPort();
+			runOnUiThread(() -> {
+				if (destroyed) return;
+				if (generation != connectionGeneration) return;
+				if (reused > 0) {
+					cfg.bindPort = reused;
+					String target = "https://127.0.0.1:" + reused + "/";
+					if (tvTunnelState != null) tvTunnelState.setText("隧道已在运行，正在打开会话…");
+					if (resumeLiveSession(target)) return;
+					openGateway(target);
+					return;
+				}
+				if (negotiated < 0) {
+					Toast.makeText(MainActivity.this, "本地端口 " + ProfileStore.BIND_PORT + " 与回退范围 "
+						+ ProfileStore.PORT_RANGE_MIN + "-" + ProfileStore.PORT_RANGE_MAX
+						+ " 均被占用，无法启动隧道。", Toast.LENGTH_LONG).show();
+					showHome();
+					return;
+				}
+				int port = negotiated;
+				cfg.bindPort = port;
+				prefs().edit().putInt(ProfileStore.KEY_BOUND_PORT, port).apply();
+				Intent svc = new Intent(MainActivity.this, TunnelService.class);
+				svc.putExtra(TunnelService.EXTRA_BIND_PORT, port);
+				if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc);
+				else startService(svc);
+				if (tvTunnelState != null) {
+					tvTunnelState.setText("隧道启动中（frpc 打洞/建联一般 3~10 秒）…"
+						+ (port == ProfileStore.BIND_PORT ? "" : "（端口 " + port + "）"));
+				}
+				showLocalShell(
+					UiState.CONNECTING,
+					"connecting",
+					"正在连接 DSH",
+					"正在建立安全隧道。",
+					"dsh-remote://app/retry",
+					"重新连接",
+					"",
+					""
+				);
+				waitAndOpen(cfg, generation);
+			});
+		});
 	}
 
 	private void waitAndOpen(final VisitorConfig cfg, final int generation) {
@@ -950,6 +971,12 @@ public class MainActivity extends Activity {
 		String url = urlInput.getText().toString().trim();
 		if (!isGatewayUrl(url)) {
 			Toast.makeText(this, "请填写 http(s):// 开头的完整网关地址", Toast.LENGTH_LONG).show();
+			return;
+		}
+		if (url.startsWith("http://")) {
+			// networkSecurityConfig 已禁明文：与其让 WebView 报 ERR_CLEARTEXT_NOT_
+			// PERMITTED 再误报成断线，不如入口处直接说清（README 契约本就要求 https）。
+			Toast.makeText(this, "明文 HTTP 已禁用：请使用 https:// 地址（局域网网关同样走 https）", Toast.LENGTH_LONG).show();
 			return;
 		}
 		prefs().edit().putString(KEY_URL, url).apply();
