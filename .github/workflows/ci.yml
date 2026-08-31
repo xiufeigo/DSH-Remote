@@ -31,6 +31,13 @@ jobs:
       - name: 类型检查
         run: pnpm typecheck
 
+      # F21：lib/client.js 是入库构建产物，与 src/client 必须逐字节一致——
+      # 重建后 diff 非空即"改了 tsx 忘记重建提交"，直接红
+      - name: 插件 bundle 同步检查（lib 与 src 一致）
+        run: |
+          pnpm -C packages/plugin build
+          git diff --exit-code -- packages/plugin/lib/
+
       - name: 快测（smoke / edge / routes / session / fixes）
         run: |
           pnpm smoke

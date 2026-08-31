@@ -66,6 +66,16 @@ DSH 官方源码（`dsh-web-app`）明确禁止 `--host 0.0.0.0`：
 - Secure 标记配合我们的强制 HTTPS
 - 服务端存哈希：`secrets.json`/数据库泄露也不等于设备被接管
 
+### 管理端点门禁（P0-2 加固）
+
+`/__dsh_remote__/admin/*`（配对码铸造 / 设备表 / 关停 / 启动令牌下发）是特权面。
+「回环源地址 + 同源 Origin」两道闸在**同机反代**拓扑（裸机 edge + 宿主 Caddy）下
+不可信：公网流量经反代后源地址全是 `127.0.0.1`，非浏览器客户端无 Origin 头也能
+通过同源闸门——PoC 实证可完整绕过访问 Token。因此叠加第三道共享密钥：网关在
+`state/secrets.json`（0600）维护 `adminToken`（自动生成、旧文件自动补齐），同机
+消费方（CLI / 插件下发器，后者每请求现读以支持轮换热跟）随请求携带
+`x-dshr-admin-token` 头，恒时比较；缺失或不匹配一律 403。公网侧无从获取该密钥。
+
 ### 已知取舍（诚实清单）
 
 - **自签证书告警**：手机浏览器首次访问需手动信任。壳 App 阶段用证书锁定消除；
@@ -100,6 +110,9 @@ DSH 官方源码（`dsh-web-app`）明确禁止 `--host 0.0.0.0`：
   代价是 gateway 不能用 enum/namespace/参数属性等非可剥离语法（tsconfig
   `erasableSyntaxOnly` + `pnpm typecheck` 在 CI 守住这条线；plugin 客户端
   半边走 tsdown 编译，不受此约束）。
+- **网关模块布局**：`server.ts` 只留初始化/路由分发/生命周期与 HTTP 路由处理器；
+  页面模板（`views.ts`）、请求体解析（`body.ts`）、WS 升级转发（`ws.ts`）各自
+  独立模块——原 972 行单体的 GW-13 拆分，模板去重做过逐字节等价验证。
 - **端口漂移**：DSH GUI 端口可能随重启变化（OS 分配）。`upstreamPort` 进配置 +
   `doctor` 指纹探测兜底。
 

@@ -196,6 +196,8 @@ node scripts/uninstall.mjs      # 卸载
   entry 模式公网暴露 VPS 上 frp 的两个端口。
 - **认证层**：一次性配对码（10 分钟有效、用后即焚）换取长效设备 Token（httpOnly Cookie，
   服务端只存 SHA-256）；配对失败 5 次锁 IP 15 分钟；每 IP 滑动窗口限流。
+  管理端点（`/__dsh_remote__/admin/*`）仅回环可达，并叠加共享密钥门禁
+  （`x-dshr-admin-token`，密钥存 PC 本机 `state/secrets.json` 自动生成，公网侧无从获取）。
 - **传输层**：手机↔网关 TLS（自签，指纹可校验；壳 App 将做证书锁定）；frpc↔frps 隧道 TLS。
 - **隔离层**：设备 Cookie 不转发给上游 DSH；上游 DSH（0.1.2+）的浏览器会话 cookie 与
   启动令牌也绝不下发手机端（只存在于 PC 本机网关进程内存）；审计日志记录全部配对/拒绝事件。
@@ -221,8 +223,9 @@ pnpm -C packages/plugin build   # 构建设置卡片客户端 bundle
 node scripts/probe-ws.mjs [端口]   # 对运行中的网关+DSH 做 WS 直通探针
 ```
 
-push/PR 到 main 时 CI 自动跑类型检查 + 快测五件套（smoke / smoke:edge /
-test:routes / test:session / test:fixes，见 `.github/workflows/ci.yml`）；
+push/PR 到 main 时 CI 自动跑类型检查 + 插件 bundle 同步检查（`src/client` 改动后
+忘记重建提交会被拦下）+ 快测五件套（smoke / smoke:edge / test:routes /
+test:session / test:fixes，见 `.github/workflows/ci.yml`）；
 重链路（panel/mobile/frp 全链路）留在本地跑。
 
 ### 版本与发布
