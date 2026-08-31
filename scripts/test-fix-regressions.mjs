@@ -332,4 +332,35 @@ test("P3-10：WS 升级 head > 4KB 回 413（不再裸断连）", async () => {
 	assert.match(head.split("\r\n")[0] ?? "", /413/, "超限 head 应回 413");
 });
 
+test("P3-8：POSIX 监听枚举解析器（ss / netstat / lsof）", async () => {
+	const { parsePosixListeners } = await import("../packages/gateway/src/upstream.ts");
+	// ss -tlnpH：第 4 列 Local Address:Port；非回环/通配 host 与越界端口过滤
+	const ss = parsePosixListeners([
+		'LISTEN 0 511 127.0.0.1:52392 0.0.0.0:* users:(("node",pid=1,fd=20))',
+		'LISTEN 0 511 *:18443 *:* users:(("dsh-remote",pid=2,fd=18))',
+		'LISTEN 0 511 [::1]:52393 [::]:* users:(("node",pid=3,fd=9))',
+		'LISTEN 0 511 192.168.1.4:9999 0.0.0.0:* users:(("x",pid=4,fd=9))',
+		'LISTEN 0 511 127.0.0.1:99999 0.0.0.0:* users:(("y",pid=5,fd=9))',
+		'LISTEN 0 511 127.0.0.1:52392 0.0.0.0:* users:(("dup",pid=6,fd=9))',
+	].join("\n"), "ss");
+	assert.deepEqual(ss.map((entry) => entry.port), [52392, 18443, 52393], "回环/通配端口去重采纳，其余过滤");
+	assert.ok(ss.every((entry) => entry.dshRelated === false), "POSIX 不标注进程（排序优化缺席不影响正确性）");
+	// netstat -tlnp：同样取第 4 列
+	const netstat = parsePosixListeners([
+		"Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program",
+		"tcp        0      0 127.0.0.1:52392          0.0.0.0:*               LISTEN      1234/node",
+		"tcp6       0      0 ::1:52393                :::*                    LISTEN      1235/node",
+	].join("\n"), "netstat");
+	assert.deepEqual(netstat.map((entry) => entry.port), [52392, 52393]);
+	// lsof -nP -iTCP -sTCP:LISTEN：NAME 为倒数第 2 列
+	const lsof = parsePosixListeners([
+		"COMMAND   PID USER   FD   TYPE   DEVICE SIZE/OFF NODE NAME",
+		"node     1234 user   20u  IPv4  123456      0t0  TCP 127.0.0.1:52392 (LISTEN)",
+		"node     1235 user   21u  IPv6  123457      0t0  TCP *:18443 (LISTEN)",
+	].join("\n"), "lsof");
+	assert.deepEqual(lsof.map((entry) => entry.port), [52392, 18443]);
+	// 空输出/全脏行：空表（fail-safe 同旧版行为）
+	assert.deepEqual(parsePosixListeners("", "ss"), []);
+	assert.deepEqual(parsePosixListeners("garbage line\nanother", "lsof"), []);
+});
 console.log("fix-regressions：阶段 0/1 修复行为钉桩已就绪");
