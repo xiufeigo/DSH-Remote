@@ -4,24 +4,26 @@ dist/
 .DS_Store
 Thumbs.db
 
-# frp ?????????????????????
+# frpc/frps 二进制与解包产物（首次使用时自动下载到 vendor/frp/，不入库）
 vendor/frp/
 
-# ???????????
+# 本机链路测试数据目录与证书/私钥（敏感，绝不入库）
 .dsh-remote-test/
 *.pem
 *.key
 *.crt
 
-# Android ???????? android/???????????
+# Android 打包中间产物（android/ 下各构建输出目录）
 android/build/
 android/dist/
 android/build-check/
 
-# frpc android ???? build.ps1 ????????
+# frpc 多 ABI .so（android 壳用；android/jniLibs/ 是 build.ps1 自动下载暂存路径，
+# app/src/main/jniLibs/ 为标准 AGP 位置——两处均体积大不入库）
 android/jniLibs/
+android/app/src/main/jniLibs/
 
-# ????????
+# 本地工具运行状态（.omo）
 .omo/
 
 # Edge 部署运行时数据（deploy/docker/data）与本机链路测试日志
@@ -35,3 +37,6 @@ chain-log.txt
 
 # Captain verification workspace (npm host packs, audit reports)
 scratch/
+
+# Codegraph 本地代码索引（junction，本机生成，不入库）
+.codegraph
