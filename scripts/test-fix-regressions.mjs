@@ -230,4 +230,22 @@ test("安全边界：设备 Cookie 不外泄上游", async () => {
 	assert.ok(seen.cookies.every((c) => c === null), "上游任何请求都不得收到设备 Cookie");
 });
 
+test("P0-2：admin 门禁要求 secrets 管理密钥——缺失/错误 403，正确 200", async () => {
+	const { adminToken } = await store.ensureSecrets();
+	const ok = await requestTls(gwUrl("/__dsh_remote__/admin/status"), {
+		headers: { "x-dshr-admin-token": adminToken },
+	});
+	assert.equal(ok.status, 200);
+	assert.match(ok.body, /certFingerprint/);
+	const none = await requestTls(gwUrl("/__dsh_remote__/admin/status"));
+	assert.equal(none.status, 403, "无密钥头必须 403（同机反代转发的公网流量同样没有密钥）");
+	const wrong = await requestTls(gwUrl("/__dsh_remote__/admin/status"), {
+		headers: { "x-dshr-admin-token": "wrong-secret" },
+	});
+	assert.equal(wrong.status, 403, "错误密钥必须 403");
+	// 攻击原语封死：公网侧（无密钥）不得铸造配对码（曾可经此绕过全部认证门）
+	const mint = await requestTls(gwUrl("/__dsh_remote__/admin/pair-code"), { method: "POST" });
+	assert.equal(mint.status, 403, "无密钥不得铸造配对码");
+});
+
 console.log("fix-regressions：阶段 0/1 修复行为钉桩已就绪");

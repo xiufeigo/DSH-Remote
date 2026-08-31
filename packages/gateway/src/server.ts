@@ -5,7 +5,8 @@
  *   /__dsh_remote__/pair                配对页（未认证可访问，POST 消费一次性码）
  *   /__dsh_remote__/manifest.webmanifest / icon.svg   PWA 静态资源
  *   /__dsh_remote__/health              存活探针（无信息泄露）
- *   /__dsh_remote__/admin/*             本机管理端点（仅接受回环来源；launch-token
+ *   /__dsh_remote__/admin/*             本机管理端点（回环来源 + 同源 Origin +
+ *                                       secrets 管理密钥三重门；launch-token
  *                                       接收插件下发的 DSH 0.1.2+ 启动令牌）
  *   其余                                设备认证后原样代理到上游 DSH Web GUI
  */
@@ -15,6 +16,7 @@ import { readFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import {
+	ADMIN_TOKEN_HEADER,
 	COOKIE_NAME,
 	INTERNAL_PREFIX,
 	LOGIN_PAGE,
@@ -29,6 +31,7 @@ import {
 	issueDeviceCookie,
 	parseCookies,
 	verifyAccessToken,
+	verifyAdminToken,
 	visitorKeyAdmits,
 } from "./auth.ts";
 import { ensureCert, loadManualCert, type GatewayCert } from "./cert.ts";
@@ -79,6 +82,8 @@ export class GatewayServer {
 	private visitor?: FrpSupervisor;
 	private cert?: GatewayCert;
 	private accessTokenHash?: string;
+	/** P0-2：管理端点共享密钥（state/secrets.json 的 adminToken），start() 时加载。 */
+	private adminToken?: string;
 	private htmlInjector: (body: Buffer) => Buffer = injectIntoHtml;
 	/**
 	 * DSH 0.1.2+ 上游浏览器会话（令牌由插件宿主半边经 admin 端点下发）。
@@ -165,6 +170,8 @@ export class GatewayServer {
 
 	async start(): Promise<void> {
 		this.accessTokenHash = await ensureAccessTokenHash(this.store, this.env);
+		// P0-2：admin 门禁密钥（ensureSecrets 对旧 secrets.json 自动补齐 adminToken）
+		this.adminToken = (await this.store.ensureSecrets()).adminToken;
 		this.htmlInjector = makeHtmlInjector(
 			mobileInjectionEnabled(this.config)
 				? { mobile: { enabled: true, breakpointPx: mobileBreakpointPx(this.config) } }
@@ -385,15 +392,18 @@ export class GatewayServer {
 			}
 			// —— 内部路由 ——
 			if (pathname.startsWith(INTERNAL_PREFIX)) {
-				if (!isLoopback(req) && pathname.startsWith(`${INTERNAL_PREFIX}admin`)) {
-					res.writeHead(403).end();
-					return;
-				}
-				// 管理端点防 CSRF：拒绝来自非本机页面的跨站请求
-				// （自签证书下浏览器通常直接握手失败，这里再加一道来源闸门）
-				if (pathname.startsWith(`${INTERNAL_PREFIX}admin`) && !isSameSiteLoopbackOrigin(req)) {
-					res.writeHead(403).end();
-					return;
+				if (pathname.startsWith(`${INTERNAL_PREFIX}admin`)) {
+					// P0-2：管理端点三重门——回环来源 + 同源 Origin + 管理密钥。
+					// 前两道挡不住「同机反代转来的公网流量」：frpc 隧道转发与宿主
+					// Caddy 反代下公网请求的 socket 源地址同样是 127.0.0.1，非浏览器
+					// 客户端又不带 Origin，曾可经 pair-code 铸造绕过全部认证门。
+					// 第三道密钥只存于 0600 的 state/secrets.json，公网侧无从获取。
+					const rawToken = req.headers[ADMIN_TOKEN_HEADER];
+					const token = Array.isArray(rawToken) ? rawToken[0] : rawToken;
+					if (!isLoopback(req) || !isSameSiteLoopbackOrigin(req) || !verifyAdminToken(token, this.adminToken)) {
+						res.writeHead(403).end();
+						return;
+					}
 				}
 				switch (`${req.method} ${pathname}`) {
 					case "GET /__dsh_remote__/health":
@@ -670,7 +680,7 @@ export class GatewayServer {
 			case "POST /__dsh_remote__/admin/launch-token": {
 				// DSH 0.1.2+ 适配：插件宿主半边在 DSH 进程内经 connection 服务
 				// 取得浏览器启动令牌后下发到这里；网关随后向上游交换会话 cookie。
-				// 仅回环可达（admin 前缀已统一回环 + 同源闸门）。
+				// admin 前缀已统一「回环 + 同源 + 管理密钥」三重门（P0-2）。
 				const parsed = await readJsonBody<{ token?: string }>(req);
 				if (!parsed.ok) {
 					respondInvalidBody(req, res, parsed.oversized === true);

@@ -2,6 +2,9 @@
 /** 对真实网关+真实 DSH 的 WS 直通探针：配对 → 升级 /api/events.mux → 期待 101。 */
 import https from "node:https";
 import tls from "node:tls";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { resolveHome } from "../packages/gateway/src/config.ts";
 
 // CLI-05：缺参数打印用法而非带栈崩溃（原先缺省 18443 直连，网关未运行时 ECONNREFUSED 未捕获）
 const portArg = process.argv[2];
@@ -16,6 +19,15 @@ const GW_PORT = Number(portArg);
 if (!Number.isInteger(GW_PORT) || GW_PORT <= 0 || GW_PORT > 65535) {
 	console.error(`非法端口：${portArg}`);
 	process.exit(1);
+}
+
+// P0-2：admin 端点（pair-code）现要求 secrets.json 的管理密钥
+const home = resolveHome();
+let adminToken = "";
+try {
+	adminToken = String(JSON.parse(await readFile(join(home, "state", "secrets.json"), "utf8")).adminToken ?? "");
+} catch {
+	console.warn(`警告：未能读取 ${join(home, "state", "secrets.json")} 的 adminToken（P0-2 起 admin 端点必需）`);
 }
 
 function request(path, { method = "GET", headers = {}, body } = {}) {
@@ -39,8 +51,14 @@ function request(path, { method = "GET", headers = {}, body } = {}) {
 }
 
 try {
-	// ① 配对
-	const pairResp = await request("/__dsh_remote__/admin/pair-code", { method: "POST" });
+	// ① 配对（admin 端点需管理密钥头，P0-2）
+	const pairResp = await request("/__dsh_remote__/admin/pair-code", {
+		method: "POST",
+		headers: { "x-dshr-admin-token": adminToken },
+	});
+	if (pairResp.status !== 200) {
+		throw new Error(`配对码铸造失败：${String(pairResp.status)}（admin 密钥缺失或错误，见 state/secrets.json adminToken）`);
+	}
 	const code = JSON.parse(pairResp.body).code;
 	const submit = await request("/__dsh_remote__/pair", {
 		method: "POST",

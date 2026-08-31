@@ -41,6 +41,12 @@ interface SecretsFile {
 	frpAuthToken: string;
 	/** stcp/xtcp 访客密钥（proxy 与 visitor 两端必须一致） */
 	frpVisitorKey: string;
+	/**
+	 * 管理端点共享密钥（P0-2）。回环 socket 源地址无法区分「本机 CLI/插件」与
+	 * 「同机反代（frpc 隧道/宿主 Caddy）转来的公网流量」，admin 门禁必须叠加
+	 * 此密钥；同机消费方读出后经 x-dshr-admin-token 头回传，公网侧无从获取。
+	 */
+	adminToken: string;
 	/** edge 前置门禁 Token 的 SHA-256（hex）；由 DSHR_ACCESS_TOKEN 首启时写入，只存哈希 */
 	accessTokenHash?: string;
 }
@@ -134,11 +140,12 @@ export class Store {
 
 	async ensureSecrets(): Promise<SecretsFile> {
 		const existing = await this.readJson<SecretsFile>("state/secrets.json");
-		if (existing?.frpAuthToken && existing?.frpVisitorKey) return existing;
-		// 兼容旧版 secrets.json（只有 frpAuthToken）：缺哪个补哪个，其余保留
+		if (existing?.frpAuthToken && existing?.frpVisitorKey && existing?.adminToken) return existing;
+		// 兼容旧版 secrets.json（缺哪个补哪个，其余保留）
 		const fresh: SecretsFile = {
 			frpAuthToken: existing?.frpAuthToken ?? randomBytes(32).toString("base64url"),
 			frpVisitorKey: existing?.frpVisitorKey ?? randomBytes(32).toString("base64url"),
+			adminToken: existing?.adminToken ?? randomBytes(32).toString("base64url"),
 			...(existing?.accessTokenHash ? { accessTokenHash: existing.accessTokenHash } : {}),
 		};
 		await this.writeAtomic("state/secrets.json", `${JSON.stringify(fresh, null, "\t")}\n`);

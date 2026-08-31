@@ -29,6 +29,7 @@ const fixture = {
 	gateway: undefined,
 	gatewayPort: 0,
 	deviceCookie: "",
+	adminToken: "",
 	seenByUpstream: /** @type {Record<string, string | undefined>} */ ({}),
 };
 
@@ -62,6 +63,8 @@ before(async () => {
 	await gateway.start();
 	fixture.gateway = gateway;
 	fixture.gatewayPort = gateway.actualPort;
+	// P0-2：admin 门禁密钥（网关 start 时已写进 secrets.json）
+	fixture.adminToken = (await store.ensureSecrets()).adminToken;
 });
 
 after(async () => {
@@ -123,8 +126,12 @@ test("PNG 图标：魔数、尺寸与解码完整性", async () => {
 	}
 });
 
-test("管理端点拒绝非回环来源（模拟头不可绕过，仅回环判定）——本机可访问", async () => {
-	const status = await callGateway("/__dsh_remote__/admin/status");
+test("管理端点要求回环 + 管理密钥（P0-2）：无密钥 403，本机持密钥可访问", async () => {
+	const denied = await callGateway("/__dsh_remote__/admin/status");
+	assert.equal(denied.status, 403, "无管理密钥必须 403（同机反代转发的公网流量同样没有密钥）");
+	const status = await callGateway("/__dsh_remote__/admin/status", {
+		headers: { "x-dshr-admin-token": fixture.adminToken },
+	});
 	assert.equal(status.status, 200);
 	assert.match(status.body, /certFingerprint/);
 });

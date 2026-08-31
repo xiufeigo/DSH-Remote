@@ -285,6 +285,28 @@ export function hashAccessToken(token: string): string {
 }
 
 /**
+ * P0-2：管理端点共享密钥头。值取自 state/secrets.json 的 adminToken，
+ * 由同机消费方（CLI 诊断 / 插件下发器）读取后随请求回传。
+ */
+export const ADMIN_TOKEN_HEADER = "x-dshr-admin-token";
+
+/**
+ * P0-2：管理密钥校验。回环 socket 源地址无法区分「本机 CLI/插件」与「同机
+ * 反代（frpc 隧道转发 / 宿主 Caddy）转来的公网流量」—— 后者会让 admin 门禁
+ * 对公网全开（配对码铸造 → 完整认证绕过）。密钥只存于 0600 的
+ * state/secrets.json，公网侧无从得知。比较双方先哈希再恒时比较（等长 hex）。
+ */
+export function verifyAdminToken(input: string | undefined, stored: string | undefined): boolean {
+	// GW-14 同理：超长输入直接拒绝，不做无谓哈希
+	if (typeof input !== "string" || input.length === 0 || input.length > 256) return false;
+	if (typeof stored !== "string" || stored.length === 0 || stored.length > 256) return false;
+	return timingSafeEqual(
+		Buffer.from(hashAccessToken(input), "utf8"),
+		Buffer.from(hashAccessToken(stored), "utf8"),
+	);
+}
+
+/**
  * 校验明文访问 Token 与持久化哈希是否一致（恒时比较）。
  * 未配置哈希（undefined / 长度不对）一律拒绝 —— 门禁缺失时应走配对页而非放行。
  */

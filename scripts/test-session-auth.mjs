@@ -7,7 +7,8 @@
  * cookie；cookie 只能由 `GET /?token=<启动令牌>` 交换取得。适配链路：
  *
  *   插件宿主（进程内 connection.authenticatedUrl() 取令牌）
- *     → POST /__dsh_remote__/admin/launch-token（createLaunchTokenDelivery）
+ *     → POST /__dsh_remote__/admin/launch-token（createLaunchTokenDelivery；
+ *       P0-2 起请求须携带 secrets adminToken 的 x-dshr-admin-token 头）
  *     → 网关 UpstreamSession 向上游交换 cookie（按 authority 缓存/重铸）
  *     → proxy.ts 注入 Cookie、剥 sec-fetch-site、剥上游 Set-Cookie、401 重铸。
  *
@@ -314,6 +315,9 @@ const gwUrl = (path) => `https://127.0.0.1:${String(gw.port)}${path}`;
 
 const { Store } = await import("../packages/gateway/src/store.ts");
 const store = await Store.open(gw.home);
+// P0-2：admin 门禁密钥（网关子进程 start 时写进 gw.home 的 secrets.json）
+const adminToken = (await store.ensureSecrets()).adminToken;
+const adminHeaders = { "x-dshr-admin-token": adminToken };
 await store.putPendingCode("SESS-TONE", 10);
 const paired = await requestTls(gwUrl("/__dsh_remote__/pair"), {
 	method: "POST",
@@ -340,12 +344,14 @@ test("集成：未下发令牌时，上游按无会话处理（本测试上游�
 test("集成：下发令牌后，反代请求携带会话 cookie 且改写寻址头", async () => {
 	const posted = await requestTls(gwUrl("/__dsh_remote__/admin/launch-token"), {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: { "content-type": "application/json", ...adminHeaders },
 		body: JSON.stringify({ token: TOKEN }),
 	});
 	assert.equal(posted.status, 200, `令牌下发应成功：${posted.body}`);
 	await waitFor("会话 cookie 就绪", async () => {
-		const status = await requestTls(gwUrl("/__dsh_remote__/admin/status"), { headers: authHeaders });
+		const status = await requestTls(gwUrl("/__dsh_remote__/admin/status"), {
+			headers: { ...authHeaders, ...adminHeaders },
+		});
 		return status.status === 200 && JSON.parse(status.body).upstreamSession === "ready";
 	});
 	const index = await requestTls(gwUrl("/"), { headers: authHeaders });
