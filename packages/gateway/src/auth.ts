@@ -240,7 +240,9 @@ export async function checkRequest(
 	if (token === undefined || token.length === 0) return { ok: false, status: 401, reason: "no-device-token" };
 	const device = await deps.store.deviceByToken(token);
 	if (device === undefined) return { ok: false, status: 401, reason: "invalid-device-token" };
-	void deps.store.touchDevice(device.id);
+	// P2-6：touchDevice 内部落盘可 reject（EPERM/EBUSY 重试耗尽、ENOSPC 等），
+	// fire-and-forget 必须兜 .catch，否则未处理 rejection 会击杀网关进程
+	void deps.store.touchDevice(device.id).catch(() => {});
 	return { ok: true, deviceId: device.id };
 }
 

@@ -22,6 +22,7 @@
 
 import assert from "node:assert/strict";
 import http from "node:http";
+import tls from "node:tls";
 import { test, after } from "node:test";
 import { requestTls, createTestGateway, makeTempHome } from "./test-harness.mjs";
 
@@ -246,6 +247,64 @@ test("P0-2：admin 门禁要求 secrets 管理密钥——缺失/错误 403，�
 	// 攻击原语封死：公网侧（无密钥）不得铸造配对码（曾可经此绕过全部认证门）
 	const mint = await requestTls(gwUrl("/__dsh_remote__/admin/pair-code"), { method: "POST" });
 	assert.equal(mint.status, 403, "无密钥不得铸造配对码");
+});
+
+// ---------- 本轮（t5）修复回归 ----------
+
+/** 原始 TLS 请求：写入任意字节（可构造 Node https 客户端发不出的请求行），返回首个响应数据块。 */
+function rawTlsExchange(port, rawBytes, { timeoutMs = 6_000 } = {}) {
+	return new Promise((resolve, reject) => {
+		const socket = tls.connect({ host: "127.0.0.1", port, rejectUnauthorized: false }, () => {
+			socket.write(rawBytes);
+		});
+		let data = "";
+		const timer = setTimeout(() => {
+			socket.destroy();
+			reject(new Error("原始 TLS 交换超时"));
+		}, timeoutMs);
+		socket.on("data", (chunk) => {
+			data += chunk.toString("latin1");
+			if (data.includes("\r\n")) {
+				clearTimeout(timer);
+				socket.destroy();
+				resolve(data);
+			}
+		});
+		socket.on("error", (error) => {
+			clearTimeout(timer);
+			reject(error);
+		});
+	});
+}
+
+test("P0-1：畸形绝对形式请求行回 4xx 且不击杀网关进程", async () => {
+	// RFC 7230 绝对形式 + 越界端口：URL 构造抛 TypeError。旧代码解析在 try 之外
+	// → 未处理 rejection → Node ≥15 默认 throw → 网关进程 exit 1（未认证单请求可打死）。
+	const raw = await rawTlsExchange(
+		gw.port,
+		"GET http://x:99999/ HTTP/1.1\r\nhost: x:99999\r\nconnection: close\r\n\r\n",
+	);
+	assert.match(raw.split("\r\n")[0] ?? "", /^HTTP\/1\.1 4\d\d/, "应回 4xx 而非断连/5xx 之外的异常");
+	// 网关必须仍然存活（同一子进程继续服务）
+	const health = await requestTls(gwUrl("/__dsh_remote__/health"));
+	assert.equal(health.status, 200, "网关不得因畸形请求行死亡");
+});
+
+test("P3-10：WS 升级 head > 4KB 回 413（不再裸断连）", async () => {
+	// 认证后、代理前：升级请求头之后紧跟 8KB「head」字节 → 应答 413 而非 RST
+	const head = await rawTlsExchange(
+		gw.port,
+		"GET /api/ws HTTP/1.1\r\n" +
+			"host: gateway.invalid\r\n" +
+			"upgrade: websocket\r\n" +
+			"connection: Upgrade\r\n" +
+			"sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+			"sec-websocket-version: 13\r\n" +
+			`cookie: dr_device=${cookie}\r\n` +
+			"\r\n" +
+			"0".repeat(8192),
+	);
+	assert.match(head.split("\r\n")[0] ?? "", /413/, "超限 head 应回 413");
 });
 
 console.log("fix-regressions：阶段 0/1 修复行为钉桩已就绪");

@@ -193,11 +193,13 @@ export class GatewayServer {
 		this.server = https.createServer(
 			{ key: this.cert.keyPem, cert: this.cert.certPem },
 			(req, res) => {
-				void this.handle(req, res);
+				// P0-1 兜底：handle 全程 try/catch，这里只拦日志回调等极端抛出，
+				// 绝不让 handle 演变成未处理 rejection（同类问题曾可打死进程）
+				void this.handle(req, res).catch(() => res.destroy());
 			},
 		);
 		this.server.on("upgrade", (req, socket, head) => {
-			void this.handleUpgrade(req, socket as Duplex, head);
+			void this.handleUpgrade(req, socket as Duplex, head).catch(() => socket.destroy());
 		});
 		await new Promise<void>((resolve, reject) => {
 			this.server?.once("error", reject);
@@ -381,10 +383,13 @@ export class GatewayServer {
 	// ---------- HTTP ----------
 
 	private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-		const url = new URL(req.url ?? "/", "https://gateway.invalid");
-		const pathname = url.pathname;
-
 		try {
+			// P0-1：绝对形式请求行（RFC 7230 合法语法，Node http 照单全收）遇畸形
+			// authority（端口越界/坏 IPv6 字面量）会让 URL 构造器抛 TypeError——
+			// 解析必须留在 try 内，否则未处理 rejection 会击杀整个网关进程
+			//（PoC：单条 `GET http://x:99999/ HTTP/1.1` 即可让网关 exit 1）。
+			const url = new URL(req.url ?? "/", "https://gateway.invalid");
+			const pathname = url.pathname;
 			// 纵深防御：请求行含控制字符一律 400（防上游请求走私）
 			if (/[\r\n\0]/.test(req.url ?? "")) {
 				res.writeHead(400).end();
@@ -500,9 +505,14 @@ export class GatewayServer {
 			// —— 反向代理 ——
 			proxyHttp(req, res, this.upstreamAddress(), this.htmlInjector);
 		} catch (error) {
-			this.log(`处理 ${pathname} 出错：${String(error)}`);
-			if (!res.headersSent) res.writeHead(500).end("dsh-remote: 内部错误");
-			else res.end();
+			// P0-1：URL 解析失败按 400（请求行畸形），其余内部错误按 500
+			const malformedUrl = (error as NodeJS.ErrnoException)?.code === "ERR_INVALID_URL";
+			this.log(`处理 ${req.url ?? "/"} 出错：${String(error)}`);
+			if (!res.headersSent) {
+				res.writeHead(malformedUrl ? 400 : 500).end(malformedUrl ? "dsh-remote: 无法解析的请求行" : "dsh-remote: 内部错误");
+			} else {
+				res.end();
+			}
 		}
 	}
 
@@ -735,7 +745,8 @@ export class GatewayServer {
 			return;
 		}
 		if (head.length > 4096) {
-			socket.destroy();
+			// P3-10：礼貌回 413 再关（与上方 401 拒绝同风格），不再裸 destroy 让客户端只见 RST
+			socket.end("HTTP/1.1 413 Payload Too Large\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
 			return;
 		}
 		proxyUpgrade(req, socket as never, head, this.upstreamAddress());
