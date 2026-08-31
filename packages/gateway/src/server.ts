@@ -1,5 +1,7 @@
 /**
  * 网关主服务：HTTPS 监听（自签证书），内部路由 + 认证门 + 反向代理。
+ * 本文件只保留初始化 / 路由分发 / 生命周期；配对与登录页模板在 views.ts，
+ * 请求体读取解析在 body.ts，WebSocket 升级转发在 ws.ts。
  *
  * 路由约定：
  *   /__dsh_remote__/pair                配对页（未认证可访问，POST 消费一次性码）
@@ -12,7 +14,6 @@
  */
 
 import https from "node:https";
-import { readFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import {
@@ -24,7 +25,6 @@ import {
 	RateLimiter,
 	checkRequest,
 	clientIp,
-	clearDeviceCookie,
 	ensureAccessTokenHash,
 	generatePairingCode,
 	isLoopback,
@@ -34,6 +34,7 @@ import {
 	verifyAdminToken,
 	visitorKeyAdmits,
 } from "./auth.ts";
+import { readJsonBody, respondInvalidBody } from "./body.ts";
 import { ensureCert, loadManualCert, type GatewayCert } from "./cert.ts";
 import {
 	effectiveEdgeFrpRole,
@@ -57,10 +58,19 @@ import {
 } from "./frp.ts";
 import { loadMobileScript } from "./mobile.ts";
 import { BRAND_SVG, ICON_SVG, iconPng, injectIntoHtml, makeHtmlInjector, renderManifest, renderServiceWorker } from "./pwa.ts";
-import { proxyHttp, proxyUpgrade, type Upstream } from "./proxy.ts";
+import { proxyHttp, type Upstream } from "./proxy.ts";
 import { UpstreamSession } from "./session.ts";
 import type { Store } from "./store.ts";
 import { resolveUpstreamPort } from "./upstream.ts";
+import {
+	deriveDeviceName,
+	isDshRemoteAndroid,
+	renderAndroidPairPage,
+	renderDefaultPairPage,
+	renderTokenLoginPage,
+	safeNext,
+} from "./views.ts";
+import { handleGatewayUpgrade } from "./ws.ts";
 
 export interface GatewayServerOptions {
 	store: Store;
@@ -199,7 +209,12 @@ export class GatewayServer {
 			},
 		);
 		this.server.on("upgrade", (req, socket, head) => {
-			void this.handleUpgrade(req, socket as Duplex, head).catch(() => socket.destroy());
+			// 认证门与直通转发都在 ws.ts；这里只做接线（P0-1 同款兜底）
+			void handleGatewayUpgrade(req, socket as Duplex, head, {
+				config: this.config,
+				store: this.store,
+				resolveUpstream: () => this.upstreamAddress(),
+			}).catch(() => socket.destroy());
 		});
 		await new Promise<void>((resolve, reject) => {
 			this.server?.once("error", reject);
@@ -719,167 +734,9 @@ export class GatewayServer {
 				res.writeHead(404).end();
 		}
 	}
-
-	// ---------- WebSocket ----------
-
-	private async handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
-		const url = req.url ?? "/";
-		// 升级请求按原始字节直通上游，控制字符必须在此拦死（防走私）
-		if (/[\r\n\0]/.test(url)) {
-			socket.destroy();
-			return;
-		}
-		if (url.startsWith(INTERNAL_PREFIX)) {
-			socket.destroy();
-			return;
-		}
-		// edge 一律要求设备 Cookie；desktop 保留访客密钥直通（与 HTTP 路径同一判定）
-		const tunnelAdmits = this.config.role !== "edge" && visitorKeyAdmits(this.config);
-		const verdict = tunnelAdmits
-			? { ok: true as const, deviceId: "visitor-key" }
-			: await checkRequest(req, { store: this.store, config: this.config });
-		if (!verdict.ok) {
-			socket.write("HTTP/1.1 401 Unauthorized\r\nconnection: close\r\n\r\n");
-			socket.destroy();
-			await this.store.audit("upgrade_rejected", { path: url.split("?")[0] });
-			return;
-		}
-		if (head.length > 4096) {
-			// P3-10：礼貌回 413 再关（与上方 401 拒绝同风格），不再裸 destroy 让客户端只见 RST
-			socket.end("HTTP/1.1 413 Payload Too Large\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
-			return;
-		}
-		proxyUpgrade(req, socket as never, head, this.upstreamAddress());
-	}
-}
-
-function isDshRemoteAndroid(req: IncomingMessage): boolean {
-	return String(req.headers["user-agent"] ?? "").includes("DSHRemoteAndroid/1");
-}
-
-function pairScript(next: string, locked: boolean): string {
-	return `<script>
-async function submit(){
- const err=document.getElementById('err');
- err.textContent='';
- const r=await fetch('${PAIR_PAGE}',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code:document.getElementById('code').value.trim(),name:document.getElementById('name').value})});
- if(r.ok){location.href=${JSON.stringify(next)};return;}
- const j=await r.json().catch(()=>({}));
- err.textContent= j.message ?? ('配对失败 ('+r.status+')');
-}
-document.getElementById('code').addEventListener('keydown',e=>{if(e.key==='Enter')submit()});
-${locked ? "document.getElementById('err').textContent='失败次数过多，请稍后再试';" : ""}
-</script>`;
-}
-
-/** edge 登录页脚本：提交访问 Token，成功后由 302/JSON 引导回 next。 */
-function loginScript(next: string, locked: boolean): string {
-	return `<script>
-async function submit(){
- const err=document.getElementById('err');
- err.textContent='';
- const r=await fetch('${LOGIN_PAGE}',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:document.getElementById('token').value.trim(),name:document.getElementById('name').value})});
- if(r.ok){location.href=${JSON.stringify(next)};return;}
- const j=await r.json().catch(()=>({}));
- err.textContent= j.message ?? ('验证失败 ('+r.status+')');
-}
-document.getElementById('token').addEventListener('keydown',e=>{if(e.key==='Enter')submit()});
-${locked ? "document.getElementById('err').textContent='失败次数过多，请稍后再试';" : ""}
-</script>`;
-}
-
-/** 从 User-Agent 推导设备显示名（Token 登录自动配对时缺省名称）。 */
-function deriveDeviceName(req: IncomingMessage): string {
-	const ua = String(req.headers["user-agent"] ?? "");
-	if (/iPad/i.test(ua)) return "iPad · 浏览器";
-	if (/iPhone/i.test(ua)) return "iPhone · 浏览器";
-	if (/Android/i.test(ua)) return "Android · 浏览器";
-	if (/Macintosh/i.test(ua)) return "Mac · 浏览器";
-	if (/Windows/i.test(ua)) return "Windows · 浏览器";
-	return "浏览器设备";
-}
-
-/**
- * edge 前置 Token 登录页。观感与默认配对页同族（深色卡片）；
- * 未认证可访问，因此渲染走纯静态模板 + safeNext 白名单，无任何注入面。
- */
-function renderTokenLoginPage(next: string, locked: boolean): string {
-	return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>DSH Remote · 访问验证</title>
-<style>
- body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#101418;color:#e8eaed;display:flex;justify-content:center;padding-top:12vh;margin:0}
- .card{background:#1a2027;border-radius:16px;padding:32px;width:min(92vw,380px)}
- h1{font-size:20px;margin:0 0 8px} p{color:#9aa4af;font-size:13px;line-height:1.6;margin:0 0 20px}
- input{width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #2c3641;background:#0d1115;color:#fff;font-size:16px;margin-bottom:12px}
- button{width:100%;padding:12px;border:none;border-radius:10px;background:#1b66ff;color:#fff;font-size:15px;font-weight:600}
- .err{color:#ff6b6b;font-size:13px;min-height:18px;margin-bottom:8px}
-</style></head><body><div class="card">
-<h1>DSH Remote</h1><p>此入口受访问 Token 保护。输入服务器上配置的 Token，验证通过后本设备将被授权并长期保持登录。</p>
-<div class="err" id="err"></div>
-<input id="token" type="password" placeholder="访问 Token" autocomplete="off">
-<input id="name" placeholder="设备名称（可选，如 我的 iPad）">
-<button onclick="submit()">验证并进入</button>
-${loginScript(next, locked)}</div></body></html>`;
-}
-
-function renderDefaultPairPage(next: string, locked: boolean): string {
-	return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>DSH Remote · 设备配对</title>
-<style>
- body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#101418;color:#e8eaed;display:flex;justify-content:center;padding-top:12vh;margin:0}
- .card{background:#1a2027;border-radius:16px;padding:32px;width:min(92vw,380px)}
- h1{font-size:20px;margin:0 0 8px} p{color:#9aa4af;font-size:13px;line-height:1.6;margin:0 0 20px}
- input{width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #2c3641;background:#0d1115;color:#fff;font-size:16px;margin-bottom:12px;text-transform:uppercase}
- button{width:100%;padding:12px;border:none;border-radius:10px;background:#1b66ff;color:#fff;font-size:15px;font-weight:600}
- .err{color:#ff6b6b;font-size:13px;min-height:18px;margin-bottom:8px}
-</style></head><body><div class="card">
-<h1>DSH Remote</h1><p>新设备需要配对。在电脑终端运行 <code>dsh-remote pair</code> 获取一次性配对码，输入后本设备将被授权访问。</p>
-<div class="err" id="err"></div>
-<input id="code" placeholder="配对码（如 XK4M-P2VW）" autocomplete="off" autocapitalize="characters">
-<input id="name" placeholder="设备名称（如 我的手机）">
-<button onclick="submit()">配对</button>
-${pairScript(next, locked)}</div></body></html>`;
-}
-
-function renderAndroidPairPage(next: string, locked: boolean): string {
-	return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>DSH Remote · 设备配对</title>
-<style>
- :root{color-scheme:light;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
- *{box-sizing:border-box}html,body{min-height:100%;margin:0}body{color:#111318;background:#fff}
- main{min-height:100vh;display:flex;flex-direction:column;padding:max(20px,env(safe-area-inset-top)) 24px max(28px,env(safe-area-inset-bottom))}
- header{display:flex;align-items:center;gap:10px;font-size:19px;font-weight:650;line-height:28px}header img{width:30px;height:30px}header small{display:inline-flex;align-items:center;min-height:17px;padding:1px 5px;border-radius:3px;background:#111318;color:#fff;font-size:10px;line-height:1}
- section{width:min(100%,360px);margin:auto;transform:translateY(-7vh)}h1{margin:0;font-size:24px;font-weight:650;line-height:1.35}p{margin:10px 0 26px;color:#73777f;font-size:14px;line-height:1.65}label{display:block;margin:0 0 7px;font-size:13px;font-weight:600}input{display:block;width:100%;min-height:48px;margin:0 0 17px;padding:0 12px;border:1px solid #d9dde5;border-radius:7px;background:#fff;color:#111318;font:inherit;font-size:16px;outline:none}input:focus{border-color:#111318;box-shadow:0 0 0 2px rgba(17,19,24,.12)}#code{text-transform:uppercase}.err{min-height:20px;margin:0 0 10px;color:#b33b3b;font-size:13px;line-height:20px}button{width:100%;min-height:48px;border:1px solid #111318;border-radius:7px;background:#111318;color:#fff;font:inherit;font-size:15px;font-weight:650;cursor:pointer}
-</style></head><body><main><header><img src="/__dsh_remote__/brand.svg" alt=""><span>deepseek</span><small>HARNESS</small></header>
-<section aria-labelledby="title"><h1 id="title">配对这台设备</h1><p>在电脑终端运行 <code>dsh-remote pair</code> 获取一次性配对码。</p>
-<div class="err" id="err" role="status" aria-live="polite"></div>
-<label for="code">配对码</label><input id="code" placeholder="如 XK4M-P2VW" autocomplete="off" autocapitalize="characters">
-<label for="name">设备名称</label><input id="name" placeholder="如 我的手机" autocomplete="nickname">
-<button type="button" onclick="submit()">配对</button>
-${pairScript(next, locked)}</section></main></body></html>`;
 }
 
 // ---------- 小工具 ----------
-
-/**
- * 配对页回跳地址白名单校验。
- * 只允许路径与基础 URL 字符；显式排除引号/反斜杠/尖括号等，
- * 杜绝经 `location.href='${next}'` 注入 JS 的 XSS（配对页可被未认证访问）。
- */
-function safeNext(raw: string | null): string {
-	if (raw === null || raw === "") return "/";
-	// GW-15：长度上限 512，拒绝超长 next（匹配成本与回跳参数都界化）
-	if (raw.length > 512) return "/";
-	if (!raw.startsWith("/") || raw.startsWith("//") || raw.includes("\\")) return "/";
-	if (!/^[A-Za-z0-9\-._~!$&()*+,;=:@%?+\/]+$/.test(raw.slice(1))) return "/";
-	return raw;
-}
 
 /**
  * 管理端点的同源判定：无 Origin（CLI/curl）或 Origin 指向本机网关自身才放行。
@@ -894,79 +751,4 @@ function isSameSiteLoopbackOrigin(req: IncomingMessage): boolean {
 	} catch {
 		return false;
 	}
-}
-
-/** GW-11：请求体超限专用错误——调用方先回标准 413 再关流，不再裸 destroy 让客户端只吃 RST。 */
-class BodyTooLargeError extends Error {
-	constructor() {
-		super("body too large");
-	}
-}
-
-/** 配对/登录/管理类端点的请求体上限（代理转发另有业务上限，见 proxy.ts）。 */
-const BODY_LIMIT_BYTES = 64 * 1024;
-
-function readBody(req: IncomingMessage): Promise<string> {
-	return new Promise((resolve, reject) => {
-		const chunks: Buffer[] = [];
-		let size = 0;
-		let settled = false;
-		req.on("data", (chunk: Buffer) => {
-			if (settled) return; // 超限/出错后停止累积，避免继续吃内存
-			size += chunk.length;
-			if (size > BODY_LIMIT_BYTES) {
-				settled = true;
-				reject(new BodyTooLargeError());
-				return;
-			}
-			chunks.push(chunk);
-		});
-		req.on("end", () => {
-			if (!settled) {
-				settled = true;
-				resolve(Buffer.concat(chunks).toString("utf8"));
-			}
-		});
-		req.on("error", (error) => {
-			if (!settled) {
-				settled = true;
-				reject(error);
-			}
-		});
-	});
-}
-
-type ParsedBody<T> = { ok: true; value: T } | { ok: false; oversized?: boolean };
-
-/**
- * SEC-02 + GW-11：读取并解析 JSON 请求体，把两类失败区分开：
- * - 超 64KB → `{ ok: false, oversized: true }`（调用方回 413 后关流）；
- * - 非法 JSON / 非对象 → `{ ok: false }`（调用方回 400，不再抛成 500）。
- */
-async function readJsonBody<T>(req: IncomingMessage): Promise<ParsedBody<T>> {
-	let text: string;
-	try {
-		text = await readBody(req);
-	} catch (error) {
-		return { ok: false, oversized: error instanceof BodyTooLargeError };
-	}
-	try {
-		const parsed: unknown = JSON.parse(text);
-		if (typeof parsed === "object" && parsed !== null) return { ok: true, value: parsed as T };
-	} catch {
-		// 非法 JSON 与下面的非对象值同样按 400 处理
-	}
-	return { ok: false };
-}
-
-/** SEC-02 / GW-11 的统一拒绝响应。 */
-function respondInvalidBody(req: IncomingMessage, res: ServerResponse, oversized: boolean): void {
-	if (oversized) {
-		// 先写完标准 413（并声明关闭连接），刷出后再销毁请求流
-		res.writeHead(413, { "content-type": "application/json", connection: "close" });
-		res.end(JSON.stringify({ message: "请求体过大" }), () => req.destroy());
-		return;
-	}
-	res.writeHead(400, { "content-type": "application/json" });
-	res.end(JSON.stringify({ message: "请求体不是合法 JSON" }));
 }
