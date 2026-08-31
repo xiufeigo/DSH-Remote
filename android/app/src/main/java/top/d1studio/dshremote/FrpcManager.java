@@ -17,13 +17,12 @@ import java.util.concurrent.TimeUnit;
  * frpc visitor 子进程托管：写 toml → exec 打包在 jniLibs 里的 libfrpc.so
  * （安装时被系统解压到 nativeLibraryDir，Android 允许执行该目录，不允许执行 filesDir）。
  *
- * 崩溃自动重启（指数退避至 60s）；日志进 logcat（tag dshr-frpc），保留尾部供「关于」查看。
+ * 崩溃自动重启（指数退避至 60s）；日志进 logcat（tag dshr-frpc）。
  * stop() 会等到进程真正退出，避免 18443 仍被旧进程占用、新 visitor 起不来。
  */
 public class FrpcManager {
 
 	private static final String TAG = "dshr-frpc";
-	private static final int MAX_LOG_LINES = 200;
 
 	private final File workDir;
 	private final File binFile;
@@ -32,7 +31,6 @@ public class FrpcManager {
 	private volatile int startEpoch = 0;
 	private Thread watcher;
 	private long backoffMs = 1000;
-	private final StringBuilder tail = new StringBuilder();
 
 	public FrpcManager(Context context) {
 		workDir = context.getFilesDir();
@@ -165,18 +163,8 @@ public class FrpcManager {
 		}
 	}
 
-	/** 尾部日志（调试用）。 */
-	public synchronized String tailLog() {
-		return tail.toString();
-	}
-
 	private void log(String line) {
 		Log.i(TAG, line);
-		synchronized (tail) {
-			tail.append(line).append('\n');
-			int extra = tail.length() - MAX_LOG_LINES * 120;
-			if (extra > 0) tail.delete(0, extra);
-		}
 	}
 
 }
