@@ -74,7 +74,10 @@ export class UpstreamSession {
 	private readonly now: () => number;
 
 	private launchToken?: string;
-	private state: SessionState = "idle";
+	// P2-5：内部字段曾与下方 get state() 同名互相遮蔽（TS2300 duplicate
+	// identifier，tsc 全线编译失败；运行时靠原生 class field 遮蔽 prototype
+	// getter 才侥幸读到活值）。字段改名收敛，公共只读走 getter。
+	private sessionState: SessionState = "idle";
 	/** authority → cookie 对（"name=value"）。 */
 	private readonly cookies = new Map<string, string>();
 	/** 单飞铸造：authority → 进行中的铸造 Promise。 */
@@ -95,8 +98,11 @@ export class UpstreamSession {
 		if (trimmed.length === 0) return;
 		if (this.launchToken === trimmed) return;
 		this.launchToken = trimmed;
-		this.state = "pending";
+		this.sessionState = "pending";
 		this.cookies.clear();
+		// P3-9：同时清掉在途铸造表 —— 旧令牌的交换完成后不得把旧纪元 cookie
+		// 写进新纪元缓存（mintOnce 内还有令牌纪元复核双保险）。
+		this.minting.clear();
 		this.lastMintAt = 0;
 		this.log("已收到 DSH 启动令牌（0.1.2+ 浏览器会话适配生效）");
 	}
@@ -108,7 +114,7 @@ export class UpstreamSession {
 
 	/** 诊断状态（admin/status 暴露用）。 */
 	get state(): SessionState {
-		return this.state;
+		return this.sessionState;
 	}
 
 	/**
@@ -130,8 +136,8 @@ export class UpstreamSession {
 		if (upstream.tls === true) return false;
 		const authority = `${upstream.host}:${String(upstream.port)}`;
 		if (this.launchToken === undefined) {
-			if (this.state === "idle") {
-				this.state = "no-token";
+			if (this.sessionState === "idle") {
+				this.sessionState = "no-token";
 				this.log("上游为 DSH 0.1.2+ 时需要浏览器会话；尚未收到启动令牌（等待插件宿主下发，旧版宿主无此要求）");
 			}
 			return false;
@@ -149,7 +155,7 @@ export class UpstreamSession {
 		if (upstream.tls === true) return;
 		const authority = `${upstream.host}:${String(upstream.port)}`;
 		if (this.cookies.delete(authority)) {
-			this.state = "pending";
+			this.sessionState = "pending";
 			this.lastMintAt = 0;
 			this.log(`上游 ${authority} 的会话 cookie 已失效，稍后重铸`);
 			void this.mint(authority, upstream).catch(() => {});
@@ -187,30 +193,35 @@ export class UpstreamSession {
 			});
 			// 303（交换成功）与 200（带有效 cookie 直取，罕见）都可取 Set-Cookie
 			if (response.status !== 303 && response.status !== 200) {
+				// P3-9：令牌纪元复核 —— 交换期间令牌被更换（setLaunchToken 已清
+				// 缓存与在途表）时，本结果属于旧纪元，不得改写新纪元的状态。
+				if (this.launchToken !== token) return undefined;
 				if (response.status === 401) {
-					this.state = "failed";
+					this.sessionState = "failed";
 					this.log("启动令牌交换被上游拒绝（DSH 重启后令牌会更换；插件宿主会自动重发，稍候即可恢复）");
 				} else {
-					this.state = "failed";
+					this.sessionState = "failed";
 					this.log(`启动令牌交换得到意外状态 ${String(response.status)}`);
 				}
 				return undefined;
 			}
 			const setCookies = response.headers.getSetCookie();
+			// P3-9：同上——旧纪元交换成功的 cookie 不写入新纪元缓存（新纪元自铸）
+			if (this.launchToken !== token) return undefined;
 			for (const raw of setCookies) {
 				const pair = cookiePairOf(raw);
 				if (pair !== undefined) {
 					this.cookies.set(authority, pair);
-					this.state = "ready";
+					this.sessionState = "ready";
 					this.log(`上游 ${authority} 会话 cookie 就绪`);
 					return pair;
 				}
 			}
-			this.state = "failed";
+			this.sessionState = "failed";
 			this.log("上游交换响应未携带会话 cookie（宿主版本可能低于 0.1.2-alpha.1，按无会话继续）");
 			return undefined;
 		} catch (error) {
-			this.state = "failed";
+			if (this.launchToken === token) this.sessionState = "failed";
 			this.log(`上游会话交换失败：${String((error as Error).message ?? error)}`);
 			return undefined;
 		}

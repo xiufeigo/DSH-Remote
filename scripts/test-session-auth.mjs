@@ -144,6 +144,29 @@ test("session：401 失效重铸（invalidate）绕过节流并恢复", async ()
 	assert.equal(session.cookieHeaderFor(upstream), "dsh-auth-k=v1");
 });
 
+test("session：令牌更换时在途旧纪元交换结果不写入新纪元（P3-9）", async () => {
+	// 可手动放行的 fetch 队列：第 1 次交换挂在途，模拟 DSH 重启换令牌的窗口期
+	const pending = [];
+	const fetchImpl = fakeFetch(() => new Promise((resolve) => pending.push(resolve)));
+	const session = new UpstreamSession({ fetchImpl, mintThrottleMs: 0 });
+	const upstream = { host: "127.0.0.1", port: 52392 };
+	session.setLaunchToken("tok-old");
+	const inflight = session.ensureCookie(upstream);
+	// 交换途中令牌更换：缓存与在途表被清空，旧纪元结果必须被丢弃
+	session.setLaunchToken("tok-new");
+	pending[0](exchangeResponse(303, "dsh-auth-old=stale"));
+	assert.equal(await inflight, false, "旧纪元交换不得令 ensureCookie 判定就绪");
+	assert.equal(session.cookieHeaderFor(upstream), undefined, "旧纪元 cookie 不得进入新纪元缓存");
+	// 新纪元以新令牌重新交换并就绪
+	const second = session.ensureCookie(upstream);
+	await waitFor("新纪元交换已发出", () => pending.length >= 2);
+	assert.match(fetchImpl.calls[1]?.url ?? "", /token=tok-new/, "第二次交换必须携带新令牌");
+	pending[1](exchangeResponse(303, "dsh-auth-new=fresh"));
+	assert.equal(await second, true);
+	assert.equal(session.cookieHeaderFor(upstream), "dsh-auth-new=fresh");
+	assert.equal(session.state, "ready");
+});
+
 // ---------- Part 2：buildUpstreamHeaders 单元 ----------
 
 test("proxy：设备 Cookie 剥离、会话 Cookie 注入、sec-fetch-site 剥离、寻址头改写", () => {
@@ -339,6 +362,16 @@ test("集成：未下发令牌时，上游按无会话处理（本测试上游�
 	const index = await requestTls(gwUrl("/"), { headers: authHeaders });
 	assert.equal(index.status, 401, "未注入会话 cookie → 上游 401 原样透传");
 	assert.ok(index.body.includes(DSH_UNAUTHORIZED_MARKER));
+});
+
+test("集成：admin/status 如实上报会话状态迁移 idle → ready（P2-5 回归）", async () => {
+	// P2-5：session.ts 内部字段曾遮蔽同名 getter（TS2300；运行时侥幸读到活值）。
+	// 钉桩 admin/status 上报路径：令牌下发前 idle，下发并交换成功后 ready。
+	const before = await requestTls(gwUrl("/__dsh_remote__/admin/status"), {
+		headers: { ...authHeaders, ...adminHeaders },
+	});
+	assert.equal(before.status, 200, `admin/status 应可访问：${before.body}`);
+	assert.equal(JSON.parse(before.body).upstreamSession, "idle", "令牌下发前会话状态必须是 idle");
 });
 
 test("集成：下发令牌后，反代请求携带会话 cookie 且改写寻址头", async () => {
