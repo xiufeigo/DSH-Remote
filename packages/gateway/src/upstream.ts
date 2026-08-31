@@ -12,6 +12,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { DSH_UNAUTHORIZED_MARKER } from "./session.ts";
 
 const MARKERS = ["__dsh_boot__", "deepseek harness", ">dsh<", "dsh-client"];
 const MAX_PROBES = 96;
@@ -23,6 +24,13 @@ export async function hasDshFingerprint(port: number, timeoutMs = 2500): Promise
 			signal: AbortSignal.timeout(timeoutMs),
 			redirect: "manual",
 		});
+		// DSH 0.1.2-alpha.1 起：未认证的 GET / 直接 401（纯文本），index 不再公开。
+		// 该 401 的响应体是 DSH 认证组件的固定文案，足以作为正向指纹 —— 否则
+		// 端口自动探测在 0.1.2+ 宿主上会全部失配。
+		if (response.status === 401) {
+			const text = (await response.text()).slice(0, 4_000).toLowerCase();
+			return text.includes(DSH_UNAUTHORIZED_MARKER);
+		}
 		if (!response.ok) return false;
 		const text = (await response.text()).slice(0, 400_000).toLowerCase();
 		return MARKERS.some((marker) => text.includes(marker));

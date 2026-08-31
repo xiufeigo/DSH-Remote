@@ -32,3 +32,6 @@ chain-log.txt
 
 # AgentTeams captain state (local tooling)
 .agent-teams/
+
+# Captain verification workspace (npm host packs, audit reports)
+scratch/

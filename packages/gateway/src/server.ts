@@ -5,7 +5,8 @@
  *   /__dsh_remote__/pair                配对页（未认证可访问，POST 消费一次性码）
  *   /__dsh_remote__/manifest.webmanifest / icon.svg   PWA 静态资源
  *   /__dsh_remote__/health              存活探针（无信息泄露）
- *   /__dsh_remote__/admin/*             本机管理端点（仅接受回环来源）
+ *   /__dsh_remote__/admin/*             本机管理端点（仅接受回环来源；launch-token
+ *                                       接收插件下发的 DSH 0.1.2+ 启动令牌）
  *   其余                                设备认证后原样代理到上游 DSH Web GUI
  */
 
@@ -54,6 +55,7 @@ import {
 import { loadMobileScript } from "./mobile.ts";
 import { BRAND_SVG, ICON_SVG, iconPng, injectIntoHtml, makeHtmlInjector, renderManifest, renderServiceWorker } from "./pwa.ts";
 import { proxyHttp, proxyUpgrade, type Upstream } from "./proxy.ts";
+import { UpstreamSession } from "./session.ts";
 import type { Store } from "./store.ts";
 import { resolveUpstreamPort } from "./upstream.ts";
 
@@ -78,12 +80,18 @@ export class GatewayServer {
 	private cert?: GatewayCert;
 	private accessTokenHash?: string;
 	private htmlInjector: (body: Buffer) => Buffer = injectIntoHtml;
+	/**
+	 * DSH 0.1.2+ 上游浏览器会话（令牌由插件宿主半边经 admin 端点下发）。
+	 * 旧版宿主（≤0.1.1-rc.2）无浏览器认证，令牌永不 arrive，注入自然缺席。
+	 */
+	private readonly session: UpstreamSession;
 
 	constructor(options: GatewayServerOptions) {
 		this.store = options.store;
 		this.config = options.config;
 		this.log = options.log ?? (() => {});
 		this.env = options.env ?? process.env;
+		this.session = new UpstreamSession({ log: (line) => this.log(line) });
 		this.limiter = new RateLimiter(
 			options.config.rateLimitPerMinute,
 			options.config.pairingFailLockThreshold,
@@ -125,18 +133,34 @@ export class GatewayServer {
 		}
 	}
 
-	/** 生效的上游地址（含是否按 HTTPS 访问的推断）。 */
+	/**
+	 * 生效的上游地址（含是否按 HTTPS 访问的推断）。
+	 * 本机 DSH（desktop、非 TLS）额外携带上游浏览器会话 cookie（0.1.2+）：
+	 * cookie 由 session.ts 为该 authority 铸造缓存；TLS 上游（对端是另一台
+	 * PC 网关）不做注入 —— 对端自己负责它本地 DSH 的会话。
+	 */
 	private upstreamAddress(): Upstream {
 		const tls = effectiveUpstreamTls(this.config);
+		let base: Upstream;
 		if (this.config.role === "edge") {
 			const role = normalizeEdgeFrpRole(this.config.frp.edge);
-			if (role === "visitor") return { host: "127.0.0.1", port: visitorBindPortOf(this.config.frp), tls };
-			if (role === "frps" && normalizeEdgeConsume(this.config.frp.edgeConsume) === "entry-port") {
-				return { host: "127.0.0.1", port: this.config.frp.remotePort ?? this.config.upstreamPort, tls };
-			}
-			if (role === "frps") return { host: "127.0.0.1", port: visitorBindPortOf(this.config.frp), tls };
+			if (role === "visitor") base = { host: "127.0.0.1", port: visitorBindPortOf(this.config.frp), tls };
+			else if (role === "frps" && normalizeEdgeConsume(this.config.frp.edgeConsume) === "entry-port") {
+				base = { host: "127.0.0.1", port: this.config.frp.remotePort ?? this.config.upstreamPort, tls };
+			} else if (role === "frps") base = { host: "127.0.0.1", port: visitorBindPortOf(this.config.frp), tls };
+			else base = { host: this.config.upstreamHost ?? "127.0.0.1", port: this.config.upstreamPort, tls };
+		} else {
+			base = { host: this.config.upstreamHost ?? "127.0.0.1", port: this.config.upstreamPort, tls };
 		}
-		return { host: this.config.upstreamHost ?? "127.0.0.1", port: this.config.upstreamPort, tls };
+		if (base.tls === true) return base;
+		const sessionCookie = this.session.cookieHeaderFor(base);
+		if (sessionCookie === undefined) {
+			// 令牌在而 cookie 不在（首铸前 / 401 重铸失败后）：后台补铸
+			// （mint 节流兜底，不会形成风暴）；本次请求先按无会话代理。
+			if (this.session.hasToken) void this.session.ensureCookie(base).catch(() => {});
+			return base;
+		}
+		return { ...base, sessionCookie, onUnauthorized: () => this.session.invalidate(base) };
 	}
 
 	async start(): Promise<void> {
@@ -639,7 +663,30 @@ export class GatewayServer {
 					frps: this.frps?.status(),
 					visitor: this.visitor?.status(),
 					upstream: `${upstream.host}:${String(upstream.port)}`,
+					upstreamSession: this.session.state,
 				}, null, "\t"));
+				return;
+			}
+			case "POST /__dsh_remote__/admin/launch-token": {
+				// DSH 0.1.2+ 适配：插件宿主半边在 DSH 进程内经 connection 服务
+				// 取得浏览器启动令牌后下发到这里；网关随后向上游交换会话 cookie。
+				// 仅回环可达（admin 前缀已统一回环 + 同源闸门）。
+				const parsed = await readJsonBody<{ token?: string }>(req);
+				if (!parsed.ok) {
+					respondInvalidBody(req, res, parsed.oversized === true);
+					return;
+				}
+				const token = typeof parsed.value.token === "string" ? parsed.value.token.trim() : "";
+				if (token.length === 0 || token.length > 512) {
+					res.writeHead(400, { "content-type": "application/json" });
+					res.end(JSON.stringify({ ok: false, message: "token 字段缺失或超长" }));
+					return;
+				}
+				this.session.setLaunchToken(token);
+				res.writeHead(200, { "content-type": "application/json" });
+				res.end(JSON.stringify({ ok: true }));
+				// 立即向上游交换会话 cookie（不阻塞响应）
+				void this.session.ensureCookie(this.upstreamAddress()).catch(() => {});
 				return;
 			}
 			case "POST /__dsh_remote__/admin/shutdown": {

@@ -97,10 +97,15 @@ export function readTunnelSnapshot(home) {
 	}
 }
 
-function requestAdmin(port, path, method = "GET") {
+function requestAdmin(port, path, method = "GET", body) {
 	return new Promise((resolveRequest) => {
+		const headers = {};
+		if (typeof body === "string" && body.length > 0) {
+			headers["content-type"] = "application/json";
+			headers["content-length"] = Buffer.byteLength(body);
+		}
 		const request = https.request(
-			{ host: "127.0.0.1", port, path, method, rejectUnauthorized: false, timeout: 4000 },
+			{ host: "127.0.0.1", port, path, method, headers, rejectUnauthorized: false, timeout: 4000 },
 			(response) => {
 				const chunks = [];
 				response.on("data", (chunk) => chunks.push(chunk));
@@ -115,7 +120,8 @@ function requestAdmin(port, path, method = "GET") {
 			resolveRequest(undefined);
 		});
 		request.on("error", () => resolveRequest(undefined));
-		request.end();
+		if (typeof body === "string" && body.length > 0) request.end(body);
+		else request.end();
 	});
 }
 
@@ -294,6 +300,70 @@ export function createRouteHandlers(deps) {
 }
 
 // ============================================================================
+// DSH 0.1.2+ 启动令牌下发器（依赖注入便于单测，真实接线见 apply）。
+// ============================================================================
+
+/**
+ * 把宿主进程的 DSH 浏览器启动令牌投递给网关的管理端点。
+ *
+ * @param deps {{
+ *   port: () => number,
+ *   requestAdmin: (port: number, path: string, method?: string, body?: string) =>
+ *     Promise<{ status: number, body: string } | undefined>,
+ *   log?: (line: string) => void,
+ *   warn?: (line: string) => void,
+ *   isDisposed?: () => boolean,
+ *   retryDelayMs?: number,
+ *   attempts?: number,
+ * }}
+ * 网关可能尚未监听（拉起中/重启中），故带有限次退避重试；令牌更换
+ * （DSH 进程重启）时重新调用 setToken 即可，网关侧按幂等处理。
+ */
+export function createLaunchTokenDelivery(deps) {
+	const send = typeof deps.requestAdmin === "function" ? deps.requestAdmin : async () => undefined;
+	const isDisposed = typeof deps.isDisposed === "function" ? deps.isDisposed : () => false;
+	const portOf = typeof deps.port === "function" ? deps.port : () => 18443;
+	const log = typeof deps.log === "function" ? deps.log : () => {};
+	const warn = typeof deps.warn === "function" ? deps.warn : () => {};
+	const retryDelayMs = Number.isInteger(deps.retryDelayMs) ? deps.retryDelayMs : 1_000;
+	const attempts = Number.isInteger(deps.attempts) ? deps.attempts : 20;
+	let token;
+	let delivering = false;
+
+	async function deliver() {
+		const value = token;
+		if (typeof value !== "string" || isDisposed() || delivering) return false;
+		delivering = true;
+		try {
+			for (let attempt = 0; attempt < attempts; attempt += 1) {
+				if (isDisposed()) return false;
+				const response = await send(portOf(), "/__dsh_remote__/admin/launch-token", "POST", JSON.stringify({ token: value }));
+				if (response !== undefined && response.status === 200) {
+					log("已向网关下发 DSH 启动令牌（浏览器会话适配）");
+					return true;
+				}
+				await new Promise((resolveWait) => setTimeout(resolveWait, retryDelayMs));
+			}
+			warn("网关持续未就绪，本轮启动令牌下发放弃；下次网关拉起后自动重试");
+			return false;
+		} finally {
+			delivering = false;
+		}
+	}
+
+	return {
+		get token() { return token; },
+		/** 记录令牌并立即投递（重复下发幂等；更换令牌会触发新一轮投递）。 */
+		setToken(value) {
+			if (typeof value !== "string" || value.trim().length === 0) return;
+			token = value;
+			void deliver();
+		},
+		deliver,
+	};
+}
+
+// ============================================================================
 // 插件对象
 // ============================================================================
 
@@ -336,6 +406,11 @@ var plugin_default = {
 				return;
 			}
 			child = proc;
+			// 网关（重）拉起后如果手里已有令牌（crash 自动重启 / 手动重启路径），
+			// 重新下发 —— 网关进程内存不保留旧令牌。
+			if (launchTokenDelivery.token !== undefined) {
+				setTimeout(() => { void launchTokenDelivery.deliver(); }, 1_500);
+			}
 			const forward = (chunk) => {
 				for (const line of chunk.toString("utf8").split("\n")) {
 					const trimmed = line.trimEnd();
@@ -369,6 +444,40 @@ var plugin_default = {
 			child = null;
 			killProcessTree(proc);
 		};
+
+		// ── DSH 0.1.2+ 浏览器会话适配：进程启动令牌下发 ─────────────
+		// 0.1.2-alpha.1 起宿主 Web 界面要求浏览器会话（GET /?token=启动令牌
+		// 换 cookie；index、/api、WS 全部校验）。connection 服务暴露
+		// authenticatedUrl()（web-app 打印 URL 用的同一入口），本插件在宿主
+		// 进程内取到令牌后下发给网关，由网关向上游交换会话 cookie 并注入
+		// 反代请求。旧版宿主（≤0.1.1-rc.2）没有 connection 服务：ctx.inject
+		// 回调不执行，网关收不到令牌、不做任何注入 —— 行为与旧版完全一致。
+		const launchTokenDelivery = createLaunchTokenDelivery({
+			port: () => {
+				const cfg = readConfigFile(home);
+				return Number.isInteger(cfg.listenPort) ? cfg.listenPort : 18443;
+			},
+			requestAdmin,
+			log: (line) => console.log(`${TAG} ${line}`),
+			warn: (line) => console.warn(`${TAG} ${line}`),
+			isDisposed: () => disposed,
+		});
+		if (typeof ctx.inject === "function") {
+			ctx.inject(["connection"], (connectionCtx) => {
+				try {
+					const connection = typeof connectionCtx?.get === "function" ? connectionCtx.get("connection") : undefined;
+					const url = typeof connection?.authenticatedUrl === "function"
+						? connection.authenticatedUrl("http://127.0.0.1/")
+						: undefined;
+					const token = url === undefined ? undefined : new URL(url).searchParams.get("token");
+					if (typeof token !== "string" || token.length === 0) return;
+					// 首次获取或令牌更换（DSH 进程重启）都会走到这里；网关侧幂等
+					launchTokenDelivery.setToken(token);
+				} catch (error) {
+					console.warn(`${TAG} 读取 DSH 启动令牌失败（宿主可能低于 0.1.2-alpha.1）：${String(error.message ?? error)}`);
+				}
+			});
+		}
 
 		const restartGateway = () => {
 			killChild();

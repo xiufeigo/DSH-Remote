@@ -2,7 +2,8 @@
  * 反向代理：
  * - HTTP：用 node:http 客户端转发（解析/编码交给 Node），改写 Host/Origin/Referer
  *   为上游回环形态以通过 DSH 的浏览器信任栅栏；剥离本网关设备 Cookie 不外泄上游；
- *   对小型 text/html 响应注入 PWA 标记；
+ *   DSH 0.1.2+ 下注入插件下发的上游浏览器会话 Cookie（session.ts）并通过
+ *   onUnauthorized 在上游 401 时触发重铸；对小型 text/html 响应注入 PWA 标记；
  * - WebSocket 升级：认证通过后按原始字节管道直通（不改写帧），双向透传。
  */
 
@@ -17,6 +18,13 @@ export interface Upstream {
 	port: number;
 	/** 上游是 HTTPS（如隧道对端的 PC 网关自签服务）时按 TLS 连接，证书不校验（指纹可后续加）。 */
 	tls?: boolean;
+	/**
+	 * DSH 0.1.2+ 浏览器会话 cookie（"name=value"，session.ts 铸造缓存）。
+	 * 缺省（旧版宿主 / TLS 上游 / 令牌未就绪）不注入 —— 行为与旧版一致。
+	 */
+	sessionCookie?: string;
+	/** 注入了会话 cookie 的请求被上游 401 拒绝时回调（触发 session.ts 重铸）。 */
+	onUnauthorized?: () => void;
 }
 
 /** 上游 HTTPS 自签证书专用 agent（进程级单例，keep-alive 复用）。 */
@@ -70,16 +78,23 @@ function rewriteUpstreamLocation(location: string, upstream: Upstream): string {
 	return location;
 }
 
-/** 生成发往上游的请求头：寻址头改写、逐跳头剥离、设备 Cookie 剥离。 */
+/** 生成发往上游的请求头：寻址头改写、逐跳头剥离、设备 Cookie 剥离、会话 Cookie 注入。 */
 export function buildUpstreamHeaders(req: IncomingMessage, upstream: Upstream): http.OutgoingHttpHeaders {
 	const authority = authorityOf(upstream);
 	const headers: http.OutgoingHttpHeaders = {};
 	for (const [key, value] of Object.entries(req.headers)) {
 		const lower = key.toLowerCase();
 		if (HOP_BY_HOP.has(lower) || lower === "host" || lower === "cookie") continue;
+		// DSH 0.1.2+ 的 /api Host fence 拒绝 sec-fetch-site: cross-site（api-request-trust.ts）。
+		// 手机浏览器发往本网关的请求可能是跨站导航/快捷方式启动，剥离后按
+		// "无标记"处理（fence 注释明确无标记可接受，Host fence 仍然生效）。
+		if (lower === "sec-fetch-site") continue;
 		headers[key] = value as string | string[];
 	}
 	headers["host"] = authority;
+	// DSH 0.1.2+：上游会话 cookie（为该 authority 铸造）。设备 Cookie 已在上方剥离，
+	// 这里注入的是网关持有的上游浏览器会话，绝不透传手机端的任何 Cookie。
+	if (upstream.sessionCookie !== undefined) headers["cookie"] = upstream.sessionCookie;
 	// GW-10：仅当原请求携带 origin 时才改写。旧实现是死三元（两分支相同），
 	// 会把 Origin 强注给本来无 origin 的请求。
 	if (headers["origin"] !== undefined) headers["origin"] = `http://${authority}`;
@@ -135,9 +150,19 @@ export function proxyHttp(
 				return;
 			}
 			const status = upstreamRes.statusCode;
+			// DSH 0.1.2+：会话 cookie 失效（DSH 重启换令牌/authority 漂移）时触发
+			// 重铸；本请求按 401 透传，客户端重试一次即可恢复。
+			if (status === 401 && upstream.sessionCookie !== undefined) {
+				try {
+					upstream.onUnauthorized?.();
+				} catch { /* 回调异常不影响代理主流程 */ }
+			}
 			const outHeaders: Record<string, string | string[]> = {};
 			for (const [key, value] of Object.entries(upstreamRes.headers)) {
 				if (value === undefined) continue;
+				// 会话隔离：上游（0.1.2+ 可能下发/刷新它自己的浏览器会话 cookie）
+				// 的 Set-Cookie 绝不下发给手机端；网关持有的会话只存在于本进程。
+				if (key === "set-cookie") continue;
 				// GW-05：剥离 Location 里的上游 authority 为相对路径。注入与非注入
 				// 两条转发路径共用 outHeaders，在此统一改写。
 				if (key === "location" && typeof value === "string") {
@@ -253,6 +278,8 @@ export function proxyUpgrade(req: IncomingMessage, socket: net.Socket, head: Buf
 		const lower = key.toLowerCase();
 		// 注意：connection/upgrade 是升级跳的必需头，不能剥；只改写寻址头并剥离 Cookie
 		if (lower === "host" || lower === "cookie") continue;
+		// 与 HTTP 路径同理：剥离 sec-fetch-site，避免上游 /api 升级路径的 fence 误拒
+		if (lower === "sec-fetch-site") continue;
 		if (lower === "origin" && typeof value === "string") {
 			lines.push(`origin: http://${authorityOf(upstream)}`);
 			continue;
@@ -260,6 +287,8 @@ export function proxyUpgrade(req: IncomingMessage, socket: net.Socket, head: Buf
 		lines.push(`${key}: ${Array.isArray(value) ? value.join(", ") : value}`);
 	}
 	lines.push(`host: ${authorityOf(upstream)}`);
+	// DSH 0.1.2+：WS 升级路径同样要求浏览器会话（401/403 与 HTTP 一致）
+	if (upstream.sessionCookie !== undefined) lines.push(`cookie: ${upstream.sessionCookie}`);
 	lines.push("\r\n");
 
 	const connectOptions = { host: upstream.host, port: upstream.port };

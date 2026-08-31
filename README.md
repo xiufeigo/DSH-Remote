@@ -34,6 +34,24 @@
 | `scripts/smoke-edge-frp.mjs` | edge 全链路冒烟（本机 frp 二进制模拟 VPS↔PC 拓扑，无二进制自动跳过） |
 | `docs/` | 架构决策、[版本与发布规范](docs/versioning.md)、VPS 部署、安全模型 |
 
+## 宿主兼容性（DSH 0.1.2-alpha.1 适配）
+
+DSH `0.1.2-alpha.1` 为 Web 宿主引入了**浏览器启动令牌认证**：每个 Host 进程生成一次性
+启动令牌，`GET /?token=<令牌>` 换取签名会话 cookie；index、`/api/*`、WebSocket upgrade
+一律要求有效 cookie（401），仅非 index 静态资产公开。未适配的旧版插件在 0.1.2+ 宿主上
+会整页 401（远程访问完全失效）。
+
+本插件自 `0.1.2-alpha.1.1` 起完成适配，并**同时兼容新旧两代宿主**：
+
+| 宿主版本 | 行为 |
+|---|---|
+| `≥ 0.1.2-alpha.1` | 插件宿主半边在 DSH 进程内经 `connection.authenticatedUrl()` 取得启动令牌，下发给网关（`POST /__dsh_remote__/admin/launch-token`）；网关向上游交换会话 cookie 并注入全部反代请求（HTTP + WS），自动处理上游端口漂移（authority 变化重铸）与 401 失效自愈 |
+| `≤ 0.1.1-rc.2` | 宿主没有 `connection` 服务与令牌认证：网关收不到令牌、不做任何注入，行为与旧版完全一致 |
+
+令牌与上游会话 cookie 只存在于 PC 本机进程内存：手机端永远拿不到令牌，上游下发的
+`Set-Cookie` 在网关响应侧被剥离；`sec-fetch-site` 等浏览器指纹头也不透传上游，避免
+0.1.2+ 的 /api Host fence 误拒。
+
 ## 快速开始
 
 ### 0. 前置
@@ -179,7 +197,8 @@ node scripts/uninstall.mjs      # 卸载
 - **认证层**：一次性配对码（10 分钟有效、用后即焚）换取长效设备 Token（httpOnly Cookie，
   服务端只存 SHA-256）；配对失败 5 次锁 IP 15 分钟；每 IP 滑动窗口限流。
 - **传输层**：手机↔网关 TLS（自签，指纹可校验；壳 App 将做证书锁定）；frpc↔frps 隧道 TLS。
-- **隔离层**：设备 Cookie 不转发给上游 DSH；审计日志记录全部配对/拒绝事件。
+- **隔离层**：设备 Cookie 不转发给上游 DSH；上游 DSH（0.1.2+）的浏览器会话 cookie 与
+  启动令牌也绝不下发手机端（只存在于 PC 本机网关进程内存）；审计日志记录全部配对/拒绝事件。
 
 完整说明见 [docs/architecture.md](docs/architecture.md)。
 
@@ -190,6 +209,7 @@ pnpm install
 pnpm smoke          # 14 项冒烟测试（网关）
 pnpm test:plugin    # 插件模拟运行（假 ctx 拉起/回收网关）
 pnpm test:routes    # 插件宿主路由逻辑单测（9 项）
+pnpm test:session   # DSH 0.1.2+ 浏览器会话适配回归（令牌下发/cookie 注入/自愈）
 pnpm -C packages/plugin build   # 构建设置卡片客户端 bundle
 node scripts/probe-ws.mjs [端口]   # 对运行中的网关+DSH 做 WS 直通探针
 ```
