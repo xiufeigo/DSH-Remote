@@ -269,7 +269,7 @@ export function visitorConnectionString(options: {
 	return `dsh-remote://visitor?${params.toString()}`;
 }
 
-export interface FrpSupervisorStatus {
+interface FrpSupervisorStatus {
 	running: boolean;
 	restarts: number;
 	lastError?: string;

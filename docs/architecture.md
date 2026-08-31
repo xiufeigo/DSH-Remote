@@ -97,7 +97,9 @@ DSH 官方源码（`dsh-web-app`）明确禁止 `--host 0.0.0.0`：
 - **HTML 注入**：仅对 `200 + text/html` 且 ≤2MB 的响应整包缓冲注入 PWA 标记，
   注入时删 `transfer-encoding` 重算 `content-length`；超限或非 HTML 一律原样流式。
 - **TS 运行方式**：Node ≥24 原生 strip-types 运行 `.ts`，因此全仓无构建步骤；
-  代价是不能用 enum/namespace/参数属性等非可剥离语法（已遵守）。
+  代价是 gateway 不能用 enum/namespace/参数属性等非可剥离语法（tsconfig
+  `erasableSyntaxOnly` + `pnpm typecheck` 在 CI 守住这条线；plugin 客户端
+  半边走 tsdown 编译，不受此约束）。
 - **端口漂移**：DSH GUI 端口可能随重启变化（OS 分配）。`upstreamPort` 进配置 +
   `doctor` 指纹探测兜底。
 

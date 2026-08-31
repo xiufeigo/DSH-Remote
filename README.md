@@ -206,13 +206,24 @@ node scripts/uninstall.mjs      # 卸载
 
 ```bash
 pnpm install
-pnpm smoke          # 14 项冒烟测试（网关）
+pnpm typecheck      # 全仓类型检查（gateway + plugin 客户端半边，TS 5.8）
+pnpm smoke          # 冒烟测试（desktop 网关角色）
+pnpm smoke:edge     # 冒烟测试（edge 角色）
 pnpm test:plugin    # 插件模拟运行（假 ctx 拉起/回收网关）
-pnpm test:routes    # 插件宿主路由逻辑单测（9 项）
+pnpm test:routes    # 插件宿主路由逻辑单测
 pnpm test:session   # DSH 0.1.2+ 浏览器会话适配回归（令牌下发/cookie 注入/自愈）
+pnpm test:fixes     # 历轮修复回归钉桩
+pnpm test:panel     # 面板端到端（需 DSH 宿主运行）
+pnpm test:client    # 客户端 bundle 加载检查
+pnpm test:mobile    # 移动布局自测（需 Chrome）
+pnpm smoke:edge:frp # edge 全链路（需本机 frp 二进制，无则自动跳过）
 pnpm -C packages/plugin build   # 构建设置卡片客户端 bundle
 node scripts/probe-ws.mjs [端口]   # 对运行中的网关+DSH 做 WS 直通探针
 ```
+
+push/PR 到 main 时 CI 自动跑类型检查 + 快测五件套（smoke / smoke:edge /
+test:routes / test:session / test:fixes，见 `.github/workflows/ci.yml`）；
+重链路（panel/mobile/frp 全链路）留在本地跑。
 
 ### 版本与发布
 

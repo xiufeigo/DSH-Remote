@@ -1,0 +1,40 @@
+# 最小 Node 测试 CI：push/PR 到 main 时跑类型检查 + 快测五件套。
+# 不跑重链路（panel/mobile/frp 全链路需浏览器或 frp 二进制，留本地）。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      # Node 24：engines >=24；测试直接 import .ts 依赖原生 type stripping
+      - name: Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 类型检查
+        run: pnpm typecheck
+
+      - name: 快测（smoke / edge / routes / session / fixes）
+        run: |
+          pnpm smoke
+          pnpm smoke:edge
+          pnpm test:routes
+          pnpm test:session
+          pnpm test:fixes

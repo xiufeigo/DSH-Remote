@@ -200,7 +200,8 @@ docker exec dsh-remote-gateway node src/cli.ts devices
 
 - 注入物：网关给上游 HTML 追加 `<script src="/__dsh_remote__/mobile.js" defer>`
   与断点变量 `window.__DSHR_MOBILE__={breakpoint:980}`（上游缺 viewport meta 时补齐）。
-- 脚本是 Android 壳 `res/raw/mobile.js` 的 web fork，激活条件从「仅竖屏」改为
+- 脚本与 Android 壳 `res/raw/mobile.js` 是同一份源（`packages/gateway/assets/mobile-web.js`
+  单一源，构建时字节级同步进 APK，见 WEB-02），激活条件从「仅竖屏」改为
   「仅视口宽度 ≤ 断点」：iPhone 全程 hook；iPad 竖屏 hook；iPad 横屏 ≥1024px
   自然回到官方 DSH 桌面布局。抽屉侧栏、设置全屏页、浮动选框钳制等行为与安卓端一致。
 - 断点可用 `DSHR_MOBILE_BREAKPOINT` 调整（240–4096）；`DSHR_MOBILE_ENABLED=false`

@@ -167,22 +167,23 @@ export function resolveHome(explicit?: string, env: NodeJS.ProcessEnv = process.
 
 /** 深合并：文件值覆盖默认值，仅覆盖已存在的键。 */
 export function mergeConfig(base: GatewayConfig, patch: Record<string, unknown>): GatewayConfig {
-	const out: GatewayConfig = structuredClone(base);
+	// GatewayConfig 无索引签名，经 unknown 中转取记录视图（键仍受 patch 的 entries 约束）
+	const out = structuredClone(base) as unknown as Record<string, unknown>;
 	for (const [key, value] of Object.entries(patch)) {
-		const current = (out as Record<string, unknown>)[key];
+		const current = out[key];
 		if (
 			value !== null && typeof value === "object" && !Array.isArray(value)
 			&& current !== null && typeof current === "object" && !Array.isArray(current)
 		) {
-			(out as Record<string, unknown>)[key] = {
+			out[key] = {
 				...(current as Record<string, unknown>),
 				...(value as Record<string, unknown>),
 			};
 		} else {
-			(out as Record<string, unknown>)[key] = value;
+			out[key] = value;
 		}
 	}
-	return out;
+	return out as unknown as GatewayConfig;
 }
 
 // ============================================================================
@@ -270,7 +271,7 @@ export function parseAllowPorts(raw: string | undefined): Array<{ start: number;
 export function applyEnvOverrides(base: GatewayConfig, env: NodeJS.ProcessEnv = process.env): GatewayConfig {
 	const out = structuredClone(base);
 	const set = (path: string[], value: unknown) => {
-		let node = out as Record<string, unknown>;
+		let node = out as unknown as Record<string, unknown>;
 		for (const key of path.slice(0, -1)) {
 			const existing = node[key];
 			if (existing === null || typeof existing !== "object" || Array.isArray(existing)) {

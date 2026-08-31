@@ -26,6 +26,7 @@
     "test:client": "node scripts/test-client-bundle.mjs",
     "test:fixes": "node scripts/test-fix-regressions.mjs",
     "test:mobile": "node scripts/test-mobile-chrome.mjs",
+    "typecheck": "pnpm -C packages/gateway typecheck && pnpm -C packages/plugin typecheck",
     "start": "node packages/gateway/src/cli.ts start"
   }
 }

@@ -150,7 +150,7 @@ export function isLoopback(req: IncomingMessage): boolean {
 }
 
 /** GW-03：归一化 IPv4 映射地址（`::ffff:1.2.3.4` → `1.2.3.4`），保证限流键一致。 */
-export function normalizeIp(addr: string): string {
+function normalizeIp(addr: string): string {
 	return addr.startsWith("::ffff:") ? addr.slice("::ffff:".length) : addr;
 }
 

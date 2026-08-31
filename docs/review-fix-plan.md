@@ -415,3 +415,38 @@ Android 壳的证书 TOFU 流程有指纹归一化保护。
 `pnpm smoke` 22/22 · `pnpm smoke:edge` 19/19 · `pnpm smoke:edge:frp` 全链路 EXIT 0（含 frps/visitor/stcp/门禁/注入）· `pnpm test:fixes`（新增）11/11 · `pnpm test:routes` 15/15 · `pnpm test:panel` 全过 · `pnpm test:client` 全过 · `pnpm test:plugin` 全过（沙箱限制解除后补跑）· `pnpm test:mobile` 全过（含 WEB-02 单一源逐字节契约）。测试脚手架已收敛至 `scripts/test-harness.mjs`（PLG-03），5 个脚本迁移为纯重构。
 
 Android 完整构建实测：`android/build.ps1`（隔离 USERPROFILE 下）EXIT 0 产出 5.6MB 已签名 APK——mobile.js 单一源同步、aapt2（含 specialUse/adjustResize Manifest）、javac、d8、frpc 打包、zipalign、apksigner 随机口令新密钥全链路走通；构建后 res/raw 与单一源字节一致复核通过。
+
+---
+
+## 附录 D：执行记录（0.1.2 质量轮 · 完结）
+
+> 轮次日期：2026-08 · 版本基线：`0.1.2-alpha.1.1`（0.1.2 会话适配随轮入库 `59d5228`）
+> 组织：AgentTeams 四路审计（网关 BUG / 插件规范 / Android+MD3 / 全仓精简）→ 修复/重构/微执行 → 收尾。
+
+### D.1 完成度
+
+| 线 | 结果 |
+|---|---|
+| 网关 BUG（scout-gateway 10 项确证） | 网关侧 8 项全部修复（P0×2/P1-3/P2×3/P3×3）；插件侧 P1-4、P2-7 随插件线落地 |
+| 插件规范（scout-plugin） | 审计结论合规、0 修复项；跨域 3 项（P0-2 adminToken 配接 / P1-4 在途令牌丢失 / P2-7 secrets 0600）落地 |
+| Android + MD3（scout-android） | P1×2（主线程探测移后台 / FGS 早停契约）+ 4 项 MD3 触控目标改进；死方法清理 2 批 |
+| 精简（scout-lean F1–F22） | F1–F16 全部落地（t10/t11/t13/t9 分批）；F17=GW-13 由 t8 拆分清偿；F18 登记不动；F19 收紧；F20–F22 决策项维持现状 |
+| 架构 | t8：server.ts 972→717 行，views/body/ws 三模块抽离（GW-13 延后债务清偿，F15 模板去重含逐字节等价验证） |
+| 新增基建 | TS 5.8 全仓类型检查（gateway/plugin/根三层 `pnpm typecheck`，config.ts 4×TS2352 清零）+ 最小 Node CI（`.github/workflows/ci.yml`：push/PR main 跑 typecheck + 快测五件套） |
+
+### D.2 本轮安全修复要点
+
+- **P0-1** 畸形 absolute-form 请求行可打死网关进程（`new URL` 在 try 外 + `void handle` 无 catch）——根因修复 + 进程级兜底。
+- **P0-2** 裸机 edge + 同机反代拓扑下 admin 端点对公网全开（完整认证绕过链 PoC 实证）——admin 端点叠加共享密钥门禁（`state/secrets.json` `adminToken` + `x-dshr-admin-token` 头），插件侧配接并支持轮换热跟。
+- **P1-3** 无 content-length 的 HTML 超注入上限时丢已缓冲前缀（GW-16 只修了声明长度路径）——超限直通前先写出已缓冲块。
+- **P2-7** 插件 `writeSecrets` 落盘无 0600（GW-07 在面板路径被绕过）——原子写统一 `mode: 0o600`。
+
+### D.3 遗留与需要人工动作
+
+1. **settings 命名空间半接入**（插件审计 ⛔ 项）：`dsh-remote` ns 注册但 value 是 schema 默认投影、与真实 config.json 脱节；当前卡片自绘不读 ns 故无用户可见影响。方向裁决（保留座位 / 真接线 / 移除）见审计报告，等用户确认。
+2. **F20–F22**：review-fix-plan 归档策略、`lib/client.js` 入库产物策略、插件宿主半边 TS 化——均为现状自洽的权衡题，维持现状。
+3. `smoke:edge:frp` / `test:panel` / `test:mobile` / `test:client` 不进 CI（需 frp 二进制 / 浏览器 / 运行中的 DSH 宿主），发版前本地全量回归。
+
+### D.4 最终回归（本机全绿）
+
+`pnpm typecheck`（新增，gateway + plugin）全绿 · `pnpm smoke` 22/22 · `pnpm smoke:edge` 19/19 · `pnpm smoke:edge:frp` 全链路 EXIT 0 · `pnpm test:plugin` 全过 · `pnpm test:routes` 17/17 · `pnpm test:session` 18/18（本轮 +5：P2-5/P3-9/adminToken/令牌纪元钉桩）· `pnpm test:panel` 全过 · `pnpm test:client` 全过 · `pnpm test:fixes` 16/16（本轮 +5：P0-1/P1-3/adminToken 钉桩）· `pnpm test:mobile` 全过（MD3 触控目标断言更新）。

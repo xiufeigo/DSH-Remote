@@ -6,13 +6,12 @@
  *                                  等待「网关监听」输出后返回句柄（含实际端口）
  *   - requestTls(url, options)     忽略自签证书的 HTTPS 请求（fetch 风格返回）
  *   - wsConnect(url, options)      原始 TLS WebSocket 升级握手（不依赖 ws 库，可做字节级断言）
- *   - autoCleanup(run, sync)       集中注册 exit / SIGINT 清理队列（崩溃 / Ctrl-C 兜底）
  *   - waitFor / waitForPort        就绪轮询
  *   - makeTempHome(prefix)         临时数据目录（自动注册清理）
  *   - startFakeUpstream(options)   假上游 DSH（可选记录寻址头；upgrade 原样回声）
  *   - fakeHttpRequest / fakeHttpResponse  插件路由测试用的假 req / res
  *
- * CLI-06：证书指纹提取复用网关 packages/gateway/src/cert.ts 的导出（单一实现，不复制正则）。
+ * 内部机制（不导出）：autoCleanup/releaseCleanup 集中清理队列、repoRoot。
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -26,7 +25,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const gatewayCliPath = join(repoRoot, "packages", "gateway", "src", "cli.ts");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -86,7 +85,7 @@ function installExitHooks() {
  * @param {(() => void) | undefined} [sync] 'exit' 事件里的同步兜底（可选）
  * @returns {{ run: Function, sync?: Function }} 令牌；完成后传给 releaseCleanup 注销
  */
-export function autoCleanup(run, sync) {
+function autoCleanup(run, sync) {
 	installExitHooks();
 	const entry = { run, sync };
 	cleanups.add(entry);
@@ -94,7 +93,7 @@ export function autoCleanup(run, sync) {
 }
 
 /** 注销清理项（资源已被显式释放后调用，避免重复清理）。 */
-export function releaseCleanup(entry) {
+function releaseCleanup(entry) {
 	cleanups.delete(entry);
 }
 
@@ -543,7 +542,3 @@ export function fakeHttpResponse() {
 	};
 	return res;
 }
-
-// ---------- CLI-06：证书指纹提取（网关单一实现） ----------
-
-export { fingerprintOf as certFingerprintOf } from "../packages/gateway/src/cert.ts";
