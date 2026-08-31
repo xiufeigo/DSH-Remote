@@ -430,9 +430,9 @@ Android 完整构建实测：`android/build.ps1`（隔离 USERPROFILE 下）EXIT
 | 网关 BUG（scout-gateway 10 项确证） | 网关侧 8 项全部修复（P0×2/P1-3/P2×3/P3×3）；插件侧 P1-4、P2-7 随插件线落地 |
 | 插件规范（scout-plugin） | 审计结论合规、0 修复项；跨域 3 项（P0-2 adminToken 配接 / P1-4 在途令牌丢失 / P2-7 secrets 0600）落地 |
 | Android + MD3（scout-android） | P1×2（主线程探测移后台 / FGS 早停契约）+ 4 项 MD3 触控目标改进；死方法清理 2 批 |
-| 精简（scout-lean F1–F22） | F1–F16 全部落地（t10/t11/t13/t9 分批）；F17=GW-13 由 t8 拆分清偿；F18 登记不动；F19 收紧；F20–F22 决策项维持现状 |
+| 精简（scout-lean F1–F22） | F1–F16 全部落地（t10/t11/t13/t9 分批）；F17=GW-13 由 t8 拆分清偿；F18 登记不动；F19 收紧；F20–F22 决策项已定夺（见 D.3） |
 | 架构 | t8：server.ts 972→717 行，views/body/ws 三模块抽离（GW-13 延后债务清偿，F15 模板去重含逐字节等价验证） |
-| 新增基建 | TS 5.8 全仓类型检查（gateway/plugin/根三层 `pnpm typecheck`，config.ts 4×TS2352 清零）+ 最小 Node CI（`.github/workflows/ci.yml`：push/PR main 跑 typecheck + 快测五件套） |
+| 新增基建 | TS 5.8 全仓类型检查（gateway/plugin/根三层 `pnpm typecheck`，config.ts 4×TS2352 清零）+ 最小 Node CI（`.github/workflows/ci.yml`：push/PR main 跑 typecheck + 插件 bundle 同步锁 + 快测五件套） |
 
 ### D.2 本轮安全修复要点
 
@@ -444,7 +444,7 @@ Android 完整构建实测：`android/build.ps1`（隔离 USERPROFILE 下）EXIT
 ### D.3 遗留与需要人工动作
 
 1. **settings 命名空间半接入**（插件审计 ⛔ 项）：`dsh-remote` ns 注册但 value 是 schema 默认投影、与真实 config.json 脱节；当前卡片自绘不读 ns 故无用户可见影响。方向裁决（保留座位 / 真接线 / 移除）见审计报告，等用户确认。
-2. **F20–F22**：review-fix-plan 归档策略、`lib/client.js` 入库产物策略、插件宿主半边 TS 化——均为现状自洽的权衡题，维持现状。
+2. **F20–F22 已定夺（本轮收尾）**：F20 本文档保留原地（附录 A 误报账本继续有效，只追加执行记录，不归档不删）；F21 `lib/client.js` 维持入库，CI 加同步锁——`pnpm -C packages/plugin build` 重建后 `git diff --exit-code`（`src/client` 改动未重建提交会被 `.github/workflows/ci.yml` 拦下）；F22 插件宿主半边维持手写零依赖 ESM（plugin tsconfig 注释注明有意不入类型检查）。
 3. `smoke:edge:frp` / `test:panel` / `test:mobile` / `test:client` 不进 CI（需 frp 二进制 / 浏览器 / 运行中的 DSH 宿主），发版前本地全量回归。
 
 ### D.4 最终回归（本机全绿）
