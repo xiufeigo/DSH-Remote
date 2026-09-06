@@ -48,6 +48,18 @@ DSH `0.1.2-alpha.1` 为 Web 宿主引入了**浏览器启动令牌认证**：每
 | `≥ 0.1.2-alpha.1` | 插件宿主半边在 DSH 进程内经 `connection.authenticatedUrl()` 取得启动令牌，下发给网关（`POST /__dsh_remote__/admin/launch-token`）；网关向上游交换会话 cookie 并注入全部反代请求（HTTP + WS），自动处理上游端口漂移（authority 变化重铸）与 401 失效自愈 |
 | `≤ 0.1.1-rc.2` | 宿主没有 `connection` 服务与令牌认证：网关收不到令牌、不做任何注入，行为与旧版完全一致 |
 
+> 兼容性已复核至 npm latest `0.1.2-rc.1`：令牌认证协议自 alpha.1 起未再变动
+> （`dsh-client-connection` 的 browser-auth 实现 alpha.2 → rc.1 逐字节一致），
+> webServer 路由注册、settings 命名空间、profile patch 层叠、客户端模块系统
+> （`window.__ModuleLoader__`）与 `settings.plugin.item` 槽位全部保持不变；
+> rc.1 新增的 webserver gzip 与 `<base href="/">` 对网关透明（恒发
+> `accept-encoding: identity`，Host/Origin 改写策略不变）。`0.1.3-alpha.1` 的
+> SessionHandle/session 锁等破坏性变更不触及本插件的集成面。
+> 另注：`dsh-client-runtime` 包在 0.1.2 系列已停发（slots 服务并入
+> `dsh-cordis-client-runner`），插件 `dsh.client.inject` 已改为引用两代宿主
+> 都存在的图行（runner + `dsh-client-ui-settings-plugins`）；缺失的 inject
+> 目标在宿主组合阶段本来就是静默跳过，旧值不致故障，仅为死引用。
+
 令牌与上游会话 cookie 只存在于 PC 本机进程内存：手机端永远拿不到令牌，上游下发的
 `Set-Cookie` 在网关响应侧被剥离；`sec-fetch-site` 等浏览器指纹头也不透传上游，避免
 0.1.2+ 的 /api Host fence 误拒。
