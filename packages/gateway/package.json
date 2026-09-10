@@ -1,6 +1,6 @@
 {
   "name": "@dsh-remote/gateway",
-  "version": "0.1.2-alpha.1.1",
+  "version": "0.1.5-rc.1.1",
   "description": "DSH Remote 网关：设备配对认证 + HTTP/WS 反向代理 + frp 传输适配器",
   "type": "module",
   "license": "MIT",

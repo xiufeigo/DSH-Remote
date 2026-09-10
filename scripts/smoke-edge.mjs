@@ -206,12 +206,13 @@ test("mobile.js 需认证；带 Cookie 可获取且支持 ETag 304", async () =>
 	assert.equal(cached.status, 304);
 });
 
-test("认证后反代上游：注入 PWA+移动 hook+viewport 兜底，设备 Cookie 不外泄", async () => {
+test("认证后反代上游：注入主屏标记+移动 hook+viewport 兜底，设备 Cookie 不外泄", async () => {
 	const r = await callGateway(fixture.gatewayPort, "/", {
 		headers: { accept: "text/html", cookie: fixture.deviceCookie },
 	});
 	assert.equal(r.status, 200);
-	assert.match(r.body, /manifest\.webmanifest/, "PWA 标记仍要注入");
+	assert.match(r.body, /__dsh_remote__\/sw\.js/, "主屏标记（SW 注册）仍要注入");
+	assert.ok(!r.body.includes("/__dsh_remote__/manifest.webmanifest"), "不得再注入自有 manifest（官方宿主提供）");
 	assert.match(r.body, /<script src="\/__dsh_remote__\/mobile\.js" defer><\/script>/, "移动 hook 标记必须注入");
 	assert.match(r.body, /window\.__DSHR_MOBILE__=\{breakpoint:900\}/, "断点以内联变量下发");
 	assert.match(r.body, /name="viewport"/, "上游缺 viewport 时应兜底注入");
@@ -307,23 +308,23 @@ test("verifyAccessToken：恒时比较、拒绝畸形哈希", async () => {
 	assert.equal(verifyAccessToken(ACCESS_TOKEN, "short"), false);
 });
 
-test("双网关链路：上游已注入 PWA 时 edge 仍补移动 hook 块（幂等按标记独立）", async () => {
+test("双网关链路：上游已注入主屏标记时 edge 仍补移动 hook 块（幂等按标记独立）", async () => {
 	const { makeHtmlInjector } = await import("../packages/gateway/src/pwa.ts");
 	const edgeInject = makeHtmlInjector({ mobile: { enabled: true, breakpointPx: 900 } });
-	// 模拟 PC 网关已注入过 PWA 标记的页面
+	// 模拟 PC 网关已注入过主屏标记的页面
 	const pcInjected = makeHtmlInjector()(
 		Buffer.from("<!doctype html><html><head><title>pc</title></head><body>__dsh_boot__</body></html>"),
 	).toString();
-	assert.match(pcInjected, /manifest\.webmanifest/);
+	assert.match(pcInjected, /__dsh_remote__\/sw\.js/);
 
 	const twice = edgeInject(Buffer.from(pcInjected)).toString();
-	assert.match(twice, /__DSHR_MOBILE__/, "已有 PWA 也不得跳过移动 hook 注入");
-	assert.ok(twice.split("manifest.webmanifest").length - 1 === 1, "PWA 标记不得重复注入");
+	assert.match(twice, /__DSHR_MOBILE__/, "已有主屏标记也不得跳过移动 hook 注入");
+	assert.ok(twice.split("/__dsh_remote__/sw.js").length - 1 === 1, "主屏标记不得重复注入");
 	assert.match(twice, /name="viewport"/);
 
-	// 完全无标记的页面：一次注入齐 PWA + 移动 hook + viewport
+	// 完全无标记的页面：一次注入齐主屏标记 + 移动 hook + viewport
 	const once = edgeInject(Buffer.from("<html><head></head></html>")).toString();
-	assert.match(once, /manifest\.webmanifest/);
+	assert.match(once, /__dsh_remote__\/sw\.js/);
 	assert.match(once, /mobile\.js/);
 	// 幂等：二次注入不重复
 	const re = edgeInject(Buffer.from(once)).toString();

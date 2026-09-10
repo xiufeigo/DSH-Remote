@@ -1,70 +1,49 @@
 /**
- * PWA 支持：manifest 与图标由网关自己提供；对上游 HTML 注入引用标记。
- * 手机「添加到主屏幕」即可全屏运行，观感接近原生 App。
+ * 主屏/独立窗口支持：只补官方宿主没有的项 —— iOS 三件套 + 主题色 +
+ * Service Worker 注册，外加 iOS 必需的 apple-touch-icon（PNG，运行时
+ * 零依赖生成：node:zlib 手写 PNG 编码器）。
  *
- * 图标三件套：
- *   icon.svg        —— 矢量源（新浏览器）
- *   icon-{192,512}.png —— 运行时零依赖生成（老 iOS/Android 需要 PNG；
- *                          node:zlib 手写 PNG 编码器，无任何依赖）
+ * **不注入 manifest**：官方 index 自带
+ * `<link rel="manifest" href="/manifest.webmanifest">`（复核过 0.1.0-rc.8 →
+ * 0.1.5-rc.1 每个版本都有），官方 manifest 提供 name/display/icons 全套；
+ * 网关再注一份只会盖掉官方品牌与 `display: fullscreen` 设定。
+ * 同理不再提供自有的 icon.svg / icon-512.png。
+ *
+ * SW 注册脚本的路径同时充当「本注入块是否已存在」的幂等标记。
  */
 
 import { deflateSync } from "node:zlib";
 import { mobileHeadTags } from "./mobile.ts";
 
-const MANIFEST_PATH = "/__dsh_remote__/manifest.webmanifest";
-
-export const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect x="16" y="16" width="480" height="480" rx="112" fill="#1b66ff"/>
-  <path d="M286 84 148 292h86l-24 136 152-216h-90z" fill="#fff"/>
-</svg>`;
+/** Service Worker 路径：既是被注册的资源，也是注入幂等标记。 */
+const SW_PATH = "/__dsh_remote__/sw.js";
+/** apple-touch-icon（iOS 只认 PNG，不读 manifest 图标）。 */
+export const APPLE_TOUCH_ICON_PATH = "/__dsh_remote__/icon-192.png";
 
 /** Android 配对页使用的轻量 DSH 鲸鱼标记；不携带配置、会话或认证信息。 */
 export const BRAND_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
   <path fill="#111318" d="M56.1 15.5c-2.4 1.9-5 2.8-7.8 2.7-3.1-5.1-8.6-8.4-14.9-8.4-7.4 0-13.7 4.5-16.4 10.9-5.3.7-9.4 4.2-10.9 9.2-2.1 7 1.9 14.5 9 16.6 2.5.7 5.1.7 7.4.1 3.2 4.7 8.6 7.7 14.6 7.7 9.8 0 17.8-8 17.8-17.8 0-2.2-.4-4.3-1.1-6.2 2.2-3.5 3.1-8.1 2.3-14.8ZM19.3 35.8a2.8 2.8 0 1 1 0-5.6 2.8 2.8 0 0 1 0 5.6Zm23.7 8.8c-4.1 2.9-9.6 3.2-14 .8 4.4-.8 8.2-3.1 10.9-6.4 1.1 2.1 2.2 3.9 3.1 5.6Zm-4.9-17.2c-2.6 0-4.8-2.1-4.8-4.8s2.2-4.8 4.8-4.8 4.8 2.1 4.8 4.8-2.2 4.8-4.8 4.8Z"/>
 </svg>`;
 
-export function renderManifest(): string {
-	return `${JSON.stringify(
-		{
-			name: "DSH Remote",
-			short_name: "DSH",
-			description: "DeepSeek Harness 远程控制",
-			start_url: "/",
-			scope: "/",
-			display: "standalone",
-			background_color: "#101418",
-			theme_color: "#1b66ff",
-			icons: [
-				{ src: "/__dsh_remote__/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any maskable" },
-				{ src: "/__dsh_remote__/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any maskable" },
-				{ src: "/__dsh_remote__/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any" },
-			],
-		},
-		null,
-		"\t",
-	)}\n`;
-}
-
-/** 生成注入到上游 HTML <head> 的标记块。 */
-export function pwaHeadTags(): string {
+/** 生成注入到上游 HTML <head> 的标记块（官方 manifest 之外的补充项）。 */
+export function homeScreenHeadTags(): string {
 	return [
-		`<link rel="manifest" href="${MANIFEST_PATH}">`,
 		`<meta name="theme-color" content="#1b66ff">`,
 		`<meta name="mobile-web-app-capable" content="yes">`,
 		`<meta name="apple-mobile-web-app-capable" content="yes">`,
 		`<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">`,
 		`<meta name="apple-mobile-web-app-title" content="DSH">`,
-		`<link rel="apple-touch-icon" href="/__dsh_remote__/icon-192.png">`,
+		`<link rel="apple-touch-icon" href="${APPLE_TOUCH_ICON_PATH}">`,
 		// WEB-01：注册网关 Service Worker（白名单缓存策略，源码见 renderServiceWorker）。
 		// SW 文件位于 /__dsh_remote__/sw.js（server.ts 内部路由，响应需带
 		// Service-Worker-Allowed: /），注册时 scope:"/" 把拦截面扩到全站。
 		// 注册失败静默降级（非安全上下文/不支持的浏览器不影响页面本身）。
-		`<script>if("serviceWorker"in navigator){navigator.serviceWorker.register("/__dsh_remote__/sw.js",{scope:"/"}).catch(function(){});}</script>`,
+		`<script>if("serviceWorker"in navigator){navigator.serviceWorker.register("${SW_PATH}",{scope:"/"}).catch(function(){});}</script>`,
 	].join("");
 }
 
 /**
- * 在 HTML 里注入 PWA 标记：优先插到 <head…> 开标签之后；
+ * 在 HTML 里注入主屏标记：优先插到 <head…> 开标签之后；
  * 没有 head 标签时插到文档最前（宽松处理，避免破坏上游页面）。
  */
 export function injectIntoHtml(html: Buffer): Buffer {
@@ -82,7 +61,7 @@ export interface HtmlInjectOptions {
  * viewport meta 时补一个（避免 iOS Safari 按桌面 980px 布局渲染）。
  *
  * 幂等按标记独立判断：edge 的上游是另一台 dsh-remote 网关时，
- * 响应里可能已有它注入的 PWA 标记——此时只补移动 hook 块，不重复注 PWA。
+ * 响应里可能已有它注入的主屏标记——此时只补移动 hook 块，不重复注。
  *
  * WEB-08：补写的 viewport meta 一次性带上目标值（`viewport-fit=cover` +
  * 浏览器缺省的 `interactive-widget=resizes-content`）。iOS 对 JS 动态改
@@ -95,11 +74,11 @@ export function makeHtmlInjector(options: HtmlInjectOptions = {}): (body: Buffer
 	const extraTags = options.mobile?.enabled === true ? mobileHeadTags(options.mobile.breakpointPx) : "";
 	return function inject(body: Buffer): Buffer {
 		const text = body.toString("utf8");
-		const needPwa = !text.includes(MANIFEST_PATH);
+		const needHome = !text.includes(SW_PATH);
 		const needMobile = extraTags !== "" && !text.includes("/__dsh_remote__/mobile.js");
-		if (!needPwa && !needMobile) return body;
+		if (!needHome && !needMobile) return body;
 		const payload =
-			(needPwa ? pwaHeadTags() : "")
+			(needHome ? homeScreenHeadTags() : "")
 			+ (needMobile
 				? extraTags
 					+ (!/name=["']viewport["']/i.test(text)

@@ -111,8 +111,12 @@ function assertSourceContracts() {
 	}
 	{
 		const pwaSrc = readFileSync(join(ROOT, "packages/gateway/src/pwa.ts"), "utf8");
-		if (!pwaSrc.includes("!text.includes(MANIFEST_PATH)") || !pwaSrc.includes('!text.includes("/__dsh_remote__/mobile.js")')) {
-			throw new Error("源码契约：WEB-07 PWA/移动注入必须按标记各自幂等（上游已注入或重注入场景不得二次插标签）");
+		if (!pwaSrc.includes("!text.includes(SW_PATH)") || !pwaSrc.includes('!text.includes("/__dsh_remote__/mobile.js")')) {
+			throw new Error("源码契约：WEB-07 主屏/移动注入必须按标记各自幂等（上游已注入或重注入场景不得二次插标签）");
+		}
+		// 官方宿主自带 manifest（0.1.0-rc.8 → 0.1.5-rc.1 每版都有）：网关不得再提供自有 manifest
+		if (!pwaSrc.includes("export function homeScreenHeadTags") || pwaSrc.includes("renderManifest") || pwaSrc.includes("MANIFEST_PATH")) {
+			throw new Error("源码契约：manifest 已交给官方宿主，网关只补主屏标记（homeScreenHeadTags）");
 		}
 	}
 	if (!src.includes("data-dshr-dragging")) {

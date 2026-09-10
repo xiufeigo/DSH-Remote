@@ -3,7 +3,7 @@
  * - HTTP：用 node:http 客户端转发（解析/编码交给 Node），改写 Host/Origin/Referer
  *   为上游回环形态以通过 DSH 的浏览器信任栅栏；剥离本网关设备 Cookie 不外泄上游；
  *   DSH 0.1.2+ 下注入插件下发的上游浏览器会话 Cookie（session.ts）并通过
- *   onUnauthorized 在上游 401 时触发重铸；对小型 text/html 响应注入 PWA 标记；
+ *   onUnauthorized 在上游 401 时触发重铸；对小型 text/html 响应注入主屏标记；
  * - WebSocket 升级：认证通过后按原始字节管道直通（不改写帧），双向透传。
  */
 
@@ -160,6 +160,12 @@ export function proxyHttp(
 			const outHeaders: Record<string, string | string[]> = {};
 			for (const [key, value] of Object.entries(upstreamRes.headers)) {
 				if (value === undefined) continue;
+				// GW-17：逐跳响应头不得转发（RFC 7230 §6.1）。Node 的 http 客户端
+				// 已把 transfer-encoding 解码为流、由本端 http 服务器按需重新分帧，
+				// 故这些头只描述「客户端↔上游」那一跳。原样转发上游的
+				// `connection: keep-alive` 会让客户端的 `connection: close` 语义
+				// 失效——表现为响应读完后连接空挂到 keepAliveTimeout 才断开。
+				if (HOP_BY_HOP.has(key)) continue;
 				// 会话隔离：上游（0.1.2+ 可能下发/刷新它自己的浏览器会话 cookie）
 				// 的 Set-Cookie 绝不下发给手机端；网关持有的会话只存在于本进程。
 				if (key === "set-cookie") continue;

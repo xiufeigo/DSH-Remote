@@ -82,8 +82,8 @@ CI 先校验 **tag == `v` + package.json 版本**（不一致直接失败），�
 
 | 项 | 值 |
 |---|---|
-| deepseek-harness 基线 | `0.1.1-rc.2` |
-| 当前已发布版本 | `0.1.2-alpha.1.1`（tag `v0.1.2-alpha.1.1`） |
-| 下一次发布 | `0.1.2-alpha.1.2` |
+| deepseek-harness 基线 | `0.1.5-rc.1` |
+| 当前已发布版本 | `0.1.5-rc.1.1`（tag `v0.1.5-rc.1.1`） |
+| 下一次发布 | `0.1.5-rc.1.2` |
 
 > 本表为快照，以根 package.json 为准；`version.mjs bump` 会自动同步上表（OPS-07）。

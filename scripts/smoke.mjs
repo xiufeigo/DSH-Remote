@@ -4,10 +4,10 @@
  *
  * 覆盖：
  *   1. 未认证导航 302 → 配对页；未认证 XHR/API 401
- *   2. 内部资源：health / pair 页 / manifest / icon
+ *   2. 内部资源：health / pair 页 / apple-touch-icon PNG / brand.svg
  *   3. 一次性配对码：错误码拒绝 → 正确码发 Cookie
  *   4. 认证后反代：上游收到改写后的 Host/Origin，设备 Cookie 不外泄
- *   5. HTML 注入 PWA 标记
+ *   5. HTML 注入主屏标记（SW 注册 + iOS meta；manifest 由官方宿主提供）
  *   6. WebSocket 升级：无 Cookie 拒绝；有 Cookie 字节级双向直通
  *   7. RateLimiter 单元行为 + 连续配对失败锁定
  *   8. frp 适配器：entry/stcp/xtcp 三形态 toml 渲染、访客配置与连接串
@@ -96,15 +96,13 @@ test("health 探针可用", async () => {
 	assert.equal(JSON.parse(response.body).ok, true);
 });
 
-test("manifest 与图标可获取", async () => {
+test("主屏资源可获取：apple-touch-icon PNG 与 brand.svg（manifest 交给官方宿主）", async () => {
+	// 官方 index 自带 <link rel="manifest" href="/manifest.webmanifest">，网关不再提供自有 manifest
 	const manifest = await callGateway("/__dsh_remote__/manifest.webmanifest");
-	assert.equal(manifest.status, 200);
-	const parsed = JSON.parse(manifest.body);
-	assert.equal(parsed.name, "DSH Remote");
-	assert.ok(parsed.icons.some((icon) => icon.src.endsWith("icon-192.png")), "manifest 应引用 PNG 图标");
-	const icon = await callGateway("/__dsh_remote__/icon.svg");
+	assert.equal(manifest.status, 404, "网关不得再提供自有 manifest（已改由官方宿主提供）");
+	const icon = await callGateway("/__dsh_remote__/icon-192.png");
 	assert.equal(icon.status, 200);
-	assert.match(icon.body, /<svg/);
+	assert.equal(icon.headers["content-type"], "image/png");
 	const brand = await callGateway("/__dsh_remote__/brand.svg");
 	assert.equal(brand.status, 200);
 	assert.equal(brand.headers["content-type"], "image/svg+xml");
@@ -112,7 +110,7 @@ test("manifest 与图标可获取", async () => {
 });
 
 test("PNG 图标：魔数、尺寸与解码完整性", async () => {
-	for (const [path, size] of [["/__dsh_remote__/icon-192.png", 192], ["/__dsh_remote__/icon-512.png", 512]]) {
+	for (const [path, size] of [["/__dsh_remote__/icon-192.png", 192]]) {
 		const response = await callGateway(path);
 		assert.equal(response.status, 200);
 		const buf = response.raw;
@@ -202,7 +200,8 @@ test("认证后请求代理到上游：Host 改写、Cookie 剥离、HTML 注入
 	});
 	assert.equal(response.status, 200);
 	assert.match(response.body, /__dsh_boot__/);
-	assert.match(response.body, /manifest\.webmanifest/, "应注入 PWA manifest 引用");
+	assert.match(response.body, /__dsh_remote__\/sw\.js/, "应注入 Service Worker 注册标记");
+	assert.ok(!response.body.includes("/__dsh_remote__/manifest.webmanifest"), "不得再注入自有 manifest");
 	// 上游看到的 Host 必须是回环形态（信任栅栏）
 	assert.equal(fixture.seenByUpstream.host, `127.0.0.1:${String(fixture.upstreamPort)}`);
 	assert.equal(fixture.seenByUpstream.origin, `http://127.0.0.1:${String(fixture.upstreamPort)}`);

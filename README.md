@@ -34,7 +34,7 @@
 | `scripts/smoke-edge-frp.mjs` | edge 全链路冒烟（本机 frp 二进制模拟 VPS↔PC 拓扑，无二进制自动跳过） |
 | `docs/` | 架构决策、[版本与发布规范](docs/versioning.md)、VPS 部署、安全模型 |
 
-## 宿主兼容性（DSH 0.1.2-alpha.1 适配）
+## 宿主兼容性（DSH 0.1.5-rc.1 基线）
 
 DSH `0.1.2-alpha.1` 为 Web 宿主引入了**浏览器启动令牌认证**：每个 Host 进程生成一次性
 启动令牌，`GET /?token=<令牌>` 换取签名会话 cookie；index、`/api/*`、WebSocket upgrade
@@ -48,17 +48,43 @@ DSH `0.1.2-alpha.1` 为 Web 宿主引入了**浏览器启动令牌认证**：每
 | `≥ 0.1.2-alpha.1` | 插件宿主半边在 DSH 进程内经 `connection.authenticatedUrl()` 取得启动令牌，下发给网关（`POST /__dsh_remote__/admin/launch-token`）；网关向上游交换会话 cookie 并注入全部反代请求（HTTP + WS），自动处理上游端口漂移（authority 变化重铸）与 401 失效自愈 |
 | `≤ 0.1.1-rc.2` | 宿主没有 `connection` 服务与令牌认证：网关收不到令牌、不做任何注入，行为与旧版完全一致 |
 
-> 兼容性已复核至 npm latest `0.1.2-rc.1`：令牌认证协议自 alpha.1 起未再变动
-> （`dsh-client-connection` 的 browser-auth 实现 alpha.2 → rc.1 逐字节一致），
-> webServer 路由注册、settings 命名空间、profile patch 层叠、客户端模块系统
-> （`window.__ModuleLoader__`）与 `settings.plugin.item` 槽位全部保持不变；
-> rc.1 新增的 webserver gzip 与 `<base href="/">` 对网关透明（恒发
-> `accept-encoding: identity`，Host/Origin 改写策略不变）。`0.1.3-alpha.1` 的
-> SessionHandle/session 锁等破坏性变更不触及本插件的集成面。
-> 另注：`dsh-client-runtime` 包在 0.1.2 系列已停发（slots 服务并入
-> `dsh-cordis-client-runner`），插件 `dsh.client.inject` 已改为引用两代宿主
-> 都存在的图行（runner + `dsh-client-ui-settings-plugins`）；缺失的 inject
-> 目标在宿主组合阶段本来就是静默跳过，旧值不致故障，仅为死引用。
+> 兼容性已复核至 npm latest `0.1.5-rc.1`（从 `0.1.2-rc.1` 起 1486 个提交），
+> 逐项核对了本插件的**全部接入面**，结论：**接入代码无需改动**。
+
+### 0.1.5-rc.1 接入面复核
+
+| 接入点 | 0.1.5-rc.1 状态 |
+|---|---|
+| `connection.authenticatedUrl()` | 不变；`browser-auth.ts` 与 `api-request-trust.ts` 与 0.1.2-rc.1 **逐字节一致** → 令牌→cookie 交换、401 自愈、Host/Origin 栅栏策略照旧 |
+| `connection` 行的服务依赖 | `['webServer','credentials']` → `['credentials']`（webServer 改可选注入）；本插件的 `ctx.inject(['connection'])` 语义不变 |
+| `webServer.register({kind:'prefix', …})`、`settings.register(ns, schema, {applies:'live'})` | 不变（`host/webserver`、`settings` 两包在本区间只改了版本号） |
+| 客户端模块系统 | `window.__ModuleLoader__.load({id, factory})` 不变；`dsh.client` 声明字段（`platform`/`inject`/`immediately`/`external`）不变；`react`、`react-dom` 仍是平台 seed（`packages/client/web/src/seed.ts`）→ 客户端半边 bundle 形态无需改 |
+| `dsh.client.inject` 目标 | `@deepseek-ai/dsh-cordis-client-runner`、`@deepseek-ai/dsh-client-ui-settings-plugins` 均在；后者仍是 keyed slot `settings.plugin.item`（键 = settings 命名空间） |
+| profile patch（`- insert:` 行） | 不变（`cordis-plugin-loader` 仍 1.0.3）→ 安装器的 junction + patch 行机制照旧 |
+| `/api` 新能力 | 0.1.3+ 新增 `POST` + `requestBody: 'buffered' \| 'streaming'` 精确路由（官方原始文件上传）。网关是 `req.pipe(upstreamReq)` 流式转发、无全局限体 → 兼容，回归见 `pnpm test:fixes` |
+
+> 0.1.3+ 新增的右侧栏（文件树 / 文档预览）、工作区文件 API、Open In…、会话格式 v0→v3
+> 迁移、OTel 遥测、`HTTP_PROXY` 等一律由反代透明穿透，与本插件无交集。
+>
+> 唯一需要留意的新 UI 交互：官方右侧栏落在 `data-side="details"` 那一列，而移动
+> hook 在窄视口下会整列隐藏（`[data-side="details"]:not([data-dshx-details-col])`）——
+> 手机上这两个新页签"看不见但没坏"。是否在移动布局里给它们开入口，留待产品决策。
+>
+> **主屏标记**：manifest 由官方 index 自带
+> （`<link rel="manifest" href="/manifest.webmanifest">`，复核过 0.1.0-rc.8 → 0.1.5-rc.1
+> 每版都有），网关**不再自带 manifest**，只补官方没有的项：Service Worker 注册、
+> `apple-touch-icon`（iOS 只认 PNG）、`apple-mobile-web-app-*`、`theme-color`。
+
+### 不支持的宿主：官方 Electron 桌面
+
+官方仓自 0.1.3 起自带 Electron 桌面（`apps/desktop` + `apps/desktop-host`，包名
+`@deepseek-ai/dsh-desktop`，`private`，走签名安装包分发）。它把 `webserver` /
+`web-startup` / `web-runtime` / `client-hmr` 四行整体 `disabled`，**不开任何监听端口**，
+Web 资产与 Fetch 走 `dsh-app://` + 帧化字节管道。
+
+本插件是「回环 HTTP 反代 + 隧道」模型，**无法接入该宿主**——不是"暂未适配"，而是那里
+根本不存在可代理的端口。支持的宿主：`dsh web`（CLI / 内嵌官方 Web GUI 的第三方桌面，
+如本机在用的 DSH-Desktop）、headless、edge 部署。
 
 令牌与上游会话 cookie 只存在于 PC 本机进程内存：手机端永远拿不到令牌，上游下发的
 `Set-Cookie` 在网关响应侧被剥离；`sec-fetch-site` 等浏览器指纹头也不透传上游，避免
@@ -267,7 +293,7 @@ VPS 上唯一要验证的只剩网络可达性。
 
 ## 路线图
 
-- [x] 网关核心：认证/反代/WS 直通/PWA 注入/frp 托管/CLI
+- [x] 网关核心：认证/反代/WS 直通/主屏标记注入/frp 托管/CLI
 - [x] cordis 插件自启
 - [x] frp 访客模式（stcp/xtcp）：VPS 不开公网入口，`dsh-remote visitor` 出码导入
 - [x] Android 壳 App：内嵌 frpc visitor + 证书锁定 + 扫码导入

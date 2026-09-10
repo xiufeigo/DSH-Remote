@@ -48,7 +48,7 @@ DSH 官方源码（`dsh-web-app`）明确禁止 `--host 0.0.0.0`：
 第1层 传输    手机→网关 TLS(自签+指纹)；frpc↔frps TLS 隧道；VPS 看不到明文
 第2层 认证    一次性配对码 → 设备 Token(httpOnly Cookie)
 第3层 抗滥用  配对失败5次锁IP15分钟；每IP滑动窗口限流；全部进审计日志
-第4层 隔离    设备 Cookie 不透传上游；上游响应原样返回不注入除 PWA 外内容
+第4层 隔离    设备 Cookie 不透传上游；上游响应原样返回不注入除主屏标记外内容
 ```
 
 ### 配对协议
@@ -104,7 +104,9 @@ DSH 官方源码（`dsh-web-app`）明确禁止 `--host 0.0.0.0`：
 - **WS 直通**：升级请求认证后按原始 TCP 字节管道转发（不解析帧），只改写
   `host`/`origin` 头。注意 `Connection`/`Upgrade` 是升级跳必需头，绝不能当逐跳头剥掉
   （冒烟测试覆盖了这一回归）。
-- **HTML 注入**：仅对 `200 + text/html` 且 ≤2MB 的响应整包缓冲注入 PWA 标记，
+- **HTML 注入**：仅对 `200 + text/html` 且 ≤2MB 的响应整包缓冲注入主屏标记
+  （SW 注册 + iOS 三件套 + 主题色；manifest 由官方宿主的
+  `/manifest.webmanifest` 提供，网关不再自带），
   注入时删 `transfer-encoding` 重算 `content-length`；超限或非 HTML 一律原样流式。
 - **TS 运行方式**：Node ≥24 原生 strip-types 运行 `.ts`，因此全仓无构建步骤；
   代价是 gateway 不能用 enum/namespace/参数属性等非可剥离语法（tsconfig

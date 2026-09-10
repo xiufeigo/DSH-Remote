@@ -11,7 +11,7 @@ iPhone/iPad Safari
       ▼
 VPS Docker：caddy:2 ──reverse_proxy──► gateway 容器（node:24-alpine）
                                         │ ① Token 门禁 → 自动配对设备 Cookie
-                                        │ ② 注入 /__dsh_remote__/mobile.js + PWA 标记
+                                        │ ② 注入 /__dsh_remote__/mobile.js + 主屏标记
                                         │ ③ 反代(含 WS 直通) → 上游 127.0.0.1:<bindPort>
                                         ▼
                        ┌─ FRP_ROLE=visitor：容器内 frpc visitor → 外部已有 frps
@@ -206,7 +206,7 @@ docker exec dsh-remote-gateway node src/cli.ts devices
   自然回到官方 DSH 桌面布局。抽屉侧栏、设置全屏页、浮动选框钳制等行为与安卓端一致。
 - 断点可用 `DSHR_MOBILE_BREAKPOINT` 调整（240–4096）；`DSHR_MOBILE_ENABLED=false`
   整体停用。
-- 双网关注入幂等：隧道对端 PC 网关也会注入 PWA 标记，edge 只补移动块，不会重复。
+- 双网关注入幂等：隧道对端 PC 网关也会注入主屏标记，edge 只补移动块，不会重复。
 
 ## 7. 环境变量速查
 

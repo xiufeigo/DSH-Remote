@@ -5,7 +5,8 @@
  *
  * 路由约定：
  *   /__dsh_remote__/pair                配对页（未认证可访问，POST 消费一次性码）
- *   /__dsh_remote__/manifest.webmanifest / icon.svg   PWA 静态资源
+ *   /__dsh_remote__/sw.js               主屏/离线用的 Service Worker（白名单缓存）
+ *   /__dsh_remote__/icon-192.png        apple-touch-icon（iOS 只认 PNG）
  *   /__dsh_remote__/health              存活探针（无信息泄露）
  *   /__dsh_remote__/admin/*             本机管理端点（回环来源 + 同源 Origin +
  *                                       secrets 管理密钥三重门；launch-token
@@ -57,7 +58,7 @@ import {
 	visitorBindPortOf,
 } from "./frp.ts";
 import { loadMobileScript } from "./mobile.ts";
-import { BRAND_SVG, ICON_SVG, iconPng, injectIntoHtml, makeHtmlInjector, renderManifest, renderServiceWorker } from "./pwa.ts";
+import { BRAND_SVG, iconPng, injectIntoHtml, makeHtmlInjector, renderServiceWorker } from "./pwa.ts";
 import { proxyHttp, type Upstream } from "./proxy.ts";
 import { UpstreamSession } from "./session.ts";
 import type { Store } from "./store.ts";
@@ -429,9 +430,6 @@ export class GatewayServer {
 					case "GET /__dsh_remote__/health":
 						res.writeHead(200, { "content-type": "application/json" }).end('{"ok":true}');
 						return;
-					case "GET /__dsh_remote__/manifest.webmanifest":
-						res.writeHead(200, { "content-type": "application/manifest+json" }).end(renderManifest());
-						return;
 					case "GET /__dsh_remote__/sw.js":
 						// WEB-01（web-pwa）：Service Worker 白名单缓存的 SW 源码。
 						// service-worker-allowed: / 放行 scope:"/" 注册（SW 文件在 /__dsh_remote__/ 下）；
@@ -443,9 +441,6 @@ export class GatewayServer {
 							"x-content-type-options": "nosniff",
 						}).end(renderServiceWorker());
 						return;
-					case "GET /__dsh_remote__/icon.svg":
-						res.writeHead(200, { "content-type": "image/svg+xml" }).end(ICON_SVG);
-						return;
 					case "GET /__dsh_remote__/brand.svg":
 						res.writeHead(200, {
 							"content-type": "image/svg+xml",
@@ -454,12 +449,11 @@ export class GatewayServer {
 						}).end(BRAND_SVG);
 						return;
 					case "GET /__dsh_remote__/icon-192.png":
-					case "GET /__dsh_remote__/icon-512.png": {
-						const size = pathname.endsWith("512.png") ? 512 : 192;
+						// apple-touch-icon：manifest 图标交给官方 /manifest.webmanifest，
+						// 这里只保留 iOS 主屏必需的 PNG（iOS 不读 manifest 图标）。
 						res.writeHead(200, { "content-type": "image/png", "cache-control": "public, max-age=604800" });
-						res.end(iconPng(size));
+						res.end(iconPng(192));
 						return;
-					}
 					case "GET /__dsh_remote__/pair":
 						await this.handlePairPage(req, res);
 						return;

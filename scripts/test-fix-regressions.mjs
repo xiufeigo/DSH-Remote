@@ -20,6 +20,8 @@
  *   - SEC-02/GW-15 畸形 JSON → 400（不再 500）
  *   - WEB-01  sw.js 内部路由：免认证 200 + service-worker-allowed + no-cache
  *   - WEB-02  mobile.js 静态资源 200 + ETag + javascript 类型
+ *   - GW-17   逐跳响应头不转发：客户端 connection: close 语义生效
+ *   - 0.1.3+ /api 流式 POST（官方原始文件上传）：边收边转、不设体积上限
  *
  * 运行：pnpm test:fixes（网关经 harness createTestGateway 以真实 CLI 子进程拉起，
  * 走完整启动链路：配置合并 → 环境变量剥离 → 单实例锁 → 监听）。
@@ -33,11 +35,35 @@ import { requestTls, createTestGateway, makeTempHome } from "./test-harness.mjs"
 
 // ---------- 单元夹具：行为可编排的假上游 ----------
 
-const seen = { acceptEncodings: [], cookies: [] };
+const seen = { acceptEncodings: [], cookies: [], upload: {}, signalFirstChunk: null };
 const behavior = http.createServer((req, res) => {
 	seen.acceptEncodings.push(req.headers["accept-encoding"] ?? null);
 	seen.cookies.push(req.headers.cookie ?? null);
 	const url = req.url ?? "";
+	if (url.startsWith("/api/stream-upload")) {
+		// 0.1.3+ 官方原始文件上传：/api 上的 POST + streaming request body
+		//（ConnectionFetchRoute.requestBody = 'streaming'）。网关必须边收边转
+		//（不得攒完整包再发），且不得对代理请求设体积上限。
+		let total = 0;
+		let signaled = false;
+		req.on("data", (chunk) => {
+			total += chunk.length;
+			if (!signaled) {
+				signaled = true;
+				seen.signalFirstChunk?.();
+			}
+		});
+		req.on("end", () => {
+			seen.upload = {
+				total,
+				transferEncoding: req.headers["transfer-encoding"] ?? null,
+				contentLength: req.headers["content-length"] ?? null,
+			};
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(JSON.stringify(seen.upload));
+		});
+		return;
+	}
 	if (url.startsWith("/redir")) {
 		// 绝对 Location 指回自己 → 网关必须剥成相对路径（GW-05）
 		res.writeHead(302, { location: `http://127.0.0.1:${String(serverPort)}/dest?x=1` });
@@ -221,7 +247,7 @@ test("GW-12 + GW-06：注入路径剥 CSP 双头并保留其他上游头；上�
 	seen.acceptEncodings.length = 0;
 	const r = await requestTls(gwUrl("/csp"), { headers: { ...authHeaders, accept: "text/html" } });
 	assert.equal(r.status, 200);
-	assert.match(r.body, /manifest\.webmanifest/, "小 HTML 应走注入路径");
+	assert.match(r.body, /__dsh_remote__\/sw\.js/, "小 HTML 应走注入路径");
 	assert.equal(r.headers["content-security-policy"], undefined, "注入路径必须剥 CSP");
 	assert.equal(r.headers["content-security-policy-report-only"], undefined, "report-only 同剥");
 	assert.equal(r.headers["x-upstream-marker"], "kept", "非 CSP 头不得误伤");
@@ -233,7 +259,7 @@ test("GW-16：>2MB 声明长度的 HTML 流式直通（正文完整、不注入�
 	assert.equal(r.status, 200);
 	assert.equal(r.raw.length, 3 * 1024 * 1024, "3MB 正文必须字节完整");
 	assert.equal(r.headers["content-security-policy"], "passthrough-must-keep", "直通路径保留上游 CSP");
-	assert.ok(!r.body.includes("manifest.webmanifest"), "直通路径不得注入");
+	assert.ok(!r.body.includes("/__dsh_remote__/sw.js"), "直通路径不得注入");
 });
 
 test("WEB-02：mobile.js 静态资源 200 + ETag + javascript 类型", async () => {
@@ -316,8 +342,80 @@ test("P1-3：>2MB 无长度声明（chunked）的 HTML 直通不丢已缓冲前�
 	});
 	assert.equal(r.status, 200);
 	assert.equal(r.raw.length, 3 * 1024 * 1024, "chunked 3MB 正文必须字节完整（旧实现静默截断为 1MB）");
-	assert.ok(!r.body.includes("manifest.webmanifest"), "直通路径不得注入");
+	assert.ok(!r.body.includes("/__dsh_remote__/sw.js"), "直通路径不得注入");
 	assert.equal(r.headers["content-type"], "text/html; charset=utf-8");
+});
+
+test("0.1.3+ 流式 POST：官方原始文件上传边收边转（不缓冲）且无体积上限", async () => {
+	// 官方 0.1.3+ 在 /api 上新增 POST + streaming request body 的精确路由
+	//（dsh-client-file-upload）。网关必须满足两点：① 请求体边到边转（不能
+	// 攒完再发，否则大文件上传会先整包驻留内存）；② 不设聚合体积上限。
+	const PART = 2 * 1024 * 1024;
+	const chunk1 = Buffer.alloc(PART, 0x41);
+	const chunk2 = Buffer.alloc(PART, 0x42);
+	let firstChunkResolve;
+	const firstChunkSeen = new Promise((resolve) => {
+		firstChunkResolve = resolve;
+	});
+	seen.signalFirstChunk = firstChunkResolve;
+
+	const socket = tls.connect({ host: "127.0.0.1", port: gw.port, rejectUnauthorized: false });
+	await new Promise((resolve, reject) => {
+		socket.once("secureConnect", resolve);
+		socket.once("error", reject);
+	});
+	let responseText = "";
+	const responseDone = new Promise((resolve) => {
+		const settle = () => resolve(responseText);
+		socket.on("data", (chunk) => {
+			responseText += chunk.toString("utf8");
+			// 响应体就绪即 settle：不依赖 socket 'end'（上游可能声明 keep-alive，
+			// 由 Node 的 keepAliveTimeout 收尾，会白等数秒且与断言无关）
+			if (responseText.includes('"total"')) settle();
+		});
+		socket.on("end", settle);
+		socket.on("close", settle);
+	});
+
+	socket.write(
+		"POST /api/stream-upload HTTP/1.1\r\n" +
+			"host: gateway.invalid\r\n" +
+			`cookie: dr_device=${cookie}\r\n` +
+			"content-type: application/octet-stream\r\n" +
+			"transfer-encoding: chunked\r\n" +
+			"connection: close\r\n\r\n",
+	);
+	socket.write(`${chunk1.length.toString(16)}\r\n`);
+	socket.write(chunk1);
+	socket.write("\r\n");
+
+	// 关键断言：第一段尚未发完（后续还会写 chunk2）时，上游就必须已经收到字节。
+	// 旧式「整包缓冲后再转发」的实现在这里会超时失败。
+	let timer;
+	try {
+		await Promise.race([
+			firstChunkSeen,
+			new Promise((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error("首块未在请求体发送完成前到达上游：网关疑似缓冲整包后再转发")),
+					5_000,
+				);
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+
+	socket.write(`${chunk2.length.toString(16)}\r\n`);
+	socket.write(chunk2);
+	socket.write("\r\n0\r\n\r\n");
+
+	const text = await responseDone;
+	socket.destroy();
+	seen.signalFirstChunk = null;
+	assert.match(text, /^HTTP\/1\.1 200/, `上传应成功透传：${text.slice(0, 200)}`);
+	assert.equal(seen.upload.total, PART * 2, "4MB 正文必须字节完整送达（网关不得设体积上限或截断）");
+	assert.equal(seen.upload.transferEncoding, "chunked", "无 content-length 的请求应以上游可接受的 chunked 形态转发");
 });
 
 test("P3-10：WS 升级 head > 4KB 回 413（不再裸断连）", async () => {

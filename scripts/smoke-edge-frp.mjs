@@ -177,7 +177,7 @@ try {
 	console.log("--- 实际响应体 ---");
 	console.log(proxied.body);
 	assert.match(proxied.body, /__dsh_boot__ chain/, "上游正文应原样返回（跨 frps 隧道）");
-	assert.match(proxied.body, /manifest\.webmanifest/, "PWA 标记应注入");
+	assert.match(proxied.body, /__dsh_remote__\/sw\.js/, "主屏标记应注入");
 	assert.match(proxied.body, /<script src="\/__dsh_remote__\/mobile\.js" defer><\/script>/, "移动 hook 标记应注入");
 
 	const mobileJs = await call("/__dsh_remote__/mobile.js", { headers: { cookie: fixture.cookie } });
