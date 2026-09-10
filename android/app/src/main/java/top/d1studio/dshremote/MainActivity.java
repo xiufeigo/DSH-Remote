@@ -76,7 +76,9 @@ import java.util.concurrent.ScheduledExecutorService;
  * 配置组与电脑端插件面板对齐，只填四项：VPS 地址、控制端口、登录密钥、访客密钥。
  * 本地端口首选 18443（与网关 listenPort 一致），被占用时在 16225~16235 内协商
  * （AND-07），实际端口透传给 frpc visitor 与 WebView 加载 URL，无需在手机上改。
- * 点卡片切换远程配置；访客密钥与电脑端一致即可连入，不再扫码配对。
+ * 启动进首页列出配置组，由用户手选连接（不默认连上次，避免上次 server 未启动
+ * 时 App 卡死在连接壳）；点卡片切换远程配置；访客密钥与电脑端一致即可连入，
+ * 不再扫码配对。
  */
 public class MainActivity extends Activity {
 
@@ -172,8 +174,9 @@ public class MainActivity extends Activity {
 		ensureWebView();
 		ProfileStore.migrateLegacy(prefs());
 		if (!handleImportIntent(getIntent())) {
-			if (hasUsableSetup()) connectFromStoredTarget();
-			else showHome();
+			// 启动一律进服务器选择页：上次连的 server 不在线时，自动连接会把 App
+			// 卡死在连接壳。连哪个 server 由用户当场手选（导入链接除外，那是显式意图）。
+			showHome();
 		}
 	}
 
@@ -548,8 +551,8 @@ public class MainActivity extends Activity {
 	}
 
 	/**
-	 * 连接设置首页（图1）。只允许：首次无配置、停止/清除隧道、以及长按鲸鱼。
-	 * 返回键不得调用本方法。
+	 * 服务器选择首页（图1），也是启动默认页。只允许：启动、首次无配置、
+	 * 停止/清除隧道、以及长按鲸鱼。返回键不得调用本方法。
 	 */
 	private void showHome() {
 		connectionGeneration += 1;
@@ -746,7 +749,7 @@ public class MainActivity extends Activity {
 			return;
 		}
 		ProfileStore.setActiveId(prefs(), profile.id);
-		beginTunnel(profile.toVisitorConfig());
+		beginTunnel(profile);
 	}
 
 	private boolean handleImportIntent(Intent i) {
@@ -769,7 +772,7 @@ public class MainActivity extends Activity {
 		p.tunnelName = ProfileStore.normalizeTunnelName(c.serverName);
 		ProfileStore.upsert(prefs(), p);
 		ProfileStore.setActiveId(prefs(), p.id);
-		beginTunnel(p.toVisitorConfig());
+		beginTunnel(p);
 		return true;
 	}
 
@@ -814,9 +817,10 @@ public class MainActivity extends Activity {
 
 	// ---------- 隧道模式 ----------
 
-	private void beginTunnel(final VisitorConfig cfg) {
+	private void beginTunnel(final ProfileStore.Profile profile) {
 		clearResumeSession();
 		final int generation = ++connectionGeneration;
+		final VisitorConfig cfg = profile.toVisitorConfig();
 		if (!cfg.isValid()) {
 			Toast.makeText(this, "连接配置不完整，请检查配置组。", Toast.LENGTH_LONG).show();
 			showHome();
@@ -832,10 +836,15 @@ public class MainActivity extends Activity {
 		// false，复用逻辑整段失效：每次重连都杀掉存活隧道换端口重启），且 400ms
 		// 超时本身也会阻塞主线程。结论统一回到 UI 线程后按 generation 过期丢弃。
 		runInBackground("tunnel-probe", () -> {
+			// 只复用「确实为这个配置组起的」存活隧道：端口存活不代表就是本次要连的
+			// server——启动改为手选后，换配置组连接是常规路径，错复用会连到旧 server。
+			String tunnelProfile = prefs().getString(ProfileStore.KEY_TUNNEL_PROFILE, "");
 			int savedPort = prefs().getInt(ProfileStore.KEY_BOUND_PORT, 0);
 			int reusePort = 0;
-			if (savedPort >= 1 && savedPort <= 65535 && isLocalPortOpen(savedPort)) reusePort = savedPort;
-			else if (isLocalPortOpen(ProfileStore.BIND_PORT)) reusePort = ProfileStore.BIND_PORT;
+			if (profile.id.equals(tunnelProfile)) {
+				if (savedPort >= 1 && savedPort <= 65535 && isLocalPortOpen(savedPort)) reusePort = savedPort;
+				else if (isLocalPortOpen(ProfileStore.BIND_PORT)) reusePort = ProfileStore.BIND_PORT;
+			}
 			// AND-07：复用存活隧道——先探上次记录的实际绑定端口，再探首选端口。
 			final int reused = reusePort;
 			// AND-07：端口协商——首选 BIND_PORT，被占用时在 16225~16235 取首个空闲端口；
@@ -922,8 +931,8 @@ public class MainActivity extends Activity {
 						"隧道未在 20 秒内就绪。请检查电脑网关、密钥和 frps 网络后重试。",
 						"dsh-remote://app/retry",
 						"重新连接",
-						"",
-						""
+						"dsh-remote://app/home",
+						"返回服务器列表"
 					);
 					return;
 				}
@@ -1423,12 +1432,6 @@ public class MainActivity extends Activity {
 		if (setupScroll != null) setupScroll.setVisibility(View.GONE);
 	}
 
-	private boolean hasUsableSetup() {
-		ProfileStore.Profile active = ProfileStore.getActive(prefs());
-		if (active != null && active.isValid()) return true;
-		return isGatewayUrl(prefs().getString(KEY_URL, ""));
-	}
-
 	private boolean isLocalShellUrl(String url) {
 		if (TextUtils.isEmpty(url)) return true;
 		String u = url.toLowerCase(Locale.US);
@@ -1510,6 +1513,10 @@ public class MainActivity extends Activity {
 		}
 		if ("/retry".equals(path)) {
 			connectFromStoredTarget();
+			return true;
+		}
+		if ("/home".equals(path)) {
+			showHome();
 			return true;
 		}
 		if ("/disconnect".equals(path)) {
@@ -1761,8 +1768,8 @@ public class MainActivity extends Activity {
 			message,
 			"dsh-remote://app/retry",
 			"重新连接",
-			"",
-			""
+			"dsh-remote://app/home",
+			"返回服务器列表"
 		);
 	}
 

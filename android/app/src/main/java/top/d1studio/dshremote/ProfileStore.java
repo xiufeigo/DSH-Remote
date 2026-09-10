@@ -27,6 +27,8 @@ public final class ProfileStore {
 	public static final int PORT_RANGE_MAX = 16235;
 	/** AND-07：本轮隧道实际绑定端口的持久化键（MainActivity/TunnelService 复用探测用）。 */
 	public static final String KEY_BOUND_PORT = "tunnel_bound_port";
+	/** 与 KEY_BOUND_PORT 成对落盘：当前前台隧道实际服务的配置组 id。复用探测据此判断能否直接复用。 */
+	public static final String KEY_TUNNEL_PROFILE = "tunnel_profile_id";
 
 	public static final String DEFAULT_MODE = "xtcp";
 	public static final String DEFAULT_TUNNEL_NAME = "dsh-remote";

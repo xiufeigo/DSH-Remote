@@ -115,8 +115,12 @@ public class TunnelService extends Service {
 			return START_NOT_STICKY;
 		}
 		cfg.bindPort = port;
+		// 端口与「本隧道服务的配置组 id」成对落盘：MainActivity 复用探测据此
+		// 判断存活隧道是否属于本次所选配置组，防止错复用连到旧 server。
 		getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
-			.putInt(ProfileStore.KEY_BOUND_PORT, port).apply();
+			.putInt(ProfileStore.KEY_BOUND_PORT, port)
+			.putString(ProfileStore.KEY_TUNNEL_PROFILE, profile.id)
+			.apply();
 
 		publishForeground();
 
