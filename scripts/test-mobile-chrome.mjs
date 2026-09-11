@@ -234,6 +234,37 @@ function assertSourceContracts() {
 	if (!src.includes(":not([data-dshx-details-col])")) {
 		throw new Error("源码契约：隐藏 details 不得误伤 Explorer 的 details 列");
 	}
+	// ── 手机端四个版面缺陷的回归契约（底部导航栏 / 键盘 / 右侧栏 / 会话头部）──
+	if (!/\[data-dshr-main-col\][^']*'[\s\S]{0,240}?padding-bottom: var\(--dshr-inset-bottom/.test(src)) {
+		throw new Error("源码契约：会话列必须让出 --dshr-inset-bottom，否则底部导航栏遮住输入底栏与统计");
+	}
+	if (!src.includes("padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;")) {
+		throw new Error("源码契约：缺少底部导航栏让位（--dshr-inset-bottom）");
+	}
+	if (!src.includes("[data-sidebar-right-panel]") || !src.includes("html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen=\"1\"] #dshr-mobile-whale")) {
+		throw new Error("源码契约：官方右侧栏全屏态必须垫出系统栏 inset（[data-sidebar-right-panel]）并收起悬浮控件");
+	}
+	if (!src.includes("function imeLiftRect") || !src.includes("el.closest('[data-composer-seat]') || el.closest('[data-composer-card]') || el")) {
+		throw new Error("源码契约：键盘抬起必须按整块输入区（[data-composer-seat]）算，只报焦点文本框会让底栏被键盘盖住");
+	}
+	if (!src.includes("window.DshRemoteApp.imeFocusRect(rect.top, rect.bottom);")) {
+		throw new Error("源码契约：imeFocusRect 必须上报 imeLiftRect 的结果");
+	}
+	if (!src.includes("[data-dshr-agent-team]") || !src.includes("function markTeamAction")) {
+		throw new Error("源码契约：缺少 Agent Team 动作标记（挪到页签行右侧）");
+	}
+	if (!src.includes("[data-dshr-tabs]") || !src.includes("function markSessionTabs")) {
+		throw new Error("源码契约：页签行必须按 [role=tablist] 标记 data-dshr-tabs（header 里的 nav 是面包屑标题，不能当页签行）");
+	}
+	if (src.includes("' [data-dshr-session-header] nav {'")) {
+		throw new Error("源码契约：页签行样式不得打在 header nav（0.1.5 那里是会话面包屑标题）上");
+	}
+	if (!src.includes("content: attr(data-dshr-job-n)") || !src.includes("function markJobIndicator")) {
+		throw new Error("源码契约：后台任务触发器必须只留状态点 + 数量（data-dshr-job-n 由 ::after 渲染）");
+	}
+	if (!src.includes("[data-dshr-job-count-text]") || !src.includes("[data-dshr-job-chevron]")) {
+		throw new Error("源码契约：后台任务触发器必须隐藏原句文本与下拉箭头");
+	}
 	if (!src.includes("grid-template-columns: 0px 0px minmax(0, 1fr)")) {
 		throw new Error("源码契约：Explorer 替换模式必须把第三列让成全宽");
 	}

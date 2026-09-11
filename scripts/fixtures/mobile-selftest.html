@@ -15,9 +15,12 @@ header { padding: 8px 12px 0 20px; }
 .title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .hello { font-size: 16px; font-weight: 600; }
 .mode { font-size: 12px; color: #5c5c66; }
-header nav { display: flex; gap: 16px; padding: 8px 0 0; }
-header nav button { border: 0; background: none; padding: 6px 0; font: inherit; color: #8b8b93; }
-header nav button.active { color: #1b66ff; box-shadow: inset 0 -2px 0 #1b66ff; }
+/* 官方 0.1.5：标题行里的 <nav> 是会话面包屑，页签行是 div[role=tablist] */
+.crumbs { display: flex; align-items: center; gap: 4px; min-width: 0; overflow: hidden; }
+.tabs { display: flex; gap: 36px; padding: 8px 0 0 8px; }
+.tabs button { border: 0; background: none; padding: 0 0 9px; font: inherit; font-size: 13px; color: #8b8b93; }
+.tabs button[aria-selected="true"] { color: #1b66ff; box-shadow: inset 0 -2px 0 #1b66ff; }
+.preset-label { font-size: 13px; color: #5c5c66; white-space: nowrap; flex: none; }
 .session-log { width: auto; height: 32px; border: 0; background: #f0f0f2; border-radius: 999px; display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; }
 .column { flex: 1; display: flex; flex-direction: column; gap: 16px; padding: 16px; min-height: 240px; }
 .bubble { align-self: flex-end; background: #e8eaf6; border-radius: 12px; padding: 10px 12px; max-width: 80%; }
@@ -40,6 +43,27 @@ header nav button.active { color: #1b66ff; box-shadow: inset 0 -2px 0 #1b66ff; }
 .access { height: 28px; border: 0; background: none; display: inline-flex; align-items: center; gap: 4px; padding: 0 4px 0 8px; }
 .model { max-width: none; min-width: max-content; height: 28px; border: 0; background: #ececee; display: flex; align-items: center; gap: 4px; }
 .stats { text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 4px 32px 0; font-size: 12px; color: #8b8b93; }
+/* 官方会话头部动作区（flex:none，窄屏会横向挤出头部——回归用） */
+.header-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+.team-action { position: relative; flex: none; }
+.team-trigger { height: 28px; border: 0; background: none; display: inline-flex; align-items: center; gap: 4px; padding: 3px 2px; font: inherit; font-size: 12px; white-space: nowrap; color: #5c5c66; }
+.job { min-height: 28px; border: 0; background: none; display: inline-flex; align-items: center; gap: 3px; padding: 3px 2px; font: inherit; font-size: 12px; white-space: nowrap; color: #5c5c66; }
+.job-dot { flex: none; }
+.job-count { margin: 0 5px; }
+/* 官方右侧栏（0.1.3+ 文件树/文档预览）：全屏态 position:fixed;inset:0 */
+.rightbar-panel {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  visibility: hidden;
+  transform: translateX(100%);
+}
+.rightbar-panel[data-sidebar-right-open] { visibility: visible; transform: none; }
+.rightbar-head { flex: none; height: 44px; display: flex; align-items: center; padding: 0 12px; font-size: 14px; border-bottom: 1px solid #ececee; }
+.rightbar-body { flex: 1; overflow: auto; padding: 12px; }
 .handle { width: 8px; background: #d9dbe0; }
 .details { min-height: 100vh; background: #fff; }
 .dshx-root { min-height: 120px; padding: 16px; font-size: 16px; }
@@ -98,19 +122,32 @@ html.dshr-mobile [data-dshr-main-col] { transition: none !important; }
   <div class="main">
     <header>
       <div class="title">
-        <div>
+        <nav class="crumbs" id="session-crumbs" aria-label="会话层级">
           <div class="hello" id="session-title">你好</div>
-          <div class="mode">标准模式</div>
+        </nav>
+        <div class="header-actions">
+          <span class="preset-label" id="preset-label">标准模式</span>
+          <div class="team-action" data-team-action="true" id="team-action">
+            <button type="button" class="team-trigger" id="team-trigger" aria-expanded="false">
+              <svg width="14" height="14" viewBox="0 0 16 16"><circle cx="8" cy="6" r="3" fill="none" stroke="currentColor"/></svg>
+              <span>Agent Team</span>
+            </button>
+          </div>
+          <button type="button" class="job" id="job-trigger" aria-label="1 个后台任务运行中">
+            <span class="job-dot" aria-hidden="true"><svg width="10" height="10" viewBox="0 0 10 10"><circle cx="5" cy="5" r="4" fill="none" stroke="currentColor"/></svg></span>
+            <span class="job-count">1 个后台任务运行中</span>
+            <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" fill="none"/></svg>
+          </button>
+          <button type="button" class="session-log" aria-label="Session log">
+            <svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 2v8M5 7l3 3 3-3M3 13h10" stroke="currentColor" fill="none"/></svg>
+            <span>Session log</span>
+          </button>
         </div>
-        <button type="button" class="session-log" aria-label="Session log">
-          <svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 2v8M5 7l3 3 3-3M3 13h10" stroke="currentColor" fill="none"/></svg>
-          <span>Session log</span>
-        </button>
       </div>
-      <nav>
-        <button type="button" class="active">对话</button>
-        <button type="button">轨迹</button>
-      </nav>
+      <div class="tabs" role="tablist" id="session-tabs">
+        <button type="button" role="tab" aria-selected="true">对话</button>
+        <button type="button" role="tab" aria-selected="false" id="tab-trajectory">轨迹</button>
+      </div>
     </header>
     <div class="column" id="chat-column">
       <div class="bubble" id="user-msg">你是什么模型</div>
@@ -178,6 +215,14 @@ html.dshr-mobile [data-dshr-main-col] { transition: none !important; }
   <div class="handle" data-side="details" id="details-handle" aria-hidden="true"></div>
   <div class="details" data-side="details" id="explorer-col">
     <div class="dshx-root" id="explorer-panel">审查面板必须可见，不能被 Remote 壳藏成白屏。</div>
+  </div>
+  <div class="rightbar-panel" id="rightbar-panel" data-sidebar-right-panel="fullscreen">
+    <div class="rightbar-head" id="rightbar-head">
+      <button type="button" class="icon-button" aria-label="退出全屏" data-sidebar-right-mode="push"><svg width="15" height="15" viewBox="0 0 16 16"><path d="M2 8h12" stroke="currentColor" fill="none"/></svg></button>
+      <span>文件树</span>
+      <button type="button" class="icon-button" aria-label="收起右侧栏" data-sidebar-right-toggle="true"><svg width="15" height="15" viewBox="0 0 16 16"><path d="M2 8h12" stroke="currentColor" fill="none"/></svg></button>
+    </div>
+    <div class="rightbar-body" id="rightbar-body">工作区文件树：手机端全屏态顶部不得顶进状态栏。</div>
   </div>
 </div>
 <div id="float-model-wrap" style="position:fixed;left:0;top:0;transform:translate(-48px,420px);min-width:max-content;z-index:50;background:#fff;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.12);">
@@ -266,6 +311,11 @@ function fireSwipe(el, x0, y0, x1, y1) {
   }
 }
 function run() {
+  // 原生 inset（状态栏 36 / 导航栏 24）——手机端避让按这两个值断言。
+  if (window.__dshRemoteInsets && typeof window.__dshRemoteInsets.set === 'function' && !window.__dshrInsetsSet) {
+    window.__dshrInsetsSet = true;
+    window.__dshRemoteInsets.set(36, 24);
+  }
   var column = document.getElementById('chat-column');
   var card = document.getElementById('composer-card');
   var row = document.getElementById('composer-row');
@@ -337,6 +387,94 @@ function run() {
   add(checks, 'card-tall', rect('composer-card').height > 80, 'h=' + Math.round(rect('composer-card').height));
 
   var bridge = window.__dshRemoteAndroidMobile;
+
+  // ── Bug 1：底部系统导航栏避让（会话列让出 --dshr-inset-bottom）──
+  var mainColEl = document.querySelector('[data-dshr-main-col]');
+  var insetBottomPx = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--dshr-inset-bottom')) || 0;
+  add(checks, 'inset-bottom-known', insetBottomPx === 24, 'inset=' + insetBottomPx);
+  add(checks, 'main-col-bottom-inset', mainColEl && getComputedStyle(mainColEl).paddingBottom === '24px',
+    mainColEl ? 'pb=' + getComputedStyle(mainColEl).paddingBottom : 'main-col missing');
+  var cardBottomPx = rect('composer-card').bottom;
+  var statsBottomPx = rect('stats').bottom;
+  var colBottomPx = mainColEl ? mainColEl.getBoundingClientRect().bottom : 0;
+  add(checks, 'bottom-nav-clearance',
+    colBottomPx > 0 && cardBottomPx <= colBottomPx - 24 + 1 && statsBottomPx <= colBottomPx - 24 + 1,
+    'card.b=' + Math.round(cardBottomPx) + ' stats.b=' + Math.round(statsBottomPx) + ' col.b=' + Math.round(colBottomPx));
+
+  // ── Bug 2：键盘抬高必须覆盖整块输入区（文本框 + 四键底栏 + 统计）──
+  var seatEl = document.querySelector('[data-composer-seat]');
+  var seatBottomPx = seatEl ? seatEl.getBoundingClientRect().bottom : 0;
+  var imeRect = bridge && typeof bridge.imeLiftRect === 'function'
+    ? bridge.imeLiftRect(document.querySelector('#composer-card textarea'))
+    : null;
+  add(checks, 'ime-lift-covers-composer',
+    !!imeRect && imeRect.bottom >= cardBottomPx - 1 && imeRect.bottom <= seatBottomPx + 1,
+    imeRect ? 'lift.b=' + Math.round(imeRect.bottom) + ' card.b=' + Math.round(cardBottomPx) + ' seat.b=' + Math.round(seatBottomPx) : 'no imeLiftRect');
+
+  // ── Bug 3：官方右侧栏全屏态必须让出状态栏/导航栏 ──
+  var rightbar = document.getElementById('rightbar-panel');
+  var frameEl = document.querySelector('.frame');
+  add(checks, 'rightbar-fixture', !!rightbar && !!frameEl);
+  if (rightbar && frameEl && bridge && typeof bridge.syncNow === 'function') {
+    frameEl.setAttribute('data-rightbar-fullscreen', '');
+    rightbar.setAttribute('data-sidebar-right-open', '');
+    bridge.syncNow();
+    var rightbarStyle = getComputedStyle(rightbar);
+    var rightbarHeadTop = rect('rightbar-head').top;
+    add(checks, 'rightbar-status-inset', rightbarStyle.paddingTop === '36px', 'pt=' + rightbarStyle.paddingTop);
+    add(checks, 'rightbar-bottom-inset', rightbarStyle.paddingBottom === '24px', 'pb=' + rightbarStyle.paddingBottom);
+    add(checks, 'rightbar-below-status-bar', rightbarHeadTop >= 36, 'head.t=' + Math.round(rightbarHeadTop));
+    var whaleRightbar = document.getElementById('dshr-mobile-whale');
+    add(checks, 'rightbar-hides-whale', !!whaleRightbar && getComputedStyle(whaleRightbar).display === 'none',
+      whaleRightbar ? 'd=' + getComputedStyle(whaleRightbar).display : 'whale missing');
+    rightbar.removeAttribute('data-sidebar-right-open');
+    frameEl.removeAttribute('data-rightbar-fullscreen');
+    bridge.syncNow();
+    add(checks, 'rightbar-flag-cleared', document.documentElement.getAttribute('data-dshr-rightbar-fullscreen') !== '1');
+  }
+
+  // ── Bug 4：头部收敛（Agent Team 挪到页签行 + 后台任务只留状态点与数量）──
+  var headerEl = document.querySelector('[data-dshr-session-header]');
+  var teamEl = document.querySelector('[data-dshr-agent-team]');
+  var tabsRowEl = document.querySelector('[data-dshr-tabs]');
+  var crumbsEl = document.getElementById('session-crumbs');
+  add(checks, 'agent-team-marked', !!teamEl);
+  add(checks, 'agent-team-relocated', !!teamEl && getComputedStyle(teamEl).position === 'absolute');
+  add(checks, 'tabs-row-marked',
+    !!tabsRowEl && tabsRowEl.getAttribute('role') === 'tablist' && tabsRowEl !== crumbsEl,
+    tabsRowEl ? 'role=' + tabsRowEl.getAttribute('role') + ' isCrumbs=' + (tabsRowEl === crumbsEl) : 'missing');
+  add(checks, 'crumbs-nav-not-tabs-row', !!crumbsEl && getComputedStyle(crumbsEl).paddingRight !== '108px',
+    crumbsEl ? 'crumbNav.pr=' + getComputedStyle(crumbsEl).paddingRight : 'no crumbs');
+  if (teamEl && headerEl && tabsRowEl) {
+    var teamRect = teamEl.getBoundingClientRect();
+    var headerRect = headerEl.getBoundingClientRect();
+    var tabsRect = tabsRowEl.getBoundingClientRect();
+    var teamMid = (teamRect.top + teamRect.bottom) / 2;
+    add(checks, 'agent-team-in-tab-row', teamMid >= tabsRect.top - 6 && teamRect.bottom <= headerRect.bottom + 1,
+      'team.t=' + Math.round(teamRect.top) + ' tabs.t=' + Math.round(tabsRect.top) + ' header.b=' + Math.round(headerRect.bottom));
+    add(checks, 'agent-team-right-of-tabs', teamRect.left >= tabsRect.left + 40,
+      'team.l=' + Math.round(teamRect.left) + ' tabs.l=' + Math.round(tabsRect.left));
+    var lastTab = document.getElementById('tab-trajectory');
+    var lastTabRight = lastTab ? lastTab.getBoundingClientRect().right : 0;
+    add(checks, 'last-tab-left-of-agent-team', lastTabRight <= teamRect.left + 1,
+      'tab.r=' + Math.round(lastTabRight) + ' team.l=' + Math.round(teamRect.left));
+    add(checks, 'header-no-horizontal-overflow', headerEl.scrollWidth <= headerEl.clientWidth + 1,
+      'sw=' + headerEl.scrollWidth + ' cw=' + headerEl.clientWidth);
+  }
+  var jobBtn = document.querySelector('button[data-dshr-job-count]');
+  add(checks, 'job-indicator-marked', !!jobBtn);
+  if (jobBtn) {
+    var jobTextEl = document.querySelector('[data-dshr-job-count-text]');
+    var jobChevronEl = document.querySelector('[data-dshr-job-chevron]');
+    var jobAfter = '';
+    try { jobAfter = String(getComputedStyle(jobBtn, '::after').content || ''); } catch (ignoredAfter) { jobAfter = ''; }
+    add(checks, 'job-indicator-number', jobBtn.getAttribute('data-dshr-job-n') === '1', 'n=' + jobBtn.getAttribute('data-dshr-job-n'));
+    add(checks, 'job-indicator-text-hidden', !!jobTextEl && getComputedStyle(jobTextEl).display === 'none');
+    add(checks, 'job-indicator-chevron-hidden', !!jobChevronEl && getComputedStyle(jobChevronEl).display === 'none');
+    add(checks, 'job-indicator-shows-count', jobAfter.indexOf('1') >= 0, 'content=' + jobAfter);
+    add(checks, 'job-indicator-compact', jobBtn.getBoundingClientRect().width <= 64, 'w=' + Math.round(jobBtn.getBoundingClientRect().width));
+  }
+
   if (bridge && typeof bridge.clampFloatingMenus === 'function') bridge.clampFloatingMenus();
   var floatIds = ['float-model-wrap', 'float-sub-wrap', 'float-access-wrap', 'float-cmd-wrap', 'float-mode-wrap'];
   for (var f = 0; f < floatIds.length; f++) {

@@ -66,9 +66,12 @@ DSH `0.1.2-alpha.1` 为 Web 宿主引入了**浏览器启动令牌认证**：每
 > 0.1.3+ 新增的右侧栏（文件树 / 文档预览）、工作区文件 API、Open In…、会话格式 v0→v3
 > 迁移、OTel 遥测、`HTTP_PROXY` 等一律由反代透明穿透，与本插件无交集。
 >
-> 唯一需要留意的新 UI 交互：官方右侧栏落在 `data-side="details"` 那一列，而移动
-> hook 在窄视口下会整列隐藏（`[data-side="details"]:not([data-dshx-details-col])`）——
-> 手机上这两个新页签"看不见但没坏"。是否在移动布局里给它们开入口，留待产品决策。
+> 唯一需要留意的新 UI 交互：官方右侧栏 0.1.3+ 落在 `data-side="details"` 那一列（移动
+> hook 在窄视口下会整列隐藏：`[data-side="details"]:not([data-dshx-details-col])`）；
+> 0.1.5 起右侧栏改由 `[data-sidebar-right-panel]` 承载，手机端走 `fullscreen` 态
+> （`position:fixed;inset:0`，绝对定位不吃 frame 的 padding），移动 hook 已给该面板
+> 补上 `--dshr-inset-top/-bottom`：标题行不再顶进状态栏、底部不压导航栏，并在此时
+> 收起悬浮鲸鱼 / 抽屉遮罩 / 拖动手柄。0.1.3 的旧列形态仍按原策略隐藏。
 >
 > **主屏标记**：manifest 由官方 index 自带
 > （`<link rel="manifest" href="/manifest.webmanifest">`，复核过 0.1.0-rc.8 → 0.1.5-rc.1

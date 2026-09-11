@@ -55,6 +55,19 @@
  *  12. 前台通知：探测「停止生成」即智能体正在跑，把会话标题和当前用户
  *      内容交给 DshRemoteApp.setSessionNotice；空闲则 running=false，
  *      原生改走静默渠道，不再展示本机端口直通文案。
+ *  13. 底部导航栏避让：会话列（含 Explorer 替换模式的第三列）让出
+ *      --dshr-inset-bottom，输入卡底栏与底部统计不被系统手势条/三键导航压住。
+ *  14. 键盘抬起按整块输入区：焦点在官方输入卡内时报 [data-composer-seat]
+ *      （文本框 + 四键底栏 + 统计）的矩形，而不是只报文本框——否则原生
+ *      恰好抬到「文本框底边高于键盘」，底栏与统计仍被键盘盖住。
+ *  15. 官方右侧栏（0.1.3+ 文件树/文档预览，[data-sidebar-right-panel]）全屏态
+ *      是 position:fixed;inset:0，绝对定位不吃 frame 的 padding：由面板自己
+ *      垫出 --dshr-inset-top/-bottom，标题行不再顶进状态栏、底部不压导航栏；
+ *      全屏时同时收起悬浮鲸鱼/遮罩/拖动手柄。
+ *  16. 会话头部收敛：官方 Agent Team 动作（[data-team-action]）只加标记，
+ *      用 CSS 定位到页签行右侧（不搬 React 节点）；后台任务触发器
+ *      （aria-label =「N 个后台任务运行中」）只保留状态点 + 数量，数量写进
+ *      data-dshr-job-n 由 ::after 渲染，原句文本与下拉箭头隐藏。
  *
  * 健壮性约定（本版本重点加固）：
  *   - 官方 DOM 结构探测带多级回退（overlay 父节点 → 侧栏开关按钮祖先链 →
@@ -169,6 +182,39 @@
 		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px));',
 		'  grid-template-columns: 0px minmax(0, 1fr) 0px !important;',
 		'  overflow: hidden;',
+		'}',
+		// ── 底部系统导航栏避让（edge-to-edge 沉浸）──
+		// 原生把导航栏高度写成 --dshr-inset-bottom；会话列整体让出这一条，
+		// 输入卡底栏（+ / 权限 / 模型 / 发送）与底部统计不再被手势条或三键导航压住。
+		// 主栏背景本就画进 padding，让位后不会出现异色空条。
+		'html.' + ROOT_CLASS + ' [data-dshr-main-col] {',
+		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
+		'}',
+		// Explorer 替换模式（第三列让给审查面板）同样让出导航栏。
+		'html.' + ROOT_CLASS + ' [data-dshx-details-col] {',
+		'  box-sizing: border-box !important;',
+		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
+		'}',
+		// ── 官方右侧栏（文件树 / 文档预览）──
+		// [data-sidebar-right-panel=fullscreen] 是 position:fixed;inset:0（绝对定位不吃
+		// frame 的 padding），面板标题行会直接顶到状态栏上、底部压住导航栏。
+		// 面板自己垫出两侧系统栏高度：背景画进 padding，状态栏后面颜色一致。
+		// push（停靠）态不垫——那一列在 frame 的 padding 之内，垫了反而多一条空白。
+		'html.' + ROOT_CLASS + ' [data-sidebar-right-panel="fullscreen"],',
+		'html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen="1"] [data-sidebar-right-panel] {',
+		'  box-sizing: border-box !important;',
+		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
+		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
+		'  background: var(--dsw-alias-bg-base, var(--dsw-specific-background, #ffffff)) !important;',
+		'}',
+		'html.' + ROOT_CLASS + '[data-dshr-dark="1"] [data-sidebar-right-panel] {',
+		'  background: var(--dsw-alias-bg-base, #111318) !important;',
+		'}',
+		// 右侧栏全屏时收起悬浮鲸鱼 / 抽屉遮罩 / 拖动手柄，别压在面板上。
+		'html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen="1"] #dshr-mobile-whale,',
+		'html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen="1"] #dshr-mobile-drawer-mask,',
+		'html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen="1"] #dshr-drawer-handle {',
+		'  display: none !important;',
 		'}',
 		// 兜底：结构探测暂时失败（frame 未标记）时，body 自身让出状态栏，
 		// 保证任何官方构建下内容都不会顶进时钟/挖孔区域。
@@ -585,6 +631,63 @@
 		'  height: 24px !important;',
 		'  flex: none !important;',
 		'}',
+		// ── 会话头部收敛：Agent Team 挪到页签行右侧 + 后台任务只留状态点与数量 ──
+		// 标题行原本挤着 模式 / Agent Team / 后台任务 / Session log，窄屏横向溢出。
+		// 这里只做 CSS 定位（绝不搬 React 节点）：给 header 建立定位上下文，
+		// 把已标记的 [data-dshr-agent-team] 绝对定位到页签行右侧，
+		// 它脱离标题行 flex 流后标题行立刻宽松。
+		'html.' + ROOT_CLASS + ' [data-dshr-session-header] {',
+		'  position: relative !important;',
+		'}',
+		'html.' + ROOT_CLASS + ' [data-dshr-session-header] [data-dshr-agent-team] {',
+		'  position: absolute !important;',
+		'  top: auto !important;',
+		'  right: 12px !important;',
+		'  bottom: 3px !important;',
+		'  margin: 0 !important;',
+		'  z-index: 2 !important;',
+		'}',
+		// 页签行给右侧 Agent Team 让出宽度，页签多了自己横向滚动，不再撑破头部。
+		// 注意：官方 0.1.5 的页签行是 div[role="tablist"]，而 header 里的 <nav>
+		// 是会话面包屑标题（不能拿它当页签行，否则标题被垫出 108px 反而更挤）。
+		'html.' + ROOT_CLASS + ' [data-dshr-session-header] [data-dshr-tabs] {',
+		'  box-sizing: border-box !important;',
+		'  padding-right: 108px !important;',
+		'  flex-wrap: nowrap !important;',
+		'  overflow-x: auto !important;',
+		'  overflow-y: hidden !important;',
+		'  scrollbar-width: none;',
+		'}',
+		'html.' + ROOT_CLASS + ' [data-dshr-session-header] [data-dshr-tabs]::-webkit-scrollbar { display: none; }',
+		// Agent Team 的弹层默认从控件左缘向右展开，控件挪到右侧后会顶出屏幕；
+		// 改成右对齐向左展开，宽度不超视口。
+		'html.' + ROOT_CLASS + ' [data-dshr-agent-team] [role="dialog"] {',
+		'  left: auto !important;',
+		'  right: 0 !important;',
+		'  max-width: calc(100vw - 24px) !important;',
+		'}',
+		// 后台任务触发器：只留状态点（转圈动效）+ 数量。数量写在 data-dshr-job-n 上，
+		// 由 ::after 渲染——不动 React 管的文本节点，重渲染不会把整句写回来。
+		'html.' + ROOT_CLASS + ' button[data-dshr-job-count] {',
+		'  display: inline-flex !important;',
+		'  align-items: center !important;',
+		'  justify-content: center !important;',
+		'  gap: 4px !important;',
+		'  min-width: 44px !important;',
+		'  min-height: 44px !important;',
+		'  padding: 0 4px !important;',
+		'  flex: none !important;',
+		'}',
+		'html.' + ROOT_CLASS + ' button[data-dshr-job-count]::after {',
+		'  content: attr(data-dshr-job-n);',
+		'  font-size: 12px !important;',
+		'  line-height: 18px !important;',
+		'  font-variant-numeric: tabular-nums;',
+		'}',
+		'html.' + ROOT_CLASS + ' button[data-dshr-job-count] [data-dshr-job-count-text],',
+		'html.' + ROOT_CLASS + ' button[data-dshr-job-count] [data-dshr-job-chevron] {',
+		'  display: none !important;',
+		'}',
 		// ── 窄屏会话条：只收缩已标记的操作行/输入底栏/统计，不改官方布局变量 ──
 		// 回复下的复制 / 点赞 / 分支 + 耗时：只缩小图标与耗时字号。
 		// 容器上绝不设 height / overflow / display / gap / flex-wrap：
@@ -858,6 +961,26 @@
 		return false;
 	}
 
+	/**
+	 * 键盘抬起的目标元素：焦点落在输入卡里时，取整块输入区
+	 * （[data-composer-seat] 含底栏与底部统计；退化到 [data-composer-card]）。
+	 * 官方输入卡是「文本框在上、四键底栏在下」，只报 textarea 的矩形时原生
+	 * 恰好抬到「文本框底边高于键盘」，底栏与统计仍留在键盘后面——用户看到
+	 * 的就是「键盘遮住输入框」。按整块输入区算，输入框整体高于键盘。
+	 */
+	function imeLiftElement(el) {
+		if (!isElement(el) || !el.closest) return el;
+		return el.closest('[data-composer-seat]') || el.closest('[data-composer-card]') || el;
+	}
+
+	/** 供原生 IME 平移与非壳自测复用的目标矩形（CSS px，视口坐标）。 */
+	function imeLiftRect(el) {
+		var target = imeLiftElement(el);
+		if (!isElement(target)) return null;
+		var r = target.getBoundingClientRect();
+		return { top: r.top, bottom: r.bottom };
+	}
+
 	function reportImeFocusToNative() {
 		if (!isAndroidShell()) return;
 		try {
@@ -867,8 +990,9 @@
 				window.DshRemoteApp.imeFocusRect(-1, -1);
 				return;
 			}
-			var r = el.getBoundingClientRect();
-			window.DshRemoteApp.imeFocusRect(r.top, r.bottom);
+			var rect = imeLiftRect(el);
+			if (!rect) return;
+			window.DshRemoteApp.imeFocusRect(rect.top, rect.bottom);
 		} catch (ignoredFocus) { /* 无 JS 桥时由原生按当前焦点 View 计算 */ }
 	}
 
@@ -2010,6 +2134,73 @@
 			if (!button.hasAttribute('aria-label')) button.setAttribute('aria-label', 'Session log');
 			mark(button, 'data-dshr-session-log');
 		}
+		markTeamAction();
+		markSessionTabs();
+		markJobIndicator();
+	}
+
+	/**
+	 * 会话页签行（对话 / 轨迹）：官方 0.1.5 是 header 里的 div[role="tablist"]，
+	 * 老构建是 header 里的 nav（含 role=tab / aria-selected 的按钮）。
+	 * 只标记真正的页签行——header 里的 <nav> 在 0.1.5 是会话面包屑标题，
+	 * 误标会把标题行垫出 108px 宽度，越改越挤。
+	 */
+	function markSessionTabs() {
+		var rows = document.querySelectorAll('[role="tablist"]');
+		for (var i = 0; i < rows.length; i++) {
+			if (rows[i].closest && rows[i].closest('[role="dialog"]')) continue;
+			mark(rows[i], 'data-dshr-tabs');
+		}
+		var navs = document.querySelectorAll('[data-dshr-session-header] nav');
+		for (var k = 0; k < navs.length; k++) {
+			if (navs[k].querySelector('button[role="tab"], button[aria-selected]') === null) continue;
+			mark(navs[k], 'data-dshr-tabs');
+		}
+	}
+
+	/**
+	 * 官方 Agent Team 动作（experimental-client-ui-agent-team 的 TeamAction，
+	 * 根节点自带稳定数据属性 data-team-action）：只加标记，交给 CSS 定位到
+	 * 页签行右侧。节点留在原 React 树里，官方开合逻辑不受影响。
+	 */
+	function markTeamAction() {
+		var host = document.querySelector('[data-team-action]');
+		if (isElement(host)) mark(host, 'data-dshr-agent-team');
+	}
+
+	/** 后台任务触发器文案：「N 个后台任务运行中」/「N background jobs running」。 */
+	var JOB_COUNT_LABEL = /(\d+)\s*(?:个后台任务|background jobs?)/i;
+
+	/**
+	 * 后台任务触发器（会话头部动作，aria-label 带数量）：手机上只保留状态点
+	 * 与数量。数量写进 data-dshr-job-n 由 CSS ::after 渲染——不改 React 管的
+	 * 文本节点，React 重渲染时不会与它争同一个文本；数量变化会改 aria-label
+	 * （观察器已监听该属性），届时重新取数。原句文本与下拉箭头标记后由 CSS 隐藏。
+	 */
+	function markJobIndicator() {
+		var buttons = document.querySelectorAll('button[aria-label]');
+		for (var i = 0; i < buttons.length; i++) {
+			var button = buttons[i];
+			var label = (button.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+			var match = JOB_COUNT_LABEL.exec(label);
+			if (!match) continue;
+			mark(button, 'data-dshr-job-count');
+			button.setAttribute('data-dshr-job-n', match[1]);
+			var kids = button.children;
+			for (var k = 0; k < kids.length; k++) {
+				var kid = kids[k];
+				if (!isElement(kid)) continue;
+				var text = (kid.textContent || '').replace(/\s+/g, ' ').trim();
+				if (text === label) {
+					mark(kid, 'data-dshr-job-count-text');
+					continue;
+				}
+				// 末尾的纯图形子节点是下拉箭头：手机上省掉，只留状态点 + 数量。
+				var last = k === kids.length - 1;
+				var glyph = kid.tagName === 'svg' || kid.tagName === 'SVG' || kid.querySelector('svg') !== null;
+				if (last && glyph && text === '') mark(kid, 'data-dshr-job-chevron');
+			}
+		}
 	}
 
 	function isSessionLogButton(button) {
@@ -2384,12 +2575,19 @@
 			} else {
 				root.removeAttribute('data-dshr-explorer-details');
 			}
+			// 官方右侧栏全屏（0.1.3+ 的文件树/文档预览）时收起本脚本的悬浮控件。
+			if (frame.hasAttribute('data-rightbar-fullscreen')) {
+				root.setAttribute('data-dshr-rightbar-fullscreen', '1');
+			} else {
+				root.removeAttribute('data-dshr-rightbar-fullscreen');
+			}
 		} else {
 			// frame 未找到：保持 body 兜底 padding 生效，内容不顶进状态栏。
 			root.removeAttribute('data-dshr-ready');
 			root.setAttribute('data-dshr-expanded', '0');
 			root.setAttribute('data-dshr-has-official-toggle', '0');
 			root.removeAttribute('data-dshr-explorer-details');
+			root.removeAttribute('data-dshr-rightbar-fullscreen');
 		}
 
 		if (typeof document.querySelectorAll !== 'function') return;
@@ -2466,7 +2664,19 @@
 		observer = new MutationObserver(syncDom);
 		observer.observe(document.body, {
 			attributes: true,
-			attributeFilter: ['data-sidebar-collapsed', 'data-dshx-overlay', 'data-ds-dark-theme', 'role', 'aria-modal', 'aria-current', 'data-state', 'aria-expanded', 'aria-label'],
+			attributeFilter: [
+				'data-sidebar-collapsed',
+				'data-dshx-overlay',
+				'data-rightbar-fullscreen',
+				'data-rightbar-open',
+				'data-ds-dark-theme',
+				'role',
+				'aria-modal',
+				'aria-current',
+				'data-state',
+				'aria-expanded',
+				'aria-label',
+			],
 			childList: true,
 			subtree: true,
 		});
@@ -2558,5 +2768,6 @@
 		clampFloatingMenus: clampFloatingMenus,
 		applyImeLift: applyImeLift,
 		readSessionNotice: collectSessionNotice,
+		imeLiftRect: imeLiftRect,
 	};
 })();

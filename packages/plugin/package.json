@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote-plugin",
-  "version": "0.1.5-rc.1.1",
+  "version": "0.1.5-rc.1.2",
   "private": true,
   "description": "DSH Remote —— 随 DSH web profile 启动自动拉起远程网关的 cordis 插件（含设置面板）",
   "type": "module",
