@@ -89,7 +89,25 @@ function assertSourceContracts() {
 	if (!src.includes("function findMainCol")) {
 		throw new Error("源码契约：缺少 findMainCol");
 	}
-	// ── WEB-02 单一源（t9/t10）：分发副本必须与网关资产逐字节一致 ──
+	// ── 深色启动（theme-follow）：标记缺失时按系统深浅铺底，不误判为浅色 ──
+	if (!src.includes("if (!dark && !findFrame())")) {
+		throw new Error("源码契约：DSH 主题标记缺失时必须回退系统深浅（syncPageTheme）");
+	}
+	if (!src.includes('[data-dshr-dark="1"]:not([data-dshr-ready="1"]) { background: #141414; }')) {
+		throw new Error("源码契约：深色启动 splash 必须铺深色底，防止状态栏 inset 白条");
+	}
+	// ── 壳直连重试 ──
+	{
+		const main = readFileSync(join(ROOT, "android/app/src/main/java/top/d1studio/dshremote/MainActivity.java"), "utf8");
+		if (!main.includes('directTarget = url;') || !main.includes("if (!TextUtils.isEmpty(directTarget))")) {
+			throw new Error("源码契约：直连重试必须回到原直连地址，不得误连 FRP 配置组");
+		}
+	}
+	// ── 壳深色主题（values-night）──
+	{
+		const night = join(ROOT, "android/app/src/main/res/values-night/styles.xml");
+		if (!existsSync(night)) throw new Error("源码契约：缺少 values-night 深色主题");
+	}
 	{
 		const singleBytes = readFileSync(join(ROOT, "packages/gateway/assets/mobile-web.js"));
 		const rawBytes = readFileSync(join(ROOT, "android/app/src/main/res/raw/mobile.js"));
@@ -145,6 +163,36 @@ function assertSourceContracts() {
 	}
 	if (!src.includes("function clampFloatingMenus")) {
 		throw new Error("源码契约：缺少浮动选框 clampFloatingMenus");
+	}
+	// ── 浮层缺陷回归（上下文环浮层被裁 / 更多菜单被搬到屏幕底部）──
+	{
+		const block = src.match(/\[data-dshr-composer-trailing\] \{[\s\S]{0,500}?'\}/);
+		if (!block) {
+			throw new Error("源码契约：找不到 [data-dshr-composer-trailing] 规则块");
+		}
+		// 注释里会出现 "overflow:hidden" 这类字样，先剔掉注释行再看真实声明
+		const rule = block[0].split("\n").filter((line) => !line.includes("//")).join("\n");
+		if (/overflow:\s*hidden/.test(rule)) {
+			throw new Error("源码契约：trailing 集群不得 overflow:hidden——上下文环浮层是它的后代，被裁掉就是「点环没反应」");
+		}
+		if (!/overflow:\s*visible/.test(rule)) {
+			throw new Error("源码契约：trailing 必须显式 overflow:visible（防后续改动又把它裁掉）");
+		}
+	}
+	if (!src.includes("function fixedContainingBlock")) {
+		throw new Error("源码契约：缺少 fixedContainingBlock——position:fixed 浮层在带 transform 的会话列里必须换算到包含块坐标系");
+	}
+	if (!src.includes("Math.round(left - hostLeft)") || !src.includes("Math.round(top - hostTop)")) {
+		throw new Error("源码契约：夹浮层必须减去 fixed 包含块原点，否则坐标会被浏览器再加一次祖先偏移");
+	}
+	if (!src.includes("function setFloatStyle") || !src.includes("if (changed) mark(el, 'data-dshr-float')")) {
+		throw new Error("源码契约：夹浮层必须靠 setFloatStyle 的「值未变不写」判定收敛");
+	}
+	if (!src.includes("result.changed && result.count > 0 && floatPasses < 4")) {
+		throw new Error("源码契约：scheduleClampFloats 必须按「确有改动」收敛——每帧重排会让浮层逐帧下漂并白烧 CPU");
+	}
+	if (!src.includes("return { count: hosts.length, changed: changed }")) {
+		throw new Error("源码契约：clampFloatingMenus 必须返回 { count, changed }");
 	}
 	if (!src.includes("interactive-widget=overlays-content")) {
 		throw new Error("源码契约：Android 壳必须 overlays-content，避免 layout viewport 再缩一次");
@@ -243,6 +291,12 @@ function assertSourceContracts() {
 	}
 	if (!src.includes("[data-sidebar-right-panel]") || !src.includes("html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen=\"1\"] #dshr-mobile-whale")) {
 		throw new Error("源码契约：官方右侧栏全屏态必须垫出系统栏 inset（[data-sidebar-right-panel]）并收起悬浮控件");
+	}
+	if (!src.includes("rightPanel.getAttribute('aria-hidden') !== 'true'")) {
+		throw new Error("源码契约：返回键必须以 aria-hidden 判定右侧栏展开态，收起后不得再拦截（否则退不到后台）");
+	}
+	if (!src.includes("button[data-sidebar-right-toggle]")) {
+		throw new Error("源码契约：返回键必须走官方 [data-sidebar-right-toggle] 收起右侧栏，不得误点退出全屏");
 	}
 	if (!src.includes("function imeLiftRect") || !src.includes("el.closest('[data-composer-seat]') || el.closest('[data-composer-card]') || el")) {
 		throw new Error("源码契约：键盘抬起必须按整块输入区（[data-composer-seat]）算，只报焦点文本框会让底栏被键盘盖住");
@@ -476,6 +530,7 @@ try {
 				if (!root.style.getPropertyValue('--dshr-inset-top')) {
 					root.style.setProperty('--dshr-inset-top', '36px');
 				}
+				window.__dshRemoteInsets.set(36, 24);
 				var frame = document.querySelector('[data-dshr-frame]') || document.querySelector('.frame');
 				var main = document.querySelector('[data-dshr-main-col]');
 				var side = document.querySelector('[data-dshr-sidebar-col]') || document.querySelector('.sidebar');
@@ -495,6 +550,8 @@ try {
 					framePadTop: frame ? getComputedStyle(frame).paddingTop : '',
 					sidePadTop: side ? getComputedStyle(side).paddingTop : '',
 					mainPadTop: main ? getComputedStyle(main).paddingTop : '',
+					mainPadBottom: main ? getComputedStyle(main).paddingBottom : '',
+					sidePadBottom: side ? getComputedStyle(side).paddingBottom : '',
 					guard: !!guard,
 					guardH: guard ? Math.round(guard.getBoundingClientRect().height) : 0
 				};
@@ -558,6 +615,12 @@ try {
 			&& landscapeProbe.sidePadTop === "36px"
 			&& landscapeProbe.mainPadTop === "36px",
 		landscapeProbe ? `official=${landscapeProbe.official} frame=${landscapeProbe.framePadTop} side=${landscapeProbe.sidePadTop} main=${landscapeProbe.mainPadTop}` : "no probe",
+	);
+	extraCheck(
+		"landscape-navigation-inset",
+		landscapeProbe && landscapeProbe.mainPadBottom === "24px"
+			&& landscapeProbe.sidePadBottom === "24px",
+		landscapeProbe ? `main=${landscapeProbe.mainPadBottom} side=${landscapeProbe.sidePadBottom}` : "no probe",
 	);
 	extraCheck(
 		"landscape-status-guard",

@@ -73,6 +73,18 @@ DSH `0.1.2-alpha.1` 为 Web 宿主引入了**浏览器启动令牌认证**：每
 > 补上 `--dshr-inset-top/-bottom`：标题行不再顶进状态栏、底部不压导航栏，并在此时
 > 收起悬浮鲸鱼 / 抽屉遮罩 / 拖动手柄。0.1.3 的旧列形态仍按原策略隐藏。
 >
+> **0.1.5 的两个新浮层**（移动 hook 已适配，`pnpm test:mobile` 有回归断言）：
+> 上下文占用环（`ContextMeter`：环是 28px 按钮，点开的面板 `position:absolute;
+> bottom:calc(100% + 8px);right:0` 长在输入卡底栏集群里）与「更多操作 → 下载 Session
+> 日志」（primitives `Menu`，非 portal 的 `position:absolute` 列表，锚在 ⋯ 按钮上）。
+> 移动 hook 的两条硬约束：① 输入卡底栏集群**不得 `overflow:hidden`**——裁剪会把
+> 上下文面板整块吃掉，表现为「点环没反应」；② 浮动选框只在真的超出安全视口时才
+> 改写成 `position:fixed`，且写坐标前必须换算到最近的 `transform` 祖先——会话列
+> 自身常驻 `transform:translateX(0)` + `will-change:transform`，它就是 fixed 后代的
+> 包含块，不换算会把祖先偏移再加一次，浮层每帧下漂，最后停在输入卡上方（表现为
+> 「下载 Session 日志跑到屏幕底下」）。夹取同时改成「值没变就不写」的收敛循环，
+> 不再每帧空转 rAF。
+>
 > **主屏标记**：manifest 由官方 index 自带
 > （`<link rel="manifest" href="/manifest.webmanifest">`，复核过 0.1.0-rc.8 → 0.1.5-rc.1
 > 每版都有），网关**不再自带 manifest**，只补官方没有的项：Service Worker 注册、

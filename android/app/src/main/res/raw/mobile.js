@@ -117,6 +117,10 @@
 		// DSH 里经常不存在，写成它的 fallback 会把设置页钉死成白底，深色字就看不见。
 		'html.' + ROOT_CLASS + '[data-dshr-dark="1"] { color-scheme: dark; }',
 		'html.' + ROOT_CLASS + '[data-dshr-dark="0"] { color-scheme: light; }',
+		// DSH 主题标记出现前（启动 splash / 插件加载）按系统深浅铺底，
+		// 否则系统深色下状态栏 inset 区域会闪出一条白底。
+		'html.' + ROOT_CLASS + '[data-dshr-dark="1"]:not([data-dshr-ready="1"]) { background: #141414; }',
+		'html.' + ROOT_CLASS + '[data-dshr-dark="1"]:not([data-dshr-ready="1"]) body { background: #141414; }',
 		// 官方横屏：不要给整个 frame 垫一层白顶（会跟灰色侧栏错色）。
 		// 列自己 padding-top，背景画进 padding，状态栏后面左右颜色才能接上。
 		'html.dshr-official-inset {',
@@ -139,11 +143,24 @@
 		'html.dshr-official-inset[data-dshr-dark="1"] [data-dshr-sidebar-col] {',
 		'  background: var(--dsw-specific-sidebar-fill, var(--dsw-alias-bg-base, #1b1b1f)) !important;',
 		'}',
+		'html.dshr-official-inset[data-dshr-dark="1"]:not([data-dshr-ready="1"]) [data-dshr-sidebar-col],',
+		'html.dshr-official-inset[data-dshr-dark="1"]:not([data-dshr-ready="1"]) [data-dshr-main-col],',
+		'html.dshr-official-inset[data-dshr-dark="1"]:not([data-dshr-ready="1"]) [data-dshx-details-col] {',
+		'  background: #141414 !important;',
+		'}',
 		'html.dshr-official-inset[data-dshr-dark="1"] [data-dshr-main-col],',
 		'html.dshr-official-inset[data-dshr-dark="1"] [data-dshx-details-col] {',
 		'  background: var(--dsw-alias-bg-base, #111318) !important;',
 		'}',
+		// 横屏保留桌面布局，但系统导航栏仍须避让；各列背景延伸至透明导航栏后。
+		'html.dshr-official-inset [data-dshr-sidebar-col],',
+		'html.dshr-official-inset [data-dshr-main-col],',
+		'html.dshr-official-inset [data-dshx-details-col] {',
+		'  box-sizing: border-box !important;',
+		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
+		'}',
 		'html.dshr-official-inset:not([data-dshr-ready="1"]) body {',
+		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
 		'  box-sizing: border-box !important;',
 		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
 		'}',
@@ -200,6 +217,7 @@
 		// frame 的 padding），面板标题行会直接顶到状态栏上、底部压住导航栏。
 		// 面板自己垫出两侧系统栏高度：背景画进 padding，状态栏后面颜色一致。
 		// push（停靠）态不垫——那一列在 frame 的 padding 之内，垫了反而多一条空白。
+		'html.dshr-official-inset [data-sidebar-right-panel="fullscreen"],',
 		'html.' + ROOT_CLASS + ' [data-sidebar-right-panel="fullscreen"],',
 		'html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen="1"] [data-sidebar-right-panel] {',
 		'  box-sizing: border-box !important;',
@@ -394,12 +412,12 @@
 		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] [data-dshr-frame] [data-dshr-main-col] {',
 		'  transition: none !important;',
 		'  transform: translateX(var(--dshr-drawer-x, 0px)) !important;',
-		'  border-radius: calc(18px * var(--dshr-drawer-p, 0)) !important;',
-		'  box-shadow: -14px 0 36px rgba(0, 0, 0, calc(0.18 * var(--dshr-drawer-p, 0))),',
-		'    0 0 0 1px rgba(0, 0, 0, calc(0.04 * var(--dshr-drawer-p, 0))) !important;',
-		'  margin-top: calc(8px * var(--dshr-drawer-p, 0)) !important;',
-		'  margin-bottom: calc(8px * var(--dshr-drawer-p, 0)) !important;',
-		'  max-height: calc(100% - (16px * var(--dshr-drawer-p, 0))) !important;',
+		// 拖动期间固定卡片几何与阴影，只更新 transform，避免每次 touchmove 重排聊天。
+		'  border-radius: 18px !important;',
+		'  box-shadow: -14px 0 36px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(0, 0, 0, 0.04) !important;',
+		'  margin-top: 8px !important;',
+		'  margin-bottom: 8px !important;',
+		'  max-height: calc(100% - 16px) !important;',
 		'  overflow: hidden !important;',
 		'}',
 		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] #dshr-mobile-whale { display: none !important; }',
@@ -755,7 +773,11 @@
 		'  gap: 6px !important;',
 		'  min-width: 0 !important;',
 		'  margin-left: 0 !important;',
-		'  overflow: hidden !important;',
+		// 绝不 overflow:hidden：上下文环的浮层（.JObwrW_panel，position:absolute；
+		// bottom: calc(100% + 8px)）就在这一行的子节点里，裁剪会把整块面板吃掉——
+		// 手机端点环"没反应"就是这个裁剪。不裁剪也不会盖住 +/权限：模型按钮自己
+		// min-width:0 + 省略号，其余子按钮 flex:0 0 auto，宽度不会溢出。
+		'  overflow: visible !important;',
 		'}',
 		'html.' + ROOT_CLASS + ' [data-dshr-composer-trailing] > button:not([data-dshr-composer-model]) {',
 		'  flex: 0 0 auto !important;',
@@ -1459,12 +1481,13 @@
 	/** 定向开/关侧栏；已是目标态时不 toggle，避免连点把抽屉又打开。 */
 	function setSidebarOpen(open) {
 		open = !!open;
-		if (isSidebarOpen() === open) {
-			pendingSidebarOpen = null;
-			return true;
-		}
+		// 官方 React 提交可能晚于手指松开；即使 DOM 仍是旧状态也要记住最终意图。
 		if (toggleBusy) {
 			pendingSidebarOpen = open;
+			return true;
+		}
+		if (isSidebarOpen() === open) {
+			pendingSidebarOpen = null;
 			return true;
 		}
 		return toggleSidebar();
@@ -1529,27 +1552,118 @@
 		return Math.max(80, width - drawerPeekPx());
 	}
 
+	var drawerVisual = null;
+	var drawerRaf = 0;
+	var drawerNextX = 0;
+
 	function setDrawerVisual(x) {
-		var max = drawerMaxShift();
+		if (!drawerVisual) {
+			var frame = findFrame();
+			drawerVisual = { max: drawerMaxShift(), main: frame ? findMainCol(frame) : null, wasOpen: isSidebarOpen() };
+			// 先锁住跟手样式，再请求官方渲染 wide 内容；不能只把 rail 拉宽。
+			document.documentElement.setAttribute('data-dshr-dragging', '1');
+			setSidebarOpen(true);
+		}
+		var max = drawerVisual.max;
 		x = Math.max(0, Math.min(max, x));
 		var p = max > 0 ? x / max : 0;
-		var root = document.documentElement;
-		root.setAttribute('data-dshr-dragging', '1');
-		root.style.setProperty('--dshr-drawer-x', Math.round(x) + 'px');
-		root.style.setProperty('--dshr-drawer-p', String(Math.round(p * 1000) / 1000));
+		// 变量只写在主列，不让每次移动使整个文档继承的样式失效。
+		if (drawerVisual.main) drawerVisual.main.style.setProperty('--dshr-drawer-x', Math.round(x) + 'px');
+		else document.documentElement.style.setProperty('--dshr-drawer-x', Math.round(x) + 'px');
 		return { x: x, p: p, max: max };
 	}
 
-	function clearDrawerVisual() {
+	function queueDrawerVisual(x) {
+		drawerNextX = x;
+		if (drawerRaf) return;
+		drawerRaf = window.requestAnimationFrame(function () {
+			drawerRaf = 0;
+			if (drawerVisual) setDrawerVisual(drawerNextX);
+		});
+	}
+
+	function clearDrawerVisual(keepState) {
+		if (settleAnim) window.cancelAnimationFrame(settleAnim);
+		settleAnim = 0;
+		if (drawerRaf) window.cancelAnimationFrame(drawerRaf);
+		drawerRaf = 0;
+		var previous = drawerVisual;
+		drawerVisual = null;
 		var root = document.documentElement;
 		root.removeAttribute('data-dshr-dragging');
-		root.style.removeProperty('--dshr-drawer-x');
-		root.style.removeProperty('--dshr-drawer-p');
+		if (previous && previous.main) {
+			previous.main.style.removeProperty('--dshr-drawer-x');
+		} else {
+			root.style.removeProperty('--dshr-drawer-x');
+		}
+		if (previous && !keepState) setSidebarOpen(previous.wasOpen);
+	}
+
+	// 关闭时先保持官方 wide 内容不变，只移动主卡片。
+	// 落位后再切换 rail，避免侧栏重排/入场动画与回位动画重叠。
+	// 这是对渲染时序的优化；实际帧率仍需真机性能采样确认。
+	var settleAnim = 0;
+	function animateMainTo(x, done) {
+		if (settleAnim) window.cancelAnimationFrame(settleAnim);
+		settleAnim = 0;
+		if (drawerRaf) window.cancelAnimationFrame(drawerRaf);
+		drawerRaf = 0;
+		var state = drawerVisual;
+		if (!state || !state.main) {
+			done();
+			return;
+		}
+		var el = state.main;
+		var from = parseFloat(el.style.getPropertyValue('--dshr-drawer-x')) || 0;
+		if (Math.abs(x - from) < 2 || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+			setDrawerVisual(x);
+			done();
+			return;
+		}
+		var start = 0;
+		var duration = 220;
+		var step = function (ts) {
+			if (drawerVisual !== state) {
+				settleAnim = 0;
+				return;
+			}
+			if (!start) start = ts;
+			var t = Math.min(1, (ts - start) / duration);
+			// 与官方 0.34s cubic-bezier(0.32,0.72,0,1) 近似的 ease-out。
+			var eased = 1 - Math.pow(1 - t, 3);
+			setDrawerVisual(from + (x - from) * eased);
+			if (t < 1) {
+				settleAnim = window.requestAnimationFrame(step);
+			} else {
+				settleAnim = 0;
+				done();
+			}
+		};
+		settleAnim = window.requestAnimationFrame(step);
 	}
 
 	function settleDrawer(wantOpen) {
-		clearDrawerVisual();
-		return setSidebarOpen(!!wantOpen);
+		if (!drawerVisual && !wantOpen && isSidebarOpen()) setDrawerVisual(drawerMaxShift());
+		var state = drawerVisual;
+		if (!state) return setSidebarOpen(!!wantOpen);
+		if (wantOpen) {
+			// 展开落位：去掉跟手样式，让官方 transform 接管，目标态已展开。
+			var result = setSidebarOpen(true);
+			clearDrawerVisual(true);
+			return result;
+		}
+		// 关闭：先补间回 0，卡片盖满后再切官方收起，rail 重排被卡片挡住。
+		animateMainTo(0, function () {
+			var closing = drawerVisual;
+			drawerVisual = null;
+			if (settleAnim) { window.cancelAnimationFrame(settleAnim); settleAnim = 0; }
+			if (drawerRaf) { window.cancelAnimationFrame(drawerRaf); drawerRaf = 0; }
+			document.documentElement.removeAttribute('data-dshr-dragging');
+			if (closing && closing.main) closing.main.style.removeProperty('--dshr-drawer-x');
+			else document.documentElement.style.removeProperty('--dshr-drawer-x');
+			setSidebarOpen(false);
+		});
+		return true;
 	}
 
 	/**
@@ -1698,6 +1812,9 @@
 				resetTrack();
 				return false;
 			}
+			// 接管当前回位位置；旧补间不能继续覆盖新手势。
+			if (settleAnim) window.cancelAnimationFrame(settleAnim);
+			settleAnim = 0;
 			tracking = true;
 			dragging = false;
 			startX = clientX;
@@ -1707,7 +1824,9 @@
 			velocity = 0;
 			startTarget = target;
 			activePointer = pointerId == null ? 'touch' : pointerId;
-			baseX = isSidebarOpen() ? drawerMaxShift() : 0;
+			baseX = drawerVisual && drawerVisual.main
+				? parseFloat(drawerVisual.main.style.getPropertyValue('--dshr-drawer-x')) || 0
+				: isSidebarOpen() ? drawerMaxShift() : 0;
 			return true;
 		}
 
@@ -1729,7 +1848,7 @@
 			velocity = (clientX - lastX) / dt;
 			lastX = clientX;
 			lastT = now;
-			setDrawerVisual(baseX + dx);
+			queueDrawerVisual(baseX + dx);
 			if (event && event.cancelable) event.preventDefault();
 		}
 
@@ -1740,12 +1859,13 @@
 			var wasDragging = dragging;
 			var start = startTarget;
 			var opened = isSidebarOpen();
+			var releaseVelocity = Date.now() - lastT < 100 ? velocity : 0;
 			resetTrack();
 			if (wasDragging) {
 				var shift = baseX + (endX - startX);
 				var visual = setDrawerVisual(shift);
 				var wantOpen = visual.p >= 0.35;
-				if (Math.abs(velocity) > 0.45) wantOpen = velocity > 0;
+				if (Math.abs(releaseVelocity) > 0.45) wantOpen = releaseVelocity > 0;
 				settleDrawer(wantOpen);
 				return;
 			}
@@ -1764,7 +1884,7 @@
 
 		function onDragCancel() {
 			if (!tracking) return;
-			var opened = isSidebarOpen();
+			var opened = drawerVisual ? drawerVisual.wasOpen : isSidebarOpen();
 			var wasDragging = dragging;
 			resetTrack();
 			if (wasDragging) settleDrawer(opened);
@@ -1775,7 +1895,7 @@
 		// 抽屉手势始终走 touch；一旦判定为横向拖动就 preventDefault。
 		document.addEventListener('touchstart', function (event) {
 			if (event.touches && event.touches.length !== 1) {
-				resetTrack();
+				onDragCancel();
 				return;
 			}
 			var touch = event.touches && event.touches[0];
@@ -1900,8 +2020,52 @@
 		return { top: top, right: right, bottom: bottom, left: left };
 	}
 
+	/**
+	 * position:fixed 的包含块（除视口外的另一种可能）。
+	 *
+	 * transform / perspective / filter / backdrop-filter / will-change:transform /
+	 * contain:layout|paint 的祖先会成为 fixed 后代的包含块——此时写进 style 的
+	 * left/top 是相对该祖先的边框盒，而不是视口。本脚本自己就给
+	 * [data-dshr-main-col] 挂了 transform + will-change（抽屉滑动必需），所以
+	 * 手机端几乎所有浮层都落在这种"内部包含块"里。
+	 */
+	function fixedContainingBlock(el) {
+		var node = el.parentElement;
+		while (node && node !== document.body && node !== document.documentElement) {
+			var cs = null;
+			try { cs = window.getComputedStyle(node); } catch (ignoredCb) { return null; }
+			if (!cs) return null;
+			var willChange = String(cs.willChange || '');
+			if (cs.transform !== 'none'
+				|| cs.perspective !== 'none'
+				|| cs.filter !== 'none'
+				|| String(cs.backdropFilter || 'none') !== 'none'
+				|| willChange.indexOf('transform') >= 0
+				|| /layout|paint|strict|content/.test(String(cs.contain || ''))) {
+				return node;
+			}
+			node = node.parentElement;
+		}
+		return null;
+	}
+
+	/** 写 !important 样式；值没变就不写（收敛判定靠它）。 */
+	function setFloatStyle(el, prop, value) {
+		if (el.style.getPropertyValue(prop) === value) return false;
+		el.style.setProperty(prop, value, 'important');
+		return true;
+	}
+
+	/**
+	 * 把浮层夹进安全视口。返回是否真的改动了样式（用于收敛，见 scheduleClampFloats）。
+	 *
+	 * 两条关键约束（手机端"更多"菜单飘到输入卡上方就是踩了这两条）：
+	 *  1. 已经整体落在安全视口内的浮层一律不碰——官方自己的锚点定位本来是对的；
+	 *  2. 需要夹时才改成 position:fixed，此时坐标必须换算到 fixed 包含块的坐标系
+	 *     （祖先里的 transform 会被浏览器再加一次），否则浮层每帧往下漂一截。
+	 */
 	function clampFloatHost(el) {
-		if (!isMobileMode() || !isElement(el) || !isVisible(el) || isLayoutChrome(el)) return;
+		if (!isMobileMode() || !isElement(el) || !isVisible(el) || isLayoutChrome(el)) return false;
 		var pad = viewportPad();
 		var vw = window.innerWidth || document.documentElement.clientWidth || 390;
 		var vh = window.innerHeight || document.documentElement.clientHeight || 844;
@@ -1912,7 +2076,12 @@
 			if (composerRect.top > 96) bottomLimit = Math.min(bottomLimit, composerRect.top - 8);
 		}
 		var rect = el.getBoundingClientRect();
-		if (rect.width <= 1 || rect.height <= 1) return;
+		if (rect.width <= 1 || rect.height <= 1) return false;
+		// 约束 1：本来就在安全区内，交给官方定位，绝不改写。
+		if (rect.left >= pad.left - 0.5 && rect.top >= pad.top - 0.5
+			&& rect.right <= vw - pad.right + 0.5 && rect.bottom <= bottomLimit + 0.5) {
+			return false;
+		}
 		var maxW = Math.max(160, vw - pad.left - pad.right);
 		var maxH = Math.max(96, bottomLimit - pad.top);
 		var width = Math.min(rect.width, maxW);
@@ -1923,23 +2092,35 @@
 		if (left < pad.left) left = pad.left;
 		if (top + height > bottomLimit) top = bottomLimit - height;
 		if (top < pad.top) top = pad.top;
-		mark(el, 'data-dshr-float');
-		el.style.setProperty('position', 'fixed', 'important');
-		el.style.setProperty('left', Math.round(left) + 'px', 'important');
-		el.style.setProperty('top', Math.round(top) + 'px', 'important');
-		el.style.setProperty('right', 'auto', 'important');
-		el.style.setProperty('bottom', 'auto', 'important');
-		el.style.setProperty('width', Math.round(width) + 'px', 'important');
-		el.style.setProperty('max-width', Math.round(maxW) + 'px', 'important');
-		el.style.setProperty('max-height', Math.round(maxH) + 'px', 'important');
-		el.style.setProperty('min-width', '0', 'important');
-		el.style.setProperty('transform', 'none', 'important');
-		el.style.setProperty('margin', '0', 'important');
-		el.style.setProperty('box-sizing', 'border-box', 'important');
+		// 约束 2：换算到 fixed 包含块的坐标系。
+		var host = fixedContainingBlock(el);
+		var hostLeft = 0;
+		var hostTop = 0;
+		if (host) {
+			var hostRect = host.getBoundingClientRect();
+			hostLeft = hostRect.left;
+			hostTop = hostRect.top;
+		}
+		var changed = false;
+		if (setFloatStyle(el, 'position', 'fixed')) changed = true;
+		if (setFloatStyle(el, 'left', Math.round(left - hostLeft) + 'px')) changed = true;
+		if (setFloatStyle(el, 'top', Math.round(top - hostTop) + 'px')) changed = true;
+		if (setFloatStyle(el, 'right', 'auto')) changed = true;
+		if (setFloatStyle(el, 'bottom', 'auto')) changed = true;
+		if (setFloatStyle(el, 'width', Math.round(width) + 'px')) changed = true;
+		if (setFloatStyle(el, 'max-width', Math.round(maxW) + 'px')) changed = true;
+		if (setFloatStyle(el, 'max-height', Math.round(maxH) + 'px')) changed = true;
+		if (setFloatStyle(el, 'min-width', '0')) changed = true;
+		if (setFloatStyle(el, 'transform', 'none')) changed = true;
+		if (setFloatStyle(el, 'margin', '0px')) changed = true;
+		if (setFloatStyle(el, 'box-sizing', 'border-box')) changed = true;
+		if (changed) mark(el, 'data-dshr-float');
+		return changed;
 	}
 
+	/** 夹一轮所有浮层，返回 { count, changed }——changed 为假表示已经收敛。 */
 	function clampFloatingMenus() {
-		if (!isMobileMode()) return 0;
+		if (!isMobileMode()) return { count: 0, changed: false };
 		var roots = collectMenuRoots();
 		var hosts = [];
 		var seen = [];
@@ -1956,17 +2137,31 @@
 			if (host) pushHost(host);
 			else if (isFloatingHost(roots[i])) pushHost(roots[i]);
 		}
-		for (var h = 0; h < hosts.length; h++) clampFloatHost(hosts[h]);
-		return hosts.length;
+		var changed = false;
+		for (var h = 0; h < hosts.length; h++) {
+			if (clampFloatHost(hosts[h])) changed = true;
+		}
+		return { count: hosts.length, changed: changed };
 	}
 
+	/**
+	 * 夹浮动选框。只在"这一轮确实改动了样式"时再排下一轮收敛；一旦收敛立即停手。
+	 * 旧实现只要页面上还有浮层就每帧重排——配合包含块偏移会让浮层逐帧向下漂，
+	 * 停在输入卡上方；同时空转 rAF 也白烧 CPU/电量。
+	 */
 	var floatRaf = 0;
+	var floatPasses = 0;
 	function scheduleClampFloats() {
 		if (floatRaf) return;
 		floatRaf = window.requestAnimationFrame(function () {
 			floatRaf = 0;
-			var count = clampFloatingMenus();
-			if (count > 0) scheduleClampFloats();
+			var result = clampFloatingMenus();
+			if (result.changed && result.count > 0 && floatPasses < 4) {
+				floatPasses++;
+				scheduleClampFloats();
+				return;
+			}
+			floatPasses = 0;
 		});
 	}
 
@@ -2644,7 +2839,12 @@
 
 	var lastPageDark = null;
 	function syncPageTheme() {
+		// 插件加载前没有主题标记不等于浅色；此时使用系统主题。
+		// 会话 frame 出现后，以 DSH 的实际选择为准（包括用户手选浅色）。
 		var dark = !!(document.body && document.body.hasAttribute('data-ds-dark-theme'));
+		if (!dark && !findFrame()) {
+			try { dark = window.matchMedia('(prefers-color-scheme: dark)').matches; } catch (ignored) {}
+		}
 		if (dark === lastPageDark) return;
 		lastPageDark = dark;
 		document.documentElement.setAttribute('data-dshr-dark', dark ? '1' : '0');
@@ -2743,6 +2943,18 @@
 				if (!isVisible(dialogs[i])) continue;
 				// 设置等模态框官方都监听 document 级 Escape。
 				document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+				return true;
+			}
+			// 官方文件右侧栏：<768px 自动全屏，宽屏可为 push 或手动全屏。
+			// 以展开标记而非显示模式判断；只收起面板，保留文件标签和路由。
+			var rightPanel = document.querySelector('[data-sidebar-right-panel][data-sidebar-right-open]');
+			if (rightPanel && rightPanel.getAttribute('aria-hidden') !== 'true') {
+				var rightToggle = rightPanel.querySelector('button[data-sidebar-right-toggle]');
+				if (rightToggle && !rightToggle.disabled) {
+					if (!dispatchNativeClick(rightToggle)) rightToggle.click();
+				}
+				// React 状态更新可能异步提交；不能因 DOM 尚未更新再 toggle 一次。
+				// 展开时即使控件暂不可用也消费返回，避免误退桌面。
 				return true;
 			}
 			if (isSidebarOpen()) return setSidebarOpen(false);

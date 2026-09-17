@@ -17,6 +17,7 @@ vendor/frp/
 android/build/
 android/dist/
 android/build-check/
+android/test-build/
 
 # frpc 多 ABI .so（android 壳用；android/jniLibs/ 是 build.ps1 自动下载暂存路径，
 # app/src/main/jniLibs/ 为标准 AGP 位置——两处均体积大不入库）

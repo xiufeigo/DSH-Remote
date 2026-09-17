@@ -104,7 +104,7 @@ public class MainActivity extends Activity {
 	private ScrollView homeScroll;
 	private LinearLayout profilesBox;
 	private ScrollView setupScroll;
-	private EditText urlInput;
+	private LinearLayout directNodesBox;
 	private EditText etName, etServer, etCport, etTunnel, etSk, etToken;
 	private TextView tvTunnelState;
 	private Button resumeSessionBtn;
@@ -145,6 +145,8 @@ public class MainActivity extends Activity {
 	private long lastBackAt = 0;
 	/** DSH 页面是否处于深色（body[data-ds-dark-theme]），用于状态栏图标和 WebView 底色。 */
 	private boolean pageDark = false;
+	/** 直连重试不得误用当前选中的 FRP 配置组。 */
+	private String directTarget = "";
 	/** 会话页沉浸状态栏；注入失败时退回实色。 */
 	private boolean edgeToEdgeChrome = true;
 
@@ -164,6 +166,7 @@ public class MainActivity extends Activity {
 	@Override
 	protected void onCreate(Bundle savedInstanceState) {
 		super.onCreate(savedInstanceState);
+		pageDark = isSystemDark();
 		configureSystemBars();
 		CookieManager.getInstance().setAcceptCookie(true);
 		rootLayout = new FrameLayout(this);
@@ -173,6 +176,7 @@ public class MainActivity extends Activity {
 		buildEditView();
 		ensureWebView();
 		ProfileStore.migrateLegacy(prefs());
+		ProfileStore.migrateDirect(prefs());
 		if (!handleImportIntent(getIntent())) {
 			// 启动一律进服务器选择页：上次连的 server 不在线时，自动连接会把 App
 			// 卡死在连接壳。连哪个 server 由用户当场手选（导入链接除外，那是显式意图）。
@@ -233,7 +237,7 @@ public class MainActivity extends Activity {
 		getWindow().setSoftInputMode(imeMode | WindowManager.LayoutParams.SOFT_INPUT_STATE_UNCHANGED);
 		if (Build.VERSION.SDK_INT >= 30) getWindow().setDecorFitsSystemWindows(false);
 		getWindow().setStatusBarColor(Color.TRANSPARENT);
-		getWindow().setNavigationBarColor(Color.WHITE);
+		getWindow().setNavigationBarColor(shellColor(R.color.shell_background));
 		if (Build.VERSION.SDK_INT >= 28) {
 			getWindow().setNavigationBarDividerColor(Color.WHITE);
 			WindowManager.LayoutParams attrs = getWindow().getAttributes();
@@ -247,6 +251,43 @@ public class MainActivity extends Activity {
 			| View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
 		if (Build.VERSION.SDK_INT >= 26) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
 		getWindow().getDecorView().setSystemUiVisibility(flags);
+		applySystemBars();
+	}
+
+	private boolean isSystemDark() {
+		return (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
+			== Configuration.UI_MODE_NIGHT_YES;
+	}
+
+	private int shellColor(int resource) {
+		return getResources().getColor(resource, getTheme());
+	}
+
+	/** 重着色而不重建表单，保留未保存的输入、焦点和滚动位置。 */
+	private void tintShell(View view) {
+		if (view == null) return;
+		String role = view.getTag() instanceof String ? (String) view.getTag() : "";
+		if (view instanceof ScrollView) view.setBackgroundColor(shellColor(R.color.shell_background));
+		if (view.getBackground() instanceof GradientDrawable) {
+			GradientDrawable bg = (GradientDrawable) view.getBackground();
+			boolean selected = "selected-card".equals(role);
+			boolean primary = "primary-button".equals(role);
+			bg.setColor(primary ? 0xFF1B66FF : shellColor(R.color.shell_surface));
+			bg.setStroke(dp(selected ? 2 : 1, getResources().getDisplayMetrics().density),
+				selected || primary ? 0xFF1B66FF : shellColor(R.color.shell_border));
+		}
+		if (view instanceof TextView) {
+			TextView text = (TextView) view;
+			text.setTextColor("primary-button".equals(role) ? Color.WHITE
+				: shellColor("muted".equals(role) ? R.color.shell_muted : R.color.shell_text));
+			text.setHintTextColor(shellColor(R.color.shell_muted));
+			if (text instanceof EditText) text.setBackgroundTintList(
+				android.content.res.ColorStateList.valueOf(shellColor(R.color.shell_muted)));
+		}
+		if (view instanceof android.view.ViewGroup) {
+			android.view.ViewGroup group = (android.view.ViewGroup) view;
+			for (int i = 0; i < group.getChildCount(); i++) tintShell(group.getChildAt(i));
+		}
 	}
 
 	// ---------- 首页：配置组卡片 ----------
@@ -296,25 +337,14 @@ public class MainActivity extends Activity {
 
 		LinearLayout direct = card(d);
 		direct.addView(cardTitle("直连入口或局域网", d));
-		urlInput = new EditText(this);
-		urlInput.setHint("https://192.168.1.8:18443");
-		urlInput.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
-		urlInput.setSingleLine(true);
-		urlInput.setImeOptions(EditorInfo.IME_ACTION_DONE);
-		direct.addView(urlInput);
-		urlInput.setOnEditorActionListener((v, actionId, event) -> {
-			if (actionId == EditorInfo.IME_ACTION_DONE) {
-				connectDirect();
-				return true;
-			}
-			return false;
-		});
-		Button connect = styledButton("连接网关", false, d);
-		connect.setOnClickListener(v -> connectDirect());
-		LinearLayout.LayoutParams connectParams = new LinearLayout.LayoutParams(
-			LinearLayout.LayoutParams.MATCH_PARENT, dp(44, d));
-		connectParams.topMargin = dp(10, d);
-		direct.addView(connect, connectParams);
+		direct.addView(hintText("保存多个 HTTPS 网关节点；连接和重试均不启动 FRP。", d));
+		directNodesBox = new LinearLayout(this);
+		directNodesBox.setOrientation(LinearLayout.VERTICAL);
+		direct.addView(directNodesBox);
+		Button addDirect = styledButton("添加直连节点", true, d);
+		addDirect.setOnClickListener(v -> showDirectEditor(null));
+		direct.addView(addDirect, new LinearLayout.LayoutParams(
+			LinearLayout.LayoutParams.MATCH_PARENT, dp(44, d)));
 		box.addView(direct, cardParams(d));
 
 		LinearLayout maintain = card(d);
@@ -364,6 +394,7 @@ public class MainActivity extends Activity {
 				bg.setCornerRadius(14 * d);
 				bg.setStroke(Math.max(2, dp(2, d)), 0xFF1B66FF);
 				item.setBackground(bg);
+				item.setTag("selected-card");
 			}
 			TextView name = cardTitle(TextUtils.isEmpty(profile.name) ? profile.serverAddr : profile.name, d);
 			item.addView(name);
@@ -387,6 +418,90 @@ public class MainActivity extends Activity {
 			item.setOnClickListener(v -> connectProfile(profile));
 			profilesBox.addView(item, cardParams(d));
 		}
+	}
+
+	private void refreshDirectNodes() {
+		if (directNodesBox == null) return;
+		directNodesBox.removeAllViews();
+		float d = getResources().getDisplayMetrics().density;
+		String lastId = prefs().getString(ProfileStore.KEY_DIRECT_ACTIVE, "");
+		List<ProfileStore.DirectNode> nodes = ProfileStore.listDirect(prefs());
+		if (nodes.isEmpty()) directNodesBox.addView(hintText("还没有直连节点，点击下方添加。", d));
+		for (ProfileStore.DirectNode node : nodes) {
+			LinearLayout item = card(d);
+			if (node.id.equals(lastId)) item.setTag("selected-card");
+			item.addView(cardTitle(node.name.isEmpty() ? node.url : node.name, d));
+			item.addView(hintText(node.url + (node.id.equals(lastId) ? "  ·  上次选择" : ""), d));
+			LinearLayout actions = new LinearLayout(this);
+			actions.setOrientation(LinearLayout.HORIZONTAL);
+			Button connect = styledButton("连接", true, d);
+			connect.setOnClickListener(v -> connectDirectNode(node));
+			actions.addView(connect, new LinearLayout.LayoutParams(0, dp(42, d), 1));
+			Button edit = styledButton("编辑", false, d);
+			edit.setOnClickListener(v -> showDirectEditor(node));
+			LinearLayout.LayoutParams ep = new LinearLayout.LayoutParams(0, dp(42, d), 1);
+			ep.leftMargin = dp(8, d);
+			actions.addView(edit, ep);
+			item.addView(actions);
+			item.setOnClickListener(v -> connectDirectNode(node));
+			LinearLayout.LayoutParams ip = cardParams(d);
+			ip.bottomMargin = dp(12, d);
+			directNodesBox.addView(item, ip);
+		}
+		tintShell(directNodesBox);
+	}
+
+	private void showDirectEditor(ProfileStore.DirectNode existing) {
+		float d = getResources().getDisplayMetrics().density;
+		LinearLayout form = card(d);
+		EditText name = labeled(form, "节点名称", "例如 家里电脑 / 公司电脑", d, InputType.TYPE_CLASS_TEXT);
+		EditText address = labeled(form, "网关地址", "https://192.168.1.8:18443", d,
+			InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+		if (existing != null) {
+			name.setText(existing.name);
+			address.setText(existing.url);
+		}
+		tintShell(form);
+		AlertDialog.Builder builder = new AlertDialog.Builder(this)
+			.setTitle(existing == null ? "添加直连节点" : "编辑直连节点")
+			.setView(form).setPositiveButton("保存", null).setNegativeButton("取消", null);
+		if (existing != null) builder.setNeutralButton("删除", (dialog, which) -> {
+			new AlertDialog.Builder(this).setTitle("删除直连节点")
+				.setMessage("删除此节点？不会清除授权，也不会断开当前会话。")
+				.setNegativeButton("取消", null)
+				.setPositiveButton("删除", (confirm, button) -> {
+					ProfileStore.deleteDirect(prefs(), existing.id);
+					refreshDirectNodes();
+				}).show();
+		});
+		AlertDialog dialog = builder.create();
+		dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+			ProfileStore.DirectNode node = new ProfileStore.DirectNode();
+			if (existing != null) node.id = existing.id;
+			node.name = name.getText().toString().trim();
+			node.url = address.getText().toString().trim();
+			if (!node.isValid()) {
+				address.setError("请输入有效的 HTTPS 网关地址（不含用户名密码）");
+				return;
+			}
+			if (node.name.isEmpty()) node.name = Uri.parse(node.url).getHost();
+			ProfileStore.upsertDirect(prefs(), node);
+			refreshDirectNodes();
+			dialog.dismiss();
+		}));
+		dialog.show();
+	}
+
+	private void connectDirectNode(ProfileStore.DirectNode node) {
+		if (!node.isValid()) {
+			showDirectEditor(node);
+			return;
+		}
+		String url = node.url;
+		prefs().edit().putString(KEY_URL, url).putString(ProfileStore.KEY_DIRECT_ACTIVE, node.id).apply();
+		directTarget = url;
+		clearResumeSession();
+		openGateway(url);
 	}
 
 	// ---------- 编辑配置组（四项与插件面板对齐） ----------
@@ -524,6 +639,7 @@ public class MainActivity extends Activity {
 			button.setTextColor(0xFF1B1B1F);
 		}
 		button.setBackground(background);
+		button.setTag(primary ? "primary-button" : "secondary-button");
 		return button;
 	}
 
@@ -531,6 +647,7 @@ public class MainActivity extends Activity {
 		TextView t = new TextView(this);
 		t.setText(text);
 		t.setTextSize(13);
+		t.setTag("muted");
 		t.setLineSpacing(0, 1.25f);
 		t.setPadding(0, 0, 0, (int) (10 * d));
 		return t;
@@ -562,8 +679,9 @@ public class MainActivity extends Activity {
 		clearResumeSession();
 		uiState = UiState.HOME;
 		activeUrl = "";
-		if (urlInput != null) urlInput.setText(prefs().getString(KEY_URL, ""));
+		directTarget = "";
 		refreshProfileCards();
+		refreshDirectNodes();
 		if (homeScroll != null) homeScroll.setVisibility(View.VISIBLE);
 		if (setupScroll != null) setupScroll.setVisibility(View.GONE);
 		if (webView != null) {
@@ -594,8 +712,8 @@ public class MainActivity extends Activity {
 		}
 		if (webView != null) webView.setVisibility(View.GONE);
 		uiState = UiState.HOME;
-		if (urlInput != null) urlInput.setText(prefs().getString(KEY_URL, ""));
 		refreshProfileCards();
+		refreshDirectNodes();
 		if (resumeSessionBtn != null) {
 			resumeSessionBtn.setVisibility(canResumeSession ? View.VISIBLE : View.GONE);
 		}
@@ -621,6 +739,18 @@ public class MainActivity extends Activity {
 		}
 		final String target = resumeUrl;
 		clearResumeSession();
+		// 直连不依赖本地 FRP 端口；保留现有文档，不因端口未开而整页重连。
+		if (!TextUtils.isEmpty(directTarget)) {
+			activeUrl = target;
+			uiState = UiState.WEB;
+			hideSettings();
+			webView.setVisibility(View.VISIBLE);
+			if (!isSessionUrl(webView.getUrl())) webView.loadUrl(target);
+			applySystemBars();
+			applyInsetsToPage(webView);
+			injectMobileAdaptation(webView);
+			return;
+		}
 		// AND-06：端口探测走统一线程池，onDestroy 时随线程池一并取消。
 		runInBackground("resume-session", () -> {
 			// AND-07：隧道可能跑在协商端口上——先探上次记录的实际端口，回落首选端口。
@@ -729,6 +859,10 @@ public class MainActivity extends Activity {
 	}
 
 	private void connectFromStoredTarget() {
+		if (!TextUtils.isEmpty(directTarget)) {
+			openGateway(directTarget);
+			return;
+		}
 		ProfileStore.Profile active = ProfileStore.getActive(prefs());
 		if (active != null && active.isValid()) {
 			connectProfile(active);
@@ -782,6 +916,10 @@ public class MainActivity extends Activity {
 		awaitingCertificateDecision = false;
 		dismissPendingHttpAuth();
 		uiState = nextState;
+		pageDark = isSystemDark();
+		edgeToEdgeChrome = true;
+		webView.setBackgroundColor(shellColor(R.color.shell_background));
+		applySystemBars();
 		if (homeScroll != null) homeScroll.setVisibility(View.GONE);
 		if (setupScroll != null) setupScroll.setVisibility(View.GONE);
 		suppressGatewayErrorsBriefly();
@@ -818,6 +956,7 @@ public class MainActivity extends Activity {
 	// ---------- 隧道模式 ----------
 
 	private void beginTunnel(final ProfileStore.Profile profile) {
+		directTarget = "";
 		clearResumeSession();
 		final int generation = ++connectionGeneration;
 		final VisitorConfig cfg = profile.toVisitorConfig();
@@ -976,22 +1115,6 @@ public class MainActivity extends Activity {
 
 	// ---------- 直连模式 ----------
 
-	private void connectDirect() {
-		String url = urlInput.getText().toString().trim();
-		if (!isGatewayUrl(url)) {
-			Toast.makeText(this, "请填写 http(s):// 开头的完整网关地址", Toast.LENGTH_LONG).show();
-			return;
-		}
-		if (url.startsWith("http://")) {
-			// networkSecurityConfig 已禁明文：与其让 WebView 报 ERR_CLEARTEXT_NOT_
-			// PERMITTED 再误报成断线，不如入口处直接说清（README 契约本就要求 https）。
-			Toast.makeText(this, "明文 HTTP 已禁用：请使用 https:// 地址（局域网网关同样走 https）", Toast.LENGTH_LONG).show();
-			return;
-		}
-		prefs().edit().putString(KEY_URL, url).apply();
-		openGateway(url);
-	}
-
 	private void openGateway(String url) {
 		connectionGeneration += 1;
 		sessionHistoryRooted = false;
@@ -1021,14 +1144,13 @@ public class MainActivity extends Activity {
 
 	private void ensureWebView() {
 		if (webView != null) return;
-		// DayNight 包装让 WebView 的 prefers-color-scheme 跟系统深浅，而不是跟
-		// Activity 的 Light 主题。Activity 自己保持浅色，避免原生连接设置白底浅字。
+		// DayNight 包装让 WebView 的 prefers-color-scheme 跟随系统。
 		Context webCtx = this;
 		if (Build.VERSION.SDK_INT >= 29) {
 			webCtx = new ContextThemeWrapper(this, android.R.style.Theme_DeviceDefault_DayNight);
 		}
 		webView = new WebView(webCtx);
-		webView.setBackgroundColor(pageDark ? 0xFF111318 : Color.WHITE);
+		webView.setBackgroundColor(shellColor(R.color.shell_background));
 		WebSettings s = webView.getSettings();
 		s.setJavaScriptEnabled(true);
 		s.setDomStorageEnabled(true);
@@ -1160,6 +1282,11 @@ public class MainActivity extends Activity {
 		rootLayout.setFitsSystemWindows(false);
 		rootLayout.setOnApplyWindowInsetsListener((view, insets) -> {
 			applyImeShift(imeBottomPx(insets));
+			// 导航模式 / 平板任务栏变化未必触发页面加载或焦点事件。
+			// 下一帧读取最新 root insets；IME 动画中不注入 JS，避免重排。
+			if (!imeAnimating && webView != null) {
+				webView.post(() -> { if (!destroyed && !imeAnimating) applyInsetsToPage(webView); });
+			}
 			if (Build.VERSION.SDK_INT >= 30) {
 				return new WindowInsets.Builder(insets)
 					.setInsets(WindowInsets.Type.ime(), Insets.NONE)
@@ -1360,6 +1487,11 @@ public class MainActivity extends Activity {
 		// WebView，prefers-color-scheme / 「跟随系统」才会跟着系统深浅变。
 		if (rootLayout != null) rootLayout.dispatchConfigurationChanged(newConfig);
 		else if (webView != null) webView.dispatchConfigurationChanged(newConfig);
+		if (uiState != UiState.WEB && webView != null) {
+			pageDark = isSystemDark();
+			webView.setBackgroundColor(shellColor(R.color.shell_background));
+		}
+		applySystemBars();
 		if (webView != null && uiState == UiState.WEB) {
 			applyInsetsToPage(webView);
 			webView.evaluateJavascript(
@@ -1376,15 +1508,23 @@ public class MainActivity extends Activity {
 
 	private void applyPageDark(boolean dark) {
 		pageDark = dark;
-		if (webView != null) webView.setBackgroundColor(dark ? 0xFF111318 : Color.WHITE);
+		if (webView != null) webView.setBackgroundColor(uiState == UiState.WEB
+			? (dark ? 0xFF141414 : Color.WHITE) : shellColor(R.color.shell_background));
 		applySystemBars();
 	}
 
 	private void applySystemBars() {
 		boolean session = uiState == UiState.WEB;
-		boolean dark = session && pageDark;
-		boolean edge = session && edgeToEdgeChrome;
-		int nav = dark ? 0xFF111318 : Color.WHITE;
+		boolean dark = session ? pageDark : isSystemDark();
+		boolean edge = !session || edgeToEdgeChrome;
+		if (rootLayout != null) rootLayout.setBackgroundColor(session
+			? (dark ? 0xFF141414 : Color.WHITE) : shellColor(R.color.shell_background));
+		if (!session) {
+			tintShell(homeScroll);
+			tintShell(setupScroll);
+		}
+		// 只在适配已启用的会话中透明：各列 CSS inset 留空间，背景画到手势条下。
+		int nav = edge ? Color.TRANSPARENT : (dark ? 0xFF141414 : Color.WHITE);
 		WindowManager.LayoutParams attrs = getWindow().getAttributes();
 		View decor = getWindow().getDecorView();
 		int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
@@ -1397,13 +1537,13 @@ public class MainActivity extends Activity {
 		}
 		if (edge) {
 			getWindow().setStatusBarColor(Color.TRANSPARENT);
-			flags |= View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN;
+			flags |= View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
 			if (Build.VERSION.SDK_INT >= 28) {
 				attrs.layoutInDisplayCutoutMode =
 					WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
 			}
 		} else {
-			getWindow().setStatusBarColor(dark ? 0xFF111318 : Color.WHITE);
+			getWindow().setStatusBarColor(dark ? 0xFF141414 : Color.WHITE);
 			if (Build.VERSION.SDK_INT >= 28) {
 				attrs.layoutInDisplayCutoutMode =
 					WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT;

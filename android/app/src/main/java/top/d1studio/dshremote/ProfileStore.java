@@ -37,6 +37,45 @@ public final class ProfileStore {
 
 	private static final String KEY_PROFILES = "vp_profiles";
 	private static final String KEY_ACTIVE = "vp_active_id";
+	/** 直连节点列表（名称 + 网关地址），与 FRP 配置组同款卡片交互。 */
+	public static final String KEY_DIRECT_NODES = "direct_nodes";
+	public static final String KEY_DIRECT_ACTIVE = "direct_active_id";
+
+	public static final class DirectNode {
+		public String id = "";
+		public String name = "";
+		public String url = "";
+
+		public boolean isValid() {
+			try {
+				java.net.URI uri = new java.net.URI(url);
+				return "https".equalsIgnoreCase(uri.getScheme()) && uri.getHost() != null
+					&& uri.getRawUserInfo() == null && (uri.getPort() == -1
+						|| (uri.getPort() >= 1 && uri.getPort() <= 65535));
+			} catch (Exception ignored) {
+				return false;
+			}
+		}
+
+		JSONObject toJson() {
+			JSONObject o = new JSONObject();
+			try {
+				o.put("id", id);
+				o.put("name", name);
+				o.put("url", url);
+			} catch (Exception ignored) {
+			}
+			return o;
+		}
+
+		static DirectNode fromJson(JSONObject o) {
+			DirectNode n = new DirectNode();
+			n.id = o.optString("id", "");
+			n.name = o.optString("name", "");
+			n.url = o.optString("url", "");
+			return n;
+		}
+	}
 
 	public static final class Profile {
 		public String id = "";
@@ -101,6 +140,66 @@ public final class ProfileStore {
 	}
 
 	private ProfileStore() {}
+
+	public static List<DirectNode> listDirect(SharedPreferences prefs) {
+		List<DirectNode> nodes = new ArrayList<>();
+		try {
+			JSONArray arr = new JSONArray(prefs.getString(KEY_DIRECT_NODES, "[]"));
+			for (int i = 0; i < arr.length(); i++) {
+				JSONObject value = arr.optJSONObject(i);
+				if (value == null) continue;
+				DirectNode node = DirectNode.fromJson(value);
+				if (!node.id.isEmpty() && node.isValid()) nodes.add(node);
+			}
+		} catch (Exception ignored) {}
+		return nodes;
+	}
+
+	private static void saveDirect(SharedPreferences prefs, List<DirectNode> nodes) {
+		JSONArray arr = new JSONArray();
+		for (DirectNode node : nodes) arr.put(node.toJson());
+		prefs.edit().putString(KEY_DIRECT_NODES, arr.toString()).apply();
+	}
+
+	public static void upsertDirect(SharedPreferences prefs, DirectNode node) {
+		if (!node.isValid()) throw new IllegalArgumentException("无效的 HTTPS 网关地址");
+		if (TextUtils.isEmpty(node.id)) node.id = UUID.randomUUID().toString();
+		List<DirectNode> nodes = listDirect(prefs);
+		for (int i = 0; i < nodes.size(); i++) {
+			if (node.id.equals(nodes.get(i).id)) {
+				nodes.set(i, node);
+				saveDirect(prefs, nodes);
+				return;
+			}
+		}
+		nodes.add(node);
+		saveDirect(prefs, nodes);
+	}
+
+	public static void deleteDirect(SharedPreferences prefs, String id) {
+		List<DirectNode> nodes = listDirect(prefs);
+		for (int i = nodes.size() - 1; i >= 0; i--) {
+			if (id.equals(nodes.get(i).id)) nodes.remove(i);
+		}
+		saveDirect(prefs, nodes);
+		if (id.equals(prefs.getString(KEY_DIRECT_ACTIVE, ""))) {
+			prefs.edit().remove(KEY_DIRECT_ACTIVE).apply();
+		}
+	}
+
+	/** 只迁移一次；用户删空列表后不得把旧地址重新加回来。 */
+	public static void migrateDirect(SharedPreferences prefs) {
+		if (prefs.contains(KEY_DIRECT_NODES)) return;
+		DirectNode node = new DirectNode();
+		node.url = prefs.getString("gateway_url", "").trim();
+		List<DirectNode> nodes = new ArrayList<>();
+		if (node.isValid()) {
+			node.id = UUID.randomUUID().toString();
+			node.name = "原直连入口";
+			nodes.add(node);
+		}
+		saveDirect(prefs, nodes);
+	}
 
 	public static List<Profile> list(SharedPreferences prefs) {
 		List<Profile> out = new ArrayList<>();

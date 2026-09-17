@@ -21,7 +21,18 @@ header { padding: 8px 12px 0 20px; }
 .tabs button { border: 0; background: none; padding: 0 0 9px; font: inherit; font-size: 13px; color: #8b8b93; }
 .tabs button[aria-selected="true"] { color: #1b66ff; box-shadow: inset 0 -2px 0 #1b66ff; }
 .preset-label { font-size: 13px; color: #5c5c66; white-space: nowrap; flex: none; }
-.session-log { width: auto; height: 32px; border: 0; background: #f0f0f2; border-radius: 999px; display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; }
+/* 官方 dsh-session-log-export / HeaderAction：Menu(portal=false, align=end, dense)。
+   官方 primitives 几何：.root{position:relative;display:inline-flex}；
+   .list{position:absolute;top:calc(100% + 4px);left:0;z-index:100;min-width:218px;max-width:360px}；
+   .alignEnd{left:auto;right:0}。手机端"下载 Session 日志"就在这层菜单里。 */
+.menu-root { position: relative; display: inline-flex; }
+.more-btn { width: 28px; height: 28px; border: 0; border-radius: 28px; background: none; padding: 6px; display: inline-flex; align-items: center; justify-content: center; color: #5c5c66; }
+.more-btn svg { width: 15px; height: 15px; }
+.menu-list { box-sizing: border-box; padding: 4px; display: flex; flex-direction: column; gap: 0; border: 0; border-radius: 20px; background: #fff; box-shadow: 0 8px 24px rgba(0,0,0,.16); position: absolute; top: calc(100% + 4px); left: 0; z-index: 100; min-width: 218px; max-width: 360px; }
+.menu-list.align-end { left: auto; right: 0; }
+.menu-viewport { display: flex; flex-direction: column; min-height: 0; }
+.menu-item { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 34px; padding: 5px 10px; border: 0; border-radius: 10px; background: transparent; cursor: pointer; font: inherit; font-size: 14px; line-height: 22px; color: #1b1b1f; text-align: left; }
+.menu-item-icon { width: 16px; height: 16px; display: inline-flex; flex: none; }
 .column { flex: 1; display: flex; flex-direction: column; gap: 16px; padding: 16px; min-height: 240px; }
 .bubble { align-self: flex-end; background: #e8eaf6; border-radius: 12px; padding: 10px 12px; max-width: 80%; }
 .reply { line-height: 1.55; }
@@ -36,10 +47,28 @@ header { padding: 8px 12px 0 20px; }
 .tools, .modes, .trailing { display: flex; align-items: center; }
 .tools { gap: 16px; }
 .trailing { gap: 12px; margin-left: auto; }
-.add, .send, .meter { border: 0; border-radius: 999px; }
+.add, .send { border: 0; border-radius: 999px; }
 .add { width: 28px; height: 28px; background: #ececee; }
 .send { width: 34px; height: 34px; background: #1b66ff; color: #fff; }
-.meter { width: 28px; height: 28px; background: none; }
+/* 官方 ContextMeter（0.1.5）：环 28×28，点开的面板 position:absolute;
+   bottom:calc(100% + 8px); right:0 —— 它就长在 trailing 集群里，
+   祖先一旦 overflow:hidden 就会被整块裁掉（"点环没反应"）。 */
+.meter-root { display: inline-flex; position: relative; }
+.meter-trigger { width: 28px; height: 28px; border: 0; border-radius: 999px; background: none; color: #8b8b93; display: grid; place-items: center; flex: none; }
+.meter-track { fill: none; stroke: #d9dbe0; stroke-width: 2px; }
+.meter-fill { fill: none; stroke: #8b8b93; stroke-width: 2px; stroke-linecap: round; }
+.meter-panel { z-index: 100; box-sizing: border-box; background: #fff; width: 264px; box-shadow: 0 8px 24px rgba(0,0,0,.16); color: #62626b; border-radius: 12px; padding: 12px; font-size: 12px; line-height: 20px; position: absolute; bottom: calc(100% + 8px); right: 0; }
+.meter-header { display: flex; align-items: center; gap: 6px; }
+.meter-percent { color: #1b1b1f; font-weight: 500; }
+.meter-bar { background: #ececee; border-radius: 999px; height: 4px; margin: 10px 0 12px; display: flex; gap: 1px; overflow: hidden; }
+.meter-seg { flex: none; height: 100%; background: #8b8b93; }
+.meter-row { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; }
+/* 官方 ComposerAttachments（待发送附件 rail）：卡片第一子节点 */
+.attach-rail { min-width: 0; margin-bottom: -6px; padding: 2px 10px 0; }
+.attach-rail-root { min-width: 0; position: relative; }
+.attach-rail-items { display: flex; align-items: stretch; gap: 10px; overflow: auto hidden; scrollbar-width: none; }
+.attach-item { flex: none; height: 64px; }
+.attach-file { display: flex; align-items: center; gap: 8px; width: 200px; height: 64px; box-sizing: border-box; border: .5px solid #d9dbe0; border-radius: 12px; background: #f6f6f7; padding: 0 10px; font-size: 12px; }
 .access { height: 28px; border: 0; background: none; display: inline-flex; align-items: center; gap: 4px; padding: 0 4px 0 8px; }
 .model { max-width: none; min-width: max-content; height: 28px; border: 0; background: #ececee; display: flex; align-items: center; gap: 4px; }
 .stats { text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 4px 32px 0; font-size: 12px; color: #8b8b93; }
@@ -138,10 +167,12 @@ html.dshr-mobile [data-dshr-main-col] { transition: none !important; }
             <span class="job-count">1 个后台任务运行中</span>
             <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" fill="none"/></svg>
           </button>
-          <button type="button" class="session-log" aria-label="Session log">
-            <svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 2v8M5 7l3 3 3-3M3 13h10" stroke="currentColor" fill="none"/></svg>
-            <span>Session log</span>
-          </button>
+          <!-- 官方 0.1.5：下载 Session 日志收进「更多操作」菜单（session-log-export 插件） -->
+          <span class="menu-root" id="more-root">
+            <button type="button" class="more-btn" id="more-btn" aria-label="更多操作" aria-haspopup="menu" aria-expanded="false">
+              <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><circle cx="8" cy="3" r="1.2" fill="currentColor"/><circle cx="8" cy="8" r="1.2" fill="currentColor"/><circle cx="8" cy="13" r="1.2" fill="currentColor"/></svg>
+            </button>
+          </span>
         </div>
       </div>
       <div class="tabs" role="tablist" id="session-tabs">
@@ -176,10 +207,19 @@ html.dshr-mobile [data-dshr-main-col] { transition: none !important; }
     </div>
     <div class="seat" data-composer-seat="">
       <div class="card" data-composer-card="true" id="composer-card">
+        <!-- 官方 conversation.input.attachments 槽位：待发送附件 rail（有附件才渲染） -->
+        <div class="attach-rail" id="attach-rail" hidden>
+          <div class="attach-rail-root">
+            <div class="attach-rail-items" id="attach-rail-items" role="group" aria-label="待发送附件"></div>
+          </div>
+        </div>
         <textarea class="ta" rows="2" placeholder="给智能体发消息"></textarea>
         <div class="row" id="composer-row">
           <div class="tools">
             <button type="button" class="add" id="add-btn" aria-label="命令" aria-haspopup="listbox">+</button>
+            <button type="button" class="add" id="attach-btn" aria-label="添加附件">
+              <svg width="14" height="14" viewBox="0 0 16 16"><path d="M10 4l-4 4a2 2 0 003 3l5-5a3.5 3.5 0 00-5-5L4 6a5 5 0 007 7" stroke="currentColor" fill="none"/></svg>
+            </button>
             <div class="modes">
               <button type="button" class="access" id="access-btn" aria-label="访问模式，当前：Workspace Write">
                 <span aria-hidden="true"><svg width="14" height="14" viewBox="0 0 16 16"><path d="M8 2l6 2v4c0 4-3 6-6 7C5 14 2 12 2 8V4l6-2z" fill="none" stroke="currentColor"/></svg></span>
@@ -194,8 +234,15 @@ html.dshr-mobile [data-dshr-main-col] { transition: none !important; }
               <span>Default</span>
               <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" fill="none"/></svg>
             </button>
-            <button type="button" class="meter" aria-label="上下文占用">○</button>
-            <button type="button" class="send" aria-label="发送消息"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 2v12M3 7l5-5 5 5" stroke="#fff" fill="none"/></svg></button>
+            <span class="meter-root" id="meter-root">
+              <button type="button" class="meter-trigger" id="meter-trigger" aria-label="上下文已用 45%" aria-haspopup="dialog" aria-expanded="false">
+                <svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">
+                  <circle class="meter-track" cx="7" cy="7" r="5.5"></circle>
+                  <circle class="meter-fill" cx="7" cy="7" r="5.5" stroke-dasharray="15.55 34.56" transform="rotate(-90 7 7)"></circle>
+                </svg>
+              </button>
+            </span>
+            <button type="button" class="send" id="send-btn" aria-label="发送消息"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 2v12M3 7l5-5 5 5" stroke="#fff" fill="none"/></svg></button>
           </div>
         </div>
       </div>
@@ -277,6 +324,80 @@ html.dshr-mobile [data-dshr-main-col] { transition: none !important; }
   document.getElementById('session-b').addEventListener('click', function () {
     document.getElementById('session-title').textContent = '第二个会话';
   });
+
+  // ── 官方 0.1.5 组件的交互替身（只做增删节点，类名/属性/几何与官方一致）──
+  var moreRoot = document.getElementById('more-root');
+  var moreBtn = document.getElementById('more-btn');
+  function moreMenu() { return moreRoot.querySelector('[role="menu"]'); }
+  moreBtn.addEventListener('click', function () {
+    if (moreMenu()) {
+      moreMenu().remove();
+      moreBtn.setAttribute('aria-expanded', 'false');
+      return;
+    }
+    var list = document.createElement('div');
+    list.className = 'menu-list align-end';
+    list.setAttribute('role', 'menu');
+    list.innerHTML =
+      '<div class="menu-viewport" role="presentation">' +
+        '<div class="menu-item-wrap">' +
+          '<button type="button" role="menuitem" class="menu-item" id="more-download">' +
+            '<span class="menu-item-icon"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 2v8M5 7l3 3 3-3M3 13h10" stroke="currentColor" fill="none"/></svg></span>' +
+            '<span class="menu-item-label">下载 Session 日志</span>' +
+          '</button>' +
+        '</div>' +
+      '</div>';
+    moreRoot.appendChild(list);
+    moreBtn.setAttribute('aria-expanded', 'true');
+  });
+
+  var meterRoot = document.getElementById('meter-root');
+  var meterBtn = document.getElementById('meter-trigger');
+  function meterPanel() { return meterRoot.querySelector('[role="dialog"]'); }
+  meterBtn.addEventListener('click', function () {
+    if (meterPanel()) {
+      meterPanel().remove();
+      meterBtn.setAttribute('aria-expanded', 'false');
+      return;
+    }
+    var panel = document.createElement('div');
+    panel.className = 'meter-panel';
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-label', '上下文已用');
+    panel.innerHTML =
+      '<div class="meter-header"><span>上下文已用</span><span class="meter-percent">45%</span>' +
+      '<span style="margin-left:auto;font-weight:500;">~58K / 128K</span></div>' +
+      '<div class="meter-bar"><div class="meter-seg" style="width:18%"></div>' +
+      '<div class="meter-seg" style="width:17%"></div><div class="meter-seg" style="width:10%"></div></div>' +
+      '<div class="meter-row"><span>系统提示词</span><span>23.0K</span></div>' +
+      '<div class="meter-row"><span>工具</span><span>21.8K</span></div>' +
+      '<div class="meter-row"><span>对话</span><span>13.2K</span></div>';
+    meterRoot.appendChild(panel);
+    meterBtn.setAttribute('aria-expanded', 'true');
+  });
+
+  var rail = document.getElementById('attach-rail');
+  var railItems = document.getElementById('attach-rail-items');
+  function addAttachment(name) {
+    var item = document.createElement('div');
+    item.className = 'attach-item';
+    item.innerHTML = '<div class="attach-file">' + name + '</div>';
+    railItems.appendChild(item);
+    rail.hidden = false;
+    return item;
+  }
+  document.getElementById('attach-btn').addEventListener('click', function () {
+    addAttachment('测试附件-长文件名-2026.txt');
+  });
+  window.__dshrTestAddAttachment = addAttachment;
+  window.__dshrTestRefs = {
+    moreRoot: moreRoot,
+    moreBtn: moreBtn,
+    meterRoot: meterRoot,
+    meterBtn: meterBtn,
+    rail: rail,
+    railItems: railItems
+  };
 })();
 function rect(id) {
   var el = document.getElementById(id);
@@ -388,6 +509,96 @@ function run() {
 
   var bridge = window.__dshRemoteAndroidMobile;
 
+  // ── 手机端三缺陷回归（0.1.5 真实组件：上下文环浮层 / 更多菜单 / 附件 rail）──
+  // 1) 上下文环：官方面板（role=dialog）是 trailing 集群的后代，集群一旦
+  //    overflow:hidden 就整块被裁掉——点了环"没反应"。
+  var refs = window.__dshrTestRefs || {};
+  var trailingEl = document.querySelector('[data-dshr-composer-trailing]');
+  add(checks, 'trailing-not-clipping',
+    !!trailingEl && getComputedStyle(trailingEl).overflowX !== 'hidden' && getComputedStyle(trailingEl).overflowY !== 'hidden',
+    trailingEl ? 'overflow=' + getComputedStyle(trailingEl).overflow : 'trailing missing');
+  if (refs.meterBtn) {
+    refs.meterBtn.click();
+    var panelEl = refs.meterRoot.querySelector('[role="dialog"]');
+    add(checks, 'meter-panel-opens', !!panelEl);
+    if (panelEl) {
+      var pr = panelEl.getBoundingClientRect();
+      add(checks, 'meter-panel-in-viewport',
+        pr.width >= 200 && pr.height >= 80 && pr.left >= 0 && pr.right <= window.innerWidth + 0.5 && pr.top >= 0 && pr.bottom <= window.innerHeight + 0.5,
+        'l=' + Math.round(pr.left) + ' r=' + Math.round(pr.right) + ' t=' + Math.round(pr.top) + ' b=' + Math.round(pr.bottom));
+      var panelHit = document.elementFromPoint((pr.left + pr.right) / 2, (pr.top + pr.bottom) / 2);
+      add(checks, 'meter-panel-hittable', !!(panelHit && (panelHit === panelEl || panelEl.contains(panelHit))),
+        panelHit ? (panelHit.id || panelHit.tagName) : 'none');
+    }
+    refs.meterBtn.click();
+    add(checks, 'meter-panel-closes', refs.meterRoot.querySelector('[role="dialog"]') === null);
+  } else {
+    add(checks, 'meter-panel-opens', false, 'meter trigger missing');
+  }
+
+  // 2) 更多菜单：官方是「锚点 + position:absolute 列表」，必须贴在按钮下方；
+  //    旧 clamp 把它改成 position:fixed，在带 transform 的会话列里坐标被加两次，
+  //    浮层逐帧下漂、最后停在输入卡上方。
+  var moreMenuTop = null;
+  if (refs.moreBtn) {
+    var moreBtnRect = refs.moreBtn.getBoundingClientRect();
+    refs.moreBtn.click();
+    var menuEl = refs.moreRoot.querySelector('[role="menu"]');
+    add(checks, 'more-menu-opens', !!menuEl);
+    if (menuEl) {
+      var mr = menuEl.getBoundingClientRect();
+      moreMenuTop = mr.top;
+      add(checks, 'more-menu-under-button',
+        mr.top >= moreBtnRect.bottom - 2 && mr.top <= moreBtnRect.bottom + 16,
+        'btn.b=' + Math.round(moreBtnRect.bottom) + ' menu.t=' + Math.round(mr.top));
+      add(checks, 'more-menu-in-viewport',
+        mr.left >= 0 && mr.right <= window.innerWidth + 0.5 && mr.top >= 0 && mr.bottom <= window.innerHeight + 0.5,
+        'l=' + Math.round(mr.left) + ' r=' + Math.round(mr.right) + ' t=' + Math.round(mr.top) + ' b=' + Math.round(mr.bottom));
+      add(checks, 'more-menu-not-teleported', !menuEl.hasAttribute('data-dshr-float'),
+        'pos=' + getComputedStyle(menuEl).position);
+      if (bridge && typeof bridge.clampFloatingMenus === 'function') {
+        bridge.clampFloatingMenus();
+        var t1 = menuEl.getBoundingClientRect().top;
+        bridge.clampFloatingMenus();
+        var t2 = menuEl.getBoundingClientRect().top;
+        add(checks, 'more-menu-clamp-stable', Math.abs(t1 - moreMenuTop) < 2 && Math.abs(t2 - t1) < 2,
+          't=' + Math.round(moreMenuTop) + '→' + Math.round(t1) + '→' + Math.round(t2));
+        // 异步兜底：下一帧 clamp 自排程跑完后不得再动（旧实现每帧下漂 ~36px）。
+        // 断言菜单相对锚点按钮的位置，而不是屏幕绝对坐标——后续抽屉动画
+        // 会带着整张卡片（含按钮与菜单）平移，相对位置不变才是正确行为。
+        window.setTimeout(function () {
+          var btnBottom = refs.moreBtn.getBoundingClientRect().bottom;
+          var menuTop = menuEl.isConnected ? menuEl.getBoundingClientRect().top : -1;
+          var offset0 = moreMenuTop - moreBtnRect.bottom;
+          var offset1 = menuTop - btnBottom;
+          add(checks, 'more-menu-still-after-raf', menuEl.isConnected && Math.abs(offset1 - offset0) < 2,
+            'off0=' + Math.round(offset0) + '→off1=' + Math.round(offset1)
+              + ' connected=' + menuEl.isConnected + ' dragging=' + document.documentElement.getAttribute('data-dshr-dragging'));
+        }, 150);
+      }
+    }
+  } else {
+    add(checks, 'more-menu-opens', false, 'more button missing');
+  }
+
+  // 3) 附件 rail：官方待发送附件就长在输入卡顶部，加入附件后必须整块可见。
+  if (refs.rail && typeof window.__dshrTestAddAttachment === 'function') {
+    window.__dshrTestAddAttachment('测试附件-长文件名-2026.txt');
+    var railRect = refs.rail.getBoundingClientRect();
+    var itemsRect = refs.railItems.getBoundingClientRect();
+    var itemEl = refs.railItems.firstElementChild;
+    var itemRect = itemEl ? itemEl.getBoundingClientRect() : null;
+    var visibleWidth = itemRect ? Math.max(0, Math.min(itemRect.right, itemsRect.right) - Math.max(itemRect.left, itemsRect.left)) : 0;
+    add(checks, 'attach-rail-visible', !refs.rail.hidden && railRect.height >= 40 && railRect.width >= 120,
+      'hidden=' + refs.rail.hidden + ' w=' + Math.round(railRect.width) + ' h=' + Math.round(railRect.height));
+    add(checks, 'attach-item-visible', visibleWidth >= 80,
+      'itemW=' + Math.round(itemRect ? itemRect.width : 0) + ' visibleW=' + Math.round(visibleWidth));
+    add(checks, 'attach-rail-in-viewport', railRect.top >= 0 && railRect.bottom <= window.innerHeight + 0.5,
+      't=' + Math.round(railRect.top) + ' b=' + Math.round(railRect.bottom));
+  } else {
+    add(checks, 'attach-rail-visible', false, 'attachment rail or test hook missing');
+  }
+
   // ── Bug 1：底部系统导航栏避让（会话列让出 --dshr-inset-bottom）──
   var mainColEl = document.querySelector('[data-dshr-main-col]');
   var insetBottomPx = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--dshr-inset-bottom')) || 0;
@@ -427,6 +638,29 @@ function run() {
     var whaleRightbar = document.getElementById('dshr-mobile-whale');
     add(checks, 'rightbar-hides-whale', !!whaleRightbar && getComputedStyle(whaleRightbar).display === 'none',
       whaleRightbar ? 'd=' + getComputedStyle(whaleRightbar).display : 'whale missing');
+    // 模拟官方收起按钮：只收起面板，不关闭文件标签、不导航。
+    var rightbarToggle = rightbar.querySelector('[data-sidebar-right-toggle]');
+    var rightbarClicks = 0;
+    rightbarToggle.onclick = function () {
+      rightbarClicks++;
+      rightbar.removeAttribute('data-sidebar-right-open');
+      frameEl.removeAttribute('data-rightbar-fullscreen');
+    };
+    var backConsumed = bridge.closeSidebarIfExpanded();
+    add(checks, 'back-closes-rightbar-fullscreen',
+      backConsumed === true && rightbarClicks === 1 && !rightbar.hasAttribute('data-sidebar-right-open'),
+      'consumed=' + backConsumed + ' clicks=' + rightbarClicks + ' open=' + rightbar.hasAttribute('data-sidebar-right-open'));
+    // push 态（宽屏手动展开）：同样应被返回键收起，而不是直接退桌面。
+    rightbar.setAttribute('data-sidebar-right-open', '');
+    rightbar.setAttribute('data-sidebar-right-panel', 'push');
+    rightbarClicks = 0;
+    var pushConsumed = bridge.closeSidebarIfExpanded();
+    add(checks, 'back-closes-rightbar-push',
+      pushConsumed === true && rightbarClicks === 1 && !rightbar.hasAttribute('data-sidebar-right-open'),
+      'consumed=' + pushConsumed + ' clicks=' + rightbarClicks + ' open=' + rightbar.hasAttribute('data-sidebar-right-open'));
+    rightbar.setAttribute('data-sidebar-right-panel', 'fullscreen');
+    // 失败也清理，避免污染后续版面测试。
+    rightbarToggle.onclick = null;
     rightbar.removeAttribute('data-sidebar-right-open');
     frameEl.removeAttribute('data-rightbar-fullscreen');
     bridge.syncNow();
@@ -494,7 +728,15 @@ function run() {
     var dragR = dragMain ? dragMain.getBoundingClientRect() : { left: 0 };
     add(checks, 'drag-follow-halfway', dragR.left >= 120 && dragR.left <= 260, 'left=' + Math.round(dragR.left));
     add(checks, 'drag-attr', document.documentElement.getAttribute('data-dshr-dragging') === '1');
+    // 拖动中官方侧栏必须已是 wide 内容（完整会话列表），不能还是图标 rail。
+    add(checks, 'drag-shows-wide-sidebar', !frame.hasAttribute('data-sidebar-collapsed'),
+      'collapsed=' + frame.hasAttribute('data-sidebar-collapsed'));
+    var dragHeight = dragMain.offsetHeight;
+    var dragShadow = getComputedStyle(dragMain).boxShadow;
+    bridge.setDrawerDrag(0.7);
+    add(checks, 'drag-keeps-layout-and-shadow', dragMain.offsetHeight === dragHeight && getComputedStyle(dragMain).boxShadow === dragShadow);
     bridge.clearDrawerDrag();
+    add(checks, 'drag-cancel-restores-collapsed', frame.hasAttribute('data-sidebar-collapsed'));
     add(checks, 'drag-cleared', document.documentElement.getAttribute('data-dshr-dragging') !== '1');
   } else {
     add(checks, 'drag-follow-halfway', false, 'missing setDrawerDrag');
@@ -531,7 +773,22 @@ function run() {
     }
     fireSwipe(mainEl, 360, 420, 40, 420);
     window.setTimeout(function () {
-      add(checks, 'swipe-closes-from-main', frame.hasAttribute('data-sidebar-collapsed'), 'collapsed=' + frame.hasAttribute('data-sidebar-collapsed'));
+      // 松手关闭现在是两段式：先补间回位（官方仍 wide），落位后才切收起。
+      var midMain = document.querySelector('[data-dshr-main-col]');
+      var midLeft = midMain ? midMain.getBoundingClientRect().left : -1;
+      var midRounded = midMain ? Math.round(parseFloat(getComputedStyle(midMain).borderTopLeftRadius) || 0) : 0;
+      add(checks, 'close-anim-glide-back', midLeft >= 0 && midLeft < 338 && getComputedStyle(midMain).transform !== 'none',
+        'left=' + Math.round(midLeft));
+      add(checks, 'close-anim-sidebar-still-wide', !frame.hasAttribute('data-sidebar-collapsed'),
+        'collapsed=' + frame.hasAttribute('data-sidebar-collapsed'));
+      add(checks, 'close-anim-keeps-card-geometry', midRounded >= 12 && Math.round(midMain.getBoundingClientRect().height) > 0,
+        'r=' + midRounded);
+      window.setTimeout(function () {
+        add(checks, 'close-anim-settles-collapsed', frame.hasAttribute('data-sidebar-collapsed'),
+          'collapsed=' + frame.hasAttribute('data-sidebar-collapsed'));
+        add(checks, 'close-anim-clears-drag-state', document.documentElement.getAttribute('data-dshr-dragging') !== '1'
+          && !(midMain.style.getPropertyValue('--dshr-drawer-x')),
+          'dragging=' + document.documentElement.getAttribute('data-dshr-dragging'));
       fireSwipe(column, 48, 360, 170, 358);
       window.setTimeout(function () {
     document.getElementById('settings-overlay').style.display = 'flex';
@@ -652,7 +909,8 @@ function run() {
       }, 80);
     }, 200);
       }, 120);
-    }, 120);
+      }, 320);
+    }, 60);
   }, 120);
 }
 function waitAndRun() {
