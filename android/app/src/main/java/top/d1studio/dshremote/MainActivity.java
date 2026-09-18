@@ -149,6 +149,11 @@ public class MainActivity extends Activity {
 	private String directTarget = "";
 	/** 会话页沉浸状态栏；注入失败时退回实色。 */
 	private boolean edgeToEdgeChrome = true;
+	/**
+	 * PERF-03：WebView JS 定时器是否已挂起（pauseTimers/resumeTimers 必须成对，
+	 * 重复 pause 会叠加计数导致 resume 一次不够，故用本标记守卫）。
+	 */
+	private boolean webTimersPaused = false;
 
 	/**
 	 * AND-06：统一后台线程池（单线程、命名、守护），替换原裸 new Thread 的
@@ -195,6 +200,60 @@ public class MainActivity extends Activity {
 	protected void onPause() {
 		super.onPause();
 		CookieManager.getInstance().flush();
+		// PERF-03：退后台即挂起 WebView 渲染与全 WebView JS 定时器（含 DSH 的
+		// token 流 MutationObserver/rAF、mobile.js 通知扫描），让射频/CPU 能睡；
+		// frpc 隧道与前台服务保留，会话不断，只是页面暂停。回前台见 onResume。
+		if (webView != null) {
+			try {
+				webView.onPause();
+			} catch (Exception ignored) {
+			}
+			if (!webTimersPaused) {
+				try {
+					webView.pauseTimers();
+					webTimersPaused = true;
+				} catch (Exception ignored) {
+				}
+			}
+		}
+	}
+
+	@Override
+	protected void onResume() {
+		super.onResume();
+		// PERF-03：与 onPause 成对恢复；在 WEB 态补一次 inset/注入（暂停期间
+		// 键盘/旋转事件可能漏掉），已有 resumeLiveSession 保证不断整页重载。
+		if (webView != null) {
+			try {
+				webView.onResume();
+			} catch (Exception ignored) {
+			}
+			if (webTimersPaused) {
+				try {
+					webView.resumeTimers();
+				} catch (Exception ignored) {
+				} finally {
+					webTimersPaused = false;
+				}
+			}
+			if (uiState == UiState.WEB && webView.getVisibility() == View.VISIBLE) {
+				applyInsetsToPage(webView);
+				// REVIEW-03：后台期间 pauseTimers 未必冻住 WS 事件，running 翻转的
+				// 通知可能陈旧（结束仍显示"生成中"）。回前台主动重读一次通知，
+				// 经 JS bridge 刷新前台服务文案；读不到桥时静默跳过。
+				try {
+					webView.evaluateJavascript(
+						"(function(){try{var b=window.__dshRemoteAndroidMobile;"
+						+ "if(!b||typeof b.readSessionNotice!=='function')return;"
+						+ "var n=b.readSessionNotice();"
+						+ "if(window.DshRemoteApp&&typeof window.DshRemoteApp.setSessionNotice==='function')"
+						+ "window.DshRemoteApp.setSessionNotice(n.title||'',n.text||'',!!n.running);"
+						+ "}catch(e){}})()",
+						null);
+				} catch (Exception ignored) {
+				}
+			}
+		}
 	}
 
 	@Override

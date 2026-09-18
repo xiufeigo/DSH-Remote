@@ -2616,11 +2616,45 @@
 
 	var lastNoticeKey = null;
 	var noticeTimer = 0;
+	// PERF-04：通知节流——token 流期间 MutationObserver 高频触发，旧 180ms
+	// debounce 下每次都要全量 querySelectorAll(div,p)+getComputedStyle 扫描，
+	// 还经 bridge 唤醒原生。为省电：debounce 提到 1000ms，且 running 未翻转时
+	// 两次上报至少间隔 2000ms；running 翻转（开始/结束）立即上报不延迟。
+	// 后台时 WebView.onPause/pauseTimers 已停 JS，这里是前台流式场景的补充。
+	var lastNoticeAt = 0;
+	var lastNoticeRunning = false;
+	var NOTICE_DEBOUNCE_MS = 1000;
+	var NOTICE_MIN_INTERVAL_MS = 2000;
+	// REVIEW-03：max-delay 防饿死——debounce 被持续 mutation 重置时，最多延迟
+	// NOTICE_MIN_INTERVAL_MS 必报一次；min-interval 提前返回时若 key 已变，
+	// 补一个区间边界定时器，不丢最后一次变化。
+	var noticeScheduledAt = 0;
+	var lastFlipCheckAt = 0;
 	function reportSessionNotice() {
+		noticeTimer = 0;
+		var running = isAgentRunning();
+		var now = Date.now ? Date.now() : 0;
+		if (running === lastNoticeRunning && now - lastNoticeAt < NOTICE_MIN_INTERVAL_MS) {
+			var probe = null;
+			try { probe = collectSessionNotice(); } catch (ignoredProbe) { return; }
+			var probeKey = (probe.running ? '1' : '0') + '\n' + probe.title + '\n' + probe.text;
+			if (probeKey !== lastNoticeKey && !noticeTimer) {
+				noticeTimer = window.setTimeout(function () {
+					noticeTimer = 0;
+					reportSessionNotice();
+				}, NOTICE_MIN_INTERVAL_MS - (now - lastNoticeAt));
+			}
+			return;
+		}
 		var notice = collectSessionNotice();
 		var key = (notice.running ? '1' : '0') + '\n' + notice.title + '\n' + notice.text;
-		if (key === lastNoticeKey) return;
+		if (key === lastNoticeKey) {
+			lastNoticeRunning = notice.running;
+			return;
+		}
 		lastNoticeKey = key;
+		lastNoticeAt = now;
+		lastNoticeRunning = notice.running;
 		try {
 			if (window.DshRemoteApp && typeof window.DshRemoteApp.setSessionNotice === 'function') {
 				window.DshRemoteApp.setSessionNotice(notice.title, notice.text, notice.running);
@@ -2629,11 +2663,29 @@
 	}
 
 	function scheduleSessionNotice() {
+		var nowMs = Date.now ? Date.now() : 0;
+		// running 翻转立即上报（开始生成/结束的感知不能等 1s）。
+		// 翻转检查本身也是 querySelectorAll，最多 500ms 查一次，免得节流反被检查吃掉。
+		if (nowMs - lastFlipCheckAt >= 500) {
+			lastFlipCheckAt = nowMs;
+			try {
+				var runningNow = isAgentRunning();
+				if (runningNow !== lastNoticeRunning) {
+					if (noticeTimer) window.clearTimeout(noticeTimer);
+					noticeTimer = 0;
+					reportSessionNotice();
+					return;
+				}
+			} catch (ignoredFlip) {}
+		}
+		// 已有 pending 且距排程不足一个区间：不再重置，保证 max-delay。
+		if (noticeTimer && nowMs - noticeScheduledAt < NOTICE_MIN_INTERVAL_MS) return;
 		if (noticeTimer) window.clearTimeout(noticeTimer);
+		noticeScheduledAt = nowMs;
 		noticeTimer = window.setTimeout(function () {
 			noticeTimer = 0;
 			reportSessionNotice();
-		}, 180);
+		}, NOTICE_DEBOUNCE_MS);
 	}
 
 	function markComposerCard(card) {

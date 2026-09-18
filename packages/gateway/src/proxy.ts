@@ -10,7 +10,9 @@
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
+import { pipeline } from "node:stream";
 import tls from "node:tls";
+import zlib from "node:zlib";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 export interface Upstream {
@@ -44,6 +46,101 @@ const HOP_BY_HOP = new Set([
 
 /** 允许整包缓冲后注入的 HTML 上限（超过则原样流式转发） */
 const INJECT_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * PERF-01：只有"可能返回待注入 HTML"的请求才强制 identity。
+ * 判定：GET/HEAD + （根路径 / 目录 / .html 结尾 / Accept 含 text/html）。
+ * 其余（JS/CSS/图片字体、/api JSON、WS 之前的普通 GET）透传客户端的
+ * accept-encoding；客户端未声明时给上游 identity（REVIEW-01：不得把压缩
+ * 字节透传给不支持解压的客户端），静态大包才能走压缩，隧道传输量按 DSH
+ * 这类 Vite 包通常省 2/3 以上。
+ * 注入正确性由响应侧兜底：见 proxyHttp 内压缩 HTML 的解压后再注入。
+ */
+export function wantsHtmlIdentity(req: IncomingMessage): boolean {
+	const method = String(req.method ?? "GET").toUpperCase();
+	if (method !== "GET" && method !== "HEAD") return false;
+	const pathname = pathnameOf(req.url);
+	// /api 只回 JSON/SSE，永不进 HTML 注入——即使形如目录也不强制 identity。
+	if (isApiPath(pathname)) return false;
+	if (pathname === "/" || pathname.endsWith("/") || pathname.toLowerCase().endsWith(".html")) return true;
+	const accept = req.headers["accept"];
+	const acceptText = Array.isArray(accept) ? accept.join(",") : String(accept ?? "");
+	return acceptText.toLowerCase().includes("text/html");
+}
+
+/** 取请求路径（去 query；异常回退 "/"）。 */
+export function pathnameOf(url: string | undefined): string {
+	const raw = String(url ?? "/");
+	return raw.split("?", 1)[0] ?? "/";
+}
+
+/** 上游 DSH 的 API 面（JSON/SSE）：永不 HTML 注入、永不网关侧压缩。 */
+export function isApiPath(pathname: string): boolean {
+	return pathname === "/api" || pathname.startsWith("/api/");
+}
+
+/** 可被网关侧即时压缩的内容类型（文本系；字体/图片二进制已压缩的不碰）。 */
+const COMPRESSIBLE_CONTENT = /^(?:text\/|application\/(?:javascript|json|manifest\+json|xml|x-www-form-urlencoded)|image\/svg\+xml)/i;
+
+/**
+ * 解析 accept-encoding 为"被接受（q>0）的编码集合"（REVIEW-01：`br;q=0` 不得选中 br）。
+ * 无效 q 值按接受处理（与浏览器缺省一致）。
+ */
+export function acceptedEncodings(acceptEncoding: unknown): Set<string> {
+	const text = Array.isArray(acceptEncoding) ? acceptEncoding.join(",") : String(acceptEncoding ?? "");
+	const out = new Set<string>();
+	for (const part of text.split(",")) {
+		const [name, ...params] = part.split(";");
+		const token = name.trim().toLowerCase();
+		if (token === "") continue;
+		let q = 1;
+		for (const param of params) {
+			const [key, value] = param.split("=");
+			if (key.trim().toLowerCase() === "q" && value !== undefined) {
+				const parsed = Number.parseFloat(value.trim());
+				if (Number.isFinite(parsed)) q = parsed;
+			}
+		}
+		if (q > 0) out.add(token);
+		else out.delete(token);
+	}
+	return out;
+}
+
+/** 从客户端 accept-encoding 选网关压缩编码：br > gzip > deflate；不支持返回 undefined。 */
+export function selectGatewayEncoding(acceptEncoding: unknown): "br" | "gzip" | "deflate" | undefined {
+	const accepted = acceptedEncodings(acceptEncoding);
+	if (accepted.has("br")) return "br";
+	// REVIEW-02：x-gzip 是 gzip 别名；裸 "*"（q>0）按最保守的 gzip 处理，
+	// 只会少压不会错发（* 语义即"任意编码可接受"，gzip 最通用）。
+	if (accepted.has("gzip") || accepted.has("x-gzip")) return "gzip";
+	if (accepted.has("deflate")) return "deflate";
+	if (accepted.has("*")) return "gzip";
+	return undefined;
+}
+
+/**
+ * 网关侧即时压缩判定（PERF-01）：只压"静态文本类 + 200 + 上游未压 + 非流式"。
+ * 明确排除：/api/*（含 SSE text/event-stream/长流 JSON，压了反而加缓冲抖动）、
+ * 非 GET、206/304/204、无内容类型或已带 content-encoding 的响应。
+ */
+export function shouldGatewayCompress(
+	req: IncomingMessage,
+	status: number,
+	outHeaders: Record<string, string | string[]>,
+): boolean {
+	if (String(req.method ?? "GET").toUpperCase() !== "GET") return false;
+	if (status !== 200) return false;
+	// REVIEW-02：与 wantsHtmlIdentity 共用 pathname 判定（剥 query、精确 /api 覆盖）。
+	if (isApiPath(pathnameOf(req.url))) return false;
+	const contentEncoding = String(outHeaders["content-encoding"] ?? "").toLowerCase();
+	if (contentEncoding !== "" && contentEncoding !== "identity") return false;
+	const contentType = String(outHeaders["content-type"] ?? "");
+	if (!COMPRESSIBLE_CONTENT.test(contentType)) return false;
+	if (String(outHeaders["content-type"] ?? "").includes("text/event-stream")) return false;
+	if (selectGatewayEncoding(req.headers["accept-encoding"]) === undefined) return false;
+	return true;
+}
 
 /** GW-04：上游空闲超时（毫秒）。只约束"请求阶段/未响应"的空闲，详见 proxyHttp 内注释。 */
 const UPSTREAM_IDLE_TIMEOUT_MS = 60_000;
@@ -89,6 +186,8 @@ export function buildUpstreamHeaders(req: IncomingMessage, upstream: Upstream): 
 		// 手机浏览器发往本网关的请求可能是跨站导航/快捷方式启动，剥离后按
 		// "无标记"处理（fence 注释明确无标记可接受，Host fence 仍然生效）。
 		if (lower === "sec-fetch-site") continue;
+		// PERF-01：accept-encoding 不盲拷，见下方按 wantsHtmlIdentity 决策。
+		if (lower === "accept-encoding") continue;
 		headers[key] = value as string | string[];
 	}
 	headers["host"] = authority;
@@ -108,14 +207,21 @@ export function buildUpstreamHeaders(req: IncomingMessage, upstream: Upstream): 
 	}
 	headers["x-forwarded-host"] = req.headers.host ?? "";
 	headers["x-forwarded-proto"] = "https";
-	// GW-06：一律声明 accept-encoding: identity，根治"压缩响应注入损坏"。
-	// 是否注入由响应决定（200 + text/html），构造请求时无法预知，凡经 proxyHttp
-	// 的请求都可能被注入 HTML；若上游（或未来前置代理）返回压缩体，整包
-	// toString("utf8") 注入会得到乱码、浏览器解码失败白屏。
-	// 取舍：静态资源因此也失去传输压缩（当前 DSH 上游不压缩，暂无实际损失）；
-	// 注入正确性优先。将来若需压缩，应升级为"zlib 解压 → 注入 → 透传/重压"，
-	// 而非移除此行。
-	headers["accept-encoding"] = "identity";
+	// PERF-01（替代旧 GW-06 一刀切 identity）：只有可能回 HTML 注入的导航
+	// 才强制 identity（注入前无需解压）；静态/接口透传客户端编码。
+	// REVIEW-01：客户端未声明 accept-encoding（curl/脚本类）时给上游 identity，
+	// 否则上游的压缩字节会被原样透传给不支持解压的客户端。
+	if (wantsHtmlIdentity(req)) {
+		headers["accept-encoding"] = "identity";
+	} else {
+		const clientEncoding = req.headers["accept-encoding"];
+		const forwarded = Array.isArray(clientEncoding)
+			? clientEncoding.join(", ")
+			: typeof clientEncoding === "string" && clientEncoding.trim() !== ""
+				? clientEncoding
+				: "identity";
+		headers["accept-encoding"] = forwarded;
+	}
 	return headers;
 }
 
@@ -179,12 +285,49 @@ export function proxyHttp(
 			}
 
 			const contentType = String(outHeaders["content-type"] ?? "");
+			// REVIEW-02：未知编码（zstd 等）不进注入缓冲——删头不解码会乱码白屏，
+			// 直接原样直通；HEAD 无 body，直接直通（旧实现会为空 body 算出注入长度）；
+			// /api 与 wantsHtmlIdentity 保持一致：接口面永不注入（注释与行为统一）。
+			const upstreamEncodingEarly = String(outHeaders["content-encoding"] ?? "").toLowerCase();
+			const decodable = upstreamEncodingEarly === "" || upstreamEncodingEarly === "identity"
+				|| upstreamEncodingEarly === "gzip" || upstreamEncodingEarly === "deflate"
+				|| upstreamEncodingEarly === "br";
 			const canInject =
 				transformHtml !== undefined
 				&& status === 200
-				&& contentType.includes("text/html");
+				&& String(req.method ?? "GET").toUpperCase() !== "HEAD"
+				&& contentType.includes("text/html")
+				&& decodable
+				&& !isApiPath(pathnameOf(req.url));
 
 			if (!canInject) {
+				// PERF-01：上游（回环 DSH）多半不压缩，手机隧道却很吃带宽。
+				// 可压缩静态由网关即时压一次再下发；已压/SSE/接口原样直通。
+				// REVIEW-01：变换字节必须剥 etag（上游 304/条件请求不得复用旧实体）。
+				if (shouldGatewayCompress(req, status, outHeaders)) {
+					const encoding = selectGatewayEncoding(req.headers["accept-encoding"]);
+					if (encoding !== undefined) {
+						delete outHeaders["content-length"];
+						delete outHeaders["etag"];
+						outHeaders["content-encoding"] = encoding;
+						const vary = String(outHeaders["vary"] ?? "");
+						outHeaders["vary"] = vary === ""
+							? "Accept-Encoding"
+							: (/accept-encoding/i.test(vary) ? vary : `${vary}, Accept-Encoding`);
+						res.writeHead(status, outHeaders);
+						// REVIEW-01：Brotli 质量 4（默认 11 首字节慢、手机隧道下不划算）；
+						// 用 pipeline：任一段失败即销毁整链，绝不 end() 出截断包。
+						const compressor = encoding === "br"
+							? zlib.createBrotliCompress({
+								params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4 },
+							})
+							: encoding === "gzip"
+								? zlib.createGzip()
+								: zlib.createDeflate();
+						pipeline(upstreamRes, compressor, res, () => {});
+						return;
+					}
+				}
 				res.writeHead(status, outHeaders);
 				upstreamRes.pipe(res);
 				return;
@@ -213,6 +356,12 @@ export function proxyHttp(
 
 			// 小型 HTML 整包缓冲注入；超限退化为原样转发。
 			// 缓冲路径必须去掉分帧头：content-length 由我们按注入后的实际长度重算。
+			// REVIEW-01：改字节同样剥 etag；未知编码到不了这里（见 canInject decodable）。
+			// PERF-01 兜底：若上游仍回了压缩 HTML（分类误判/未来代理），先解压再注入，
+			// 下发给手机时按 identity（HTML 本体小，不值得为它再压一次）。
+			const upstreamEncoding = String(outHeaders["content-encoding"] ?? "").toLowerCase();
+			delete outHeaders["content-encoding"];
+			delete outHeaders["etag"];
 			delete outHeaders["transfer-encoding"];
 			const chunks: Buffer[] = [];
 			let total = 0;
@@ -224,7 +373,12 @@ export function proxyHttp(
 					// P1-3（GW-16 补全）：未声明长度（chunked）路径超限时，必须先把
 					// 「已缓冲前缀 + 触发超限的当前块」写出再切直通 —— 旧实现清空
 					// chunks 直接 pipe，上游 3MB 手机端只收到 1MB（静默截断无标记）。
+					// PERF-01：若上游是压缩 HTML，直通必须恢复 content-encoding，
+					// 否则手机会把压缩字节当 identity 解码白屏。
 					delete outHeaders["content-length"];
+					if (upstreamEncoding === "gzip" || upstreamEncoding === "deflate" || upstreamEncoding === "br") {
+						outHeaders["content-encoding"] = upstreamEncoding;
+					}
 					outHeaders["transfer-encoding"] = "chunked";
 					res.writeHead(status, outHeaders);
 					for (const buffered of chunks) res.write(buffered);
@@ -237,10 +391,48 @@ export function proxyHttp(
 			});
 			upstreamRes.on("end", () => {
 				if (overflow) return;
-				const injected = transformHtml(Buffer.concat(chunks));
-				outHeaders["content-length"] = String(injected.length);
-				res.writeHead(status, outHeaders);
-				res.end(injected);
+				try {
+					let html = Buffer.concat(chunks);
+					if (upstreamEncoding === "gzip" || upstreamEncoding === "deflate" || upstreamEncoding === "br") {
+						try {
+							// REVIEW-01：maxOutputLength 防压缩炸弹；deflate 失败回退 raw。
+							const cap = { maxOutputLength: INJECT_MAX_BYTES } as const;
+							html = upstreamEncoding === "gzip"
+								? zlib.gunzipSync(html, cap)
+								: upstreamEncoding === "deflate"
+									? (() => {
+										try {
+											return zlib.inflateSync(html, cap);
+										} catch {
+											return zlib.inflateRawSync(html, cap);
+										}
+									})()
+									: zlib.brotliDecompressSync(html, cap);
+						} catch {
+							// 解压失败：按原压缩字节直通（恢复编码头，不注入）。
+							outHeaders["content-encoding"] = upstreamEncoding;
+							outHeaders["content-length"] = String(html.length);
+							res.writeHead(status, outHeaders);
+							res.end(html);
+							return;
+						}
+						if (html.length > INJECT_MAX_BYTES) {
+							// 解后超限：同样回退直通，避免网关内存爆炸。
+							const raw = Buffer.concat(chunks);
+							outHeaders["content-encoding"] = upstreamEncoding;
+							outHeaders["content-length"] = String(raw.length);
+							res.writeHead(status, outHeaders);
+							res.end(raw);
+							return;
+						}
+					}
+					const injected = transformHtml(html);
+					outHeaders["content-length"] = String(injected.length);
+					res.writeHead(status, outHeaders);
+					res.end(injected);
+				} catch {
+					res.end();
+				}
 			});
 			upstreamRes.on("error", () => res.end());
 		},

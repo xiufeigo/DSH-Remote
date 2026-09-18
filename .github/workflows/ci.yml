@@ -1,4 +1,4 @@
-# 最小 Node 测试 CI：push/PR 到 main 时跑类型检查 + 快测五件套。
+# 最小 Node 测试 CI：push/PR 到 main 时跑类型检查 + 快测六件套。
 # 不跑重链路（panel/mobile/frp 全链路需浏览器或 frp 二进制，留本地）。
 name: ci
 
@@ -38,10 +38,11 @@ jobs:
           pnpm -C packages/plugin build
           git diff --exit-code -- packages/plugin/lib/
 
-      - name: 快测（smoke / edge / routes / session / fixes）
+      - name: 快测（smoke / edge / routes / session / fixes / perf）
         run: |
           pnpm smoke
           pnpm smoke:edge
           pnpm test:routes
           pnpm test:session
           pnpm test:fixes
+          pnpm test:perf
