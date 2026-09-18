@@ -512,7 +512,7 @@ export class GatewayServer {
 			}
 
 			// —— 反向代理 ——
-			proxyHttp(req, res, this.upstreamAddress(), this.htmlInjector);
+			proxyHttp(req, res, this.upstreamAddress(), this.htmlInjector, this.log);
 		} catch (error) {
 			// P0-1：URL 解析失败按 400（请求行畸形），其余内部错误按 500
 			const malformedUrl = (error as NodeJS.ErrnoException)?.code === "ERR_INVALID_URL";

@@ -79,6 +79,28 @@ export function isApiPath(pathname: string): boolean {
 	return pathname === "/api" || pathname.startsWith("/api/");
 }
 
+/**
+ * DIAG-30s：带哈希指纹的静态资产（Vite 构建产物如 /assets/index-AbC123.js）
+ * 且上游没给缓存头时，补一年 immutable。WebView 的 HTTP 缓存进程外持久、
+ * 杀后台不丢——二次冷启动直接读盘，不再经隧道全量拉。只在上游无
+ * cache-control 时补（尊重上游显式语义）；文件名无哈希的不碰（内容会变）。
+ */
+const HASHED_ASSET = /\/[^/]*[.-][0-9A-Za-z_-]{8,}\.(?:js|mjs|css|woff2?|ttf|otf|eot|png|jpe?g|gif|webp|svg|ico)$/;
+
+export function applyImmutableCache(
+	req: IncomingMessage,
+	status: number,
+	outHeaders: Record<string, string | string[]>,
+): void {
+	if (String(req.method ?? "GET").toUpperCase() !== "GET") return;
+	if (status !== 200) return;
+	if (outHeaders["cache-control"] !== undefined) return;
+	const pathname = pathnameOf(req.url);
+	if (isApiPath(pathname)) return;
+	if (!HASHED_ASSET.test(pathname)) return;
+	outHeaders["cache-control"] = "public, max-age=31536000, immutable";
+}
+
 /** 可被网关侧即时压缩的内容类型（文本系；字体/图片二进制已压缩的不碰）。 */
 const COMPRESSIBLE_CONTENT = /^(?:text\/|application\/(?:javascript|json|manifest\+json|xml|x-www-form-urlencoded)|image\/svg\+xml)/i;
 
@@ -232,11 +254,25 @@ export function proxyHttp(
 	res: ServerResponse,
 	upstream: Upstream,
 	transformHtml?: (body: Buffer) => Buffer,
+	/** DIAG-30s：慢请求（>2s）与上游 401 打点，定位手机端白屏卡在哪一跳。 */
+	log?: (line: string) => void,
 ): void {
 	const headers = buildUpstreamHeaders(req, upstream);
 	const transport = upstream.tls === true ? https : http;
 	/** 上游响应头是否已到达；GW-04 的空闲超时只在此之前生效。 */
 	let upstreamResponded = false;
+	/** DIAG-30s：整跳耗时（网关收请求→响应写完），只报慢的不刷屏。 */
+	const proxyStartMs = Date.now();
+	if (log !== undefined) {
+		res.on("finish", () => {
+			try {
+				const ms = Date.now() - proxyStartMs;
+				if (ms > 2000) {
+					log(`slow-proxy ${String(req.method ?? "GET")} ${pathnameOf(req.url)} → ${String(res.statusCode)} ${String(ms)}ms`);
+				}
+			} catch { /* 打点绝不影响代理主流程 */ }
+		});
+	}
 	const upstreamReq = transport.request(
 		{
 			host: upstream.host,
@@ -258,6 +294,12 @@ export function proxyHttp(
 			const status = upstreamRes.statusCode;
 			// DSH 0.1.2+：会话 cookie 失效（DSH 重启换令牌/authority 漂移）时触发
 			// 重铸；本请求按 401 透传，客户端重试一次即可恢复。
+			// DIAG-30s：401 直接决定手机白屏（主帧拿 401 文本、无自动重试），打点。
+			if (status === 401) {
+				try {
+					log?.(`upstream-401 ${String(req.method ?? "GET")} ${pathnameOf(req.url)}（有会话cookie=${String(upstream.sessionCookie !== undefined)}）`);
+				} catch { /* 打点绝不影响代理主流程 */ }
+			}
 			if (status === 401 && upstream.sessionCookie !== undefined) {
 				try {
 					upstream.onUnauthorized?.();
@@ -301,6 +343,8 @@ export function proxyHttp(
 				&& !isApiPath(pathnameOf(req.url));
 
 			if (!canInject) {
+				// DIAG-30s：哈希静态补 immutable（杀后台后冷启动读盘，不再全量拉）。
+				applyImmutableCache(req, status, outHeaders);
 				// PERF-01：上游（回环 DSH）多半不压缩，手机隧道却很吃带宽。
 				// 可压缩静态由网关即时压一次再下发；已压/SSE/接口原样直通。
 				// REVIEW-01：变换字节必须剥 etag（上游 304/条件请求不得复用旧实体）。

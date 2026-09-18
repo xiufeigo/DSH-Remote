@@ -2910,10 +2910,23 @@
 	// 注入可能早于 body/React 首帧。观察器必须在 body 出现后补装，不能只在
 	// 脚本首次执行时尝试一次；否则初始标记虽能由 boot 补齐，后续展开状态无人同步。
 	var observer = null;
+	// DIAG-30s：首屏 React 水合是 mutation 风暴，每批全量 syncDom 会把主线程
+	// 打满（querySelectorAll 全文档）。合并到 50ms 一次；不用 rAF——后台页
+	// rAF 不触发，会连带拖住 running 翻转通知。直接调用处（boot/resize/桥）
+	// 仍走同步 syncDom，不受影响。
+	var syncQueued = false;
+	function scheduleSyncDom() {
+		if (syncQueued) return;
+		syncQueued = true;
+		window.setTimeout(function () {
+			syncQueued = false;
+			syncDom();
+		}, 50);
+	}
 	function startObserver() {
 		if (observer !== null) return true;
 		if (typeof MutationObserver === 'undefined' || !document.body) return false;
-		observer = new MutationObserver(syncDom);
+		observer = new MutationObserver(scheduleSyncDom);
 		observer.observe(document.body, {
 			attributes: true,
 			attributeFilter: [

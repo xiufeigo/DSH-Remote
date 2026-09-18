@@ -28,6 +28,7 @@ import test from "node:test";
 import zlib from "node:zlib";
 import {
 	acceptedEncodings,
+	applyImmutableCache,
 	buildUpstreamHeaders,
 	isApiPath,
 	pathnameOf,
@@ -354,6 +355,28 @@ test("wantsHtmlIdentity：HEAD 走 identity；selectGatewayEncoding 认 x-gzip �
 	assert.equal(isApiPath(pathnameOf("/api/data?x=1")), true);
 	assert.equal(isApiPath(pathnameOf("/api")), true);
 	assert.equal(isApiPath(pathnameOf("/apis")), false);
+});
+
+test("applyImmutableCache：只给无缓存头的哈希静态补一年", () => {
+	const hashed = { "content-type": "application/javascript" };
+	applyImmutableCache(fakeReq({ url: "/assets/index-AbC12345.js" }), 200, hashed);
+	assert.equal(hashed["cache-control"], "public, max-age=31536000, immutable");
+
+	const unhashed = { "content-type": "application/javascript" };
+	applyImmutableCache(fakeReq({ url: "/assets/app.js" }), 200, unhashed);
+	assert.equal(unhashed["cache-control"], undefined);
+
+	const respected = { "content-type": "text/css", "cache-control": "no-cache" };
+	applyImmutableCache(fakeReq({ url: "/assets/app-AbC12345.css" }), 200, respected);
+	assert.equal(respected["cache-control"], "no-cache");
+
+	const api = { "content-type": "application/json" };
+	applyImmutableCache(fakeReq({ url: "/api/x-AbC12345.js" }), 200, api);
+	assert.equal(api["cache-control"], undefined);
+
+	const notFound = { "content-type": "application/javascript" };
+	applyImmutableCache(fakeReq({ url: "/assets/index-AbC12345.js" }), 404, notFound);
+	assert.equal(notFound["cache-control"], undefined);
 });
 
 // ---------- Part 6：Service Worker 语义 ----------
