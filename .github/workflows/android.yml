@@ -1,5 +1,5 @@
 # Android 壳 App 构建：复用 android/build.ps1（无 Gradle 手工工具链）。
-# ubuntu runner 预装 pwsh；SDK/JDK 由官方 action 提供，与本地同一套版本要求。
+# ubuntu runner 预装 pwsh 与 Android SDK；JDK 由官方 action 提供，与本地同一套版本要求。
 name: android-apk
 
 on:
@@ -24,8 +24,13 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Android SDK（platforms;android-36 + build-tools;35.0.0）
-        uses: android-actions/setup-android@v3
+      # runner 预装 Android SDK（ANDROID_HOME 指向 /usr/local/lib/android/sdk）。
+      # 不再用 android-actions/setup-android@v3：Node 24 强升后它内部接受 SDK 许可
+      # 的步骤会直接崩（2026-09 实测 exit 1），预装 sdkmanager 即够用。
+      - name: Android SDK（runner 预装，导出 ANDROID_SDK_ROOT 并把 sdkmanager 加进 PATH）
+        run: |
+          echo "ANDROID_SDK_ROOT=${ANDROID_HOME:-/usr/local/lib/android/sdk}" >> "$GITHUB_ENV"
+          echo "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
 
       - name: 安装构建所需 SDK 组件
         run: |
