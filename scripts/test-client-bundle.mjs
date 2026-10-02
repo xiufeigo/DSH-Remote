@@ -4,7 +4,8 @@
  * 真实执行 lib/client.js 工厂体，验证：
  *   1. 包装器形状正确、工厂可执行（CJS 垫片生效）；
  *   2. 导出 apply/inject/name；inject 只依赖 slots（移动适配已移交给 Android App 注入）；
- *   3. apply 后保留 settings.plugin.item 卡片（key 对齐宿主命名空间）。
+ *   3. apply 后保留 settings.plugin.item 卡片（key 对齐宿主命名空间），
+ *      并新增 0.2.x 的 settings.plugins.tab 双槽位注册。
  */
 
 import assert from "node:assert/strict";
@@ -80,7 +81,7 @@ for (const marker of ["DSH Remote", "手机远程访问本机 DSH", "xtcp + stcp
 }
 console.log("✓ SSR 渲染通过（折叠态头部完整，长度", html.length, "字符）");
 
-// 模拟槽位上下文，验证设置卡片注册（且不再注册任何移动端槽位）。
+// 模拟槽位上下文，验证设置卡片注册（双槽位：0.1.x item 卡片 + 0.2.x plugins.tab）。
 const registrations = [];
 const injected = [];
 const ctx = {
@@ -97,13 +98,20 @@ const ctx = {
 };
 exports.apply(ctx);
 
-assert.deepEqual(injected, ["settings.plugin.item"], "只应注册设置卡片槽位");
-assert.equal(registrations.length, 1);
-const settings = registrations[0];
-assert.equal(settings.options.id, "dsh-remote");
-// 卡片 key 必须等于宿主半边 settings.register 的命名空间（dsh-remote），
+assert.deepEqual(injected, ["settings.plugin.item", "settings.plugins.tab"], "应双槽位注册（0.1.x 卡片 + 0.2.x tab）");
+assert.equal(registrations.length, 2);
+const [legacyItem, modernTab] = registrations;
+// 0.1.x：卡片 key 必须等于宿主半边 settings.register 的命名空间（dsh-remote），
 // 否则设置页 describe() 对不上 key，卡片会被整个过滤掉。
-assert.equal(settings.options.key, "dsh-remote");
-assert.equal(typeof settings.component, "function", "设置卡片应为 React 组件函数");
+assert.equal(legacyItem.options.name, "settings.plugin.item");
+assert.equal(legacyItem.options.id, "dsh-remote");
+assert.equal(legacyItem.options.key, "dsh-remote");
+assert.equal(typeof legacyItem.component, "function", "设置卡片应为 React 组件函数");
+// 0.2.x：tab 列表槽需要显式 id/order/label（单一贡献时整页直显，无需 key）。
+assert.equal(modernTab.options.name, "settings.plugins.tab");
+assert.equal(modernTab.options.id, "dsh-remote");
+assert.equal(modernTab.options.order, 40);
+assert.equal(modernTab.options.label, "DSH Remote");
+assert.equal(typeof modernTab.component, "function", "tab 容器应为 React 组件函数");
 
 console.log("✅ 客户端 bundle 与设置卡片注册全部通过");

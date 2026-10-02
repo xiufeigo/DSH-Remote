@@ -2,6 +2,8 @@
  * DSH-Remote —— 浏览器半边：设置 → 插件 里的配置卡片。
  *
  * 与 dsh-explorer 同一套接入方式：slots.inject("settings.plugin.item") 注册卡片；
+ * 0.2.0+ 宿主该卡片槽改版为 settings.plugins.tab 列表槽，这里双槽位注册、
+ * 两代宿主各取所需（详见 apply() 内注释）。
  * 数据不走 localStorage（那些值必须落在 PC 的 config.json），而是通过插件宿主
  * 半边注册在 DSH webServer 上的 /dsh-remote/config 路由读写，保存后宿主会
  * 自动重启网关子进程生效。
@@ -239,7 +241,12 @@ function Row({ label, hint, children }: { label: string; hint?: string; children
 }
 
 /** 设置 → 插件 页的 DSH Remote 卡片。 */
-export function DshRemoteSettingsCard() {
+/**
+ * 设置卡本体。`as` 参数化根元素：0.1.x 宿主的 settings.plugin.item 列表槽
+ * 渲染在 <ul> 里（语义根 <li>），0.2.x 的 settings.plugins.tab 渲染在
+ * div.panel 里（语义根 <div>）——见 apply() 的双槽位注册。
+ */
+export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {}) {
   const [open, setOpen] = useState(false)
   const [form, setForm] = useState<any>(null)
   const [status, setStatus] = useState<any>(null)
@@ -377,8 +384,9 @@ export function DshRemoteSettingsCard() {
       || formPort !== Number(tunnel.serverPort ?? 0)
       || (typeof liveName === 'string' && liveName.length > 0 && liveName !== formName))
 
+  const Root = as
   return (
-    <li className={`dshr-card${open ? ' open' : ''}`}>
+    <Root className={`dshr-card${open ? ' open' : ''}`}>
       <button type="button" className="dshr-head" aria-expanded={open} onClick={() => { setOpen(v => !v) }}>
         <span className="dshr-copy">
           <span className="dshr-name">DSH Remote</span>
@@ -488,8 +496,13 @@ export function DshRemoteSettingsCard() {
           </div>
         )
         : null}
-    </li>
+    </Root>
   )
+}
+
+/** 0.2.x 设置页 tab 容器：渲染在 div.panel 里，避免 <li> 裸根。 */
+function DshRemoteSettingsTab() {
+  return <DshRemoteSettingsCard as="div" />
 }
 
 /** 必需服务：槽位注册器。移动端适配由 Android App 注入完成（见 android 壳），插件不再参与。 */
@@ -518,5 +531,24 @@ export function apply(ctx: ClientContext): void {
     })
   } catch (error) {
     console.error('dsh-remote: settings card inject failed', error)
+  }
+  // 0.2.0+ 宿主：插件设置页改版——卡片槽 settings.plugin.item 被 tab 列表槽
+  // settings.plugins.tab 取代（tab 需要显式 label；单一贡献时整页直显，见
+  // ui-settings-plugins 的 PluginsSettingsSection）。旧槽位在 0.2.x 不再被
+  // 渲染、新槽位在 0.1.x 不存在，双注册互不干扰，两代宿主各取所需。
+  try {
+    ctx.slots.inject('settings.plugins.tab', () => {
+      try {
+        return ctx.slots.register(
+          { name: 'settings.plugins.tab', id: 'dsh-remote', order: 40, label: 'DSH Remote' },
+          DshRemoteSettingsTab as never,
+        )
+      } catch (error) {
+        console.error('dsh-remote: settings tab register failed', error)
+        return () => {}
+      }
+    })
+  } catch (error) {
+    console.error('dsh-remote: settings tab inject failed', error)
   }
 }

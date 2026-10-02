@@ -18,6 +18,13 @@
  *     resizes-content + visualViewport 兜底（isAndroidShell() 判定，原有逻辑）。
  * 其余适配逻辑两端完全一致；原生桥调用在非壳环境本就安全短路
  * （isAndroidShell() 为 false），无需分支。
+ *   - 设备档位（schema v2）：原生在注入前写 window.__DSHR_MOBILE__.device
+ *     （'phone' | 'tablet' | 'auto'，缺省 'auto'）。'tablet' 任意朝向都走官方
+ *     DSH 桌面布局（本脚本在 OFF 态逐项拆除自身痕迹，见 teardownHookTraces）；
+ *     'phone' 竖屏启用、横屏 OFF；'auto' 完全等价于本文件改动前的既有行为，
+ *     web/edge 路径逐字节不变。档位只由原生判定，JS 侧不看视口宽度（WEB-02）。
+ *   - 运行时切换：window.__dshrSetDevice(mode) 幂等重算，hook 未装完时先落
+ *     配置、装完后按最新值生效（不抛错），供原生 onConfigurationChanged 调用。
  *
  * 设计目标：不依赖服务器端是否安装 dsh-remote-plugin。手机连接任何官方 DSH Web
  * （装或不装插件）都由本脚本完成移动适配：
@@ -943,6 +950,15 @@
 	var imeLiftTimer = 0;
 
 	function applyImeLift() {
+		// 严格 OFF（平板档）：键盘占位由原生平移负责，页面一律不写行内变量
+		//（clearImeLift 会写 --dshr-ime，那本身就是痕迹）。
+		if (isStrictOff()) {
+			lastImeVvHeight = -1;
+			document.documentElement.removeAttribute('data-dshr-ime');
+			document.documentElement.style.removeProperty('--dshr-ime');
+			document.documentElement.style.removeProperty('--dshr-vv-height');
+			return;
+		}
 		// Android 壳：键盘占位只由原生平移负责，不得锁 html 高度、不得缩小 WebView。
 		if (isAndroidShell() || !isMobileMode()) {
 			lastImeVvHeight = -1;
@@ -1088,20 +1104,141 @@
 	var mql = window.matchMedia('(max-width: ' + breakpoint + 'px)');
 	var portraitMql = null;
 	try { portraitMql = window.matchMedia('(orientation: portrait)'); } catch (ignoredO) { portraitMql = null; }
+
+	// ── 设备档位（schema v2，见文件头） ──
+	// 原生在注入 mobile.js 之前写 window.__DSHR_MOBILE__.device；缺省 'auto'。
+	// 档位只由原生判定（sw ≥ 600 ⇒ tablet），本脚本不得用视口宽度反推（WEB-02）。
+	var DEVICE_MODES = ['phone', 'tablet', 'auto'];
+	var deviceMode = 'auto';
+	try {
+		var injectedDevice = window.__DSHR_MOBILE__ ? window.__DSHR_MOBILE__.device : null;
+		var parsedDevice = normalizeDeviceMode(injectedDevice);
+		if (parsedDevice) deviceMode = parsedDevice;
+	} catch (ignoredDevice) { /* 缺省 'auto' */ }
+
+	function normalizeDeviceMode(value) {
+		if (typeof value !== 'string') return null;
+		var mode = value.trim().toLowerCase();
+		return DEVICE_MODES.indexOf(mode) >= 0 ? mode : null;
+	}
+
+	/**
+	 * 启用矩阵（契约 3.4）。三条分支各自等价于一种既有行为：
+	 *   - 'tablet'：任意朝向 OFF。平板的系统栏让位由原生容器负责（契约 3.6），
+	 *     页面不得再写任何 DOM，故走 teardownHookTraces 的严格 OFF。
+	 *   - 'phone' ：竖屏 ON（现有全部移动适配），横屏 OFF（维持现状：官方布局 +
+	 *     dshr-official-inset 让出状态栏，G3/D1「维持现状」）。
+	 *   - 'auto'  ：完全等价于本文件改动前的既有行为——壳内只看竖屏，web 端只看
+	 *     视口宽度 ≤ 断点，逐字节不变。
+	 */
+	function resolveHookEnabled(portrait) {
+		if (deviceMode === 'tablet') return false;
+		if (deviceMode === 'phone') return portrait;
+		if (isAndroidShell()) return portrait;
+		return !!mql.matches;
+	}
+
+	// 严格 OFF 只属于 'tablet' 档：原生已经把 WebView 让出系统栏空间，页面必须
+	// 回到「与完全不注入一致」的零痕迹状态。'phone' 横屏与 'auto' 仍走既有 OFF 分支。
+	function isStrictOff() {
+		return deviceMode === 'tablet';
+	}
+
+	// hook 当前启用态。__dshrSetDevice 与 applyWidthScope 共用，保证同值零副作用。
+	var hookOn = false;
+
+	/**
+	 * 严格 OFF 拆除（契约 3.5）。平板档下 hook 必须在 <html> 与 body 上不留可见
+	 * 痕迹：根类、data-dshr-* 标记、注入节点、写在官方节点上的标记与行内样式
+	 * 全部还原，官方交互（侧栏/设置/输入/浮动选框）不受任何影响。
+	 *
+	 * 惰性无效、按契约允许保留的注入物见交付报告：
+	 *   1. head 里的 <style data-dshr-mobile-css>——除四个 hook 自有节点的裸 ID
+	 *      规则外，全部规则都以 html.dshr-mobile / html.dshr-official-inset 开头，
+	 *      这两个类已被移除，故无一条规则命中官方 DOM；那四个裸 ID 规则的宿主
+	 *      节点本函数已从 DOM 删除，规则同样无宿主。
+	 *   2. MutationObserver——严格 OFF 下根本不安装（它会在 <html> 上写
+	 *      data-dshr-observer，本身就是痕迹）；syncDom() 亦在入口早退，切回
+	 *      phone 档时由 recomputeDeviceScope 补装。
+	 *   3. meta viewport 的 viewport-fit=cover / interactive-widget——脚本顶层一次性
+	 *      写入，非档位相关，契约 3.6 要求手机模式 edge-to-edge 机制不变。
+	 */
+	function teardownHookTraces() {
+		var root = document.documentElement;
+		// 1) <html>：根类 + 全部 data-dshr-* 标记 + 本脚本写过的行内变量。
+		root.classList.remove(ROOT_CLASS);
+		root.classList.remove('dshr-official-inset');
+		removeHookAttributes(root);
+		root.style.removeProperty('--dshr-drawer-width');
+		root.style.removeProperty('--dshr-drawer-peek');
+		root.style.removeProperty('--dshr-ime');
+		root.style.removeProperty('--dshr-vv-height');
+		// 2) hook 创建的节点：悬浮鲸鱼、抽屉遮罩、状态栏挡板、drag handle。
+		for (var n = 0; n < HOOK_NODE_IDS.length; n++) {
+			var own = document.getElementById(HOOK_NODE_IDS[n]);
+			if (own && own.parentNode) own.parentNode.removeChild(own);
+		}
+		// 3) 打在官方节点上的标记与行内样式（全部由本脚本写入，可安全还原）。
+		resetFloatHosts();
+		clearDrawerVisual();
+		unmarkAll();
+		// 4) 丢弃深浅色缓存：否则切回 phone 档时 syncPageTheme 会因「值没变」
+		//    早退，data-dshr-dark 补不回来，状态就与首次装上不一致了。
+		lastPageDark = null;
+	}
+	var HOOK_NODE_IDS = [
+		'dshr-mobile-whale',
+		'dshr-mobile-drawer-mask',
+		'dshr-status-guard',
+		'dshr-drawer-handle',
+	];
+
+	function removeHookAttributes(node) {
+		if (!node || node.nodeType !== 1) return;
+		var names = [];
+		var attrs = node.attributes;
+		for (var i = 0; i < attrs.length; i++) names.push(attrs[i].name);
+		for (var j = 0; j < names.length; j++) {
+			if (names[j].indexOf('data-dshr-') === 0) node.removeAttribute(names[j]);
+		}
+	}
+
+	/** 还原 clampFloatHost 改写过的行内样式（position/left/top/... 全是本脚本写的）。 */
+	function resetFloatHosts() {
+		if (!document.querySelectorAll) return;
+		var props = ['position', 'left', 'top', 'right', 'bottom', 'width', 'max-width',
+			'max-height', 'min-width', 'transform', 'margin', 'box-sizing'];
+		var hosts = document.querySelectorAll('[data-dshr-float]');
+		for (var i = 0; i < hosts.length; i++) {
+			for (var p = 0; p < props.length; p++) hosts[i].style.removeProperty(props[p]);
+		}
+	}
+
+	/** 清掉标记台账：只删本脚本自己加的属性，不碰官方原生属性。 */
+	function unmarkAll() {
+		if (!marked) return;
+		for (var i = 0; i < marked.length; i++) {
+			var entry = marked[i];
+			if (entry[0] && entry[0].removeAttribute) entry[0].removeAttribute(entry[1]);
+		}
+		marked = [];
+		// markJobIndicator 的数量属性不走 mark()，单独清一次。
+		if (!document.querySelectorAll) return;
+		var jobs = document.querySelectorAll('[data-dshr-job-n]');
+		for (var j = 0; j < jobs.length; j++) jobs[j].removeAttribute('data-dshr-job-n');
+	}
+
 	function applyWidthScope() {
 		var tablet = isTabletViewport();
 		var portrait = isPortraitViewport();
-		var on;
-		if (isAndroidShell()) {
-			// 安卓端旧行为原式：仅竖屏启用；壳内不看宽度断点（部分机型 layout
-			// viewport 虚高），横屏交给官方 DSH 桌面布局。
-			on = portrait && (isAndroidShell() || mql.matches);
-		} else {
-			// web 端旧行为：不看竖横屏，视口宽度 ≤ 断点即启用；
-			// iPad 横屏（≥断点）自然回到官方布局。
-			on = !!mql.matches;
-		}
+		var on = resolveHookEnabled(portrait);
+		hookOn = on;
 		var root = document.documentElement;
+		if (!on && isStrictOff()) {
+			// 平板档：官方布局零改动，直接走拆除路径（不写 dshr-official-inset）。
+			teardownHookTraces();
+			return;
+		}
 		root.classList[on ? 'add' : 'remove'](ROOT_CLASS);
 		root.classList[on ? 'remove' : 'add']('dshr-official-inset');
 		if (on && tablet) root.setAttribute('data-dshr-tablet', '1');
@@ -1114,6 +1251,19 @@
 		applyImeLift();
 		reportImeFocusToNative();
 	}
+
+	// ── 运行时档位切换 API（契约 3.3） ──
+	// 必须挂在脚本顶层：原生 onConfigurationChanged 可能在本脚本装完前就调用。
+	// 装完前只落配置（供 applyWidthScope 首次计算用），装完后立即按最新值重算。
+	window.__dshrSetDevice = function (mode) {
+		var next = normalizeDeviceMode(mode);
+		if (!next) return false;
+		if (next === deviceMode) return false;
+		deviceMode = next;
+		if (typeof recomputeDeviceScope === 'function') recomputeDeviceScope();
+		return true;
+	};
+	var recomputeDeviceScope = null;
 	if (mql.addEventListener) mql.addEventListener('change', applyWidthScope);
 	else if (mql.addListener) mql.addListener(applyWidthScope);
 	if (portraitMql) {
@@ -1124,11 +1274,22 @@
 	bindImeLift();
 
 	// ── 原生 inset 变量（MainActivity 在页面加载/焦点变化时调用） ──
+	// 平板档由原生容器给 WebView 让位（契约 3.6），页面不再持有这两个行内变量；
+	// 但仍记住最后一次收到的值，切回 phone 档时立刻补写，保证可逆。
+	var lastInsetTop = 0;
+	var lastInsetBottom = 0;
 	window.__dshRemoteInsets = {
 		set: function (topPx, bottomPx) {
+			var top = Number(topPx);
+			var bottom = Number(bottomPx);
+			if (isNaN(top)) top = 0;
+			if (isNaN(bottom)) bottom = 0;
+			lastInsetTop = top;
+			lastInsetBottom = bottom;
+			if (isStrictOff()) return;
 			var rootStyle = document.documentElement.style;
-			rootStyle.setProperty('--dshr-inset-top', Number(topPx) + 'px');
-			rootStyle.setProperty('--dshr-inset-bottom', Number(bottomPx) + 'px');
+			rootStyle.setProperty('--dshr-inset-top', top + 'px');
+			rootStyle.setProperty('--dshr-inset-bottom', bottom + 'px');
 			applyImeLift();
 		},
 	};
@@ -1960,11 +2121,6 @@
 		if (node.getAttribute('data-state') === 'closed') return false;
 		var role = (node.getAttribute('role') || '').toLowerCase();
 		if (role === 'menu' || role === 'listbox' || role === 'tree') return true;
-		if (node.hasAttribute('data-radix-popper-content-wrapper')) return true;
-		if (node.hasAttribute('data-radix-menu-content')) return true;
-		if (node.hasAttribute('data-radix-select-content')) return true;
-		if (node.hasAttribute('data-radix-dropdown-menu-content')) return true;
-		if (node.hasAttribute('data-radix-popover-content')) return true;
 		if (node.querySelector('[role="menuitem"], [role="option"], [role="menuitemradio"], [role="menuitemcheckbox"]')) {
 			return isFloatingHost(node) || isFloatingHost(node.parentElement);
 		}
@@ -1988,11 +2144,6 @@
 			'[role="menu"]',
 			'[role="listbox"]',
 			'[role="tree"]',
-			'[data-radix-popper-content-wrapper]',
-			'[data-radix-menu-content]',
-			'[data-radix-select-content]',
-			'[data-radix-dropdown-menu-content]',
-			'[data-radix-popover-content]',
 		].join(',');
 		var nodes = document.querySelectorAll(selector);
 		var roots = [];
@@ -2744,6 +2895,9 @@
 	}
 
 	function syncDom() {
+		// 严格 OFF（平板档）：观察器保留但立即返回——契约 3.5 允许的「早退的
+		// observer」。这里必须早于任何标记/建节点动作，否则会重新留下痕迹。
+		if (isStrictOff()) return;
 		var root = document.documentElement;
 		var frame = findFrame();
 		if (frame) {
@@ -2859,7 +3013,15 @@
 	// 脚本首次执行时尝试一次；否则初始标记虽能由 boot 补齐，后续展开状态无人同步。
 	var observer = null;
 	function startObserver() {
-		if (observer !== null) return true;
+		if (observer !== null) {
+			// 观察器本身还装着，但严格 OFF 的拆除已抹掉 data-dshr-observer；
+			// 切回 phone 档时必须补回，否则与「首次装上」的状态不可逆。
+			if (!isStrictOff()) document.documentElement.setAttribute('data-dshr-observer', '1');
+			return true;
+		}
+		// 严格 OFF 不装观察器：它会在 <html> 上写 data-dshr-observer，本身就是痕迹。
+		// 切回 phone 档时由 recomputeDeviceScope 补装。
+		if (isStrictOff()) return false;
 		if (typeof MutationObserver === 'undefined' || !document.body) return false;
 		observer = new MutationObserver(syncDom);
 		observer.observe(document.body, {
@@ -2868,7 +3030,6 @@
 				'data-sidebar-collapsed',
 				'data-dshx-overlay',
 				'data-rightbar-fullscreen',
-				'data-rightbar-open',
 				'data-ds-dark-theme',
 				'role',
 				'aria-modal',
@@ -2886,6 +3047,8 @@
 
 	var bootTicks = 0;
 	function boot() {
+		// 平板档：官方 DOM 探针与 hook 无关，不做有界重试（否则白烧 12s 定时器）。
+		if (isStrictOff()) return;
 		var observing = startObserver();
 		syncDom();
 		var ready = document.documentElement.getAttribute('data-dshr-ready') === '1';
@@ -2895,6 +3058,17 @@
 			window.setTimeout(boot, 300);
 		}
 	}
+	// 运行时切回 phone 档时补装观察器并按最新 DOM 重算（契约 3.3 的立即生效）。
+	recomputeDeviceScope = function () {
+		applyWidthScope();
+		if (!hookOn) return;
+		// 平板档期间原生 inset 只被记住、没写进 DOM，这里补写回来保证可逆。
+		var rootStyle = document.documentElement.style;
+		rootStyle.setProperty('--dshr-inset-top', lastInsetTop + 'px');
+		rootStyle.setProperty('--dshr-inset-bottom', lastInsetBottom + 'px');
+		startObserver();
+		syncDom();
+	};
 	boot();
 	if (document.readyState === 'loading') {
 		document.addEventListener('DOMContentLoaded', function () {

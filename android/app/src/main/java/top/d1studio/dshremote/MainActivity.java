@@ -22,6 +22,7 @@ import android.text.InputType;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.ContextThemeWrapper;
+import android.view.DisplayCutout;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
@@ -83,11 +84,24 @@ import java.util.concurrent.ScheduledExecutorService;
 public class MainActivity extends Activity {
 
 	public static final String PREFS = "dsh_remote";
+
+	/**
+	 * 隧道常驻通知「连接设置」动作的 Intent action（D6）。
+	 * 平板档（sw >= 600）不装移动 hook，页面上没有长按鲸鱼入口（契约 3.4），
+	 * 通知是运行中进入连接设置页的进程外入口；与 ACTION_STOP 是两码事，不碰隧道。
+	 */
+	public static final String ACTION_OPEN_SETTINGS = "top.d1studio.dshremote.action.OPEN_SETTINGS";
+
 	private static final String KEY_URL = "gateway_url";
 	private static final String KEY_CERT_PREFIX = "cert_fp_";
 	private static final String KEY_HTTP_AUTH_REMEMBER_PREFIX = "http_auth_remember_";
 	private static final String MOBILE_UA_TOKEN = " DSHRemoteAndroid/1";
 	private static final int IME_PAD_HYSTERESIS_DP = 12;
+	/** 平板档门槛（契约 3.1）：smallestScreenWidthDp >= 600 即平板 / 折叠屏展开。 */
+	private static final int TABLET_SW_DP = 600;
+	/** 设备档位：契约里 device 的两个原生取值。 */
+	private static final String MODE_PHONE = "phone";
+	private static final String MODE_TABLET = "tablet";
 	private static final int REQ_FILE_CHOOSER = 1001;
 	private static final int REQ_NOTIF_PERM = 1002;
 	private static final long TUNNEL_READY_TIMEOUT_MS = 20_000L;
@@ -116,6 +130,14 @@ public class MainActivity extends Activity {
 	/** 从会话进入连接设置时暂存，用于「返回会话」而不必重连。 */
 	private String resumeUrl = "";
 	private boolean canResumeSession = false;
+	/**
+	 * 本次连接设置页是不是「平板档 + 会话根返回键」进来的（D6.1）。为 true 时设置页的
+	 * 返回键退到后台而不是回会话——否则平板档下「会话根 → 设置 → 返回 → 会话 → 返回 →
+	 * 设置」死循环，用返回键退不出 App。一次性消费：退后台那一刻立即清零，任何离开设置页
+	 * 的路径也都经 clearResumeSession() 清零，故再次进入会话/设置不会残留。
+	 * 手机档永不置位（唯一置位点在 finishWebBack() 的 isTabletClass() 分支内）。
+	 */
+	private boolean settingsViaBackKey = false;
 	private UiState uiState = UiState.BOOTSTRAP;
 	/** 每次重新配置/断开都递增，过期的隧道等待线程不得再打开旧页面。 */
 	private int connectionGeneration = 0;
@@ -177,7 +199,7 @@ public class MainActivity extends Activity {
 		ensureWebView();
 		ProfileStore.migrateLegacy(prefs());
 		ProfileStore.migrateDirect(prefs());
-		if (!handleImportIntent(getIntent())) {
+		if (!handleImportIntent(getIntent()) && !handleOpenSettingsIntent(getIntent())) {
 			// 启动一律进服务器选择页：上次连的 server 不在线时，自动连接会把 App
 			// 卡死在连接壳。连哪个 server 由用户当场手选（导入链接除外，那是显式意图）。
 			showHome();
@@ -188,7 +210,8 @@ public class MainActivity extends Activity {
 	protected void onNewIntent(Intent intent) {
 		super.onNewIntent(intent);
 		setIntent(intent);
-		handleImportIntent(intent);
+		if (handleImportIntent(intent)) return;
+		handleOpenSettingsIntent(intent);
 	}
 
 	@Override
@@ -718,7 +741,12 @@ public class MainActivity extends Activity {
 			resumeSessionBtn.setVisibility(canResumeSession ? View.VISIBLE : View.GONE);
 		}
 		if (tvTunnelState != null && canResumeSession) {
-			tvTunnelState.setText("隧道仍在运行。点上方「返回当前会话」或系统返回键继续，无需重新连接。");
+			// D6.1：平板档由返回键进入时，返回键 = 退到后台（不回会话，否则死循环），
+			// 这时不能再承诺「系统返回键继续」——只承诺上方按钮。其余入口（通知动作 /
+			// 长按鲸鱼 / 手机档）返回键确实回会话，原文案成立。
+			tvTunnelState.setText(settingsViaBackKey && isTabletClass()
+				? "隧道仍在运行。点上方「返回当前会话」继续，无需重新连接。"
+				: "隧道仍在运行。点上方「返回当前会话」或系统返回键继续，无需重新连接。");
 		}
 		if (homeScroll != null) homeScroll.setVisibility(View.VISIBLE);
 		if (setupScroll != null) setupScroll.setVisibility(View.GONE);
@@ -728,6 +756,9 @@ public class MainActivity extends Activity {
 	private void clearResumeSession() {
 		canResumeSession = false;
 		resumeUrl = "";
+		// 离开连接设置页的所有出口（返回会话、返回键退后台之外的重连、直连、showHome）
+		// 都经这里，顺带把「本次来自返回键路径」的一次性标记清掉，不留残值。
+		settingsViaBackKey = false;
 		if (resumeSessionBtn != null) resumeSessionBtn.setVisibility(View.GONE);
 	}
 
@@ -907,6 +938,20 @@ public class MainActivity extends Activity {
 		ProfileStore.upsert(prefs(), p);
 		ProfileStore.setActiveId(prefs(), p.id);
 		beginTunnel(p);
+		return true;
+	}
+
+	/**
+	 * 隧道常驻通知「连接设置」动作的落点（D6）。冷启动（onCreate）与已在前台/后台
+	 * （onNewIntent，Activity 是 singleTask）两条路径复用同一入口，行为一致：
+	 * 只切到连接设置页，不动隧道、不重载 WebView 页面。
+	 * 与 handleImportIntent 一样是「一次性意图」：消费后清掉 Intent 上的 action，
+	 * 避免系统因内存回收重建 Activity 时又无端跳回设置页。
+	 */
+	private boolean handleOpenSettingsIntent(Intent i) {
+		if (i == null || !ACTION_OPEN_SETTINGS.equals(i.getAction())) return false;
+		i.setAction(null);
+		showConnectionSettings();
 		return true;
 	}
 
@@ -1282,6 +1327,8 @@ public class MainActivity extends Activity {
 		rootLayout.setFitsSystemWindows(false);
 		rootLayout.setOnApplyWindowInsetsListener((view, insets) -> {
 			applyImeShift(imeBottomPx(insets));
+			// 平板档的让位量直接取系统栏/挖孔，导航模式与横竖屏变化都要跟上。
+			applyDeviceClassInsets();
 			// 导航模式 / 平板任务栏变化未必触发页面加载或焦点事件。
 			// 下一帧读取最新 root insets；IME 动画中不注入 JS，避免重排。
 			if (!imeAnimating && webView != null) {
@@ -1449,8 +1496,103 @@ public class MainActivity extends Activity {
 		return mobileAdaptJs;
 	}
 
+	/**
+	 * 设备档位的【唯一权威实现】（契约 3.1）：只看原生的 smallestScreenWidthDp，
+	 * 不得在壳里改用 JS 视口宽度——部分机型 layout viewport 虚高（WEB-02 既有结论）。
+	 * sw >= 600 → tablet（平板 / 折叠屏展开）；否则 phone。折叠/展开由系统改写
+	 * Configuration，onConfigurationChanged 里重算即生效。
+	 */
+	private String deviceMode() {
+		int sw = getResources().getConfiguration().smallestScreenWidthDp;
+		return sw >= TABLET_SW_DP ? MODE_TABLET : MODE_PHONE;
+	}
+
+	private boolean isTabletClass() {
+		return MODE_TABLET.equals(deviceMode());
+	}
+
+	/**
+	 * 把原生判定的档位写进注入配置（契约 3.2 的 device 字段）。
+	 * 必须排在注入 mobile.js 之前，否则 hook 首次执行读到的可能是旧值/空值。
+	 * Object.assign 保留网关下发的 breakpoint。
+	 */
+	private void applyDeviceModeToPage(WebView view) {
+		if (view == null) return;
+		view.evaluateJavascript(
+			"(function(){window.__DSHR_MOBILE__=Object.assign(window.__DSHR_MOBILE__||{},{device:'"
+				+ deviceMode() + "'});})()",
+			null);
+	}
+
+	/**
+	 * 运行时切换（契约 3.3）：先写配置，再调 hook 暴露的幂等 API。
+	 * 放在同一段脚本里，顺序天然确定；hook 未安装时该 API 只更新配置、不抛错。
+	 * 折叠/展开与旋转都走这里——不重载 WebView、不碰隧道。
+	 */
+	private void syncDeviceModeToPage(WebView view) {
+		if (view == null) return;
+		String mode = deviceMode();
+		view.evaluateJavascript(
+			"(function(){window.__DSHR_MOBILE__=Object.assign(window.__DSHR_MOBILE__||{},{device:'" + mode
+				+ "'});var s=window.__dshrSetDevice;if(typeof s==='function')s('" + mode + "');})()",
+			null);
+	}
+
+	/**
+	 * 注入移动适配脚本。所有注入点都必须经过这里，因此「先写档位配置」是结构性的：
+	 * 配置写入与脚本注入是同一个方法内相邻的两条 evaluateJavascript，同线程按序执行，
+	 * hook 首次执行时一定读得到正确档位。
+	 */
 	private void injectMobileAdaptation(WebView view) {
+		applyDeviceModeToPage(view);
 		view.evaluateJavascript(readMobileAdaptJs(), null);
+	}
+
+	/**
+	 * 平板档位的系统栏让位（契约 3.6 / 验收 G5）：用 WebView 自身的 padding 收缩内容视口，
+	 * 官方布局拿到的是一个「本来就小一号」的视口——不写任何 DOM/CSS。
+	 * 手机档位恒为 0 padding，现有 edge-to-edge + --dshr-inset-* 透传完全不变；
+	 * 本地壳页（uiState != WEB）自带同名 CSS 变量接收端，也不走这里，避免双重留白。
+	 */
+	private void applyDeviceClassInsets() {
+		if (webView == null) return;
+		boolean pad = isTabletClass() && uiState == UiState.WEB;
+		if (!pad) {
+			if (webView.getPaddingLeft() != 0 || webView.getPaddingTop() != 0
+					|| webView.getPaddingRight() != 0 || webView.getPaddingBottom() != 0) {
+				webView.setPadding(0, 0, 0, 0);
+			}
+			return;
+		}
+		WindowInsets insets = getWindow().getDecorView().getRootWindowInsets();
+		if (insets == null) {
+			webView.setPadding(0, 0, 0, 0);
+			return;
+		}
+		int left, top, right, bottom;
+		if (Build.VERSION.SDK_INT >= 30) {
+			Insets cut = insets.getInsets(WindowInsets.Type.displayCutout());
+			left = cut.left;
+			right = cut.right;
+			// 横屏挖孔在左右、竖屏在顶部；导航模式切换会变，所以只靠 statusBars 不够。
+			top = Math.max(insets.getInsets(WindowInsets.Type.statusBars()).top, cut.top);
+			bottom = Math.max(insets.getInsets(WindowInsets.Type.navigationBars()).bottom, cut.bottom);
+		} else {
+			left = 0;
+			right = 0;
+			top = insets.getSystemWindowInsetTop();
+			bottom = insets.getStableInsetBottom();
+			if (Build.VERSION.SDK_INT >= 28) {
+				DisplayCutout cut = insets.getDisplayCutout();
+				if (cut != null) {
+					left = cut.getSafeInsetLeft();
+					right = cut.getSafeInsetRight();
+					top = Math.max(top, cut.getSafeInsetTop());
+					bottom = Math.max(bottom, cut.getSafeInsetBottom());
+				}
+			}
+		}
+		webView.setPadding(left, top, right, bottom);
 	}
 
 	/**
@@ -1458,11 +1600,15 @@ public class MainActivity extends Activity {
 	 * 若脚本始终缺失（evaluateJavascript 丢失、极端 WebView 环境），
 	 * 退回实色状态栏模式——内容整体位于状态栏下方，绝不与系统栏重叠；
 	 * 脚本正常时保持透明状态栏沉浸模式。
+	 * 平板档位整体跳过：那里 hook 主动保持关闭，__dshRemoteMobileInstalled 必然缺失，
+	 * 跑这套自检只会误退成实色状态栏并反复补注，把平板模式搞坏。
 	 */
 	private void scheduleAdaptationProbe(WebView view) {
 		view.postDelayed(() -> {
 			if (uiState != UiState.WEB || view.getVisibility() != View.VISIBLE) return;
+			if (isTabletClass()) return;
 			view.evaluateJavascript("String(window.__dshRemoteMobileInstalled===true)", value -> {
+				if (uiState != UiState.WEB || isTabletClass()) return;
 				boolean injected = value != null && value.contains("true");
 				applySystemBarMode(injected);
 				if (!injected) {
@@ -1470,8 +1616,9 @@ public class MainActivity extends Activity {
 					injectMobileAdaptation(view);
 					applyInsetsToPage(view);
 					view.postDelayed(() -> {
-						if (uiState != UiState.WEB) return;
+						if (uiState != UiState.WEB || isTabletClass()) return;
 						view.evaluateJavascript("String(window.__dshRemoteMobileInstalled===true)", retry -> {
+							if (uiState != UiState.WEB || isTabletClass()) return;
 							if (retry != null && retry.contains("true")) applySystemBarMode(true);
 						});
 					}, 2000);
@@ -1493,10 +1640,23 @@ public class MainActivity extends Activity {
 		}
 		applySystemBars();
 		if (webView != null && uiState == UiState.WEB) {
+			// 折叠/展开、旋转后按新档位即时生效（契约 3.1/3.3）：
+			// 只改注入配置 + 调 hook 的幂等切换 API，绝不重载 WebView、绝不碰隧道。
+			applyDeviceClassInsets();
+			if (!isTabletClass()) {
+				// 折回手机档时补一次注入：hook 在平板档可能整体早退，
+				// 只靠 __dshrSetDevice 不保证脚本已装上（契约 3.3 的保守解读）。
+				injectMobileAdaptation(webView);
+			}
+			syncDeviceModeToPage(webView);
 			applyInsetsToPage(webView);
 			webView.evaluateJavascript(
 				"(function(){var a=window.__dshRemoteAndroidMobile;if(a&&a.syncViewport)a.syncViewport();})()",
 				null);
+			if (!isTabletClass()) {
+				// 重新自检一次：档位切换不会触发页面加载，靠它把状态栏模式拉回正确值。
+				scheduleAdaptationProbe(webView);
+			}
 		}
 	}
 
@@ -1516,12 +1676,20 @@ public class MainActivity extends Activity {
 	private void applySystemBars() {
 		boolean session = uiState == UiState.WEB;
 		boolean dark = session ? pageDark : isSystemDark();
-		boolean edge = !session || edgeToEdgeChrome;
+		// 平板档位恒为沉浸态：hook 关闭、页面不知道自己拿的是「缩过」的视口，
+		// 状态栏必须透明 + 让位，不能沿用手机档「注入失败退实色」的判定。
+		boolean tabletSession = session && isTabletClass();
+		boolean edge = !session || tabletSession || edgeToEdgeChrome;
 		if (rootLayout != null) rootLayout.setBackgroundColor(session
 			? (dark ? 0xFF141414 : Color.WHITE) : shellColor(R.color.shell_background));
 		if (!session) {
 			tintShell(homeScroll);
 			tintShell(setupScroll);
+		}
+		// 平板档下状态栏/导航栏露出的是 WebView padding 区（背景即页面底色），
+		// 这里把 WebView 底色钉到页面深浅色，避免出现壳色色块。
+		if (tabletSession && webView != null) {
+			webView.setBackgroundColor(dark ? 0xFF141414 : Color.WHITE);
 		}
 		// 只在适配已启用的会话中透明：各列 CSS inset 留空间，背景画到手势条下。
 		int nav = edge ? Color.TRANSPARENT : (dark ? 0xFF141414 : Color.WHITE);
@@ -1565,6 +1733,8 @@ public class MainActivity extends Activity {
 				controller.setSystemBarsAppearance(dark ? 0 : mask, mask);
 			}
 		}
+		// 系统栏形态一变就同步平板档的 WebView 让位（导航模式切换/折叠都会走到这里）。
+		applyDeviceClassInsets();
 	}
 
 	private void hideSettings() {
@@ -2109,6 +2279,14 @@ public class MainActivity extends Activity {
 		}
 		if (uiState == UiState.HOME) {
 			if (canResumeSession) {
+				// D6.1：只有「平板档 && 本次由返回键路径进入设置」才退后台；其余一切
+				// （手机档任意路径、平板档下通知动作/长按鲸鱼进入）仍回会话。
+				// 读取即消费：退后台前清零，标记不会带到下一次进入。
+				if (settingsViaBackKey && isTabletClass()) {
+					settingsViaBackKey = false;
+					moveTaskToBack(true);
+					return;
+				}
 				resumeSession();
 				return;
 			}
@@ -2133,7 +2311,8 @@ public class MainActivity extends Activity {
 
 	/**
 	 * 会话内返回：先关官方弹层/侧栏（由 JS 处理）；再仅在同一网关内 goBack。
-	 * 不退到连接壳或设置页。已在会话根时把 App 放到后台，隧道继续跑。
+	 * 平板档在会话根改为打开 App 连接设置（D6 ①）；手机档沿用旧行为——
+	 * 已在会话根时把 App 放到后台，隧道继续跑。
 	 */
 	private void finishWebBack() {
 		if (uiState != UiState.WEB || webView == null || webView.getVisibility() != View.VISIBLE) {
@@ -2152,6 +2331,23 @@ public class MainActivity extends Activity {
 				}
 			}
 			webView.clearHistory();
+		}
+		// 走到这里就是「会话根」：上面已判定没有官方弹层要关（JS 回调没关掉任何东西）、
+		// 没有侧栏要收（同一个回调）、WebView 也没有同网关的上一页可回。
+		// D6 ①：平板档不装移动 hook，页面上没有长按鲸鱼入口，这里是兜底——
+		// 改为打开连接设置页；再按一次由 handleAppBack() 的 HOME 分支决定
+		// （有活会话就回会话，没有才退到后台）。showConnectionSettings() 不杀隧道、
+		// 不丢 WebView 页面，设置页自身的返回行为一字未改。
+		// 手机档：isTabletClass() 为 false，直接落到原来的 moveTaskToBack(true)。
+		if (isTabletClass()) {
+			// 记下本次是「返回键路径」进来的：设置页的返回键据此退到后台（D6.1），
+			// 而不是走 HOME 分支回会话——那会变成会话⇄设置死循环。
+			// 置位只在平板档分支内，手机档本标记恒为 false，行为一字未改。
+			// 若此时没有活会话（fromSession 为 false），showConnectionSettings() 内部的
+			// clearResumeSession() 会把标记清掉——那种情况返回键本就走 super.onBackPressed()。
+			settingsViaBackKey = true;
+			showConnectionSettings();
+			return;
 		}
 		moveTaskToBack(true);
 	}

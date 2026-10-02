@@ -7,6 +7,8 @@ let react_jsx_runtime = require("react/jsx-runtime");
 * DSH-Remote —— 浏览器半边：设置 → 插件 里的配置卡片。
 *
 * 与 dsh-explorer 同一套接入方式：slots.inject("settings.plugin.item") 注册卡片；
+* 0.2.0+ 宿主该卡片槽改版为 settings.plugins.tab 列表槽，这里双槽位注册、
+* 两代宿主各取所需（详见 apply() 内注释）。
 * 数据不走 localStorage（那些值必须落在 PC 的 config.json），而是通过插件宿主
 * 半边注册在 DSH webServer 上的 /dsh-remote/config 路由读写，保存后宿主会
 * 自动重启网关子进程生效。
@@ -231,7 +233,12 @@ function Row({ label, hint, children }) {
 	});
 }
 /** 设置 → 插件 页的 DSH Remote 卡片。 */
-function DshRemoteSettingsCard() {
+/**
+* 设置卡本体。`as` 参数化根元素：0.1.x 宿主的 settings.plugin.item 列表槽
+* 渲染在 <ul> 里（语义根 <li>），0.2.x 的 settings.plugins.tab 渲染在
+* div.panel 里（语义根 <div>）——见 apply() 的双槽位注册。
+*/
+function DshRemoteSettingsCard({ as = "li" } = {}) {
 	const [open, setOpen] = (0, react.useState)(false);
 	const [form, setForm] = (0, react.useState)(null);
 	const [status, setStatus] = (0, react.useState)(null);
@@ -392,7 +399,7 @@ function DshRemoteSettingsCard() {
 	const formName = String(form?.frp?.name ?? "").trim() || "dsh-remote";
 	const liveName = Array.isArray(tunnel?.proxies) ? tunnel.proxies.find((proxy) => proxy.type === "xtcp")?.name ?? tunnel.proxies[0]?.name : void 0;
 	const tunnelMismatch = tunnel !== null && (formAddr !== String(tunnel.serverAddr ?? "") || formPort !== Number(tunnel.serverPort ?? 0) || typeof liveName === "string" && liveName.length > 0 && liveName !== formName);
-	return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", {
+	return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(as, {
 		className: `dshr-card${open ? " open" : ""}`,
 		children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
 			type: "button",
@@ -562,6 +569,10 @@ function DshRemoteSettingsCard() {
 		}) : null]
 	});
 }
+/** 0.2.x 设置页 tab 容器：渲染在 div.panel 里，避免 <li> 裸根。 */
+function DshRemoteSettingsTab() {
+	return /* @__PURE__ */ (0, react_jsx_runtime.jsx)(DshRemoteSettingsCard, { as: "div" });
+}
 /** 必需服务：槽位注册器。移动端适配由 Android App 注入完成（见 android 壳），插件不再参与。 */
 const inject = ["slots"];
 const name = "dsh-remote-plugin";
@@ -585,6 +596,23 @@ function apply(ctx) {
 		});
 	} catch (error) {
 		console.error("dsh-remote: settings card inject failed", error);
+	}
+	try {
+		ctx.slots.inject("settings.plugins.tab", () => {
+			try {
+				return ctx.slots.register({
+					name: "settings.plugins.tab",
+					id: "dsh-remote",
+					order: 40,
+					label: "DSH Remote"
+				}, DshRemoteSettingsTab);
+			} catch (error) {
+				console.error("dsh-remote: settings tab register failed", error);
+				return () => {};
+			}
+		});
+	} catch (error) {
+		console.error("dsh-remote: settings tab inject failed", error);
 	}
 }
 //#endregion

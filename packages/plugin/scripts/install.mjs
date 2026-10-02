@@ -39,8 +39,12 @@ const opt = (name) => {
 	const i = argv.indexOf(name);
 	return i >= 0 && argv[i + 1] !== undefined && !argv[i + 1].startsWith("--") ? argv[i + 1] : undefined;
 };
-const PROFILE = opt("--profile") ?? "web";
 const DSH_HOME = process.env.DSH_HOME || join(process.env.USERPROFILE || process.env.HOME || "", ".dsh");
+// 目标 profile：显式 --profile 优先；否则自动识别——官方桌面（DeepSeek Harness
+// 桌面端）的 profile 名为 desktop，第三方 DSH Desktop（内嵌 dsh web）为 web。
+// 两者并存时优先 desktop（官方桌面是当前活跃宿主），日志会明示所选目标。
+const defaultProfile = existsSync(join(DSH_HOME, "profiles", "desktop")) ? "desktop" : "web";
+const PROFILE = opt("--profile") ?? defaultProfile;
 const PROFILE_DIR = join(DSH_HOME, "profiles", PROFILE);
 const PATCH_PATH = join(PROFILE_DIR, "cordis.patch.yml");
 const FARM_DIR = join(DSH_HOME, "profiles", "node_modules");
@@ -53,8 +57,10 @@ const log = (...parts) => console.log(...parts);
 /**
  * PLG-01：尽力读取所适配的 DSH 宿主版本（写进安装标记）。
  * 优先级：env DSH_HOST_VERSION → DSH Desktop 安装位置的 payload-manifest.json
- * （frontend.version）→ dsh-web-frontend 包 package.json → "unknown"。
- * 读不到不阻塞安装：标记里记 "unknown"，--repair 仍能按链接/行本身体检。
+ * （frontend.version）→ dsh-web-frontend 包 package.json → 官方桌面侧的
+ * profile 包农场（~/.dsh/profiles/node_modules/@deepseek-ai/dsh，两代桌面
+ * 通用）→ "unknown"。读不到不阻塞安装：标记里记 "unknown"，--repair 仍能
+ * 按链接/行本身体检。
  */
 function detectHostVersion() {
 	const fromEnv = process.env.DSH_HOST_VERSION;
@@ -84,6 +90,15 @@ function detectHostVersion() {
 			}
 		} catch { /* 尝试下一个来源 */ }
 	}
+	// 官方桌面（DeepSeek Harness）：宿主版本与 profile 农场里的 @deepseek-ai/dsh
+	// 包一致（农场即宿主运行时的包集，CLI/桌面两代通用）。
+	try {
+		const farmDshPath = join(DSH_HOME, "profiles", "node_modules", "@deepseek-ai", "dsh", "package.json");
+		const farmDsh = JSON.parse(readFileSync(farmDshPath, "utf8"));
+		if (typeof farmDsh.version === "string" && farmDsh.version.length > 0) {
+			return { version: farmDsh.version, source: farmDshPath };
+		}
+	} catch { /* 尝试下一个来源 */ }
 	return { version: "unknown", source: "not-detected" };
 }
 
@@ -225,7 +240,9 @@ function ensurePatchRow() {
 
 log(`▶ dsh-remote-plugin ${REPAIR ? "修复体检" : "安装"}${DRY ? "（dry-run）" : ""}`);
 log(`  repo:     ${REPO_ROOT}`);
-log(`  profile:  ${PROFILE_DIR}`);
+log(`  profile:  ${PROFILE_DIR}${opt("--profile") === undefined
+	? `（自动识别 → ${PROFILE === "desktop" ? "官方桌面端 desktop" : "web 宿主 web"}；可用 --profile 覆盖）`
+	: ""}`);
 
 if (!existsSync(join(GATEWAY_DIR, "src", "cli.ts"))) throw new Error(`找不到 gateway 包：${GATEWAY_DIR}`);
 if (!existsSync(join(PLUGIN_DIR, "lib", "index.js"))) throw new Error(`找不到 plugin 包：${PLUGIN_DIR}`);

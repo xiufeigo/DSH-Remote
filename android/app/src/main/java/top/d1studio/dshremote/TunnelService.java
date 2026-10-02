@@ -25,7 +25,8 @@ import android.util.Log;
  * 通知：Android 要求前台服务必须挂一条通知。有智能体任务在跑时，通知显示
  * 会话标题和当前内容；空闲时改到静默渠道（尽量不进通知栏）。旧的「隧道」
  * 渠道一旦创建就降不了重要性，空闲必须换新渠道 id。
- * 通知带「断开」操作（AND-02），不进 App 即可停隧道。
+ * 通知带「断开」操作（AND-02），不进 App 即可停隧道；另有「连接设置」操作（D6 ②），
+ * 给平板档（hook 关闭、页面上没有长按鲸鱼入口）补一个运行中进连接设置页的入口。
  */
 public class TunnelService extends Service {
 
@@ -210,6 +211,10 @@ public class TunnelService extends Service {
 		// AND-02：通知直达「断开」，不必先进 App 再停隧道。
 		b.addAction(new Notification.Action.Builder(
 			R.drawable.ic_stat_tunnel, "断开", stopIntent()).build());
+		// D6 ②：通知直达「连接设置」。平板档不装移动 hook，页面上没有长按鲸鱼入口，
+		// 这里是运行中进连接设置页的进程外入口；点它不碰隧道，只切 MainActivity 的界面。
+		b.addAction(new Notification.Action.Builder(
+			R.drawable.ic_stat_tunnel, "连接设置", settingsIntent()).build());
 		if (Build.VERSION.SDK_INT >= 21) {
 			b.setVisibility(running ? Notification.VISIBILITY_PUBLIC : Notification.VISIBILITY_SECRET);
 			b.setCategory(running ? Notification.CATEGORY_PROGRESS : Notification.CATEGORY_SERVICE);
@@ -245,6 +250,20 @@ public class TunnelService extends Service {
 		int flags = PendingIntent.FLAG_UPDATE_CURRENT;
 		if (Build.VERSION.SDK_INT >= 23) flags |= PendingIntent.FLAG_IMMUTABLE;
 		return PendingIntent.getService(this, 1, stop, flags);
+	}
+
+	/**
+	 * D6 ②：通知「连接设置」动作。requestCode 2 与内容点(0)、断开(1) 相互独立——
+	 * PendingIntent 的相等性不含 action，三个 requestCode 撞车会互相覆盖成同一个。
+	 * 目标是 MainActivity 而非本服务，因此点它不会走 onStartCommand，不影响隧道生命周期。
+	 */
+	private PendingIntent settingsIntent() {
+		Intent open = new Intent(this, MainActivity.class);
+		open.setAction(MainActivity.ACTION_OPEN_SETTINGS);
+		open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
+		int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+		if (Build.VERSION.SDK_INT >= 23) flags |= PendingIntent.FLAG_IMMUTABLE;
+		return PendingIntent.getActivity(this, 2, open, flags);
 	}
 
 	private static String clip(String text, int max) {

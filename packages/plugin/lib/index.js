@@ -432,6 +432,18 @@ export function createLaunchTokenDelivery(deps) {
 	};
 }
 
+/**
+ * 从宿主 webServer 服务提取可信的上游端口（纯函数，供钉桩测试）。
+ * dsh-host-webserver 的 WebServer 暴露 get port()（config.port 为 0 时是
+ * OS 分配的真实绑定值）；缺失/非法一律 undefined，交回 autoFixUpstreamPort 兜底。
+ */
+function upstreamPortHintFrom(server) {
+	const port = server?.port;
+	return typeof port === "number" && Number.isInteger(port) && port > 0 && port <= 65535
+		? port
+		: undefined;
+}
+
 // ============================================================================
 // 插件对象
 // ============================================================================
@@ -448,6 +460,20 @@ var plugin_default = {
 		let restartTimer = null;
 		let plannedStop = false;
 
+		// ── 上游端口精确交接（官方桌面端加固） ─────────────────────
+		// 官方桌面宿主（dsh-desktop-host）每次启动可能为内嵌 Web 宿主随机分配
+		// 端口；webServer 服务暴露 get port()（config.port 为 0 时返回 OS 分配
+		// 的真实绑定值）。把真实端口经 DSHR_UPSTREAM_PORT 交给网关子进程
+		// （applyEnvOverrides 优先级高于 config.json），免去启动扫描；取不到时
+		// 保持原状，由 autoFixUpstreamPort 的回环扫描兜底（两代宿主通用）。
+		const upstreamPortHint = () => {
+			try {
+				return upstreamPortHintFrom(typeof ctx.get === "function" ? ctx.get("webServer") : undefined);
+			} catch {
+				return undefined;
+			}
+		};
+
 		const spawnGateway = () => {
 			if (disposed) return;
 			if (child !== null && child.exitCode === null) {
@@ -462,10 +488,18 @@ var plugin_default = {
 				return;
 			}
 			plannedStop = false;
+			const hint = upstreamPortHint();
+			if (hint !== undefined) {
+				console.log(`${TAG} 上游端口精确交接：DSHR_UPSTREAM_PORT=${String(hint)}（来自宿主 webServer 服务）`);
+			}
 			let proc;
 			try {
 				proc = spawn(process.execPath, [cliPath, "start"], {
-					env: { ...process.env, DSH_REMOTE_HOME: home },
+					env: {
+						...process.env,
+						DSH_REMOTE_HOME: home,
+						...(hint !== undefined ? { DSHR_UPSTREAM_PORT: String(hint) } : {}),
+					},
 					stdio: ["ignore", "pipe", "pipe"],
 					windowsHide: true,
 				});
@@ -665,12 +699,23 @@ var plugin_default = {
 		}
 
 		// ── 设置命名空间（settings 服务存在时才注册） ────────────────
+		// 双代宿主兼容：0.1.x 用 settings.register(ns, schema, {applies:'live'})
+		// 挂命名空间（dsh-settings-file 的 SettingsForms）；0.2.0 起 SettingsForms
+		// 移除了 register（设置页改由 describe()/configure() 从 Loader 条目投影、
+		// 客户端卡片槽换 settings.plugins.tab），退化为 configure({auto:true})。
+		// 卡片本体由客户端半边的双槽位注册承载，两条路径都不影响网关与设置卡。
 		const settings = typeof ctx.get === "function" ? ctx.get("settings") : undefined;
 		if (settings !== undefined && typeof settings.register === "function") {
 			try {
 				settings.register("dsh-remote", buildSettingsSchema(), { applies: "live" });
 			} catch (error) {
 				console.error(`${TAG} settings.register 失败`, error);
+			}
+		} else if (settings !== undefined && typeof settings.configure === "function") {
+			try {
+				settings.configure({ auto: true });
+			} catch (error) {
+				console.warn(`${TAG} settings.configure 失败（0.2+ 宿主设置页自动表单降级，不影响网关与设置卡）：${String(error.message ?? error)}`);
 			}
 		}
 	},
@@ -767,4 +812,4 @@ function buildSettingsSchema() {
 	});
 }
 
-export { plugin_default as default };
+export { plugin_default as default, upstreamPortHintFrom };

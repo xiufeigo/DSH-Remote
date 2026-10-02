@@ -80,8 +80,34 @@ function assertSourceContracts() {
 	if (!src.includes("dshr-status-guard")) {
 		throw new Error("源码契约：缺少状态栏误触挡板 dshr-status-guard");
 	}
-	if (!src.includes("portrait && (isAndroidShell() || mql.matches)")) {
-		throw new Error("源码契约：Android hook 仅竖屏启用，横屏必须走官方 DSH");
+	// 0.2.0-rc.2 设备分档：启用矩阵（契约 3.4）取代旧的
+	// `portrait && (isAndroidShell() || mql.matches)` 单式。
+	if (!src.includes("function resolveHookEnabled")) {
+		throw new Error("源码契约：缺少 resolveHookEnabled 启用矩阵");
+	}
+	const matrix = src.match(/function resolveHookEnabled\(portrait\) \{[\s\S]{0,400}?\n\t\}/);
+	if (!matrix) {
+		throw new Error("源码契约：找不到 resolveHookEnabled 函数体");
+	}
+	if (!/deviceMode === 'tablet'\) return false/.test(matrix[0])) {
+		throw new Error("源码契约：device='tablet' 必须任意朝向 OFF（平板走官方桌面布局）");
+	}
+	if (!/deviceMode === 'phone'\) return portrait/.test(matrix[0])) {
+		throw new Error("源码契约：device='phone' 必须竖屏 ON、横屏 OFF");
+	}
+	if (!/if \(isAndroidShell\(\)\) return portrait/.test(matrix[0]) || !/return !!mql\.matches/.test(matrix[0])) {
+		throw new Error("源码契约：device='auto' 必须等价于改动前行为（壳内只看竖屏，web 端只看宽度断点）");
+	}
+	// 契约 3.3：运行时切换 API 必须挂在脚本顶层且幂等。
+	if (!/window\.__dshrSetDevice = function \(mode\)/.test(src)) {
+		throw new Error("源码契约：缺少 window.__dshrSetDevice 运行时档位切换 API");
+	}
+	if (!src.includes("if (next === deviceMode) return false;")) {
+		throw new Error("源码契约：__dshrSetDevice 必须幂等——同值重复调用零副作用");
+	}
+	// 契约 3.5：平板档 OFF 必须走零痕迹拆除路径。
+	if (!src.includes("function teardownHookTraces") || !src.includes("if (!on && isStrictOff())")) {
+		throw new Error("源码契约：device='tablet' 的 OFF 必须走 teardownHookTraces 零痕迹拆除");
 	}
 	if (!src.includes("grid-column: 2")) {
 		throw new Error("源码契约：主栏必须 grid-column:2，否则 absolute 侧栏后会掉进 0px 列");

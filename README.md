@@ -34,7 +34,7 @@
 | `scripts/smoke-edge-frp.mjs` | edge 全链路冒烟（本机 frp 二进制模拟 VPS↔PC 拓扑，无二进制自动跳过） |
 | `docs/` | 架构决策、[版本与发布规范](docs/versioning.md)、VPS 部署、安全模型 |
 
-## 宿主兼容性（DSH 0.1.5-rc.1 基线）
+## 宿主兼容性（DSH 0.2.0-rc.2 基线）
 
 DSH `0.1.2-alpha.1` 为 Web 宿主引入了**浏览器启动令牌认证**：每个 Host 进程生成一次性
 启动令牌，`GET /?token=<令牌>` 换取签名会话 cookie；index、`/api/*`、WebSocket upgrade
@@ -48,8 +48,10 @@ DSH `0.1.2-alpha.1` 为 Web 宿主引入了**浏览器启动令牌认证**：每
 | `≥ 0.1.2-alpha.1` | 插件宿主半边在 DSH 进程内经 `connection.authenticatedUrl()` 取得启动令牌，下发给网关（`POST /__dsh_remote__/admin/launch-token`）；网关向上游交换会话 cookie 并注入全部反代请求（HTTP + WS），自动处理上游端口漂移（authority 变化重铸）与 401 失效自愈 |
 | `≤ 0.1.1-rc.2` | 宿主没有 `connection` 服务与令牌认证：网关收不到令牌、不做任何注入，行为与旧版完全一致 |
 
-> 兼容性已复核至 npm latest `0.1.5-rc.1`（从 `0.1.2-rc.1` 起 1486 个提交），
-> 逐项核对了本插件的**全部接入面**，结论：**接入代码无需改动**。
+> 兼容性已复核至 npm latest `0.2.0-rc.2`（0.1.5-rc.1 那次复核从 `0.1.2-rc.1` 起共 1486
+> 个提交），逐项核对了本插件的**全部接入面**，结论：**接入代码无需改动**。另已对照
+> `0.2.0-rc.2` 发布物复核**前向兼容**（见下节），并实测**官方 Electron 桌面端**
+> （DeepSeek Harness 桌面，内嵌 0.2.0-rc.2 Web 宿主）反代全链路可用。
 
 ### 0.1.5-rc.1 接入面复核
 
@@ -90,20 +92,58 @@ DSH `0.1.2-alpha.1` 为 Web 宿主引入了**浏览器启动令牌认证**：每
 > 每版都有），网关**不再自带 manifest**，只补官方没有的项：Service Worker 注册、
 > `apple-touch-icon`（iOS 只认 PNG）、`apple-mobile-web-app-*`、`theme-color`。
 
-### 不支持的宿主：官方 Electron 桌面
+### 0.2.0-rc.2 移动 hook 接入面复核
 
-官方仓自 0.1.3 起自带 Electron 桌面（`apps/desktop` + `apps/desktop-host`，包名
-`@deepseek-ai/dsh-desktop`，`private`，走签名安装包分发）。它把 `webserver` /
-`web-startup` / `web-runtime` / `client-hmr` 四行整体 `disabled`，**不开任何监听端口**，
-Web 资产与 Fetch 走 `dsh-app://` + 帧化字节管道。
+本轮起基线切到 **0.2.0-rc.2**（= npm latest = 用户机器上正在运行的桌面版）。
+移动 hook（`packages/gateway/assets/mobile-web.js`）对官方 DOM 的**结构依赖共 71 条**，
+逐条对照最新版产物复核结果：
 
-本插件是「回环 HTTP 反代 + 隧道」模型，**无法接入该宿主**——不是"暂未适配"，而是那里
-根本不存在可代理的端口。支持的宿主：`dsh web`（CLI / 内嵌官方 Web GUI 的第三方桌面，
-如本机在用的 DSH-Desktop）、headless、edge 部署。
+| 判定 | 数量 | 说明 |
+|---|---|---|
+| **失效（回归）** | **0** | rc.1 有、0.2.0-rc.2 无的结构依赖：**零条** |
+| 不变 | 52 | 在 0.2.0-rc.2 产物中仍位于同一包、同一语义位置 |
+| 换包 | 1 | `data-team-action` 换到 `dsh-experimental-client-ui-agent-team`，判据本身未变 |
+| 两版都无 | 18 | rc.1 时代即不存在（死代码 / 第三方插件），**不构成本轮回归** |
 
-令牌与上游会话 cookie 只存在于 PC 本机进程内存：手机端永远拿不到令牌，上游下发的
-`Set-Cookie` 在网关响应侧被剥离；`sec-fetch-site` 等浏览器指纹头也不透传上游，避免
-0.1.2+ 的 /api Host fence 误拒。
+构成 `findFrame()` 主判据的四条（`data-sidebar-collapsed` / `data-shell-overlay` /
+`data-side` / `gridTemplateColumns` 含 `minmax`）与右侧栏三件套
+（`data-sidebar-right-panel/-open/-toggle`）全部原样保留，故本轮 hook 侧几乎没有修复面。
+
+> **基线产物位置（别再用错）**：0.2.0-rc.2 的前端产物在**官方桌面 app.asar 内**——
+> `…\Programs\DeepSeek Harness\resources\app.asar` →
+> `dsh/node_modules/@deepseek-ai/dsh-web-frontend/dist/`（入口 `index-*.js` / `index-*.css`）；
+> **DOM 构造代码不在 app-shell bundle 内**，而在 `dsh-client-ui-*/lib/client.js`。
+> `~/.dsh/profiles/node_modules/@deepseek-ai/` 下的副本是 **0.1.5-rc.1 且 `dist` 被本地改过**
+> （`dist.upstream-bak` 才是原始备份），拿它做基线会得到错误且被污染的结论。
+> 复核明细见 `scratch/plan-0.2.0-rc.2/recon.md`。
+
+### 官方 Electron 桌面（DeepSeek Harness 桌面端）：支持
+
+> **更正**：本节旧版（≤0.1.5-rc.1.4 时期）写的是「官方桌面不开任何端口、无法接入」。
+> 那是早期 `apps/desktop` 的形态；实测当前官方桌面安装包（内嵌 `dsh-desktop-host`，
+> profile 用 `dsh-base` + `dsh-web-app` bundle 组合）**内嵌完整 Web 宿主并监听
+> `127.0.0.1:<动态端口>`**，`GET /` 无令牌返回 401 固定文案——标准 0.1.2+ 启动令牌
+> 认证形态，与本插件的反代模型完全兼容。`webserver` / `web-startup` / `web-runtime` /
+> `client-hmr` 四行在该宿主上全部在位且激活，`settings` 服务照常。
+
+桌面端专属加固（自 `0.1.5-rc.1.5` 起）：
+
+| 项 | 说明 |
+|---|---|
+| 上游端口精确交接 | 桌面端 Web 宿主端口每次启动可能漂移；插件宿主半边从 `webServer.port`（OS 分配时返回真实绑定值）取端口，经 `DSHR_UPSTREAM_PORT` 交给网关（env 优先级高于 config.json），免去启动扫描；取不到仍由 `autoFixUpstreamPort` 回环扫描兜底。回归：`pnpm test:desktop` |
+| 安装器自动识别 profile | `node scripts/install.mjs` 不带 `--profile` 时，存在 `~/.dsh/profiles/desktop` 即装进 desktop（官方桌面），否则 web；显式 `--profile` 永远优先 |
+| 宿主版本探测 | 安装标记的 hostVersion 新增 profile 农场 `@deepseek-ai/dsh/package.json` 来源（官方桌面 app.asar 内版本无法直读，农场与宿主运行时同源） |
+
+与 0.2.0-rc.2 基线的差异（对照 npm `@deepseek-ai/dsh` 0.2.0-rc.2 发布物逐项核对）：
+
+- `connection.authenticatedUrl(baseUrl)` 签名不变（语义推广为任意 mount，令牌机制不变）；webserver `register` 不变；**401 固定文案逐字节不变** → 网关指纹两代通吃。
+- 0.2.0 **移除了 `settings.register()`**（SettingsForms 改为 `describe()/configure()/update()` 条目投影模型）：宿主半边检测到无 register 时降级 `settings.configure({auto:true})`，不影响网关与设置卡。
+- 客户端卡片槽 `settings.plugin.item` 被 `settings.plugins.tab` 列表槽取代（tab 需显式 label，单一贡献整页直显）：客户端半边**双槽位注册**，两代宿主各取所需。
+- 回归钉桩：`pnpm test:desktop`（DESK-01 端口交接 / DESK-02 settings 双路径 / DESK-03 hint 纯函数）。
+
+> 令牌与上游会话 cookie 只存在于 PC 本机进程内存：手机端永远拿不到令牌，上游下发的
+> `Set-Cookie` 在网关响应侧被剥离；`sec-fetch-site` 等浏览器指纹头也不透传上游，避免
+> 0.1.2+ 的 /api Host fence 误拒。
 
 ## 快速开始
 
@@ -172,12 +212,36 @@ node packages/gateway/src/cli.ts visitor --mode xtcp
   `powershell -File android\build.ps1` 即可出 APK），任意扫码器扫上面的
   二维码 → App 自动接管导入并自动建立隧道 → 直接进入 DSH；无可用后端时只显示本地连接状态，
   不会显示伪造的工作区或会话内容。证书指纹随码下发，无告警。
-  手机端竖屏移动界面（隐藏桌面 rail、鲸鱼侧栏入口、设置底部 sheet、状态栏沉浸避让）；横屏走官方 DSH
+  界面按**设备档位**分档（判定源是原生 `smallestScreenWidthDp`，见下方「设备档位」小节）：
+  手机竖屏走手机界面，横屏与平板/折叠屏展开走官方 DSH 桌面界面。移动适配
   由 **App 注入的脚本完成，不依赖服务器端是否安装本插件**，连接官方 DSH Web 同样生效。
 - **PC/其他设备**：拿 `frpc-visitor.toml` 跑 `frpc -c`，访问 `https://127.0.0.1:<bindPort>`。
 
 xtcp 打洞成功时数据手机 ⇄ PC 直连不过 VPS；失败自动回退 stcp 中转不断连。
 详见 [docs/vps-frps-setup.md §4.5](docs/vps-frps-setup.md)。
+
+### 设备档位：手机 / 平板（Android 壳）
+
+壳内按**设备档位**决定是否启用移动 hook，档位由**原生**判定：
+`smallestScreenWidthDp >= 600` ⇒ `tablet`（平板 / 折叠屏展开），否则 `phone`。
+
+| 档位 | 竖屏 | 横屏 |
+|---|---|---|
+| `phone`（`sw < 600`） | **手机界面**：隐藏桌面 rail、鲸鱼侧栏入口、设置全屏页、状态栏沉浸避让 | 官方 DSH 桌面布局（沿用 `dshr-official-inset` 让位） |
+| `tablet`（`sw ≥ 600`，含折叠屏展开） | **与官方 DSH 桌面版一致的界面**：hook 关闭、**零痕迹** | 同左（官方桌面界面） |
+
+- **判定源唯一**：原生 `smallestScreenWidthDp`。**JS 不得用视口宽度反推档位**——部分机型
+  layout viewport 虚高（WEB-02 既有结论），壳内曾因此误判。原生在注入 hook 之前把档位写进
+  `window.__DSHR_MOBILE__.device`（`phone` / `tablet` / `auto`），JS 只消费该值。
+- **平板/折叠屏展开＝零痕迹**：`<html>` 上无 `data-dshr-*` 属性、无 hook 根类（含
+  `dshr-official-inset`），页面上无 hook 创建的可见节点。系统栏避让由**原生**收缩 WebView
+  padding 完成，官方布局本身零改动。
+- **运行中折叠 ⇄ 展开切换**：只改注入配置并调 hook 幂等切换 API，**不重载 WebView、不中断隧道**。
+- **平板档的「连接设置」入口**（hook 关闭后页面上的长按鲸鱼入口不复存在，由原生补两个入口）：
+  - 隧道常驻通知增加「**连接设置**」动作，进程外直达，不碰隧道；
+  - **会话根按系统返回键**打开连接设置（手机档仍是退到后台）。
+
+> 浏览器 / Edge 注入路径的判档规则**维持现状**（仍按视口宽度断点），不受本规则影响。
 
 ### 局域网模式（可选，无 VPS 时先用起来）
 
@@ -194,7 +258,8 @@ xtcp 打洞成功时数据手机 ⇄ PC 直连不过 VPS；失败自动回退 st
 
 把网关搬到公网 VPS 上跑（Docker 或裸机一键脚本）：自带 frpc/frps、前置访问 Token
 认证（登录即自动配对设备）、窄视口自动套 Android 端同款移动 hook 布局——
-iOS 无需任何 App：
+iOS 无需任何 App。该路径的判档仍按**视口宽度断点**（`device` 缺省 `auto`），
+不使用 Android 壳的 `smallestScreenWidthDp` 设备档位规则：
 
 ```bash
 cd deploy/docker && cp .env.example .env   # 填域名与访问 Token
@@ -226,8 +291,9 @@ node scripts/install.mjs        # junction 进 profile 农场 + 写 patch 行
 node scripts/uninstall.mjs      # 卸载
 ```
 
-重启 DSH Desktop 后，网关随 profile 自动拉起（`config.json` 里 `"autoStart": false`
-可关闭）。
+不带 `--profile` 时自动识别目标：存在 `~/.dsh/profiles/desktop`（官方桌面端）装
+desktop，否则装 web；显式 `--profile <名字>` 永远优先。重启 DSH 后，网关随 profile
+自动拉起（`config.json` 里 `"autoStart": false` 可关闭）。
 
 ### 5. 设置面板（设置 → 插件 → DSH Remote）
 
@@ -271,6 +337,7 @@ pnpm test:fixes     # 历轮修复回归钉桩
 pnpm test:panel     # 面板端到端（需 DSH 宿主运行）
 pnpm test:client    # 客户端 bundle 加载检查
 pnpm test:mobile    # 移动布局自测（需 Chrome）
+pnpm test:device    # 设备档位自测（真实 0.2.0-rc.2 页面 55 条断言，实测 55/55；宿主/网关不可达自动跳过）
 pnpm smoke:edge:frp # edge 全链路（需本机 frp 二进制，无则自动跳过）
 pnpm -C packages/plugin build   # 构建设置卡片客户端 bundle
 node scripts/probe-ws.mjs [端口]   # 对运行中的网关+DSH 做 WS 直通探针
@@ -281,14 +348,27 @@ push/PR 到 main 时 CI 自动跑类型检查 + 插件 bundle 同步检查（`sr
 test:session / test:fixes，见 `.github/workflows/ci.yml`）；
 重链路（panel/mobile/frp 全链路）留在本地跑。
 
+> `pnpm test:device` 在**真实的 DSH 0.2.0-rc.2 页面上**跑设备档位断言（经 Chrome CDP
+> 配对取真页面，不是 fixture）。它需要**本机 DSH 与网关 `127.0.0.1:18443` 都在跑**
+> （铸一次性配对码、读取 `~/.dsh-remote/state/secrets.json` 的 adminToken）。
+> 宿主/网关不可达、找不到 Chrome 时会打印原因并**以退出码 0 自动跳过**，不算失败——
+> 与 `smoke:edge:frp` 的无依赖跳过约定一致。运行结束会吊销本次创建的测试设备。
+>
+> 本机实测：矩阵 A–E（手机竖屏 / 手机横屏 / 平板 ×2 / 运行中切换）共 55 条断言，
+> **55/55 通过、连跑 4 次全绿**，平板档两臂（注入 vs 完全不注入）关键元素**逐项像素差全 0**；
+> 脚本带「渲染完成门禁」并做过反向验证（临时放宽后稳定复现 53/55 与两条 D 场景 FAIL）。
+> 模拟器端到端（B1–B9）、通知动作运行时验证与已知限制见
+> [android/README.md 验证小节](android/README.md#验证)。
+
 ### 版本与发布
 
-版本号 = `<deepseek-harness 基线版本>.<发版号>`，发版号每次发布 +1，
-详见 [docs/versioning.md](docs/versioning.md)：
+版本号 = `<deepseek-harness 基线版本>.<发版号>`，发版号每次发布 +1，详见
+[docs/versioning.md](docs/versioning.md)。当前基线 `0.2.0-rc.2`、版本 `0.2.0-rc.2.1`
+（**尚未发布**：本地已出 APK，未 push、未打 tag）：
 
 ```powershell
 pnpm ver:bump     # 发版号 +1 并同步 package.json；harness 升级用 --base <新版本>
-git tag v0.1.1-rc.2.6 && git push origin v0.1.1-rc.2.6   # 推 tag 即自动打包发布
+git tag v0.2.0-rc.2.1 && git push origin v0.2.0-rc.2.1   # 推 tag 即自动打包发布
 ```
 
 ### 部署 VPS 前的本地全链路自测（无需 VPS）
@@ -312,6 +392,7 @@ VPS 上唯一要验证的只剩网络可达性。
 - [x] cordis 插件自启
 - [x] frp 访客模式（stcp/xtcp）：VPS 不开公网入口，`dsh-remote visitor` 出码导入
 - [x] Android 壳 App：内嵌 frpc visitor + 证书锁定 + 扫码导入
+- [x] Android 设备档位分档（DSH 0.2.0-rc.2 基线）：手机竖屏＝手机界面；平板/折叠屏展开＝官方桌面界面且零痕迹；手机横屏＝官方桌面布局
 - [x] Edge Web 服务：Docker/裸机部署，iPhone/iPad 浏览器直达（Token 门禁 + 移动 hook 布局 + 可选容器内 frps）
 - [ ] tsnet 传输适配器（无 VPS 备选）
 - [ ] iOS 壳 App（需开发者账号分发；Edge Web 服务已覆盖浏览器场景）
