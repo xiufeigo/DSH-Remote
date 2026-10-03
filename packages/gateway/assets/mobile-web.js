@@ -1621,6 +1621,40 @@
 		return document.documentElement.classList.contains(ROOT_CLASS);
 	}
 
+	// ── WEB-09 官方右侧栏（[data-sidebar-right-panel]，文件树/预览面板）──
+	// 判据与返回键桥（closeSidebarIfExpanded）逐字一致：以展开标记为准，不看显示模式。
+	// 关闭态下面板虽然「已挂载」（display:flex、rect 铺满、pointer-events:none），
+	// 所以「已挂载」不能当「已打开」用——必须同时看 data-sidebar-right-open 与 aria-hidden。
+	function findRightbarPanel() {
+		return document.querySelector('[data-sidebar-right-panel]');
+	}
+
+	function isRightbarOpen() {
+		var panel = findRightbarPanel();
+		if (!panel || !panel.hasAttribute('data-sidebar-right-open')) return false;
+		return panel.getAttribute('aria-hidden') !== 'true';
+	}
+
+	/**
+	 * 打开官方右侧栏。
+	 * 官方唯一入口是面板内那颗 button[data-sidebar-right-toggle]
+	 * （官方源码：onClick: () => actions.toggleExpanded(sessionId)）——app.asar 内
+	 * `swipe` 零命中，官方没有任何手势能开右栏（见 scratch/t11/report.md §3）。
+	 * 关闭态下那颗按钮 rect 在视口外（412px 视口里 x≈790，pointer-events:none），
+	 * 因此 **坐标派发不可用**：实测 CDP 真实鼠标点击打不开（recon §4 方法 C），
+	 * 而派发合成 MouseEvent 事件流（WEB-04 既有通道，绕过命中测试直接进 React 委托）能开。
+	 * 沿用返回键桥同一条通道与同一颗按钮，开/关可逆（实测 4 连点往返）。
+	 * 返回是否真的把意图派发出去了；调用方不再据此判断成功与否——React 提交是异步的。
+	 */
+	function openOfficialRightbar() {
+		var panel = findRightbarPanel();
+		if (!panel) return false;
+		var toggle = panel.querySelector('button[data-sidebar-right-toggle]');
+		if (!toggle || toggle.disabled) return false;
+		if (!dispatchNativeClick(toggle)) toggle.click();
+		return true;
+	}
+
 	function isDialogOpen() {
 		return document.documentElement.getAttribute('data-dshr-dialog') === '1';
 	}
@@ -1855,6 +1889,16 @@
 
 	function canStartDrawerTrack(target, x0) {
 		if (!isMobileMode() || isDrawerLocked() || toggleBusy) return false;
+		// WEB-09 守卫：官方右栏打开时（<768px 官方把它铺成 position:absolute;inset:0 全屏，
+		// 盖住整个视口）**不要**再武装左抽屉手势。
+		// 实测存在真实缺陷：右栏全屏时触点命中的是面板内部节点，左抽屉本身是收起的，
+		// 于是下面「关闭态」那一支的豁免全不命中（既不在侧栏、也不在遮罩、
+		// 也不是 isIgnoredSwipeTarget 目标、不在横向滚动容器内），canStartDrawerTrack
+		// 返回 true → 在面板上右滑会把**左抽屉**点亮展开（recon §2：expanded=1、
+		// 官方列宽 360px），而此刻鲸鱼与遮罩都被 data-dshr-rightbar-fullscreen 隐藏，
+		// 用户连一个像素的反馈都看不到。右栏打开期间左抽屉手势必须彻底不武装；
+		// 右栏自己也不需要手势（官方只有按钮入口）。
+		if (isRightbarOpen()) return false;
 		if (!isElement(target)) return false;
 		var frame = findFrame();
 		if (!frame) return false;
@@ -1953,6 +1997,9 @@
 		var lastT = 0;
 		var velocity = 0;
 		var startTarget = null;
+		// WEB-09：抽屉关闭时的左滑候选。方向门命中时**只记不动**，
+		// 真正的开关动作留到 touchend 再兑现（原因见 considerRightbarSwipe 的注释）。
+		var rightbarCandidate = null;
 
 		function resetTrack() {
 			tracking = false;
@@ -1960,6 +2007,9 @@
 			startTarget = null;
 			velocity = 0;
 			activePointer = null;
+			// 注意：这里**不**清 rightbarCandidate。方向门正是「记下候选 → resetTrack() →
+			// return」，候选必须活过这次 resetTrack 才能等到 touchend 兑现。
+			// 它的清理点在 touchstart（防上一次残留）与 touchend/touchcancel（用完即清）。
 		}
 
 		var activePointer = null;
@@ -2001,6 +2051,23 @@
 					resetTrack();
 					return;
 				}
+				// WEB-08 方向门：抽屉关闭时（手势起手时未展开，baseX<=0）只认右滑（dx>0）。
+				// 左滑必须在这里就放弃接管并把事件原样还给官方/浏览器：
+				//   1) 判定必须早于下面的 dragging=true / setDrawerVisual(baseX)。setDrawerVisual
+				//      首次调用会**无条件**置上 data-dshr-dragging 并 setSidebarOpen(true)，随后才把
+				//      x 夹到 [0,max]——左滑的负位移被夹成 0，于是「左侧栏被点亮 + 主栏回弹」，
+				//      而末尾的 event.preventDefault() 又把官方手势吃掉。判定挪到 setDrawerVisual
+				//      之后就已经晚了：那时 setSidebarOpen(true) 早已执行。
+				//   2) 抽屉展开时（baseX>0）不放行，保留既有行为：左滑关闭、右滑按既有逻辑跟手。
+				if (baseX <= 0 && dx < 0) {
+					// WEB-09：左滑记成「打开官方右栏」的候选，然后**原样**放弃抽屉接管。
+					// 候选只存起点，松手前不做任何动作；兑现点在下面的 touchend 监听里
+					// （见 considerRightbarSwipe 的注释）。dragging 始终为 false，
+					// 因此不会点亮左抽屉、不会写 --dshr-drawer-x、也到不了下面的 preventDefault。
+					rightbarCandidate = { x0: startX, y0: startY, target: startTarget };
+					resetTrack();
+					return;
+				}
 				dragging = true;
 				setDrawerVisual(baseX);
 			}
@@ -2011,6 +2078,39 @@
 			lastT = now;
 			queueDrawerVisual(baseX + dx);
 			if (event && event.cancelable) event.preventDefault();
+		}
+
+		/**
+		 * WEB-09：左滑 → 打开官方右侧栏。
+		 *
+		 * 为什么必须在 **touchend** 才兑现，而不是在方向门里就点开：
+		 *   1) 方向门命中时手指才移动了 10px，距离还很短。此时开右栏等于把一次
+		 *      「手指划过」的起手动作变成状态翻转，用户中途反悔（滑回去）就来不及收回。
+		 *   2) 阈值判定需要**终点**坐标（总位移 |dx|≥48、横向占优、|dy|≤96），
+		 *      起点坐标记在 rightbarCandidate 里，只有松手时才知道终点。
+		 *   3) 全程不 preventDefault、不写任何抽屉样式，官方/浏览器的事件原样放行，
+		 *      与 WEB-08 方向门「还手给官方」的结论一致。
+		 *
+		 * 豁免为什么天然成立：候选只在方向门命中后存在，而方向门在 tracking 期间，
+		 * tracking 又只在 canStartDrawerTrack 通过后才开始 —— 横向可滚容器
+		 * （isInHorizontallyScrollableContainer）、isIgnoredSwipeTarget（输入框/输入卡/鲸鱼/
+		 * 状态栏/统计行）、侧栏内、遮罩上在起点就被全部挡掉；右栏已打开时
+		 * canStartDrawerTrack 直接 false（不再武装）。抽屉展开时方向门（baseX>0）根本不产生
+		 * 候选，左滑仍是关抽屉，行为不变。
+		 */
+		function considerRightbarSwipe(candidate, endX, endY) {
+			if (!candidate) return false;
+			if (!isMobileMode() || isDrawerLocked()) return false;
+			if (isSidebarOpen()) return false;   // 抽屉展开中不碰右栏
+			if (isRightbarOpen()) return false;  // 已经开着就不 toggle，避免左滑把右栏关掉
+			var dx = endX - candidate.x0;
+			var dy = endY - candidate.y0;
+			if (dx >= 0) return false;
+			// 阈值沿用 considerSwipe 的既有风格：位移 48px、横向占优 1.4 倍、纵向不超过 96px。
+			if (Math.abs(dx) < 48) return false;
+			if (Math.abs(dx) < Math.abs(dy) * 1.4) return false;
+			if (Math.abs(dy) > 96) return false;
+			return openOfficialRightbar();
 		}
 
 		function onDragEnd(clientX, clientY) {
@@ -2055,6 +2155,8 @@
 		// Android WebView 的 PointerEvent 会在页面滚动时 pointercancel，右滑打开侧栏被吞掉。
 		// 抽屉手势始终走 touch；一旦判定为横向拖动就 preventDefault。
 		document.addEventListener('touchstart', function (event) {
+			// WEB-09：新一次触摸先清掉上一次没走完流程的候选（防残留误触发）。
+			rightbarCandidate = null;
 			if (event.touches && event.touches.length !== 1) {
 				onDragCancel();
 				return;
@@ -2070,9 +2172,20 @@
 		}, { capture: true, passive: false });
 		document.addEventListener('touchend', function (event) {
 			var touch = event.changedTouches && event.changedTouches[0];
-			onDragEnd(touch ? touch.clientX : lastX, touch ? touch.clientY : startY);
+			var endX = touch ? touch.clientX : lastX;
+			var endY = touch ? touch.clientY : startY;
+			// WEB-09：方向门记下的左滑候选在这里兑现（为什么是 touchend 而不是方向门，
+			// 见 considerRightbarSwipe 的注释）。候选存在时方向门已经 resetTrack()，
+			// tracking 为 false，所以下面的 onDragEnd 会首行 return——两条路径不会互相干扰。
+			var candidate = rightbarCandidate;
+			rightbarCandidate = null;
+			if (candidate) considerRightbarSwipe(candidate, endX, endY);
+			onDragEnd(endX, endY);
 		}, { capture: true, passive: true });
 		document.addEventListener('touchcancel', function () {
+			// touchcancel 一律不兑现候选：它意味着滚动/系统已经把这次触摸接管走，
+			// 且这条路径的坐标是 lastX 而不是真实终点，拿它开右栏是假阳性。
+			rightbarCandidate = null;
 			if (!tracking) return;
 			var dx = lastX - startX;
 			if (dragging || Math.abs(dx) >= 48) onDragEnd(lastX, startY);

@@ -410,6 +410,143 @@ try {
 		return -1;
 	}
 
+	/**
+	 * 手势方向门（WEB-08）的触摸探针。
+	 *
+	 * 为什么必须用 CDP `Input.dispatchTouchEvent` 而不是合成 `new TouchEvent(...)`：
+	 * 钩子只听 touch 事件（mobile-web.js 明确「抽屉手势始终走 touch」，因为
+	 * Android WebView 的 PointerEvent 在页面滚动时会 pointercancel 把右滑吞掉），
+	 * 而 CDP 的 dispatchTouchEvent 走渲染器**真实输入管线**，事件顺序、
+	 * 合并（coalescing）与 WebView 上的路径一致，合成事件测不出真实行为。
+	 *
+	 * 探针注册在 capture 阶段且晚于钩子（钩子在本文件 injectHook 时就已绑好），
+	 * 所以同一个 touchmove 上它看到的就是钩子 preventDefault 之后的 final 状态。
+	 */
+	async function installTouchProbe() {
+		await evaluate(`(function(){
+			if (window.__dshrProbeInstalled) return true;
+			window.__dshrProbeInstalled = true;
+			window.__dshrMoves = 0;
+			window.__dshrPrevented = 0;
+			document.addEventListener('touchmove', function (event) {
+				window.__dshrMoves++;
+				if (event.defaultPrevented) window.__dshrPrevented++;
+			}, { capture: true, passive: true });
+			return true;
+		})()`);
+	}
+	const resetTouchProbe = () =>
+		evaluate(`(function(){ window.__dshrMoves = 0; window.__dshrPrevented = 0; return true; })()`);
+	const readTouchProbe = () =>
+		evaluate(`(function(){ return { moves: window.__dshrMoves, prevented: window.__dshrPrevented }; })()`);
+
+	/**
+	 * 现算一条**钩子真会接管**的触点行。
+	 * 必须与 mobile-web.js 的 canStartDrawerTrack / isIgnoredSwipeTarget /
+	 * isInHorizontallyScrollableContainer 用同一套规则，否则手势在第一步就被钩子放弃，
+	 * 测出来的「左滑没有误触发」是假阴性（y 落在 [data-composer-card] 上就属于这种）。
+	 */
+	async function findSwipeLaneY() {
+		const lane = await evaluate(`(function(){
+			var ys = [];
+			for (var y = 90; y < 880; y += 10) {
+				for (var x = 340; x <= 390; x += 10) {
+					var e = document.elementFromPoint(x, y);
+					if (!e || !e.closest) continue;
+					if (e.closest('textarea, input, select, [contenteditable="true"]')) continue;
+					if (e.closest('[data-composer-card]')) continue;
+					if (e.closest('#dshr-mobile-whale')) continue;
+					if (e.closest('#dshr-status-guard')) continue;
+					if (e.closest('[data-dshr-stats-line]')) continue;
+					if (e.closest('pre, code, table')) continue;
+					var scrollable = false, n = e;
+					while (n && n !== document.body && n !== document.documentElement) {
+						try {
+							var cs = window.getComputedStyle(n), ox = cs.overflowX || '';
+							if ((ox === 'auto' || ox === 'scroll') && n.scrollWidth > n.clientWidth) { scrollable = true; break; }
+						} catch (ignoredStyle) { /* ignore */ }
+						n = n.parentElement;
+					}
+					if (scrollable) continue;
+					if (e.closest('[data-dshr-main-col]')) { ys.push(y); break; }
+				}
+			}
+			var mid = ys.filter(function (v) { return v > 120 && v < 700; });
+			return { count: ys.length, y: (mid.length ? mid[Math.floor(mid.length / 2)] : (ys.length ? ys[0] : 300)) };
+		})()`);
+		return lane;
+	}
+
+	/**
+	 * 一次真实触摸滑动。x0 起点必须避开左缘 24px，否则 Chrome 的边缘返回手势会导航走，
+	 * 读数全丢（右侧「返回上一会话」正是靠这个区域）。segments 段 × ~16ms ≈ 200ms。
+	 */
+	async function dispatchSwipe(x0, x1, y, segments = 6) {
+		await resetTouchProbe();
+		const point = (x, py) => [{ x, y: py, id: 1, radiusX: 6, radiusY: 6, force: 1 }];
+		await call("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: point(x0, y) });
+		for (let i = 1; i <= segments; i++) {
+			await call("Input.dispatchTouchEvent", {
+				type: "touchMove",
+				touchPoints: point(Math.round(x0 + ((x1 - x0) * i) / segments), y),
+			});
+			await wait(16);
+		}
+		await call("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+		await wait(1400); // 官方 0.34s 过渡 + hook 的 scheduleSyncDom(50ms) 收敛
+		return readTouchProbe();
+	}
+
+	/**
+	 * 官方右栏（[data-sidebar-right-panel]，文件树/预览面板）的开合判定与驱动。
+	 *
+	 * 为什么不能拿 `data-rightbar-collapsed` 的有无当「开/合」信号：
+	 * 实测该属性在**开合两态都在** frame 上（收起态 attr=true，打开态仍 attr=true），
+	 * 真正区分开合的是 `data-sidebar-right-open` + `aria-hidden`——
+	 * 与 mobile-web.js 的 isRightbarOpen()、以及返回键桥 closeSidebarIfExpanded() 逐字一致。
+	 * 关闭态下面板本来就「已挂载」（display:flex、rect 铺满 412x915、pointer-events:none），
+	 * 所以「已挂载」也不能当「已打开」用。
+	 */
+	const isRightbarOpen = () =>
+		evaluate(`(function(){
+			var p = document.querySelector('[data-sidebar-right-panel]');
+			return !!(p && p.hasAttribute('data-sidebar-right-open') && p.getAttribute('aria-hidden') !== 'true');
+		})()`);
+	/** 走官方那颗 button[data-sidebar-right-toggle]（与 hook 返回键桥同一条通道）。 */
+	const clickOfficialRightbarToggle = () =>
+		evaluate(`(function(){
+			var p = document.querySelector('[data-sidebar-right-panel]'); if (!p) return 'no-panel';
+			var t = p.querySelector('button[data-sidebar-right-toggle]'); if (!t || t.disabled) return 'disabled';
+			var r = t.getBoundingClientRect();
+			t.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window,
+				button: 0, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 }));
+			return 'dispatched';
+		})()`);
+	/** 幂等关到右栏关闭态（官方控件开/关可逆，实测 4 连点往返）。 */
+	async function ensureRightbarClosed() {
+		for (let i = 0; i < 3; i++) {
+			if (!(await isRightbarOpen())) return true;
+			await clickOfficialRightbarToggle();
+			await wait(700);
+		}
+		return !(await isRightbarOpen());
+	}
+	/**
+	 * 幂等开到右栏打开态。
+	 * 必须「先读状态再决定点不点」并留出官方 0.34s 过渡的沉淀时间：
+	 * 关→开连着做时，紧跟着的点击会落在关闭动画里，React 的 toggleExpanded 提交不上，
+	 * 于是后面取触点行时面板根本没开（实测会得到 null 车道）。
+	 */
+	async function ensureRightbarOpen() {
+		for (let i = 0; i < 4; i++) {
+			if (await isRightbarOpen()) return true;
+			await wait(400);
+			await clickOfficialRightbarToggle();
+			await wait(700);
+		}
+		return await isRightbarOpen();
+	}
+
 	// ── 页面快照（对照实验的唯一数据源；只读官方结构，不含 hook 私有标记）──
 	const SNAPSHOT = `(() => {
 		const r = document.documentElement;
@@ -519,6 +656,207 @@ try {
 		return{left:Math.round(b.left),right:Math.round(b.right),inViewport:b.left>=-1&&b.right<=innerWidth+1};})()`);
 	if (trailing) record("A", "输入卡底栏集群在视口内", trailing.inViewport, JSON.stringify(trailing));
 	else record("A", "输入卡底栏集群在视口内", null, "未找到 [data-dshr-composer-trailing]（该页无底栏集群）");
+	// ── WEB-08 手势方向门：主页面左滑**不得**点亮左侧抽屉（用户报告的 bug）──
+	// 修复前：onDragMove 越过 10px 阈值就 dragging=true + setDrawerVisual(baseX)，
+	// 而 setDrawerVisual 首次调用会无条件 setSidebarOpen(true) 再把负位移夹到 0，
+	// 于是左滑把左侧栏点亮/展开、并 preventDefault 吃掉官方手势。
+	// 修复后：抽屉关闭时方向门在 setDrawerVisual **之前** resetTrack()，左滑全程不接管。
+	// 官方 0.2.0-rc.2 侧：左滑车道扫描 + 整个 app.asar 内 `swipe` 标识符 0 处命中，
+	// 右栏唯一入口是 <button onClick={() => actions.toggleExpanded(sessionId)}>，
+	// 即官方本来就没有「左滑开右栏」手势——所以左滑的正确表现是**什么都不发生**。
+	const lane = await findSwipeLaneY();
+	info("A", `手势触点行：可接管 y 共 ${lane.count} 个，选用 y=${lane.y}（左滑 380→130 / 右滑 100→350）`);
+	await installTouchProbe();
+	// 抽屉状态在收起态（前面的 ensureCollapsed 已归一），先确认方向门的「关闭态」前提
+	await ensureCollapsed();
+	await waitUntil(`document.documentElement.getAttribute('data-dshr-expanded') === '0'`, 3000);
+	const swipeBefore = await evaluate(`(function(){
+		var r = document.documentElement;
+		return { expanded: r.getAttribute('data-dshr-expanded'), dragging: r.getAttribute('data-dshr-dragging'),
+			collapsed: !!document.querySelector('[data-sidebar-collapsed]'),
+			sideW: (function(){var s=document.querySelector('[data-dshr-sidebar-col]');return s?Math.round(s.getBoundingClientRect().width):-1;})() };
+	})()`);
+
+	// A-left-swipe：主栏左滑 → 左侧抽屉必须完全不动，且事件不被钩子吃掉
+	const leftProbe = await dispatchSwipe(380, 130, lane.y);
+	const leftAfter = await evaluate(`(function(){
+		var r = document.documentElement;
+		var vis = function(id){ var e=document.getElementById(id); if(!e) return 'absent';
+			var c=getComputedStyle(e), b=e.getBoundingClientRect();
+			return (c.display==='none'||c.visibility==='hidden'||b.width===0)?'hidden':'VISIBLE'; };
+		return { expanded: r.getAttribute('data-dshr-expanded'), dragging: r.getAttribute('data-dshr-dragging'),
+			collapsed: !!document.querySelector('[data-sidebar-collapsed]'),
+			rightCollapsed: !!document.querySelector('[data-rightbar-collapsed]'),
+			sideW: (function(){var s=document.querySelector('[data-dshr-sidebar-col]');return s?Math.round(s.getBoundingClientRect().width):-1;})(),
+			mask: vis('dshr-mobile-drawer-mask'), handle: vis('dshr-drawer-handle') };
+	})()`);
+	record("A", "A-left-swipe 主栏左滑后 data-dshr-expanded 仍为 0", leftAfter.expanded === "0", `expanded=${leftAfter.expanded}（修复前会翻成 1）`);
+	record("A", "A-left-swipe 官方侧栏仍收起且列宽为 0", leftAfter.collapsed === true && leftAfter.sideW === 0, `data-sidebar-collapsed=${leftAfter.collapsed} 侧栏列宽=${leftAfter.sideW}px（修复前第 1 帧就变 360px）`);
+	record("A", "A-left-swipe 遮罩/拖柄全程不可见", leftAfter.mask !== "VISIBLE" && leftAfter.handle !== "VISIBLE", `mask=${leftAfter.mask} handle=${leftAfter.handle}`);
+	record("A", "A-left-swipe 无 data-dshr-dragging 残留", leftAfter.dragging === null, `data-dshr-dragging=${leftAfter.dragging}`);
+	record("A", "A-left-swipe 该 touchmove 未被 preventDefault", leftProbe.moves > 0 && leftProbe.prevented === 0, `touchmove=${leftProbe.moves} 个 被 preventDefault=${leftProbe.prevented} 个（修复前 6/6 被吃掉）`);
+	record("A", "A-left-swipe 官方右栏保持收起（官方本无左滑开右栏手势）", leftAfter.rightCollapsed === true, `data-rightbar-collapsed=${leftAfter.rightCollapsed}`);
+
+	// ── WEB-09 左滑 → 打开官方右侧栏（文件树/预览面板）──
+	// 承接上面那条左滑：手指已经抬起，hook 在 touchend 兑现了候选，右栏应已打开。
+	// 官方 0.2.0-rc.2 自己**没有**这个手势（app.asar 内 `swipe` 零命中，右栏唯一入口是
+	// button[data-sidebar-right-toggle] 的 onClick），所以这一步开成功即证明是 hook 新加的。
+	const rbAfterLeft = await evaluate(`(function(){
+		var r = document.documentElement;
+		var p = document.querySelector('[data-sidebar-right-panel]');
+		var b = p ? p.getBoundingClientRect() : null;
+		return { open: !!(p && p.hasAttribute('data-sidebar-right-open') && p.getAttribute('aria-hidden') !== 'true'),
+			ariaHidden: p ? p.getAttribute('aria-hidden') : null,
+			box: b ? { x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height) } : null,
+			full: !!(b && b.x === 0 && b.y === 0 && b.width >= innerWidth - 1 && b.height >= innerHeight - 1),
+			expanded: r.getAttribute('data-dshr-expanded'),
+			sideW: (function(){var s=document.querySelector('[data-dshr-sidebar-col]');return s?Math.round(s.getBoundingClientRect().width):-1;})(),
+			panelText: p ? (p.innerText||'').replace(/\\s+/g,' ').trim().slice(0,40) : '' };
+	})()`);
+	record("A", "A-left-swipe-opens-rightbar 主栏左滑打开官方右栏", rbAfterLeft.open === true,
+		`data-sidebar-right-open=${rbAfterLeft.open} aria-hidden=${rbAfterLeft.ariaHidden} 面板内容="${rbAfterLeft.panelText}"（官方自身无此手势，故本条只可能由 hook 打开）`);
+	record("A", "A-left-swipe-opens-rightbar 手机上右栏为全屏", rbAfterLeft.full === true,
+		`panel=${JSON.stringify(rbAfterLeft.box)} 视口=412x915（<768px 官方把右栏铺成 inset:0 全屏）`);
+	record("A", "A-left-swipe-opens-rightbar 打开右栏时左抽屉仍关闭", rbAfterLeft.expanded === "0" && rbAfterLeft.sideW === 0,
+		`expanded=${rbAfterLeft.expanded} 侧栏列宽=${rbAfterLeft.sideW}px`);
+
+	// 归一：把右栏关回关闭态，后面的 A-right-swipe 断言基线不能被右栏影响。
+	// 留 600ms 让官方 0.34s 过渡彻底结束，否则紧跟着的 reopen 会落进动画里点空。
+	await ensureRightbarClosed();
+	await wait(600);
+	await waitUntil(`(function(){var p=document.querySelector('[data-sidebar-right-panel]');return !(p&&p.hasAttribute('data-sidebar-right-open')&&p.getAttribute('aria-hidden')!=='true');})()`, 3000);
+	record("A", "A-left-swipe-opens-rightbar 右栏可逆（官方控件能关回去）", (await isRightbarOpen()) === false,
+		`关闭后 data-sidebar-right-open=${await isRightbarOpen()}`);
+
+	// ── WEB-09 守卫：右栏已打开时左滑不得误开左抽屉，且不得把右栏 toggle 关掉 ──
+	// 修复前 canStartDrawerTrack 对右栏上的触点返回 true（既不在侧栏/遮罩、也不是忽略目标），
+	// 在面板上右滑会把左抽屉点亮展开（expanded=1、官方列宽 360px），而鲸鱼与遮罩此刻都被
+	// data-dshr-rightbar-fullscreen 隐藏，用户连一个像素反馈都看不到。
+	await ensureRightbarOpen();
+	const rbLane = await evaluate(`(function(){
+		for (var y = 100; y < 860; y += 10) {
+			for (var x = 60; x <= 340; x += 20) {
+				var e = document.elementFromPoint(x, y); if (!e || !e.closest) continue;
+				var p = document.querySelector('[data-sidebar-right-panel]'); if (!p || !p.contains(e)) continue;
+				if (e.closest('textarea, input, select, [contenteditable="true"]')) continue;
+				if (e.closest('[data-composer-card], #dshr-mobile-whale, #dshr-status-guard, [data-dshr-stats-line]')) continue;
+				var s = false, n = e;
+				while (n && n !== document.body && n !== document.documentElement) {
+					try { var cs = getComputedStyle(n), ox = cs.overflowX || '';
+						if ((ox === 'auto' || ox === 'scroll') && n.scrollWidth > n.clientWidth) { s = true; break; } } catch (ignoredStyle) { /* ignore */ }
+					n = n.parentElement;
+				}
+				if (s) continue;
+				return { y: y, x: x, tag: e.tagName.toLowerCase() };
+			}
+		}
+		return null;
+	})()`);
+	record("A", "A-left-swipe-rightbar-open-no-drawer 已把右栏打开（守卫前提）", (await isRightbarOpen()) === true,
+		`data-sidebar-right-open=${await isRightbarOpen()}`);
+	record("A", "A-left-swipe-rightbar-open-no-drawer 已在右栏内取到可接管触点行", !!rbLane, JSON.stringify(rbLane));
+	if (rbLane) {
+		await dispatchSwipe(380, 130, rbLane.y);
+		const rbSwipeAfter = await evaluate(`(function(){
+			var r = document.documentElement;
+			var p = document.querySelector('[data-sidebar-right-panel]');
+			return { expanded: r.getAttribute('data-dshr-expanded'),
+				sideW: (function(){var s=document.querySelector('[data-dshr-sidebar-col]');return s?Math.round(s.getBoundingClientRect().width):-1;})(),
+				stillOpen: !!(p && p.hasAttribute('data-sidebar-right-open') && p.getAttribute('aria-hidden') !== 'true') };
+		})()`);
+		record("A", "A-left-swipe-rightbar-open-no-drawer 右栏开着时左滑不开左抽屉", rbSwipeAfter.expanded === "0" && rbSwipeAfter.sideW === 0,
+			`expanded=${rbSwipeAfter.expanded} 侧栏列宽=${rbSwipeAfter.sideW}px（修复前右滑会变 expanded=1 / 360px）`);
+		record("A", "A-left-swipe-rightbar-open-no-drawer 右栏开着时左滑不 toggle 关右栏", rbSwipeAfter.stillOpen === true,
+			`data-sidebar-right-open=${rbSwipeAfter.stillOpen}（开着时再点会误关，故此处必须不动作）`);
+		// 右滑也一并验：守卫生效时右栏全屏上右滑不得开左抽屉。
+		// 起点必须 ≥200：x0≤150 会触发 Chrome 边缘返回手势把页面导航到 about:blank
+		// （与本改动无关——注入/不注入两臂都会触发，见 scratch/t12/diag-nav.log）。
+		await dispatchSwipe(250, 400, rbLane.y);
+		const rbRightAfter = await evaluate(`(function(){
+			var r = document.documentElement;
+			var s = document.querySelector('[data-dshr-sidebar-col]');
+			return { href: location.href, expanded: r.getAttribute('data-dshr-expanded'),
+				sideW: s ? Math.round(s.getBoundingClientRect().width) : -1 };
+		})()`);
+		record("A", "A-left-swipe-rightbar-open-no-drawer 右栏全屏时右滑不开左抽屉（守卫生效）",
+			rbRightAfter.href.includes("18443") && rbRightAfter.expanded === "0" && rbRightAfter.sideW === 0,
+			`expanded=${rbRightAfter.expanded} 侧栏列宽=${rbRightAfter.sideW}px href=${rbRightAfter.href}（修复前 expanded=1 / 360px）`);
+	}
+	await ensureRightbarClosed();
+
+	// ── WEB-09 豁免：横向可滚动容器内的左滑必须把横滑还给原生滚动，不得开右栏 ──
+	// 豁免来自 canStartDrawerTrack（isInHorizontallyScrollableContainer），候选只能在
+	// tracking 期间产生，所以容器内的触点根本到不了方向门。
+	const hscroll = await evaluate(`(function(){
+		var m = document.querySelector('[data-dshr-main-col]'); if (!m) return { ok: false, why: 'no-main' };
+		var box = document.createElement('div');
+		box.id = 'dshr-t12-hscroll';
+		box.style.cssText = 'position:absolute;left:0;right:0;top:120px;height:60px;overflow-x:auto;overflow-y:hidden;background:rgba(0,0,0,.05);z-index:5;-webkit-overflow-scrolling:touch;';
+		var inner = document.createElement('div');
+		inner.style.cssText = 'width:1200px;height:100%;';
+		inner.textContent = 'T12-HSCROLL-PROBE-'.repeat(40);
+		box.appendChild(inner);
+		m.appendChild(box);
+		var b = box.getBoundingClientRect();
+		return { ok: true, sw: box.scrollWidth, cw: box.clientWidth,
+			y: Math.round(b.y + b.height / 2), rect: { x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height) } };
+	})()`);
+	record("A", "A-left-swipe-hscroll-exempt 已造出横向可滚动容器", hscroll.ok === true && hscroll.sw > hscroll.cw,
+		`scrollWidth=${hscroll.sw} clientWidth=${hscroll.cw} rect=${JSON.stringify(hscroll.rect)}`);
+	if (hscroll.ok) {
+		await dispatchSwipe(380, 100, hscroll.y);
+		const hsAfter = await evaluate(`(function(){
+			var e = document.getElementById('dshr-t12-hscroll');
+			var p = document.querySelector('[data-sidebar-right-panel]');
+			return { open: !!(p && p.hasAttribute('data-sidebar-right-open') && p.getAttribute('aria-hidden') !== 'true'),
+				expanded: document.documentElement.getAttribute('data-dshr-expanded'),
+				sideW: (function(){var s=document.querySelector('[data-dshr-sidebar-col]');return s?Math.round(s.getBoundingClientRect().width):-1;})(),
+				scrollLeft: e ? e.scrollLeft : -1 };
+		})()`);
+		record("A", "A-left-swipe-hscroll-exempt 横滑容器内左滑不开右栏（横滑还给滚动）", hsAfter.open === false,
+			`data-sidebar-right-open=${hsAfter.open} scrollLeft=${hsAfter.scrollLeft}（>0 即证明横滑确实交给了原生滚动）`);
+		record("A", "A-left-swipe-hscroll-exempt 横滑容器内左滑不开左抽屉", hsAfter.expanded === "0" && hsAfter.sideW === 0,
+			`expanded=${hsAfter.expanded} 侧栏列宽=${hsAfter.sideW}px`);
+		await evaluate(`(function(){var e=document.getElementById('dshr-t12-hscroll');if(e&&e.parentNode)e.parentNode.removeChild(e);return true;})()`);
+	}
+	await ensureRightbarClosed();
+	await ensureCollapsed();
+
+	// A-right-swipe（回归）：主栏右滑 → 左侧抽屉照常展开
+	await dispatchSwipe(100, 350, lane.y);
+	await waitUntil(`document.documentElement.getAttribute('data-dshr-expanded') === '1'`, 3000);
+	await wait(500);
+	const rightAfter = await evaluate(`(function(){
+		var vis = function(id){ var e=document.getElementById(id); if(!e) return 'absent';
+			var c=getComputedStyle(e), b=e.getBoundingClientRect();
+			return (c.display==='none'||c.visibility==='hidden'||b.width===0)?'hidden':'VISIBLE'; };
+		var s = document.querySelector('[data-dshr-sidebar-col]');
+		return { expanded: document.documentElement.getAttribute('data-dshr-expanded'),
+			collapsed: !!document.querySelector('[data-sidebar-collapsed]'),
+			sideW: s ? Math.round(s.getBoundingClientRect().width) : -1,
+			mask: vis('dshr-mobile-drawer-mask'), handle: vis('dshr-drawer-handle') };
+	})()`);
+	record("A", "A-right-swipe 主栏右滑展开左侧抽屉（回归）", rightAfter.expanded === "1" && rightAfter.collapsed === false && rightAfter.sideW > 100 && rightAfter.mask === "VISIBLE" && rightAfter.handle === "VISIBLE", `expanded=${rightAfter.expanded} 官方收起=${rightAfter.collapsed} 侧栏列宽=${rightAfter.sideW}px mask=${rightAfter.mask} handle=${rightAfter.handle}`);
+
+	// A-close-swipe（回归）：抽屉展开状态下左滑 → 收起
+	const closeProbe = await dispatchSwipe(380, 130, lane.y);
+	await waitUntil(`document.documentElement.getAttribute('data-dshr-expanded') === '0'`, 3000);
+	await wait(500);
+	const closeAfter = await evaluate(`(function(){
+		var r = document.documentElement;
+		var s = document.querySelector('[data-dshr-sidebar-col]');
+		var m = document.getElementById('dshr-mobile-drawer-mask');
+		return { expanded: r.getAttribute('data-dshr-expanded'), dragging: r.getAttribute('data-dshr-dragging'),
+			collapsed: !!document.querySelector('[data-sidebar-collapsed]'),
+			sideW: s ? Math.round(s.getBoundingClientRect().width) : -1,
+			maskDisplay: m ? getComputedStyle(m).display : 'absent' };
+	})()`);
+	record("A", "A-close-swipe 展开态左滑收起抽屉（回归）", closeAfter.expanded === "0" && closeAfter.collapsed === true && closeAfter.sideW === 0, `expanded=${closeAfter.expanded} 官方收起=${closeAfter.collapsed} 侧栏列宽=${closeAfter.sideW}px touchmove=${closeProbe.moves} 被拒=${closeProbe.prevented}`);
+	// 归一：把后续 whale 断言的起点还原成标准收起基线
+	await ensureCollapsed();
+	await waitUntil(`document.documentElement.getAttribute('data-dshr-expanded') === '0'`, 3000);
+	info("A", `手势组完成：左滑前 expanded=${swipeBefore.expanded} 侧栏列宽=${swipeBefore.sideW}px（基线）`);
+
 	// 点鲸鱼 → 官方侧栏抽屉展开
 	const openClicks = await toggleViaWhale(true);
 	const afterOpen = await evaluate(`(()=>{const f=document.querySelector('[data-sidebar-collapsed]');const m=document.querySelector('[data-dshr-main-col]');

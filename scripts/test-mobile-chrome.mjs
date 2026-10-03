@@ -149,6 +149,54 @@ function assertSourceContracts() {
 	if (!src.includes("if (isInHorizontallyScrollableContainer(target)) return false;")) {
 		throw new Error("源码契约：WEB-05 canStartDrawerTrack 必须接入横向可滚容器豁免");
 	}
+	// ── WEB-08：手势方向门，且必须早于 setDrawerVisual 接管 ──
+	// 用户报告：手机主页面「从右往左滑」会点亮左侧抽屉而不是走官方右栏。
+	// 根因是 onDragMove 越过 10px 阈值就 dragging=true + setDrawerVisual(baseX)，
+	// 而 setDrawerVisual 首次调用无条件 setSidebarOpen(true) 才夹 x，左滑的负位移被夹成 0。
+	{
+		const GATE = "if (baseX <= 0 && dx < 0) {";
+		if (!src.includes(GATE)) {
+			throw new Error("源码契约：WEB-08 缺手势方向门（抽屉关闭时左滑必须放弃接管）");
+		}
+		// 取 onDragMove 的函数体：到下一个同缩进的 function 声明为止（不做花括号计数，
+		// 免得被函数体里的对象/数组字面量带偏），并**剔掉 // 注释行**——
+		// 方向门自己的注释里就出现过 "setDrawerVisual(baseX)" 这几个字，
+		// 按原文取下标会指向注释而不是真正的接管点，判定会假绿/假红。
+		const fnStart = src.indexOf("function onDragMove(clientX, clientY, event) {");
+		if (fnStart < 0) throw new Error("源码契约：找不到 onDragMove 函数");
+		const fnEnd = src.indexOf("\n\t\tfunction ", fnStart);
+		if (fnEnd < 0) throw new Error("源码契约：无法确定 onDragMove 函数体边界");
+		const body = src
+			.slice(fnStart, fnEnd)
+			.split("\n")
+			.filter((line) => !line.trim().startsWith("//"))
+			.join("\n");
+		const gateAt = body.indexOf(GATE);
+		if (gateAt < 0) throw new Error("源码契约：WEB-08 方向门不在 onDragMove 函数体内");
+		const dragStart = body.indexOf("dragging = true;");
+		const takeOver = body.indexOf("setDrawerVisual(baseX);");
+		const pd = body.indexOf("event.preventDefault()");
+		if (dragStart < 0 || takeOver < 0) {
+			throw new Error("源码契约：WEB-08 校验失败——onDragMove 里找不到 dragging = true; / setDrawerVisual(baseX); 接管点");
+		}
+		// 方向门必须在 dragging=true / setDrawerVisual(baseX) **之前**：
+		// 挪到 setDrawerVisual 之后就已经晚了——那时 setSidebarOpen(true) 早已执行，
+		// 左侧栏被点亮且末尾的 preventDefault() 已把官方手势吃掉。
+		if (gateAt > dragStart) {
+			throw new Error("源码契约：WEB-08 方向门必须早于 dragging = true（否则已进入跟手路径）");
+		}
+		if (gateAt > takeOver) {
+			throw new Error("源码契约：WEB-08 方向门必须早于 setDrawerVisual(baseX)（setSidebarOpen(true) 已执行就来不及了）");
+		}
+		// 方向门要早于 preventDefault，否则事件仍被吃掉（等于没还手给官方）。
+		if (pd < 0 || gateAt > pd) {
+			throw new Error("源码契约：WEB-08 方向门必须早于 event.preventDefault()（左滑要把事件还给官方/浏览器）");
+		}
+		// 方向门必须真的放弃接管：走 resetTrack() 并 return，不能继续跟手。
+		if (!/resetTrack\(\);\s*\n\s*return;/.test(body.slice(gateAt, gateAt + 200))) {
+			throw new Error("源码契约：WEB-08 方向门必须 resetTrack() 后立即 return（放弃接管）");
+		}
+	}
 	// ── WEB-07：hook 幂等——脚本自带重复执行护栏，注入端按标记幂等 ──
 	if (!src.includes("window.__dshRemoteMobileInstalled")) {
 		throw new Error("源码契约：WEB-07 缺重复执行护栏 __dshRemoteMobileInstalled（壳内+edge 双注入会叠 hook）");
