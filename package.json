@@ -26,6 +26,7 @@
     "test:client": "node scripts/test-client-bundle.mjs",
     "test:fixes": "node scripts/test-fix-regressions.mjs",
     "test:desktop": "node scripts/test-desktop-compat.mjs",
+    "test:perf": "node --test scripts/test-perf-opt.mjs",
     "test:mobile": "node scripts/test-mobile-chrome.mjs",
     "test:device": "node scripts/test-device-class.mjs",
     "typecheck": "pnpm -C packages/gateway typecheck && pnpm -C packages/plugin typecheck",

@@ -9,6 +9,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Rect;
@@ -171,6 +172,17 @@ public class MainActivity extends Activity {
 	private String directTarget = "";
 	/** 会话页沉浸状态栏；注入失败时退回实色。 */
 	private boolean edgeToEdgeChrome = true;
+	/**
+	 * PERF-03：WebView JS 定时器是否已挂起（pauseTimers/resumeTimers 必须成对，
+	 * 重复 pause 会叠加计数导致 resume 一次不够，故用本标记守卫）。
+	 */
+	private boolean webTimersPaused = false;
+	/**
+	 * DIAG-30s：本次连接起点（openGateway 落点）。onPageStarted/onPageFinished/
+	 * 首次进入会话三处打 t+xxms，用户复现时抓 `adb logcat -s dshr-perf` 即可
+	 * 看出 30s 花在哪一段（TLS+首包 / 资源加载 / DSH 前端启动）。
+	 */
+	private long connectStartMs = 0;
 
 	/**
 	 * AND-06：统一后台线程池（单线程、命名、守护），替换原裸 new Thread 的
@@ -218,6 +230,60 @@ public class MainActivity extends Activity {
 	protected void onPause() {
 		super.onPause();
 		CookieManager.getInstance().flush();
+		// PERF-03：退后台即挂起 WebView 渲染与全 WebView JS 定时器（含 DSH 的
+		// token 流 MutationObserver/rAF、mobile.js 通知扫描），让射频/CPU 能睡；
+		// frpc 隧道与前台服务保留，会话不断，只是页面暂停。回前台见 onResume。
+		if (webView != null) {
+			try {
+				webView.onPause();
+			} catch (Exception ignored) {
+			}
+			if (!webTimersPaused) {
+				try {
+					webView.pauseTimers();
+					webTimersPaused = true;
+				} catch (Exception ignored) {
+				}
+			}
+		}
+	}
+
+	@Override
+	protected void onResume() {
+		super.onResume();
+		// PERF-03：与 onPause 成对恢复；在 WEB 态补一次 inset/注入（暂停期间
+		// 键盘/旋转事件可能漏掉），已有 resumeLiveSession 保证不断整页重载。
+		if (webView != null) {
+			try {
+				webView.onResume();
+			} catch (Exception ignored) {
+			}
+			if (webTimersPaused) {
+				try {
+					webView.resumeTimers();
+				} catch (Exception ignored) {
+				} finally {
+					webTimersPaused = false;
+				}
+			}
+			if (uiState == UiState.WEB && webView.getVisibility() == View.VISIBLE) {
+				applyInsetsToPage(webView);
+				// REVIEW-03：后台期间 pauseTimers 未必冻住 WS 事件，running 翻转的
+				// 通知可能陈旧（结束仍显示"生成中"）。回前台主动重读一次通知，
+				// 经 JS bridge 刷新前台服务文案；读不到桥时静默跳过。
+				try {
+					webView.evaluateJavascript(
+						"(function(){try{var b=window.__dshRemoteAndroidMobile;"
+						+ "if(!b||typeof b.readSessionNotice!=='function')return;"
+						+ "var n=b.readSessionNotice();"
+						+ "if(window.DshRemoteApp&&typeof window.DshRemoteApp.setSessionNotice==='function')"
+						+ "window.DshRemoteApp.setSessionNotice(n.title||'',n.text||'',!!n.running);"
+						+ "}catch(e){}})()",
+						null);
+				} catch (Exception ignored) {
+				}
+			}
+		}
 	}
 
 	@Override
@@ -1165,6 +1231,8 @@ public class MainActivity extends Activity {
 		sessionHistoryRooted = false;
 		submittedHttpAuthThisConnection.clear();
 		final String target = url.trim();
+		connectStartMs = System.currentTimeMillis();
+		Log.i("dshr-perf", "openGateway t+0ms target=" + target);
 		showLocalShell(
 			UiState.CONNECTING,
 			"connecting",
@@ -1240,7 +1308,21 @@ public class MainActivity extends Activity {
 			}
 
 			@Override
+			public void onPageStarted(WebView view, String url, Bitmap favicon) {
+				// DIAG-30s：主帧导航提交点。首包慢（TLS/网关/上游）会体现在
+				// openGateway→onPageStarted 的差值里。
+				if (connectStartMs > 0 && isSessionUrl(url)) {
+					Log.i("dshr-perf", "onPageStarted t+"
+						+ (System.currentTimeMillis() - connectStartMs) + "ms url=" + url);
+				}
+			}
+
+			@Override
 			public void onPageFinished(WebView view, String url) {
+				if (connectStartMs > 0 && isSessionUrl(url)) {
+					Log.i("dshr-perf", "onPageFinished t+"
+						+ (System.currentTimeMillis() - connectStartMs) + "ms url=" + url);
+				}
 				enterSessionPage(view, url);
 				applyInsetsToPage(view);
 			}
@@ -1257,6 +1339,10 @@ public class MainActivity extends Activity {
 
 			@Override
 			public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+				if (request != null && request.isForMainFrame() && error != null) {
+					Log.w("dshr-perf", "mainFrame error code=" + error.getErrorCode()
+						+ " desc=" + error.getDescription() + " url=" + request.getUrl());
+				}
 				if (suppressGatewayErrors || awaitingCertificateDecision) return;
 				if (request == null || !request.isForMainFrame()) return;
 				if (isIgnorableWebError(error)) return;
@@ -1268,6 +1354,12 @@ public class MainActivity extends Activity {
 			@Override
 			public void onReceivedHttpError(WebView view, WebResourceRequest request,
 					WebResourceResponse response) {
+				// DIAG-30s：主帧任何 HTTP 错误都打点（含 401——上游会话失效时主帧
+				// 拿 401 纯文本、无自动重试，用户看到的就是"白屏卡住"）。
+				if (request != null && request.isForMainFrame() && response != null) {
+					Log.w("dshr-perf", "mainFrame httpError status=" + response.getStatusCode()
+						+ " url=" + request.getUrl());
+				}
 				if (suppressGatewayErrors || request == null || !request.isForMainFrame()) return;
 				if (response.getStatusCode() >= 500 && isActiveGatewayUri(request.getUrl())) {
 					showGatewayFailure("网关已连接，但电脑上的 DSH Web 暂时不可用。");
@@ -1773,6 +1865,12 @@ public class MainActivity extends Activity {
 		injectMobileAdaptation(view);
 		if (uiState == UiState.HOME || uiState == UiState.EDIT) return;
 		boolean alreadyInSession = uiState == UiState.WEB && sessionHistoryRooted;
+		// DIAG-30s：首次进入会话=用户看到可用界面的时刻，total 减去前面各段
+		// 即 DSH 前端启动+API 瀑布耗时。
+		if (!alreadyInSession && connectStartMs > 0) {
+			Log.i("dshr-perf", "enterSession t+"
+				+ (System.currentTimeMillis() - connectStartMs) + "ms url=" + url);
+		}
 		hideSettings();
 		uiState = UiState.WEB;
 		applySystemBars();
@@ -2139,9 +2237,14 @@ public class MainActivity extends Activity {
 		}
 		final boolean changed = stored != null && !stored.equalsIgnoreCase(fp);
 		if (!changed && stored != null) {
+			if (connectStartMs > 0) {
+				Log.i("dshr-perf", "sslPinned t+"
+					+ (System.currentTimeMillis() - connectStartMs) + "ms host=" + key);
+			}
 			handler.proceed();
 			return;
 		}
+		Log.i("dshr-perf", "sslDecision host=" + key + " changed=" + changed);
 		awaitingCertificateDecision = true;
 		handler.cancel();
 

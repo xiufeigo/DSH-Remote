@@ -93,27 +93,30 @@ export function makeHtmlInjector(options: HtmlInjectOptions = {}): (body: Buffer
 }
 
 /**
- * WEB-01：Service Worker 源码（白名单缓存策略）。
+ * WEB-01：Service Worker 源码（白名单缓存策略，PERF-02 stale-while-revalidate）。
  *
  * 历史策略是「网络优先、失败回退缓存」且不区分请求类别：瞬断时
  * `/api/*`、`/__dsh_remote__/*` 动态接口可能命中过期缓存；未认证 +
  * 网络异常时还会命中缓存里的受保护 HTML → WS 401 → 白屏死锁，连登录页
  * 都回不去。现改为白名单制：
  *
- *   - 只有「静态资源扩展名」的同源 GET 请求可进缓存（网络优先，
- *     成功后更新缓存，失败才回退缓存）；
+ *   - 只有「静态资源扩展名」的同源 GET 请求可进缓存；
  *   - 导航请求、`/api/*`、`/__dsh_remote__/*`（登录/配对页、配对码、
  *     管理端点等）一律穿透网络，失败不回退缓存——认证相关的响应
  *     永远拿网关的实时判定，离线/瞬断时不会把过期受保护页面糊回给用户；
  *     网络恢复后导航自然回到登录页，不再有缓存造成的死锁。
  *
+ * PERF-02：静态走 stale-while-revalidate —— 有缓存先秒渲染旧版，
+ * 后台 revalidate 成功后更新缓存（下次打开即新版）；无缓存才等网络，
+ * 失败回退缓存。二次打开不再被隧道全量下载卡住。
+ *
  * 不在白名单内的请求不调用 respondWith，等价于完全不拦截。
  * 缓存名带版本号：策略/资源结构变更时改名即可在 activate 时清旧缓存。
  */
 export function renderServiceWorker(): string {
-	return `/* DSH-Remote Service Worker —— 静态资源白名单缓存（WEB-01） */
+	return `/* DSH-Remote Service Worker —— 静态资源白名单缓存（WEB-01 + PERF-02 SWR） */
 "use strict";
-var CACHE_NAME = "dsh-remote-static-v1";
+var CACHE_NAME = "dsh-remote-static-v2";
 var CACHEABLE = /\\.(?:js|mjs|css|png|jpe?g|gif|webp|svg|woff2?|ttf|otf|eot|ico)$/i;
 
 self.addEventListener("install", function (event) {
@@ -144,22 +147,46 @@ self.addEventListener("fetch", function (event) {
 	if (url.pathname.indexOf("/api/") === 0 || url.pathname.indexOf("/__dsh_remote__/") === 0) return;
 	// 白名单：仅静态资源扩展名可缓存。
 	if (!CACHEABLE.test(url.pathname)) return;
+	// PERF-02 stale-while-revalidate：命中缓存即秒回，后台更新；
+	// 未命中等网络（成功后写缓存），网络失败才回退缓存。
+	// REVIEW-02：match/put 共用去 query 的归一化 key（否则同路径不同 query
+	// 堆积条目且命中实现相关）；revalidate 用 cache:"no-cache" 真回源；
+	// put 并入 waitUntil 链（SW 提前终止不丢更新）；整链兜底回退网络
+	// （CacheStorage 抛错时不让静态请求直接失败，退化为旧网络优先行为）。
 	event.respondWith(
-		fetch(request).then(function (fresh) {
-			if (fresh.ok) {
-				var cacheControl = fresh.headers.get("cache-control") || "";
-				if (!/no-store|private/i.test(cacheControl)) {
-					var copy = fresh.clone();
-					caches.open(CACHE_NAME).then(function (cache) { cache.put(request, copy); }).catch(function () {});
+		caches.open(CACHE_NAME).then(function (cache) {
+			var cacheKey = url.origin + url.pathname;
+			return cache.match(cacheKey, { ignoreSearch: true }).then(function (cached) {
+				var networkUpdate = fetch(request, { cache: "no-cache" }).then(function (fresh) {
+					if (fresh.ok) {
+						var cacheControl = fresh.headers.get("cache-control") || "";
+						// REVIEW-02：no-cache 语义是"每次使用前必须校验"，SWR 的
+						// "先给旧版"严格来说违反它——这类响应不进 SW 缓存（哈希
+						// 文件名资源一般带长 max-age，仍吃得到 SWR 秒开；no-cache
+						// 资源走 WebView 自带 HTTP 缓存做条件请求，正确性优先）。
+						if (!/no-store|private|no-cache/i.test(cacheControl)) {
+							var copy = fresh.clone();
+							return cache.put(cacheKey, copy).then(function () { return fresh; }, function () { return fresh; });
+						}
+					}
+					return fresh;
+				}).catch(function () { return cached; });
+				if (cached) {
+					// 后台 revalidate 的拒绝已在内部消化；这里只为延长 SW 存活。
+					// 异步回调调 waitUntil 在个别引擎会抛 InvalidStateError，加固。
+					try {
+						if (networkUpdate && typeof networkUpdate.catch === "function") {
+							event.waitUntil(networkUpdate.catch(function () {}));
+						}
+					} catch (waitErr) {}
+					return cached;
 				}
-			}
-			return fresh;
-		}).catch(function () {
-			return caches.match(request, { ignoreSearch: true }).then(function (cached) {
-				if (cached) return cached;
-				throw new Error("dsh-remote sw: offline and not cached " + request.url);
+				return networkUpdate.then(function (fresh) {
+					if (fresh) return fresh;
+					throw new Error("dsh-remote sw: offline and not cached " + request.url);
+				});
 			});
-		})
+		}).catch(function () { return fetch(request); })
 	);
 });
 `;

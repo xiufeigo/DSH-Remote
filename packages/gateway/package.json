@@ -13,7 +13,7 @@
   "scripts": {
     "start": "node src/cli.ts start",
     "doctor": "node src/cli.ts doctor",
-    "test": "node --test ../../scripts/test-plugin-routes.mjs ../../scripts/test-session-auth.mjs",
+    "test": "node --test ../../scripts/test-plugin-routes.mjs ../../scripts/test-session-auth.mjs ../../scripts/test-perf-opt.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
