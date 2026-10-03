@@ -7,6 +7,7 @@ import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
@@ -72,6 +73,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 
+import org.json.JSONObject;
+
 /**
  * DSH Remote Android 客户端。
  *
@@ -94,7 +97,8 @@ public class MainActivity extends Activity {
 	public static final String ACTION_OPEN_SETTINGS = "top.d1studio.dshremote.action.OPEN_SETTINGS";
 
 	private static final String KEY_URL = "gateway_url";
-	private static final String KEY_CERT_PREFIX = "cert_fp_";
+	/** 地址维度的证书指纹键前缀（存量安装 + 直连/局域网节点），见 CertPin.HOST_PREFIX。 */
+	private static final String KEY_CERT_PREFIX = CertPin.HOST_PREFIX;
 	private static final String KEY_HTTP_AUTH_REMEMBER_PREFIX = "http_auth_remember_";
 	private static final String MOBILE_UA_TOKEN = " DSHRemoteAndroid/1";
 	private static final int IME_PAD_HYSTERESIS_DP = 12;
@@ -105,7 +109,10 @@ public class MainActivity extends Activity {
 	private static final String MODE_TABLET = "tablet";
 	private static final int REQ_FILE_CHOOSER = 1001;
 	private static final int REQ_NOTIF_PERM = 1002;
-	private static final long TUNNEL_READY_TIMEOUT_MS = 20_000L;
+	/**
+	 * 隧道就绪等待硬顶。T23-B 把它搬到 TunnelReady（纯常量、可单测），值仍是 20_000ms。
+	 * @see TunnelReady#TUNNEL_READY_TIMEOUT_MS
+	 */
 
 	private enum UiState {
 		BOOTSTRAP,
@@ -122,6 +129,8 @@ public class MainActivity extends Activity {
 	private LinearLayout directNodesBox;
 	private EditText etName, etServer, etCport, etTunnel, etSk, etToken;
 	private TextView tvTunnelState;
+	/** T22-D：连接设置页的只读诊断行（无点击、无控件），显示 hook 最近一次上报。 */
+	private TextView tvUiDiag;
 	private Button resumeSessionBtn;
 	private String editingProfileId = "";
 	private WebView webView;
@@ -170,19 +179,61 @@ public class MainActivity extends Activity {
 	private boolean pageDark = false;
 	/** 直连重试不得误用当前选中的 FRP 配置组。 */
 	private String directTarget = "";
+	/**
+	 * T23-A：本次连接来自哪个配置组（直连/局域网节点为空串）。
+	 * 隧道模式下一律连本机回环地址 127.0.0.1:&lt;端口&gt;，两个配置档背后是两台不同的
+	 * 电脑、却共用同一个回环端口 ⇒ 只按 host:port 锁证书必然在切档时误报「证书已变更！」。
+	 * 有它才能按配置档身份核对指纹（CertPin.PROFILE_PREFIX）。每次 openGateway 一次性赋值，
+	 * 不跨连接残留。
+	 */
+	private String activeProfileId = "";
 	/** 会话页沉浸状态栏；注入失败时退回实色。 */
 	private boolean edgeToEdgeChrome = true;
 	/**
-	 * PERF-03：WebView JS 定时器是否已挂起（pauseTimers/resumeTimers 必须成对，
-	 * 重复 pause 会叠加计数导致 resume 一次不够，故用本标记守卫）。
+	 * PERF-03：WebView JS 定时器是否已挂起（进程级全局，本标记只用于「不要叠加 pause」）。
+	 *
+	 * pauseTimers()/resumeTimers() 的作用域是【整个进程】而不是单个 WebView（AOSP 原文：
+	 * "This is a global requests, not restricted to just this WebView"），所以本标记
+	 * 必须 static：一旦 Activity 重建（T17 §3 里 fontScale/locale/navigation 等未声明
+	 * 在 configChanges 的配置变化即可触发），实例字段会归零而进程真实状态仍为 paused，
+	 * 新实例 onResume 的 if 永假 ⇒ 定时器被永久冻结到进程被杀，而 hook 的收敛全部依赖
+	 * setTimeout/rAF（mobile-web.js:3243 的有界重试、:3195 的去抖）。这正是
+	 * 「连接失败/中断后再次连接」的典型动作序列。
 	 */
-	private boolean webTimersPaused = false;
+	private static boolean webTimersPaused = false;
+	/**
+	 * 当前是否处于前台。只用于 ensureWebView() 新建 WebView 后按「当前处于前台」把
+	 * 进程级全局态归零；正确性不依赖它——onResume 无条件 resumeTimers 才是结构不变量。
+	 */
+	private static volatile boolean appInForeground = false;
 	/**
 	 * DIAG-30s：本次连接起点（openGateway 落点）。onPageStarted/onPageFinished/
 	 * 首次进入会话三处打 t+xxms，用户复现时抓 `adb logcat -s dshr-perf` 即可
 	 * 看出 30s 花在哪一段（TLS+首包 / 资源加载 / DSH 前端启动）。
 	 */
 	private long connectStartMs = 0;
+
+	/**
+	 * T22-B：主框架失败的那个 URL。Chromium 在主框架失败后仍用【原 URL】回调
+	 * onPageFinished / doUpdateVisitedHistory / onPageCommitVisible，所以错误页会以
+	 * 「网关 URL」的身份走到 enterSessionPage。若照常判成会话页，就会给错误页注入
+	 * hook、置 uiState=WEB、clearHistory()，之后所有网关失败被 showGatewayFailure
+	 * 永久降级成 Toast、「重新连接」入口从此消失。命中本字段的 URL 一律不进 WEB 态。
+	 * 每次网关失败都置位，命中本字段的 URL 一律不进 WEB 态。清零只有两个点：
+	 * openGateway（新一轮连接尝试，含「重新连接」）与 enterSessionPage 里
+	 * 「换了 URL」的成功路径。**不能在 onPageStarted 或 showLocalShell 清**——
+	 * 前者与主框架错误同毫秒到达（会提前清掉），后者是失败处理自己走的路径
+	 * （showGatewayFailure → showLocalShell，清了等于没记）。
+	 */
+	private String failedMainFrameUrl = "";
+	/**
+	 * T22-D：hook 侧最近一次上报的页面适配诊断（window.DshRemoteApp.setUiDiag 过桥），
+	 * 字段集与 hook 的 collectUiDiag() 同源：device/on/rootClass/ready/whale/frame/
+	 * strictOff。只在内存里留最近一份，供连接设置页那行只读诊断显示；缺失显示「未上报」。
+	 * 由 WebView 的 JS 线程写、UI 线程读，故声明 volatile。
+	 */
+	private volatile String uiDiagRaw = "";
+	private volatile String uiDiagSummary = "";
 
 	/**
 	 * AND-06：统一后台线程池（单线程、命名、守护），替换原裸 new Thread 的
@@ -238,19 +289,25 @@ public class MainActivity extends Activity {
 				webView.onPause();
 			} catch (Exception ignored) {
 			}
+			// 守卫只用于「不要叠加 pause」：pause 侧可能叠加、resume 侧不依赖它
+			// （onResume 无条件 resumeTimers），故这一处语义未变。
 			if (!webTimersPaused) {
 				try {
 					webView.pauseTimers();
 					webTimersPaused = true;
-				} catch (Exception ignored) {
+					Log.i("dshr-perf", "onPause: 进程级定时器已挂起（webTimersPaused=true）");
+				} catch (Exception e) {
+					Log.w("dshr-perf", "onPause: pauseTimers 失败 " + e);
 				}
 			}
 		}
+		appInForeground = false;
 	}
 
 	@Override
 	protected void onResume() {
 		super.onResume();
+		appInForeground = true;
 		// PERF-03：与 onPause 成对恢复；在 WEB 态补一次 inset/注入（暂停期间
 		// 键盘/旋转事件可能漏掉），已有 resumeLiveSession 保证不断整页重载。
 		if (webView != null) {
@@ -258,16 +315,26 @@ public class MainActivity extends Activity {
 				webView.onResume();
 			} catch (Exception ignored) {
 			}
-			if (webTimersPaused) {
-				try {
-					webView.resumeTimers();
-				} catch (Exception ignored) {
-				} finally {
-					webTimersPaused = false;
-				}
+			// 防御性恢复（T17 b'）：resumeTimers() 是全局「恢复运行」而非「加一」，
+			// 前台必须恒为未暂停。**无条件**调用，不看 webTimersPaused——该字段一旦与
+			// 真实全局态失配（Activity 重建后归零、resumeTimers 抛异常后被 finally 清掉），
+			// 条件式恢复就会永远不执行，定时器被永久冻结到进程被杀。
+			// 不依赖「重复 pause 是否叠加计数」这一未证实语义：pause 侧有守卫不叠加，
+			// 重复 resume 在两种语义下都安全。
+			try {
+				webView.resumeTimers();
+				webTimersPaused = false;
+				Log.i("dshr-perf", "onResume: 进程级定时器已恢复运行（无条件 resumeTimers）");
+			} catch (Exception e) {
+				// 恢复失败不得把标志留在「已挂起」——否则下一轮守卫会把 pause 也跳过。
+				webTimersPaused = false;
+				Log.w("dshr-perf", "onResume: resumeTimers 失败（标志已清零，下轮仍会重试）" + e);
 			}
 			if (uiState == UiState.WEB && webView.getVisibility() == View.VISIBLE) {
 				applyInsetsToPage(webView);
+				// T27-B：回前台也重排一次自检。退后台期间页面可能被系统回收重建
+				// （或用户在别处改了什么导致档位/收敛态漂移），回前台是补注的天然时机。
+				scheduleAdaptationProbe(webView);
 				// REVIEW-03：后台期间 pauseTimers 未必冻住 WS 事件，running 翻转的
 				// 通知可能陈旧（结束仍显示"生成中"）。回前台主动重读一次通知，
 				// 经 JS bridge 刷新前台服务文案；读不到桥时静默跳过。
@@ -292,6 +359,9 @@ public class MainActivity extends Activity {
 		// 等待轮询线程不再持有 Activity 空转。
 		destroyed = true;
 		bgExecutor.shutdownNow();
+		// T23-B：frpc 就绪回调是静态字段且持有本 Activity，销毁即注销
+		//（正常路径由 waitAndOpen 的 finally 注销，这里兜底重建/异常路径）。
+		FrpcManager.setReadyListener(null);
 		dismissPendingHttpAuth();
 		fileCallback = null;
 		if (webView != null) {
@@ -300,6 +370,17 @@ public class MainActivity extends Activity {
 			// → 移出视图树 → 清子视图（Chromium 全屏视频/下拉等宿主子 View）
 			// → 停止加载 → 清历史 → destroy。
 			webView.removeJavascriptInterface("DshRemoteApp");
+			// 归还进程级全局态（T17 P1 的直接成因）：pauseTimers 的作用域是整个进程，
+			// 不会随本实例一起死。销毁前不恢复，同进程内下一个 Activity 实例就继承
+			// 一个「已暂停」的进程，而它的 webTimersPaused 因字段重建而为 false，
+			// 于是永不 resumeTimers —— 定时器永久冻结。
+			try {
+				webView.resumeTimers();
+				Log.i("dshr-perf", "onDestroy: 销毁 WebView 前归还进程级定时器（resumeTimers）");
+			} catch (Exception e) {
+				Log.w("dshr-perf", "onDestroy: 归还定时器失败 " + e);
+			}
+			webTimersPaused = false;
 			webView.setOnKeyListener(null);
 			webView.setWebViewClient(null);
 			webView.setWebChromeClient(null);
@@ -423,6 +504,14 @@ public class MainActivity extends Activity {
 		tvTunnelState.setTextSize(13);
 		tvTunnelState.setPadding(0, dp(10, d), 0, 0);
 		box.addView(tvTunnelState);
+
+		// T22-D：只读诊断行（纯文本、不可点、不新增任何控件），显示 hook 最近一次
+		// 上报的页面适配效果。给「手机界面到底有没有生效」一个当场可读的答案。
+		tvUiDiag = new TextView(this);
+		tvUiDiag.setTextSize(12);
+		tvUiDiag.setPadding(0, dp(4, d), 0, 0);
+		box.addView(tvUiDiag);
+		refreshUiDiagLine();
 
 		LinearLayout direct = card(d);
 		direct.addView(cardTitle("直连入口或局域网", d));
@@ -816,7 +905,53 @@ public class MainActivity extends Activity {
 		}
 		if (homeScroll != null) homeScroll.setVisibility(View.VISIBLE);
 		if (setupScroll != null) setupScroll.setVisibility(View.GONE);
+		refreshUiDiagLine();
 		applySystemBars();
+	}
+
+	/**
+	 * 刷新连接设置页那行只读诊断。显示最近一次 hook 上报的关键字段
+	 * （device/on/rootClass/ready/whale/frame/strictOff），从未收到上报时显示「未上报」。
+	 * 必须在 UI 线程调用。
+	 */
+	private void refreshUiDiagLine() {
+		if (tvUiDiag == null) return;
+		String summary = uiDiagSummary;
+		tvUiDiag.setText(TextUtils.isEmpty(summary)
+			? "页面适配诊断：未上报（连上会话后由页面回报）"
+			: summary);
+	}
+
+	/**
+	 * 把 hook 的诊断 JSON 折成一行文案。字段名与 hook 的 collectUiDiag() 同源，
+	 * 任何字段缺失都显示「未上报」而不是省略——缺字段本身就是要说出来的信息。
+	 * 解析失败返回空串，由 refreshUiDiagLine() 落回「未上报」。
+	 */
+	private static String formatUiDiag(String json) {
+		if (TextUtils.isEmpty(json)) return "";
+		try {
+			JSONObject o = new JSONObject(json);
+			return "页面适配诊断：档位 " + diagStr(o, "device")
+				+ " · 钩子 " + diagBool(o, "on")
+				+ " · 根类 " + diagStr(o, "rootClass")
+				+ " · 收敛 " + diagBool(o, "ready")
+				+ " · 鲸鱼 " + diagBool(o, "whale")
+				+ " · 三栏 " + diagBool(o, "frame")
+				+ " · 严格关闭 " + diagBool(o, "strictOff");
+		} catch (Exception e) {
+			return "";
+		}
+	}
+
+	private static String diagStr(JSONObject o, String key) {
+		if (!o.has(key)) return "未上报";
+		String v = o.optString(key, "");
+		return TextUtils.isEmpty(v) ? "无" : v;
+	}
+
+	private static String diagBool(JSONObject o, String key) {
+		if (!o.has(key)) return "未上报";
+		return o.optBoolean(key) ? "是" : "否";
 	}
 
 	private void clearResumeSession() {
@@ -1001,6 +1136,10 @@ public class MainActivity extends Activity {
 		p.secretKey = c.secretKey;
 		p.mode = ProfileStore.DEFAULT_MODE;
 		p.tunnelName = ProfileStore.normalizeTunnelName(c.serverName);
+		// T23-A：二维码里的网关自签指纹必须随配置组一起存下来。改前这里没拷，
+		// Profile 也没有该字段 ⇒ 指纹在导入那一刻就被丢弃，后续首连前的「预置指纹」
+		// 分支永远不成立（每次都退回 TOFU）。
+		p.fingerprint = CertPin.normalizeFingerprint(c.fingerprint);
 		ProfileStore.upsert(prefs(), p);
 		ProfileStore.setActiveId(prefs(), p.id);
 		beginTunnel(p);
@@ -1069,6 +1208,8 @@ public class MainActivity extends Activity {
 	private void beginTunnel(final ProfileStore.Profile profile) {
 		directTarget = "";
 		clearResumeSession();
+		// T23-A：证书按配置档身份锁定，连接全程（含复用活隧道的直连 openGateway）都要带着它。
+		activeProfileId = profile.id;
 		final int generation = ++connectionGeneration;
 		final VisitorConfig cfg = profile.toVisitorConfig();
 		if (!cfg.isValid()) {
@@ -1106,9 +1247,9 @@ public class MainActivity extends Activity {
 				if (reused > 0) {
 					cfg.bindPort = reused;
 					String target = "https://127.0.0.1:" + reused + "/";
-					if (tvTunnelState != null) tvTunnelState.setText("隧道已在运行，正在打开会话…");
+					setTunnelState("隧道已在运行，正在打开会话…");
 					if (resumeLiveSession(target)) return;
-					openGateway(target);
+					openGateway(target, profile.id);
 					return;
 				}
 				if (negotiated < 0) {
@@ -1121,14 +1262,13 @@ public class MainActivity extends Activity {
 				int port = negotiated;
 				cfg.bindPort = port;
 				prefs().edit().putInt(ProfileStore.KEY_BOUND_PORT, port).apply();
+				// T23-B：状态标签逐步更新。改前只有「隧道启动中（…3~10 秒）…」这一句，
+				// 且 openGateway 之后再也不动它 ⇒ 用户是在看一个过期标签判断卡没卡。
+				setTunnelState("正在启动隧道（端口 " + port + "）…");
 				Intent svc = new Intent(MainActivity.this, TunnelService.class);
 				svc.putExtra(TunnelService.EXTRA_BIND_PORT, port);
 				if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc);
 				else startService(svc);
-				if (tvTunnelState != null) {
-					tvTunnelState.setText("隧道启动中（frpc 打洞/建联一般 3~10 秒）…"
-						+ (port == ProfileStore.BIND_PORT ? "" : "（端口 " + port + "）"));
-				}
 				showLocalShell(
 					UiState.CONNECTING,
 					"connecting",
@@ -1139,46 +1279,88 @@ public class MainActivity extends Activity {
 					"",
 					""
 				);
-				waitAndOpen(cfg, generation);
+				// 壳页已经就位，这一条才会同时落到壳页正文上（用户真正在看的那块屏）。
+				setShellStage("正在建立隧道（frpc 打洞/建联）…"
+					+ (port == ProfileStore.BIND_PORT ? "" : "（端口 " + port + "）"));
+				waitAndOpen(cfg, generation, profile.id);
 			});
 		});
 	}
 
-	private void waitAndOpen(final VisitorConfig cfg, final int generation) {
-		final long deadline = System.currentTimeMillis() + TUNNEL_READY_TIMEOUT_MS;
+	/**
+	 * 隧道就绪等待。判据只有一个：本地回环端口能不能连上。
+	 *
+	 * T23-B 相对改前的三处变化（20s 硬顶与打洞 fallbackTimeoutMs=5000 都【没动】）：
+	 * ①探测从 connect 600ms 收到 200ms —— 回环要么秒连要么秒拒，600ms 是过度冗余；
+	 * ②间隔从固定 400ms 改成 100→200→400ms 轻微退避，最坏检出滞后 1000ms → 600ms；
+	 * ③frpc 命中就绪日志时立刻唤醒一次探测，而不是死等下一个 tick。
+	 *   日志只用来提前触发，【端口可连仍是唯一判据】——frp 的文案会随版本/语言漂移，
+	 *   绝不放行任何连接。
+	 */
+	private void waitAndOpen(final VisitorConfig cfg, final int generation, final String profileId) {
+		final long startMs = System.currentTimeMillis();
+		final long deadline = startMs + TunnelReady.TUNNEL_READY_TIMEOUT_MS;
+		final Object signal = new Object();
+		final boolean[] signaled = new boolean[1];
 		// AND-06：就绪轮询走统一线程池；onDestroy 的 shutdownNow() 会中断该轮询。
 		runInBackground("tunnel-wait", () -> {
+			FrpcManager.setReadyListener(() -> {
+				synchronized (signal) {
+					signaled[0] = true;
+					signal.notifyAll();
+				}
+			});
 			boolean up = false;
-			while (!destroyed && System.currentTimeMillis() < deadline) {
-				if (Thread.currentThread().isInterrupted()) break;
-				try {
-					Socket s = new Socket();
-					s.connect(new InetSocketAddress("127.0.0.1", cfg.bindPort), 600);
-					s.close();
-					up = true;
-					break;
-				} catch (IOException ignored) {
+			int attempts = 0;
+			long statusMs = 0;
+			try {
+				while (!destroyed && System.currentTimeMillis() < deadline) {
+					if (Thread.currentThread().isInterrupted()) break;
+					if (isLoopbackPortOpen(cfg.bindPort)) {
+						up = true;
+						Log.i("dshr-perf", "隧道就绪 t+"
+							+ (System.currentTimeMillis() - startMs) + "ms 端口=" + cfg.bindPort
+							+ " 探测次数=" + (attempts + 1));
+						break;
+					}
+					attempts++;
+					synchronized (signal) {
+						if (signaled[0]) {
+							// frpc 已报就绪：不等退避，立刻再探一次。
+							signaled[0] = false;
+						} else {
+							try {
+								signal.wait(TunnelReady.nextDelayMs(attempts));
+							} catch (InterruptedException e) {
+								Thread.currentThread().interrupt();
+								break;
+							}
+							signaled[0] = false;
+						}
+					}
+					// 状态文案每秒刷新一次已等待时长，让「还在等、等了多久」当场可读。
+					long now = System.currentTimeMillis();
+					if (now - statusMs >= 1000) {
+						statusMs = now;
+						setShellStage(TunnelReady.waitingLabel(now - startMs));
+					}
 				}
-				try {
-					Thread.sleep(400);
-				} catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-					break;
-				}
+			} finally {
+				// 回调持有 Activity，绝不能留在静态字段里。
+				FrpcManager.setReadyListener(null);
 			}
 			final boolean ok = up;
 			runOnUiThread(() -> {
 				if (destroyed) return;
 				if (generation != connectionGeneration || uiState != UiState.CONNECTING) return;
 				if (!ok) {
-					if (tvTunnelState != null) {
-						tvTunnelState.setText("隧道未就绪：检查电脑网关、密钥和 frps 网络。");
-					}
+					setTunnelState("隧道未就绪：检查电脑网关、密钥和 frps 网络。");
 					showLocalShell(
 						UiState.CONNECTING,
 						"failed",
 						"无法连接 DSH",
-						"隧道未在 20 秒内就绪。请检查电脑网关、密钥和 frps 网络后重试。",
+						"隧道未在 " + (TunnelReady.TUNNEL_READY_TIMEOUT_MS / 1000)
+							+ " 秒内就绪。请检查电脑网关、密钥和 frps 网络后重试。",
 						"dsh-remote://app/retry",
 						"重新连接",
 						"dsh-remote://app/home",
@@ -1187,14 +1369,98 @@ public class MainActivity extends Activity {
 					return;
 				}
 				// 二维码携带的指纹在首连前预置：免 TOFU 弹窗，直接锁定。
-				if (cfg.fingerprint.length() == 64) {
-					prefs().edit()
-						.putString(KEY_CERT_PREFIX + "127.0.0.1:" + cfg.bindPort, cfg.fingerprint)
-						.apply();
+				// T27-A：预置**只**写配置档键。判定侧已把「配置档连接」与「直连地址」
+				// 两个信任语境彻底分开（不再互回退），此时写共享地址键对本档毫无用处，
+				// 反而会把这份信任泄漏给同一 host:port 上的直连/局域网节点。
+				String seedFp = CertPin.normalizeFingerprint(cfg.fingerprint);
+				if (seedFp.length() == 64) {
+					SharedPreferences.Editor seed = prefs().edit();
+					for (String key : CertPin.seedKeys(profileId, "127.0.0.1", cfg.bindPort)) {
+						seed.putString(key, seedFp);
+					}
+					seed.apply();
+					Log.i("dshr-perf", "预置网关证书指纹 profile=" + profileId
+						+ " 端口=" + cfg.bindPort);
 				}
-				openGateway("https://127.0.0.1:" + cfg.bindPort + "/");
+				setTunnelState("隧道已就绪，正在打开 DSH…");
+				openGateway("https://127.0.0.1:" + cfg.bindPort + "/", profileId);
 			});
 		});
+	}
+
+	/**
+	 * 回环端口探测（隧道就绪的唯一判据）。必须在后台线程调用。
+	 * 回环 connect 要么立刻成功、要么立刻 ECONNREFUSED，超时只用于兜底
+	 * （端口被半死进程占住时），故 200ms 足够。
+	 */
+	private static boolean isLoopbackPortOpen(int port) {
+		try {
+			Socket s = new Socket();
+			try {
+				s.connect(new InetSocketAddress("127.0.0.1", port), (int) TunnelReady.PROBE_TIMEOUT_MS);
+				return true;
+			} finally {
+				try {
+					s.close();
+				} catch (IOException ignored) {
+				}
+			}
+		} catch (IOException ignored) {
+			return false;
+		}
+	}
+
+	/**
+	 * T23-B：状态文案的唯一写入口（空指针安全，可从后台线程调用）。只写原生标签。
+	 *
+	 * 刻意【不】碰 WebView：直连/复用路径上 openGateway 时屏幕上仍是上一张会话页，
+	 * 对它 evaluateJavascript 会排在那个页面的 JS 队列后面（实测在 DSH 首屏解析期间
+	 * 要等几十毫秒），等于给每条连接白加一次等待。壳页正文由 setShellStage 单独负责，
+	 * 只在确定「壳页正在屏上」（隧道等待期）时才发那一次 JS。
+	 */
+	private void setTunnelState(final String text) {
+		if (tvTunnelState == null) return;
+		runOnUiThread(() -> {
+			if (tvTunnelState != null) tvTunnelState.setText(text);
+		});
+	}
+
+	/**
+	 * 隧道等待期的阶段文案：原生标签 + 本地壳页正文一起更新。
+	 *
+	 * 为什么要落到壳页：连接中原生连接设置页是隐藏的，屏幕上只有这张壳页，
+	 * 改前它从头到尾只有「正在建立安全隧道。」一句不变的话——用户判断不了卡在哪一步。
+	 * 用 evaluateJavascript 只改文本节点、【不重新导航】，因此不碰 T22 的失败窗口与
+	 * 失败标记时序；且带 data-state==='connecting' 守卫，失败壳/会话页都不会被改。
+	 */
+	private void setShellStage(final String text) {
+		setTunnelState(text);
+		if (webView == null) return;
+		runOnUiThread(() -> {
+			if (webView == null || uiState != UiState.CONNECTING) return;
+			String js = "(function(){try{var b=document.body;var p=document.querySelector('main p');"
+				+ "if(p&&b&&b.getAttribute('data-state')==='connecting'){p.textContent="
+				+ jsStringLiteral(text) + ";}}catch(e){}})()";
+			try {
+				webView.evaluateJavascript(js, null);
+			} catch (Exception ignored) {
+			}
+		});
+	}
+
+	/** 把字符串安全地编成 JS 字面量（阶段文案含全角省略号与括号，不做转义会拼坏脚本）。 */
+	private static String jsStringLiteral(String value) {
+		StringBuilder sb = new StringBuilder(value.length() + 8);
+		sb.append('"');
+		for (int i = 0; i < value.length(); i++) {
+			char c = value.charAt(i);
+			if (c == '"' || c == '\\') sb.append('\\').append(c);
+			else if (c == '\n') sb.append("\\n");
+			else if (c == '\r') sb.append("\\r");
+			else if (c < 0x20) sb.append(String.format(Locale.US, "\\u%04x", (int) c));
+			else sb.append(c);
+		}
+		return sb.append('"').toString();
 	}
 
 	/**
@@ -1227,12 +1493,29 @@ public class MainActivity extends Activity {
 	// ---------- 直连模式 ----------
 
 	private void openGateway(String url) {
+		openGateway(url, "");
+	}
+
+	/**
+	 * @param profileId 本次连接的配置组 id；直连/局域网节点传空串。
+	 *                   T23-A：证书锁定按配置档身份比对，只有隧道路径才带得进去。
+	 */
+	private void openGateway(String url, String profileId) {
 		connectionGeneration += 1;
 		sessionHistoryRooted = false;
 		submittedHttpAuthThisConnection.clear();
 		final String target = url.trim();
+		activeProfileId = profileId == null ? "" : profileId;
 		connectStartMs = System.currentTimeMillis();
+		// 一轮新的连接尝试 = 失败标记的唯一清零点。「重新连接」也走这里，故
+		// 重试不会被上一轮的失败标记挡住；而同一次尝试内 showGatewayFailure 换出的
+		// 失败壳不得清它，否则紧随的 onPageFinished 又会把错误页判成会话页。
+		failedMainFrameUrl = "";
 		Log.i("dshr-perf", "openGateway t+0ms target=" + target);
+		// T23-B：这一步起就把状态标签推进到「正在打开 DSH 页面…」。改前这里不动标签，
+		// 屏幕上会一直留着上一阶段的「隧道启动中（…3~10 秒）…」，直到 enterSession 才被
+		// 覆盖成「隧道运行中」——用户看到的过期文案正是「卡住了」的来源。
+		setTunnelState("正在打开 DSH 页面…（验证网关与设备授权）");
 		showLocalShell(
 			UiState.CONNECTING,
 			"connecting",
@@ -1244,6 +1527,12 @@ public class MainActivity extends Activity {
 			""
 		);
 		activeUrl = target;
+		// T27-B：一轮新的连接尝试 = 自检重排预算的起点（滚动窗口也要显式归零，
+		// 否则上一轮的重定向风暴会把紧接着的「重新连接」也挡在窗口外）。
+		adaptProbeArms = 0;
+		adaptProbeWindowStartMs = 0L;
+		lastAdaptProbeArmMs = 0L;
+		adaptProbeCapLogged = false;
 		webView.post(() -> {
 			if (uiState == UiState.CONNECTING && target.equals(activeUrl)) webView.loadUrl(target);
 		});
@@ -1257,12 +1546,37 @@ public class MainActivity extends Activity {
 
 	private void ensureWebView() {
 		if (webView != null) return;
+		// 测试期可观测性：仅当 APK 自身带 FLAG_DEBUGGABLE（即用 `build.ps1 -Debug`
+		// 走 `aapt2 link --debug-mode` 产出的 dsh-remote-debug.apk）才打开 WebView
+		// DevTools 协议，用于 adb forward + CDP 读页面真值（mobile hook 是否装上、
+		// 挂在哪一步）。发布构建不带该 flag，故此分支永不成立——发布包不暴露调试口。
+		// 严禁改成无条件开启：debuggable 的 WebView 任何本地应用都能接管调试。
+		if ((getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+			try {
+				WebView.setWebContentsDebuggingEnabled(true);
+				Log.i("dshr-perf", "WebView DevTools 已开启（debuggable 构建）");
+			} catch (Exception e) {
+				Log.w("dshr-perf", "开启 WebView DevTools 失败：" + e);
+			}
+		}
 		// DayNight 包装让 WebView 的 prefers-color-scheme 跟随系统。
 		Context webCtx = this;
 		if (Build.VERSION.SDK_INT >= 29) {
 			webCtx = new ContextThemeWrapper(this, android.R.style.Theme_DeviceDefault_DayNight);
 		}
 		webView = new WebView(webCtx);
+		// 进程级全局态不随实例走：新建后按「当前是否在前台」把它归零——前台立刻钉回
+		// 运行中，后台则交给 onResume 的无条件 resumeTimers（那才是结构不变量）。
+		if (appInForeground) {
+			try {
+				webView.resumeTimers();
+			} catch (Exception e) {
+				Log.w("dshr-perf", "ensureWebView: resumeTimers 失败 " + e);
+			}
+		}
+		webTimersPaused = false;
+		Log.i("dshr-perf", "ensureWebView 新建 WebView：appInForeground=" + appInForeground
+			+ "，进程级定时器标志归零");
 		webView.setBackgroundColor(shellColor(R.color.shell_background));
 		WebSettings s = webView.getSettings();
 		s.setJavaScriptEnabled(true);
@@ -1311,6 +1625,10 @@ public class MainActivity extends Activity {
 			public void onPageStarted(WebView view, String url, Bitmap favicon) {
 				// DIAG-30s：主帧导航提交点。首包慢（TLS/网关/上游）会体现在
 				// openGateway→onPageStarted 的差值里。
+				// 这里【不】清 failedMainFrameUrl：主框架错误可能与 onPageStarted 同一
+				// 毫秒到达（如 ERR_UNSAFE_PORT 实测两者同为 t+348ms），在这里清会把
+				// 紧随其后的 onPageFinished 放行，错误页又会被当成会话页。
+				// 失败标记只由 openGateway（新一轮连接）和「换 URL 进会话」清除。
 				if (connectStartMs > 0 && isSessionUrl(url)) {
 					Log.i("dshr-perf", "onPageStarted t+"
 						+ (System.currentTimeMillis() - connectStartMs) + "ms url=" + url);
@@ -1339,14 +1657,22 @@ public class MainActivity extends Activity {
 
 			@Override
 			public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-				if (request != null && request.isForMainFrame() && error != null) {
+				boolean mainFrame = request != null && request.isForMainFrame();
+				if (mainFrame && error != null) {
 					Log.w("dshr-perf", "mainFrame error code=" + error.getErrorCode()
 						+ " desc=" + error.getDescription() + " url=" + request.getUrl());
 				}
-				if (suppressGatewayErrors || awaitingCertificateDecision) return;
-				if (request == null || !request.isForMainFrame()) return;
+				if (awaitingCertificateDecision) return;
+				if (!mainFrame) return;
+				// 我们主动 stopLoading / 换壳造成的取消已被 isIgnorableWebError 滤掉，
+				// 所以走到这里的主框架错误一定是真实失败——**不能再被错误抑制窗口吞掉**。
+				// 原来的 1200ms 窗口比实测首个主框架错误的到达时间（t+89ms）长一个数量级，
+				// 曾让整条失败反馈消失，用户只看到 Chromium 原始错误页（T16 缺陷 1）。
+				// 窗口长度从此不再决定用户看到什么：主框架错误结构性绕过本标志。
 				if (isIgnorableWebError(error)) return;
+				suppressGatewayErrors = false;
 				if (isActiveGatewayUri(request.getUrl())) {
+					failedMainFrameUrl = request.getUrl().toString();
 					showGatewayFailure("网络连接中断，请确认网关和隧道仍在运行。");
 				}
 			}
@@ -1360,10 +1686,13 @@ public class MainActivity extends Activity {
 					Log.w("dshr-perf", "mainFrame httpError status=" + response.getStatusCode()
 						+ " url=" + request.getUrl());
 				}
-				if (suppressGatewayErrors || request == null || !request.isForMainFrame()) return;
-				if (response.getStatusCode() >= 500 && isActiveGatewayUri(request.getUrl())) {
-					showGatewayFailure("网关已连接，但电脑上的 DSH Web 暂时不可用。");
-				}
+				if (awaitingCertificateDecision || response == null
+					|| request == null || !request.isForMainFrame()) return;
+				if (response.getStatusCode() < 500 || !isActiveGatewayUri(request.getUrl())) return;
+				// 同 onReceivedError：主框架 5xx 也不受错误抑制窗口影响。
+				suppressGatewayErrors = false;
+				failedMainFrameUrl = request.getUrl().toString();
+				showGatewayFailure("网关已连接，但电脑上的 DSH Web 暂时不可用。");
 			}
 
 			@Override
@@ -1631,12 +1960,34 @@ public class MainActivity extends Activity {
 	}
 
 	/**
+	 * T27-B：清掉「半装」毒化守卫。
+	 * mobile.js 的幂等守卫在 IIFE **第一行**就置位（__dshRemoteMobileInstalled），
+	 * 而脚本末尾把样式挂进文档需要 documentElement 已存在（mobile-web.js:911
+	 * 的 (document.head || document.documentElement).appendChild）。Page.reload 触发的
+	 * onPageStarted 正好落在这个空档（实测抛
+	 * 「TypeError: Cannot read properties of null (reading 'appendChild')」）：
+	 * 守卫已置位、API 从未定义 ⇒ 此后**每一次**注入都是空操作，本文档再也装不上，
+	 * 连自检第 1 轮的补注入也救不回来（实测 reload 后 hook 永久不收敛）。
+	 * 这里只做一件事：发现「守卫已置位但 API 没定义」就清掉守卫，让下一次注入真正装上。
+	 * 已正常装上的页面（API 存在）判 0、不动，零副作用。
+	 * 耦合点：若日后 mobile.js 不再导出 __dshRemoteAndroidMobile，这里会误清守卫 →
+	 * 变成「每次注入都重装」。改 mobile.js 的对外 API 时必须同步改这里。
+	 */
+	private static final String HOOK_STALE_GUARD_JS =
+		"(function(){try{"
+		+ "if(window.__dshRemoteMobileInstalled===true"
+		+ "&&typeof window.__dshRemoteAndroidMobile==='undefined'){"
+		+ "window.__dshRemoteMobileInstalled=false;return 1;}"
+		+ "return 0;}catch(e){return -1;}})()";
+
+	/**
 	 * 注入移动适配脚本。所有注入点都必须经过这里，因此「先写档位配置」是结构性的：
-	 * 配置写入与脚本注入是同一个方法内相邻的两条 evaluateJavascript，同线程按序执行，
-	 * hook 首次执行时一定读得到正确档位。
+	 * 配置写入、守卫自愈与脚本注入是同一个方法内相邻的三条 evaluateJavascript，
+	 * 同线程按序执行，hook 首次执行时一定读得到正确档位。
 	 */
 	private void injectMobileAdaptation(WebView view) {
 		applyDeviceModeToPage(view);
+		view.evaluateJavascript(HOOK_STALE_GUARD_JS, null);
 		view.evaluateJavascript(readMobileAdaptJs(), null);
 	}
 
@@ -1688,35 +2039,157 @@ public class MainActivity extends Activity {
 	}
 
 	/**
-	 * 注入自检：页面加载数秒后确认适配脚本确实在页面里运行。
-	 * 若脚本始终缺失（evaluateJavascript 丢失、极端 WebView 环境），
-	 * 退回实色状态栏模式——内容整体位于状态栏下方，绝不与系统栏重叠；
-	 * 脚本正常时保持透明状态栏沉浸模式。
-	 * 平板档位整体跳过：那里 hook 主动保持关闭，__dshRemoteMobileInstalled 必然缺失，
-	 * 跑这套自检只会误退成实色状态栏并反复补注，把平板模式搞坏。
+	 * 「效果」判据脚本：一次性回读根类 / 鲸鱼 / 收敛 / 根元素全量 data-dshr-*。
+	 * 全部包在 try 里，保证任何异常都以「未生效」呈现、绝不抛。
+	 *
+	 * **必须返回对象而不是 JSON 字符串**：evaluateJavascript 的回调拿到的是结果的
+	 * JSON 编码——返回字符串会再被编码一层（外层带引号、内层引号被转义），
+	 * 传给 new JSONObject() 会直接抛异常，把健康页面误判成「未生效」。
+	 *
+	 * 判据是【效果】而不是安装标志：hook 的 `window.__dshRemoteMobileInstalled`
+	 * 在 mobile-web.js 的 IIFE 顶部（任何实际工作之前）就置位，拿它当判据在原理上
+	 * 分不清「装上了」和「装上了但没生效」，于是「根类缺失 / 鲸鱼不可见」这类半吊子
+	 * 状态会被判成健康、永远不补注（T16 缺陷 3 / T17 §0.D）。
+	 * 鲸鱼判据与 hook 的 isVisible() 同源（getClientRects().length > 0）。
+	 */
+	private static final String ADAPT_EFFECT_JS =
+		"(function(){try{"
+		+ "var r=document.documentElement;"
+		+ "var root=r.classList.contains('dshr-mobile');"
+		+ "var w=document.getElementById('dshr-mobile-whale');"
+		+ "var whale=!!(w&&w.getClientRects&&w.getClientRects().length>0);"
+		// hook 主动收起鲸鱼的两个状态（右侧栏全屏 / Explorer 详情替换模式）不判为
+		// 未生效：那两条 display:none!important 是 hook 自己打的，能读到这两个
+		// data-dshr-* 就证明脚本已经跑过并写过痕迹。
+		+ "var hidden=r.getAttribute('data-dshr-rightbar-fullscreen')==='1'"
+		+ "||r.getAttribute('data-dshr-explorer-details')==='1';"
+		+ "return {root:root,whale:whale,hidden:hidden,"
+		+ "ready:r.getAttribute('data-dshr-ready')==='1',"
+		+ "cls:r.className||'',href:(location&&location.href)||''};"
+		+ "}catch(e){return {root:false,whale:false,hidden:false,err:String(e)};}})()";
+
+	/** 自检轮数上限：有界重试，避免「永久不生效」时无限补注。 */
+	private static final int ADAPT_PROBE_MAX_ROUNDS = 3;
+
+	/** 首轮自检的延迟：留够时间让 DSH 前端起完再判「效果」。 */
+	private static final long ADAPT_PROBE_FIRST_DELAY_MS = 6000L;
+
+	/**
+	 * T27-B：一次连接内「重排自检」的上限与节奏。
+	 * 反例（独立对抗复核 §2.B）：reload / 会话内导航 / 回前台三条路径都绕过了
+	 * scheduleAdaptationProbe（enterSessionPage 在 alreadyInSession 时提前 return），
+	 * 于是页面一旦重载就再也无人补注——实测破坏效果 26.7s 未修复、自检日志 0 条。
+	 * 现在这些路径都会重排，但**必须有界**，否则重定向循环会把自检排成永动机：
+	 *   - 最小间隔 3s：一次导航会连着回调 onPageCommitVisible / doUpdateVisitedHistory /
+	 *     onPageFinished 三个入口，不折叠就会把一次导航排成 3 次自检；
+	 *   - 60s 滑动窗口内最多 4 次：重定向风暴下最多 4 次/分钟，不是无限。
+	 * 平板档在 scheduleAdaptationProbe 里就返回（零痕迹，契约 3.5），不占预算。
+	 */
+	private static final long ADAPT_PROBE_MIN_INTERVAL_MS = 3000L;
+	private static final long ADAPT_PROBE_ARM_WINDOW_MS = 60000L;
+	private static final int ADAPT_PROBE_MAX_ARMS = 4;
+	/** 本窗口内已排次数（滚动窗口，跨窗口归零）。 */
+	private int adaptProbeArms = 0;
+	private long adaptProbeWindowStartMs = 0L;
+	private long lastAdaptProbeArmMs = 0L;
+	private boolean adaptProbeCapLogged = false;
+
+	/**
+	 * 注入自检：页面加载数秒后确认移动适配**真的生效**了。
+	 * 若始终未生效则退回实色状态栏模式——内容整体位于状态栏下方，绝不与系统栏重叠；
+	 * 任何一轮生效就自动恢复透明状态栏沉浸模式。
+	 *
+	 * T27-B：除了首连窗口，**reload / 会话内导航 / 回前台**也会走到这里
+	 * （那三条路径此前全部绕过，自检永不重排，页面一重载就再也无人补注）。
+	 * 有界：最小间隔 ADAPT_PROBE_MIN_INTERVAL_MS 折叠一次导航的三个回调；
+	 * ADAPT_PROBE_ARM_WINDOW_MS 窗口内最多 ADAPT_PROBE_MAX_ARMS 次（重定向风暴下
+	 * 最多 4 次/分钟），不是永动机。
+	 * 平板档**在这里就返回**：契约 3.5 要求零痕迹（无根类、无 data-dshr-*），
+	 * 连定时器都不排——自检不得往页面写任何东西，跑它只会把平板模式搞坏。
 	 */
 	private void scheduleAdaptationProbe(WebView view) {
-		view.postDelayed(() -> {
-			if (uiState != UiState.WEB || view.getVisibility() != View.VISIBLE) return;
-			if (isTabletClass()) return;
-			view.evaluateJavascript("String(window.__dshRemoteMobileInstalled===true)", value -> {
-				if (uiState != UiState.WEB || isTabletClass()) return;
-				boolean injected = value != null && value.contains("true");
-				applySystemBarMode(injected);
-				if (!injected) {
-					// 最后再补一次注入机会，成功后自动恢复沉浸模式。
-					injectMobileAdaptation(view);
-					applyInsetsToPage(view);
-					view.postDelayed(() -> {
-						if (uiState != UiState.WEB || isTabletClass()) return;
-						view.evaluateJavascript("String(window.__dshRemoteMobileInstalled===true)", retry -> {
-							if (uiState != UiState.WEB || isTabletClass()) return;
-							if (retry != null && retry.contains("true")) applySystemBarMode(true);
-						});
-					}, 2000);
-				}
-			});
-		}, 6000);
+		if (view == null || isTabletClass()) return;
+		long now = System.currentTimeMillis();
+		if (now - lastAdaptProbeArmMs < ADAPT_PROBE_MIN_INTERVAL_MS) return;
+		if (now - adaptProbeWindowStartMs > ADAPT_PROBE_ARM_WINDOW_MS) {
+			adaptProbeWindowStartMs = now;
+			adaptProbeArms = 0;
+			adaptProbeCapLogged = false;
+		}
+		if (adaptProbeArms >= ADAPT_PROBE_MAX_ARMS) {
+			if (!adaptProbeCapLogged) {
+				adaptProbeCapLogged = true;
+				Log.w("dshr-perf", "自检重排已达上限（" + ADAPT_PROBE_MAX_ARMS + " 次/"
+					+ (ADAPT_PROBE_ARM_WINDOW_MS / 1000) + "s），本窗口内不再重排："
+					+ "重新连接会恢复");
+			}
+			return;
+		}
+		adaptProbeArms += 1;
+		lastAdaptProbeArmMs = now;
+		Log.i("dshr-perf", "排自检（本连接第 " + adaptProbeArms + "/" + ADAPT_PROBE_MAX_ARMS
+			+ " 次），延迟 " + ADAPT_PROBE_FIRST_DELAY_MS + "ms");
+		view.postDelayed(() -> runAdaptationProbe(view, 1), ADAPT_PROBE_FIRST_DELAY_MS);
+	}
+
+	/**
+	 * 第 round 轮「效果」自检。未达效果时：①先用不依赖 JS 定时器的同步修复入口
+	 * （__dshRemoteAndroidMobile.syncViewport = applyWidthScope + syncDom，纯同步、
+	 * 幂等、不重载页面）修一次；②第 1 轮再按既有策略补一次注入；③有界重试到
+	 * ADAPT_PROBE_MAX_ROUNDS 轮为止。每一轮未达效果都打 dshr-perf 日志，绝不静默。
+	 */
+	private void runAdaptationProbe(final WebView view, final int round) {
+		if (uiState != UiState.WEB || view.getVisibility() != View.VISIBLE) return;
+		if (isTabletClass()) return;
+		view.evaluateJavascript(ADAPT_EFFECT_JS, value -> {
+			if (uiState != UiState.WEB || isTabletClass()) return;
+			boolean effective = isAdaptationEffective(value);
+			// 与原策略一致：未生效立即退回实色状态栏，后续任一轮生效就自动恢复沉浸。
+			applySystemBarMode(effective);
+			if (effective) return;
+			Log.w("dshr-perf", "自检第 " + round + "/" + ADAPT_PROBE_MAX_ROUNDS
+				+ " 轮：移动适配未生效 " + value);
+			syncViewportNow(view);
+			if (round == 1) {
+				// 最后再补一次注入机会（hook 自带幂等守卫，已装上时是空操作）。
+				injectMobileAdaptation(view);
+				applyInsetsToPage(view);
+			}
+			if (round < ADAPT_PROBE_MAX_ROUNDS) {
+				view.postDelayed(() -> runAdaptationProbe(view, round + 1), 2000);
+			} else {
+				Log.w("dshr-perf", "自检连续 " + ADAPT_PROBE_MAX_ROUNDS
+					+ " 轮未生效，保持实色状态栏兜底：" + value);
+			}
+		});
+	}
+
+	/** 解析「效果」判据的返回值。任一字段缺失/解析失败一律判为未生效（保守）。 */
+	private static boolean isAdaptationEffective(String json) {
+		if (TextUtils.isEmpty(json)) return false;
+		try {
+			JSONObject o = new JSONObject(json);
+			if (!o.optBoolean("root", false)) return false;
+			return o.optBoolean("whale", false) || o.optBoolean("hidden", false);
+		} catch (Exception e) {
+			return false;
+		}
+	}
+
+	/**
+	 * 调 hook 暴露的同步修复入口（契约 3.3 的运行时切换同一入口）：
+	 * syncViewport() = applyWidthScope() + syncDom()，纯同步、不吃 JS 定时器、幂等。
+	 * hook 未装上时该属性不存在，判空在脚本里、静默跳过。
+	 */
+	private void syncViewportNow(WebView view) {
+		if (view == null) return;
+		try {
+			view.evaluateJavascript(
+				"(function(){var a=window.__dshRemoteAndroidMobile;"
+				+ "if(a&&a.syncViewport)a.syncViewport();})()",
+				null);
+		} catch (Exception ignored) {
+		}
 	}
 
 	@Override
@@ -1742,9 +2215,7 @@ public class MainActivity extends Activity {
 			}
 			syncDeviceModeToPage(webView);
 			applyInsetsToPage(webView);
-			webView.evaluateJavascript(
-				"(function(){var a=window.__dshRemoteAndroidMobile;if(a&&a.syncViewport)a.syncViewport();})()",
-				null);
+			syncViewportNow(webView);
 			if (!isTabletClass()) {
 				// 重新自检一次：档位切换不会触发页面加载，靠它把状态栏模式拉回正确值。
 				scheduleAdaptationProbe(webView);
@@ -1861,6 +2332,16 @@ public class MainActivity extends Activity {
 	 */
 	private void enterSessionPage(WebView view, String url) {
 		if (view == null || !isSessionUrl(url)) return;
+		// 错误页不是会话页：主框架失败后 Chromium 仍用【原 URL】回调这三个入口，
+		// 若照常判成会话页就会 ①给错误页注入 hook、②置 uiState=WEB、③clearHistory()，
+		// 于是之后所有网关失败被 showGatewayFailure 永久降级成 Toast、
+		// 「重新连接」入口从此消失（T16 缺陷 2/3）。命中失败 URL 一律不进 WEB 态。
+		if (!failedMainFrameUrl.isEmpty() && failedMainFrameUrl.equals(url)) {
+			Log.w("dshr-perf", "跳过会话页判定（主框架失败后的错误页）：" + url);
+			return;
+		}
+		// 换了 URL 就是另一个文档，重新拿到「未失败」的起点。
+		failedMainFrameUrl = "";
 		activeUrl = url;
 		injectMobileAdaptation(view);
 		if (uiState == UiState.HOME || uiState == UiState.EDIT) return;
@@ -1879,6 +2360,10 @@ public class MainActivity extends Activity {
 		}
 		if (alreadyInSession) {
 			applyInsetsToPage(view);
+			// T27-B：reload / 会话内导航此前在这里提前 return，自检再也排不上
+			// （实测重载后破坏效果 26.7s 未修复、自检日志 0 条）。此处补排：
+			// 页面刚重新加载，谁也不知道 hook 有没有收敛成功。
+			scheduleAdaptationProbe(view);
 			return;
 		}
 		if (!sessionHistoryRooted) {
@@ -1938,13 +2423,25 @@ public class MainActivity extends Activity {
 		return true;
 	}
 
+	/**
+	 * 主动拆页（stopLoading / 换壳）时短暂抑制网关错误回调。
+	 *
+	 * 窗口从 1200ms 收紧到 400ms：它唯一需要覆盖的是「我们刚 stopLoading 的那次导航
+	 * 被 Chromium 取消」产生的 ERR_ABORTED，而该回调就在同一个消息循环里送达，
+	 * 400ms 已有大量余量。原来 1200ms 的窗口比实测首个主框架错误的到达时间（t+89ms）
+	 * 长一个数量级，整条失败反馈被吞掉，用户只看到 Chromium 原始错误页（T16 缺陷 1）。
+	 *
+	 * 更重要的是窗口长度**不再决定用户看到什么**：主框架错误（onReceivedError 与
+	 * 主框架 5xx）已在各自回调里结构性绕过本标志并先行清零，所以
+	 * 「首个主框架错误必定到达 App 的失败壳」与本窗口取值无关。
+	 */
 	private void suppressGatewayErrorsBriefly() {
 		suppressGatewayErrors = true;
 		final int epoch = ++suppressGatewayEpoch;
 		if (webView != null) {
 			webView.postDelayed(() -> {
 				if (epoch == suppressGatewayEpoch) suppressGatewayErrors = false;
-			}, 1200);
+			}, 400);
 		} else {
 			suppressGatewayErrors = false;
 		}
@@ -2162,6 +2659,10 @@ public class MainActivity extends Activity {
 
 	private void showGatewayFailure(String message) {
 		if (suppressGatewayErrors) return;
+		// 活会话中途掉线只提示、不把用户从正在看的内容里拽走——这是有意设计。
+		// 缺陷 3 的「永久降级成 Toast」发生在**连接阶段**：错误页曾被 enterSessionPage
+		// 误判成会话页而置成 WEB（已由 failedMainFrameUrl 拦下），失败壳因此仍在，
+		// 「重新连接」入口不丢。连接阶段不会进 WEB 态，故这里不会把首次失败吃掉。
 		if (uiState == UiState.WEB) {
 			Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
 			return;
@@ -2182,9 +2683,11 @@ public class MainActivity extends Activity {
 	}
 
 	/**
-	 * 自签证书固定：键为 host:port，值为规范化的 SHA-256 hex（小写无冒号）。
-	 * 命中 → 直接放行；未命中/变更 → 弹确认（变更时强提示 MITM 风险），
-	 * 用户信任后记录指纹并重载（同一 handler 不能二次 proceed）。
+	 * 自签证书固定：键按【配置档身份】存（cert_prof_&lt;profileId&gt;），地址键
+	 * （cert_fp_&lt;host&gt;:&lt;port&gt;）**只**服务非配置档连接（直连/局域网节点）。
+	 * 判定与写回全在 CertPin.verify 里（纯函数、可单测）；命中 → 直接放行；
+	 * 变更 → 弹确认并强提示 MITM 风险，用户信任后记录指纹并重载
+	 * （同一 handler 不能二次 proceed）。
 	 */
 	private void handleSslError(SslErrorHandler handler, SslError error) {
 		if (awaitingCertificateDecision) {
@@ -2228,15 +2731,17 @@ public class MainActivity extends Activity {
 			return;
 		}
 		Uri base = Uri.parse(activeUrl);
-		final String key = base.getHost() + ":" + effectivePort(base);
 		final String fp = fingerprint;
-		String stored = prefs().getString(KEY_CERT_PREFIX + key, null);
-		if (stored == null) {
-			String legacyKey = base.getHost() + ":" + base.getPort();
-			stored = prefs().getString(KEY_CERT_PREFIX + legacyKey, null);
-		}
-		final boolean changed = stored != null && !stored.equalsIgnoreCase(fp);
-		if (!changed && stored != null) {
+		// T23-A/T27-A：配置档身份优先，且**只**看该配置档自己的键——没有就 TOFU，
+		// 不回退共享地址键（那是别的配置档/直连语境的信任，读它会误报证书已变更）。
+		// 没有配置档身份（直连/局域网节点）时才走地址键；两处都没有才走 TOFU。
+		final CertPin.Decision decision = CertPin.verify(
+			key -> prefs().getString(key, null),
+			activeProfileId, base.getHost(), effectivePort(base), base.getPort(), fp);
+		final String key = decision.label;
+		final String stored = decision.stored;
+		final boolean changed = decision.action == CertPin.Action.CHANGED;
+		if (decision.action == CertPin.Action.TRUSTED) {
 			if (connectStartMs > 0) {
 				Log.i("dshr-perf", "sslPinned t+"
 					+ (System.currentTimeMillis() - connectStartMs) + "ms host=" + key);
@@ -2244,7 +2749,9 @@ public class MainActivity extends Activity {
 			handler.proceed();
 			return;
 		}
-		Log.i("dshr-perf", "sslDecision host=" + key + " changed=" + changed);
+		Log.i("dshr-perf", "sslDecision host=" + key + " changed=" + changed
+			+ " profile=" + (activeProfileId.isEmpty() ? "-" : activeProfileId)
+			+ " " + decision.describe());
 		awaitingCertificateDecision = true;
 		handler.cancel();
 
@@ -2254,11 +2761,14 @@ public class MainActivity extends Activity {
 			msg.insert(0, "警告：该地址的证书与上次记录不同！若不是你本人更换了网关或证书，请取消——这可能是一次中间人攻击。\n\n");
 		}
 		new AlertDialog.Builder(this)
-			.setTitle(changed ? "证书已变更！" : (stored == null ? "信任此服务器？" : "证书校验失败"))
+			.setTitle(changed ? "证书已变更！" : (stored.isEmpty() ? "信任此服务器？" : "证书校验失败"))
 			.setMessage(msg.toString())
 			.setPositiveButton(changed ? "仍要更新信任" : "信任并继续", (dialog, which) -> {
 				awaitingCertificateDecision = false;
-				prefs().edit().putString(KEY_CERT_PREFIX + key, fp).apply();
+				// 写回键与判定同源（CertPin 决定）：有配置档身份就只写配置档键，
+				// 不再覆盖共享的地址键——否则会把另一个配置档的信任冲掉。
+				prefs().edit().putString(decision.key, fp).apply();
+				Log.i("dshr-perf", "证书信任已记录 " + decision.describe());
 				if (!TextUtils.isEmpty(activeUrl)) webView.loadUrl(activeUrl);
 			})
 			.setNegativeButton("取消", (dialog, which) -> {
@@ -2311,7 +2821,10 @@ public class MainActivity extends Activity {
 		SharedPreferences p = prefs();
 		SharedPreferences.Editor editor = p.edit();
 		for (String key : p.getAll().keySet()) {
+			// T23-A：配置档维度的锁定键也要一起清，否则「清除本机授权数据」会留下
+			// 半套信任——地址键没了、配置档键还在，下一次连接照样直接放行。
 			if (key.startsWith(KEY_CERT_PREFIX)
+				|| key.startsWith(CertPin.PROFILE_PREFIX)
 				|| key.startsWith(KEY_HTTP_AUTH_REMEMBER_PREFIX)) editor.remove(key);
 		}
 		editor.apply();
@@ -2469,6 +2982,32 @@ public class MainActivity extends Activity {
 		@JavascriptInterface
 		public void setSessionNotice(String title, String text, boolean running) {
 			TunnelService.updateSessionNotice(getApplicationContext(), title, text, running);
+		}
+
+		/**
+		 * T22-D：接住 hook 的页面适配诊断上报（mobile-web.js reportUiDiag）。
+		 * 在 WebView 的 JS 线程上被调用，故这里只做「解析 → 存字段 → 投递一次 UI 更新」：
+		 * 解析全包 try/catch 绝不抛，UI 更新走 runOnUiThread 绝不阻塞主线程。
+		 * hook 侧已用 typeof 判空，桥缺失时静默跳过；桥在时也不得把异常带回页面。
+		 */
+		@JavascriptInterface
+		public void setUiDiag(String json) {
+			String summary;
+			try {
+				summary = formatUiDiag(json);
+			} catch (Throwable ignored) {
+				return;
+			}
+			uiDiagRaw = json == null ? "" : json;
+			// hook 侧已按**判重键**（JSON.stringify 去掉 ts）去抖：载荷带 Date.now()，
+			// 若拿整份 payload 判重则同状态永远不相等；去掉 ts 后状态未变就不重复过桥。
+			// 这里再加一层按**摘要**去重：即使 hook 侧判重键因故失效（例如旧版 hook
+			// 脚本，或将来新增字段导致判重口径漂移），繁忙页面上报也不会刷屏。
+			if (!summary.equals(uiDiagSummary)) {
+				Log.i("dshr-perf", "hook 诊断上报 " + uiDiagRaw);
+			}
+			uiDiagSummary = summary;
+			runOnUiThread(() -> refreshUiDiagLine());
 		}
 
 		@JavascriptInterface

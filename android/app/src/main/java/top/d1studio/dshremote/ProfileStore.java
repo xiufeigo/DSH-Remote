@@ -87,6 +87,16 @@ public final class ProfileStore {
 		public String mode = DEFAULT_MODE;
 		/** 与电脑端 frp.name 一致，写进 frps 的 proxy 名；不是配置组显示名。 */
 		public String tunnelName = DEFAULT_TUNNEL_NAME;
+		/**
+		 * T23-A：网关自签证书 SHA-256（hex 小写无冒号）。
+		 *
+		 * 改前这个指纹在导入时就被丢掉了：Profile 没有该字段，toVisitorConfig() 写死
+		 * fingerprint=""，于是 MainActivity 的「二维码携带的指纹在首连前预置」分支
+		 * （cfg.fingerprint.length()==64）永远不成立——**预置是死代码**，每次隧道连接
+		 * 必然落到 TOFU「信任此服务器？」。存下来之后，两个配置档各自带着自己那台电脑的
+		 * 指纹，按配置档身份锁定（见 CertPin），切档才不会再互相误报。
+		 */
+		public String fingerprint = "";
 
 		public boolean isValid() {
 			return serverAddr.length() > 0
@@ -104,7 +114,7 @@ public final class ProfileStore {
 			c.secretKey = secretKey;
 			c.authToken = authToken;
 			c.bindPort = BIND_PORT;
-			c.fingerprint = "";
+			c.fingerprint = CertPin.normalizeFingerprint(fingerprint);
 			return c;
 		}
 
@@ -119,6 +129,7 @@ public final class ProfileStore {
 				o.put("secretKey", secretKey);
 				o.put("mode", mode);
 				o.put("tunnelName", tunnelName);
+				o.put("fingerprint", fingerprint);
 			} catch (Exception ignored) {
 			}
 			return o;
@@ -135,6 +146,9 @@ public final class ProfileStore {
 			String mode = o.optString("mode", DEFAULT_MODE);
 			p.mode = "stcp".equals(mode) ? "stcp" : DEFAULT_MODE;
 			p.tunnelName = normalizeTunnelName(o.optString("tunnelName", DEFAULT_TUNNEL_NAME));
+			// 存量配置组没有这个键（optString 兜空），由 toVisitorConfig() 规范化为空串
+			// ⇒ 退化到 TOFU，不会拿旧值误判。
+			p.fingerprint = CertPin.normalizeFingerprint(o.optString("fingerprint", ""));
 			return p;
 		}
 	}

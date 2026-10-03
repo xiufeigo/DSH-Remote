@@ -879,6 +879,244 @@ try {
 	const shotA0 = await shot("A-phone-portrait-412x915-hook-on");
 	info("A", `截图（hook ON 收起态）：${shotA0}`);
 
+	// ══════════════ T21 键盘组：开抽屉不弹键盘 + 焦点守卫 ══════════════
+	//
+	// 判据说明：headless Chrome 没有软键盘，所以用**焦点状态**做代理。真机上的因果链是
+	// 「composer 仍持焦 + 刚发生用户手势 ⇒ Chromium 抬起虚拟键盘」（scratch/t18/keyboard.md
+	// §3 决定性 A/B：hook 鲸鱼 724/760ms 弹、官方 Collapse sidebar 不弹且 composer 失焦、
+	// 滚动不弹）。于是「动作结束后 composer 不再持焦」就是弹键盘的必要前提条件，
+	// 也是这条修复真正要守住的不变量。
+	//
+	// 「粘滞态」= 真机上「点输入框 → IME 弹 → BACK 收 → composer 仍持焦」；headless 里没有
+	// IME，但 DOM 焦点粘滞是可测的同构状态，制造方式就是先真实点输入框再点别处。
+	console.log("\n[A/T21] 焦点守卫 + 开抽屉不弹键盘（焦点状态作代理判据）");
+	const diagA = await evaluate(`(function(){
+		return typeof window.__dshrMobileDiag === 'function' ? window.__dshrMobileDiag() : null;
+	})()`);
+	record("A/T21", "A-ui-diag __dshrMobileDiag() 报出 phone 档收敛状态",
+		!!diagA && diagA.device === "phone" && diagA.on === true && diagA.ready === true
+			&& diagA.whale === true && diagA.frame === true && diagA.strictOff === false,
+		JSON.stringify(diagA));
+	// T27-D：reportUiDiag 的去抖必须**真的**生效。判据（敏感、可证伪）：
+	// 在页面里挂一个计数桥，连打 6 次 syncViewport（每次都走到 syncDom 末尾的
+	// reportUiDiag），期间**状态不变** ⇒ 只应过桥 1 次。旧实现拿整份 payload 判重，
+	// 而 payload 里带 ts: Date.now() ⇒ 永不相等 ⇒ 6 次全过桥（去抖是死代码）。
+	// 反向：状态真变了必须照报（去抖不能把诊断打瞎），用 rootClass 制造变化再还原。
+	// 整段是同步的：MutationObserver 回调只能在微任务检查点交付，插不进来，
+	// 所以计数是确定的，不靠 sleep。
+	const dedupe = await evaluate(`(function(){
+		var n = 0, last = null;
+		var prev = window.DshRemoteApp;
+		window.DshRemoteApp = { setUiDiag: function (p) { n += 1; last = p; } };
+		try {
+			var a = window.__dshRemoteAndroidMobile;
+			if (!a || typeof a.syncViewport !== 'function') return { err: 'no syncViewport' };
+			for (var i = 0; i < 6; i++) a.syncViewport();
+			var afterSteady = n;
+			document.documentElement.classList.add('t27-diag-probe');
+			a.syncViewport();
+			var afterDirty = n;
+			document.documentElement.classList.remove('t27-diag-probe');
+			a.syncViewport();
+			return { steady: afterSteady, dirty: afterDirty, restored: n, last: last };
+		} finally {
+			window.DshRemoteApp = prev;
+		}
+	})()`);
+	record("A/T27", "D-ui-diag-dedupe 状态未变时 6 轮 syncDom 只过桥一次", dedupe.steady === 1,
+		`稳态过桥 ${dedupe.steady} 次（期望 1；旧实现=6）`);
+	record("A/T27", "D-ui-diag-dedupe 状态真变化时仍照报（没把诊断打瞎）",
+		dedupe.dirty === 2 && dedupe.restored === 3,
+		`改 rootClass 后=${dedupe.dirty} 还原后=${dedupe.restored}（期望 2 / 3）`);
+	record("A/T27", "D-ui-diag-payload 过桥载荷仍是 7 字段 + ts（诊断行不受影响）",
+		(() => {
+			try {
+				const keys = Object.keys(JSON.parse(dedupe.last)).sort().join(",");
+				return keys === "device,frame,on,ready,rootClass,strictOff,ts,whale";
+			} catch (e) {
+				return false;
+			}
+		})(),
+		`载荷字段=${(() => { try { return Object.keys(JSON.parse(dedupe.last)).sort().join(","); } catch (e) { return "unparsable"; } })()}`);
+	/** 官方 composer 里的可编辑元素（真机 a11y 里就是一个 EditText）+ 可点性判定。 */
+	const findComposer = () => evaluate(`(function(){
+		var seat = document.querySelector('[data-composer-seat]') || document.querySelector('[data-composer-card]');
+		var scope = seat || document.querySelector('[data-dshr-main-col]') || document.body;
+		var el = scope.querySelector('textarea, input[type="text"], [contenteditable="true"]')
+			|| document.querySelector('textarea');
+		if (!el) return null;
+		var b = el.getBoundingClientRect();
+		var cx = Math.round(b.left + b.width / 2), cy = Math.round(b.top + b.height / 2);
+		var inView = cx >= 0 && cy >= 0 && cx <= innerWidth && cy <= innerHeight;
+		var hit = inView ? document.elementFromPoint(cx, cy) : null;
+		return { tag: el.tagName.toLowerCase(), x: cx, y: cy,
+			w: Math.round(b.width), h: Math.round(b.height), inView: inView,
+			tappable: !!(hit && (hit === el || (hit.closest && hit.closest('textarea, input, [contenteditable]')))) };
+	})()`);
+	const isEditableFocused = () => evaluate(`(function(){
+		var a = document.activeElement;
+		if (!a || a === document.body || a === document.documentElement) return false;
+		var t = (a.tagName || '').toLowerCase();
+		return t === 'input' || t === 'textarea' || t === 'select' || !!a.isContentEditable;
+	})()`);
+	const focusOwner = () => evaluate(`(function(){
+		var a = document.activeElement;
+		if (!a) return 'null';
+		var tag = (a.tagName || '?').toLowerCase();
+		var hint = a.getAttribute('aria-label') || a.getAttribute('placeholder') || a.getAttribute('data-placeholder') || '';
+		return tag + (hint ? '[' + hint.slice(0, 18) + ']' : '');
+	})()`);
+	/** 一次真实触摸点按：走 CDP 输入管线的 isTrusted 事件，与真机手指同一条路径。 */
+	async function realTap(x, y, holdMs = 70, settleMs = 300) {
+		const pt = [{ x, y, id: 1, radiusX: 8, radiusY: 8, force: 1 }];
+		await call("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: pt });
+		await wait(holdMs);
+		await call("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+		await wait(settleMs);
+	}
+	/** 官方侧栏开关（hook 标了 data-dshr-official-toggle）的中心点，可点才返回。 */
+	const findOfficialTogglePoint = () => evaluate(`(function(){
+		var t = document.querySelector('[data-dshr-official-toggle]');
+		if (!t) return null;
+		var b = t.getBoundingClientRect();
+		var cx = Math.round(b.left + b.width / 2), cy = Math.round(b.top + b.height / 2);
+		return { label: t.getAttribute('aria-label') || '', x: cx, y: cy,
+			w: Math.round(b.width), h: Math.round(b.height),
+			usable: b.width > 4 && b.height > 4 && cx >= 0 && cy >= 0 && cx <= innerWidth && cy <= innerHeight };
+	})()`);
+	const comp = await findComposer();
+	record("A/T21", "A-tap-precondition 已找到官方 composer 可编辑元素", !!comp && comp.tappable === true, JSON.stringify(comp));
+	if (comp && comp.tappable) {
+		// ① 真实点输入框 → 焦点必须保留（这才是用户要的：只有他自己点输入框才弹键盘）。
+		await realTap(comp.x, comp.y);
+		const keptUserTap = await waitUntil(`(function(){
+			var a=document.activeElement; if(!a||a===document.body||a===document.documentElement) return false;
+			var t=(a.tagName||'').toLowerCase();
+			return t==='input'||t==='textarea'||t==='select'||!!a.isContentEditable; })()`, 3000);
+		record("A/T21", "A-focus-guard-allows-user-tap 真实点输入框后焦点保留（键盘照常弹）",
+			keptUserTap === true && (await isEditableFocused()) === true,
+			`activeElement=${await focusOwner()}（守卫若误伤，这条会变成 body）`);
+
+		// ② 对照臂：官方 Collapse sidebar 真实点按同样把焦点带走（hook 鲸鱼必须与它一致）。
+		//    要拿到「抽屉展开 + composer 仍持焦」这个对照前提，有两个坑：
+		//      - 抽屉展开时主列被 translateX 推出视口，点不到 composer；
+		//      - 开抽屉的 hook 路径（openSidebarIfCollapsed → setSidebarOpen → toggleSidebar）
+		//        自修复 1 起**本来就会收焦点**（这正是它该做的）。
+		//    所以做法是：用户先真实点输入框（守卫放行，同时开出一个 800ms 的「用户主动
+		//    聚焦」窗口）→ 走 hook API 开抽屉 → 在窗口内 focus() 一次把粘滞态装回去。
+		//    这与真机同构：点输入框 → 键盘弹 → BACK 收 → 切会话/开抽屉，composer 仍持焦。
+		await ensureCollapsed();
+		await waitUntil(`document.documentElement.getAttribute('data-dshr-expanded') === '0'`, 3000);
+		await realTap(comp.x, comp.y, 40, 120);
+		const stickyForControl = await isEditableFocused();
+		const openedByApi = await evaluate(`(function(){
+			try { return String(window.__dshRemoteAndroidMobile.openSidebarIfCollapsed()); }
+			catch (err) { return 'error:' + String(err && err.message); } })()`);
+		// 窗口内（≤800ms）把焦点装回 composer —— 必须在下面那 700ms 过渡等待**之前**。
+		const rearm = await evaluate(`(function(){
+			var seat=document.querySelector('[data-composer-seat]')||document.querySelector('[data-composer-card]')||document.body;
+			var el=seat.querySelector('textarea, input[type="text"], [contenteditable="true"]');
+			if(!el) return 'no-editable';
+			el.focus();
+			return el===document.activeElement ? 'focused' : 'refused'; })()`);
+		// 官方 0.34s 抽屉过渡必须落定后才能定位官方开关：抽屉是滑入的，过渡中按钮还在移动，
+		// 此刻取 rect 再点会点空（harness 自己的 shot() 也为此固定等 700ms）。
+		await waitDrawer(true);
+		await wait(700);
+		const stickyInDrawer = await isEditableFocused();
+		const offToggle = await findOfficialTogglePoint();
+		info("A/T21", `对照臂：openSidebarIfCollapsed=${openedByApi} 窗口内 focus()=${rearm} 落定后输入框持焦=${stickyInDrawer}（前提：点输入框后持焦=${stickyForControl}）`);
+		if (offToggle && offToggle.usable && stickyInDrawer) {
+			await realTap(offToggle.x, offToggle.y, 60, 300);
+			const closedByOfficial = await waitDrawer(false);
+			record("A/T21", "A-official-collapse-keeps-blur 官方 Collapse sidebar 真实点按后输入框不持焦",
+				closedByOfficial === true && (await isEditableFocused()) === false,
+				`官方开关 aria-label="${offToggle.label}" @(${offToggle.x},${offToggle.y}) 抽屉收起=${closedByOfficial} activeElement=${await focusOwner()}`);
+		} else {
+			record("A/T21", "A-official-collapse-keeps-blur 官方 Collapse sidebar 真实点按后输入框不持焦",
+				null, `对照前提不成立：官方开关=${JSON.stringify(offToggle)} 抽屉展开态输入框持焦=${stickyInDrawer}`);
+			await ensureCollapsed();
+		}
+
+		// ③ 修法本体：粘滞态下真实点鲸鱼开抽屉 → composer 必须交出焦点（不再抬起键盘）。
+		await ensureCollapsed();
+		await waitUntil(`document.documentElement.getAttribute('data-dshr-expanded') === '0'`, 3000);
+		await realTap(comp.x, comp.y);
+		const stickyForWhale = await waitUntil(`(function(){
+			var a=document.activeElement; if(!a||a===document.body||a===document.documentElement) return false;
+			var t=(a.tagName||'').toLowerCase();
+			return t==='input'||t==='textarea'||t==='select'||!!a.isContentEditable; })()`, 3000);
+		const whalePoint = await evaluate(`(function(){
+			var w=document.getElementById('dshr-mobile-whale'); if(!w) return null;
+			var b=w.getBoundingClientRect(); var c=getComputedStyle(w);
+			if(c.display==='none'||c.visibility==='hidden'||b.width<4) return null;
+			return { x: Math.round(b.left+b.width/2), y: Math.round(b.top+b.height/2), w: Math.round(b.width), h: Math.round(b.height) }; })()`);
+		record("A/T21", "A-whale-precondition 粘滞态成立且鲸鱼可点",
+			stickyForWhale === true && !!whalePoint,
+			`输入框持焦=${stickyForWhale} 鲸鱼=${JSON.stringify(whalePoint)}（粘滞态=真机 IME 弹过后被 BACK 收起）`);
+		if (whalePoint) {
+			await realTap(whalePoint.x, whalePoint.y);
+			const whaleOpened = await waitDrawer(true);
+			await wait(500); // 官方 0.34s 过渡 + hook 的 scheduleSyncDom(50ms) 收敛
+			const stillFocused = await isEditableFocused();
+			record("A/T21", "A-whale-no-keyboard 粘滞态下点鲸鱼开抽屉后输入框不再持焦（不弹键盘）",
+				whaleOpened === true && stillFocused === false,
+				`抽屉展开=${whaleOpened} activeElement=${await focusOwner()}${stillFocused ? " ← 修复前 composer 仍持焦 → Chromium 抬键盘" : ""}`);
+		} else {
+			record("A/T21", "A-whale-no-keyboard 粘滞态下点鲸鱼开抽屉后输入框不再持焦（不弹键盘）",
+				null, "鲸鱼不可点，未执行");
+		}
+
+		// ④ 焦点守卫：非用户手势的程序化 focus() 也要被收回（T16/T18 的切会话自动聚焦
+		//    属同一类；用户口径是「只有他自己点输入框才弹键盘」）。
+		await ensureCollapsed();
+		await waitUntil(`document.documentElement.getAttribute('data-dshr-expanded') === '0'`, 3000);
+		await evaluate(`(function(){ var a=document.activeElement; if(a&&a.blur) a.blur(); return true; })()`);
+		await wait(200);
+		const probeFocus = await evaluate(`(function(){
+			var seat=document.querySelector('[data-composer-seat]')||document.querySelector('[data-composer-card]')||document.body;
+			var el=seat.querySelector('textarea, input[type="text"], [contenteditable="true"]')||document.querySelector('textarea');
+			if(!el) return 'no-editable';
+			el.focus();
+			return (el===document.activeElement) ? 'focused' : 'focus-refused'; })()`);
+		await wait(400);
+		const programmaticKept = await isEditableFocused();
+		record("A/T21", "A-focus-guard-blocks-programmatic 非用户手势的 element.focus() 被收回",
+			probeFocus !== 'no-editable' && programmaticKept === false,
+			`focus() 结果=${probeFocus} 事后 activeElement=${await focusOwner()}${programmaticKept ? " ← 守卫没拦住" : ""}`);
+
+		// ⑤ 回归：守卫不得破坏正常输入——真实点输入框 → 焦点保留 → insertText 落到输入框。
+		await realTap(comp.x, comp.y);
+		const usableFocused = await waitUntil(`(function(){
+			var a=document.activeElement; if(!a||a===document.body||a===document.documentElement) return false;
+			var t=(a.tagName||'').toLowerCase();
+			return t==='input'||t==='textarea'||t==='select'||!!a.isContentEditable; })()`, 3000);
+		const before = await evaluate(`(function(){
+			var a=document.activeElement; if(!a) return null;
+			if('value' in a) return String(a.value||'');
+			return String(a.textContent||''); })()`);
+		await call("Input.insertText", { text: "T21-kbd-probe" });
+		await wait(400);
+		const after = await evaluate(`(function(){
+			var a=document.activeElement; if(!a) return null;
+			if('value' in a) return String(a.value||'');
+			return String(a.textContent||''); })()`);
+		record("A/T21", "A-composer-still-usable 真实点输入框后仍可正常输入",
+			usableFocused === true && after !== null && after !== before && String(after).indexOf("T21-kbd-probe") >= 0,
+			`insertText 前=${JSON.stringify(String(before).slice(-24))} 后=${JSON.stringify(String(after).slice(-24))} activeElement=${await focusOwner()}`);
+		// 收尾：清掉探针文本、收回焦点、归一到收起基线（后面的官方设置覆盖依赖它）。
+		await evaluate(`(function(){
+			var a=document.activeElement;
+			if(a&&'value' in a){ try { a.value=''; } catch(ignored){} }
+			var ev=null; try{ ev=new Event('input',{bubbles:true}); }catch(ignored2){}
+			if(a&&ev&&a.dispatchEvent) a.dispatchEvent(ev);
+			return true; })()`);
+		await evaluate(`(function(){ var a=document.activeElement; if(a&&a.blur) a.blur(); return true; })()`);
+		await ensureCollapsed();
+		await waitUntil(`document.documentElement.getAttribute('data-dshr-expanded') === '0'`, 3000);
+	}
+
+
 	// ── 顺带覆盖（只读）：官方设置入口打开后是否成为全屏页 ──
 	await toggleViaWhale(true);
 	const settingsHit = await evaluate(`(function(){
@@ -926,6 +1164,227 @@ try {
 	} else {
 		record("A", "点开现存会话后手机界面仍正常渲染", null, `未触达会话条目（${sessionHit}）`);
 	}
+
+
+	// ══════════════ T24 输入联想浮层（`/` 触发的命令面板）锚定组 ══════════════
+	//
+	// 用户报告（v0.2.0-rc.2.2 真机）：在输入框打 `/goal` 时，命令面板「不是从输入框弹出，
+	// 而是从屏幕最顶端、且溢出状态栏那一侧开始」。
+	//
+	// 真值（scratch/t24/report.md，真实页面 + Input.insertText 真实输入，两臂逐帧采样）：
+	//   官方锚点  浮层 [16,84,373,377] 底边 461 / 输入卡顶边 465 → 4px 缝，top 84 远在状态栏之下
+	//   对照臂    浮层 [72,84,317,363] 底边 447 / 输入卡顶边 451 → 同样是 4px 缝
+	//   修复前    官方那一帧被我们的 clampFloatHost 判成越界（安全区把输入卡顶边再减 8px，
+	//             而官方只留 4px），于是改写成 position:fixed; inset:8px auto auto 16px
+	//             → 浮层 top 84→32、高 377→425；原生未写 --dshr-inset-top 时 top 直接=8px，压进状态栏。
+	//
+	// 判据取「安全视口 + 贴着输入卡 + 我们没碰过它」三条。安全视口那条必须**两臂都成立**：
+	// 对照臂（不注入）单独跑一遍，防止把「官方本来就这样」误判成回归，也防止将来
+	// 官方自己改了锚点而 hook 的放行变成漏网。
+	const T24_INSET_TOP = 24; // 真机上由原生写入 --dshr-inset-top；浏览器里手动模拟状态栏高度
+	// 官方锚定缝：实测 4px；上限取 6px 是为了把 clampFloatHost 自己的 8px 让位排除在窗口外
+	// （修复前 gap=8，修复后 gap=4）。
+	const T24_ANCHOR_GAP_MAX = 6;
+	const T24_MENU_PROBE = `(function(){
+		var m = document.querySelector('[data-trigger-menu]');
+		var card = document.querySelector('[data-composer-card]');
+		var cs = getComputedStyle(document.documentElement);
+		var insetTop = parseFloat(cs.getPropertyValue('--dshr-inset-top')) || 0;
+		var insetBottom = parseFloat(cs.getPropertyValue('--dshr-inset-bottom')) || 0;
+		var r = m ? m.getBoundingClientRect() : null;
+		var c = card ? card.getBoundingClientRect() : null;
+		return { found: !!m,
+			marked: !!(m && m.hasAttribute('data-dshr-float')),
+			position: m ? getComputedStyle(m).position : null,
+			inlineTop: m ? (getComputedStyle(m).top || '') : null,
+			inlineLeft: m ? (getComputedStyle(m).left || '') : null,
+			hasListbox: !!(m && m.querySelector('[role="listbox"]')),
+			rect: r ? { top: Math.round(r.top), left: Math.round(r.left), right: Math.round(r.right),
+				bottom: Math.round(r.bottom), w: Math.round(r.width), h: Math.round(r.height) } : null,
+			cardTop: c ? Math.round(c.top) : null,
+			gapToCard: (r && c) ? Math.round(c.top - r.bottom) : null,
+			insetTop: insetTop, insetBottom: insetBottom,
+			innerWidth: window.innerWidth, innerHeight: window.innerHeight }; })()`;
+	/** 清输入框 + 收焦点（只读纪律：绝不发消息）。 */
+	async function clearComposer() {
+		await evaluate(`(function(){
+			var a=document.activeElement;
+			if(a&&'value' in a){ try { a.value=''; } catch(ignored){} }
+			try { a.textContent=''; } catch(ignored2){}
+			try { a.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward'})); } catch(ignored3){}
+			if(a&&a.blur) a.blur();
+			return true; })()`);
+		await wait(300);
+	}
+	/**
+	 * 找官方 composer 的可编辑元素 + 可点坐标。
+	 * 比 A/T21 那版更宽：会话打开后 [data-composer-seat] 与 [data-composer-card] 未必是祖先关系，
+	 * 只在 seat 里找会漏（实测漏掉时整组断言只能 SKIP）。这里先在两者各自的子树里找，
+	 * 再退回整页取**可见且最大**的那个，并在找不到时把分层诊断带出来（SKIP 也要能定位原因）。
+	 */
+	const findComposerForPalette = () => evaluate(`(function(){
+		var SEL = 'textarea, input[type="text"], [contenteditable="true"]';
+		var pick = function (root) { return root ? root.querySelector(SEL) : null; };
+		var el = pick(document.querySelector('[data-composer-seat]'))
+			|| pick(document.querySelector('[data-composer-card]'))
+			|| pick(document.querySelector('[data-dshr-main-col]'));
+		if (!el) {
+			var all = [...document.querySelectorAll(SEL)].filter(function (e) {
+				var c = getComputedStyle(e), b = e.getBoundingClientRect();
+				return c.display !== 'none' && c.visibility !== 'hidden' && b.width > 40 && b.height > 20; });
+			all.sort(function (a, b) { return (b.getBoundingClientRect().width * b.getBoundingClientRect().height)
+				- (a.getBoundingClientRect().width * a.getBoundingClientRect().height); });
+			el = all[0] || null;
+		}
+		if (!el) {
+			return { missing: true,
+				seat: !!document.querySelector('[data-composer-seat]'),
+				card: !!document.querySelector('[data-composer-card]'),
+				inDoc: document.querySelectorAll(SEL).length,
+				url: location.pathname };
+		}
+		var b = el.getBoundingClientRect();
+		return { tag: el.tagName.toLowerCase(),
+			x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2),
+			w: Math.round(b.width), h: Math.round(b.height),
+			draft: String(('value' in el ? el.value : el.textContent) || '').slice(0, 30) };
+	})()`);
+	/**
+	 * 清空草稿。
+	 *
+	 * 不能靠改 DOM（`el.textContent=''` + 派发 input）：官方 DraftEditorRuntime 把草稿
+	 * 放在自己的 state 里，还跨页面持久化——直接改 DOM 会被下一次 React 渲染写回，
+	 * 实测注入臂清完仍是 "T21-kbd-probe/"，而 `/` 跟在字母后面不满足官方 boundaryOk，
+	 * 联想根本不会触发（上一版对照臂就是这样 SKIP 的）。
+	 * 所以走渲染器真实按键：Ctrl+A 全选 + Backspace 删除，官方自己的删除路径才会同步 state。
+	 */
+	async function clearDraftByKeyboard() {
+		const readDraft = () => evaluate(`(function(){
+			var a=document.activeElement; if(!a||a===document.body||a===document.documentElement) return null;
+			return String(('value' in a ? a.value : a.textContent) || ''); })()`);
+		const key = async (k, code, vk, modifiers) => {
+			await call("Input.dispatchKeyEvent", { type: "keyDown", key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, ...(modifiers ? { modifiers } : {}) });
+			await call("Input.dispatchKeyEvent", { type: "keyUp", key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, ...(modifiers ? { modifiers } : {}) });
+		};
+		for (let round = 0; round < 3; round++) {
+			const draft = await readDraft();
+			if (draft === null) return { ok: false, why: "输入框未持焦，无法清草稿" };
+			if (draft.length === 0) return { ok: true, rounds: round };
+			await key("a", "KeyA", 65, 2); // 2 = Ctrl
+			await wait(150);
+			await key("Backspace", "Backspace", 8);
+			await wait(450);
+		}
+		const left = await readDraft();
+		return { ok: left === "", why: `三轮 Ctrl+A + Backspace 后草稿仍为 ${JSON.stringify(String(left).slice(0, 30))}` };
+	}
+	/** 真实点输入框 + 真实输入一个「/」，把官方命令面板打开。 */
+	async function openInputTriggerPalette() {
+		const comp = await findComposerForPalette();
+		if (!comp || comp.missing) {
+			return { ok: false, why: `找不到 composer 可编辑元素（seat=${comp && comp.seat} card=${comp && comp.card} 文档内可编辑元素=${comp && comp.inDoc}）` };
+		}
+		let focused = false;
+		for (let i = 0; i < 4 && !focused; i++) {
+			await realTap(comp.x, comp.y, 70, 400);
+			focused = await isEditableFocused();
+			if (!focused) await wait(500);
+		}
+		if (!focused) return { ok: false, why: `真实点按后输入框仍未持焦（输入框 @${comp.x},${comp.y} ${comp.w}x${comp.h}）` };
+		// 起点必须是**空草稿**：`/` 只有落在词首（官方 detectTrigger 的 boundaryOk）才触发。
+		// 草稿由官方 state 持有且跨页持久化，只能用真实按键清（见 clearDraftByKeyboard）。
+		const cleared = await clearDraftByKeyboard();
+		if (!cleared.ok) return { ok: false, why: cleared.why };
+		// 光标落到草稿末尾：官方按 caret 判触发，落在中间会让 `/` 变成 inline 而非 leading
+		await evaluate(`(function(){
+			var a=document.activeElement; if(!a) return false;
+			var r=document.createRange(); r.selectNodeContents(a); r.collapse(false);
+			var s=window.getSelection(); s.removeAllRanges(); s.addRange(r); return true; })()`);
+		await wait(200);
+		await call("Input.insertText", { text: "/" });
+		const opened = await waitUntil(`!!document.querySelector('[data-trigger-menu]')`, 8000);
+		if (!opened) {
+			const draft = await evaluate(`(function(){var a=document.activeElement; if(!a) return 'no-active';
+				return String(('value' in a ? a.value : a.textContent) || '').slice(0,20);})()`);
+			return { ok: false, why: `输入 / 后 [data-trigger-menu] 未出现（草稿=${JSON.stringify(draft)}）` };
+		}
+		await wait(700); // 官方落位 + hook 钳位收敛（修复后应无改动）
+		return { ok: true, comp };
+	}
+	// 两臂用**同一段探针、同一段阈值**；只有「有没有注入 hook」这一个变量。
+	const assertPaletteSafe = (scenario, label, p) => {
+		if (!p.found) {
+			record(scenario, `${label} 输入联想浮层已打开`, null, "未出现 [data-trigger-menu]");
+			return;
+		}
+		record(scenario, `${label} 输入联想浮层已打开且是官方命令面板`, p.found && p.hasListbox && p.rect.w > 100,
+			`rect=${JSON.stringify(p.rect)} 内含 [role=listbox]=${p.hasListbox} position=${p.position}（官方命令面板有 ~10 条命令，宽 >100px）`);
+		// A-input-trigger-anchored：锚在输入卡上 + 整体落在安全视口内
+		const inSafe = p.rect.top >= p.insetTop && p.rect.left >= 0
+			&& p.rect.right <= p.innerWidth && p.rect.bottom <= p.innerHeight;
+		const anchored = p.gapToCard !== null && p.gapToCard >= 0 && p.gapToCard <= T24_ANCHOR_GAP_MAX;
+		record(scenario, `${label} 输入联想浮层锚在输入卡上并处于安全视口内`, inSafe && anchored,
+			`top=${p.rect.top} left=${p.rect.left} right=${p.rect.right} bottom=${p.rect.bottom} 视口=${p.innerWidth}x${p.innerHeight} insetTop=${p.insetTop} | 输入卡顶边=${p.cardTop} 浮层底边与之相距=${p.gapToCard}px（实测官方 4px，窗口 [0,${T24_ANCHOR_GAP_MAX}]；修复前 ${T24_ANCHOR_GAP_MAX + 2}px=8px 属于钳位让位，不算锚定）`);
+		// A-float-not-overshoot-statusbar：顶边不得越过 --dshr-inset-top。
+		// 后半句「不得被顶到安全区上沿」是这条断言真正的判别力：clampFloatHost 判越界后
+		// 写的正是 `top = pad.top = 8 + insetTop`（实测 24+8=32），也就是「贴在安全区最上沿」。
+		// 只写 `top >= insetTop` 的话，修复前的 32px 仍然 ≥ 24px 会蒙混过关。
+		const clearOfStatusBar = p.rect.top >= p.insetTop;
+		const notGluedToSafeTop = p.rect.top > p.insetTop + 8;
+		record(scenario, `${label} 输入联想浮层顶边未越过 --dshr-inset-top`, clearOfStatusBar && notGluedToSafeTop,
+			`浮层 top=${p.rect.top} vs --dshr-inset-top=${p.insetTop}（要求 top ≥ ${p.insetTop} 且 top > ${p.insetTop + 8}，` +
+			`即不能被顶到安全区上沿；修复前 top=32=${p.insetTop}+8 正是钳位写下的 pad.top，inset 未写入时更只有 8px，整条压在状态栏上）`);
+		// 我们不得再改写它：官方锚点归官方，钳位一律放行
+		record(scenario, `${label} 浮层未被 hook 钳位改写（无 data-dshr-float）`, p.marked === false,
+			`data-dshr-float=${p.marked} position=${p.position} computed top=${p.inlineTop} left=${p.inlineLeft}` +
+			(p.marked ? " ← 修复前会被写成 position:fixed + inset:8px auto auto 16px" : ""));
+	};
+	console.log("\n[A/T24] 输入联想浮层锚定（真实输入 `/`，注入/不注入两臂）");
+	// 两臂都从**全新加载的页面**起步。
+	// 场景 A 前面几十步（抽屉/手势/点会话条目）会把页面留在各种中间态——实测点完会话
+	// 条目后页面上可能**已经没有 composer**（seat/card/可编辑元素全为 0），
+	// 拿这种状态当注入臂起点，两臂就不是同一个起点，对照实验立刻失去意义。
+	await setViewport(412, 915);
+	await loadRealPage();
+	await injectHook("phone");
+	// 模拟真机原生写入的状态栏 inset（两臂都写，保证只有一个变量）
+	await evaluate(`document.documentElement.style.setProperty('--dshr-inset-top','${T24_INSET_TOP}px'); true`);
+	await wait(300);
+	const t24Hooked = await openInputTriggerPalette();
+	if (t24Hooked.ok) {
+		const p = await evaluate(T24_MENU_PROBE);
+		info("A/T24", `注入臂：浮层=${JSON.stringify(p.rect)} 输入卡顶边=${p.cardTop} 缝=${p.gapToCard}px position=${p.position} computedTop=${p.inlineTop} computedLeft=${p.inlineLeft} data-dshr-float=${p.marked} insetTop=${p.insetTop}`);
+		assertPaletteSafe("A/T24", "A-input-trigger", p);
+		const shotT24Hooked = await shot("A-phone-portrait-412x915-input-trigger-anchored");
+		info("A/T24", `截图（注入臂，浮层锚在输入卡上方）：${shotT24Hooked}`);
+	} else {
+		record("A/T24", "A-input-trigger 输入联想浮层已打开且是官方命令面板", null, t24Hooked.why);
+		record("A/T24", "A-input-trigger 输入联想浮层锚在输入卡上并处于安全视口内", null, t24Hooked.why);
+		record("A/T24", "A-float-not-overshoot-statusbar 输入联想浮层顶边未越过 --dshr-inset-top", null, t24Hooked.why);
+		record("A/T24", "A-input-trigger 浮层未被 hook 钳位改写（无 data-dshr-float）", null, t24Hooked.why);
+	}
+	await clearComposer();
+	// ── 对照臂：同一页面、同一视口、同一探针，**完全不注入** hook ──
+	await loadRealPage();
+	await evaluate(`document.documentElement.style.setProperty('--dshr-inset-top','${T24_INSET_TOP}px'); true`);
+	await wait(300);
+	const t24Control = await openInputTriggerPalette();
+	if (t24Control.ok) {
+		const p = await evaluate(T24_MENU_PROBE);
+		info("A/T24", `对照臂（不注入）：浮层=${JSON.stringify(p.rect)} 输入卡顶边=${p.cardTop} 缝=${p.gapToCard}px position=${p.position} data-dshr-float=${p.marked} insetTop=${p.insetTop}`);
+		// 同一条安全视口 + 锚定判据在官方臂上也必须成立：成立才说明「放行官方锚点」是对的
+		assertPaletteSafe("A/T24", "A-input-trigger-control", p);
+		await clearComposer();
+	} else {
+		record("A/T24", "A-input-trigger-control 输入联想浮层已打开且是官方命令面板", null, `对照臂未打开：${t24Control.why}`);
+		record("A/T24", "A-input-trigger-control 输入联想浮层锚在输入卡上并处于安全视口内", null, `对照臂未打开：${t24Control.why}`);
+		record("A/T24", "A-input-trigger-control 输入联想浮层顶边未越过 --dshr-inset-top", null, `对照臂未打开：${t24Control.why}`);
+		record("A/T24", "A-input-trigger-control 浮层未被 hook 钳位改写（无 data-dshr-float）", null, `对照臂未打开：${t24Control.why}`);
+	}
+	// 对照臂是一次全新导航，hook 已随之消失。**不**在此处装回去：场景 B 紧接着就
+	// setViewport + loadRealPage + injectHook，中间再注入一次只会多绑一遍手势/观察器。
+	// 页面只读纪律：把草稿清干净，绝不发送。
+	await clearComposer();
 
 	// ══════════════════ B 手机横屏 915×412 / device=phone → hook OFF（既有 inset 行为）══════════════════
 	console.log("\n[场景 B] 手机横屏 915×412  device=phone → 期望 hook OFF（沿用 dshr-official-inset）");

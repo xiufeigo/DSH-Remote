@@ -145,6 +145,125 @@ function assertSourceContracts() {
 	if (!src.includes("var dispatched = dispatchNativeClick(button);")) {
 		throw new Error("源码契约：WEB-04 dispatchNativeClick 必须是 toggleSidebar 首选点击通道");
 	}
+	// ── T21 修复 1：hook 发起的侧栏开合前必须先让可编辑元素失焦 ──
+	// 用户报告「打开左侧栏会弹虚拟键盘」。根因（scratch/t18/keyboard.md §3）：鲸鱼
+	// touchend 里的 event.preventDefault() 连带取消了「点按 → 焦点离开可编辑元素」这条
+	// 默认行为，composer 仍持焦；紧接着 dispatchNativeClick 在同一次触摸的用户激活窗口内
+	// 派发合成 click，Chromium 遂抬键盘。官方 Collapse sidebar 不弹，正是因为它靠这条被
+	// 吃掉的默认行为（真机 A/B：hook 鲸鱼 724/760ms 弹，官方不弹）。
+	if (!src.includes("function blurEditableFocus")) {
+		throw new Error("源码契约：缺少 blurEditableFocus（打开左侧栏弹虚拟键盘的根因修法）");
+	}
+	{
+		// 判据必须复用 isEditableFocus，不得另写一份（两处漂移就会漏掉 contenteditable）。
+		if (!/function blurEditableFocus\(\)[\s\S]{0,400}isEditableFocus\(/.test(src)) {
+			throw new Error("源码契约：blurEditableFocus 必须复用 isEditableFocus 判据，不得另写一份");
+		}
+		// 取 toggleSidebar 的函数体：到下一个同缩进的 function 声明为止。
+		const fnStart = src.indexOf("function toggleSidebar() {");
+		if (fnStart < 0) throw new Error("源码契约：找不到 toggleSidebar");
+		const fnEnd = src.indexOf("\n\tfunction ", fnStart);
+		if (fnEnd < 0) throw new Error("源码契约：无法确定 toggleSidebar 函数体边界");
+		const body = src.slice(fnStart, fnEnd);
+		const blurAt = body.indexOf("blurEditableFocus();");
+		if (blurAt < 0) {
+			throw new Error("源码契约：toggleSidebar 入口必须调用 blurEditableFocus()（鲸鱼 preventDefault 吃掉了默认失焦 → 弹虚拟键盘）");
+		}
+		// 必须早于合成 click：落在仍持焦的输入框上的 click 照样会被 Chromium 抬起键盘。
+		const clickAt = body.indexOf("dispatchNativeClick(button)");
+		if (clickAt >= 0 && blurAt > clickAt) {
+			throw new Error("源码契约：blurEditableFocus() 必须早于 dispatchNativeClick(button)，否则合成 click 落在仍持焦的输入框上");
+		}
+		// 又必须晚于连点护栏：护栏命中时这次调用根本不派发动作，不该顺手收走用户焦点。
+		const busyAt = body.indexOf("if (toggleBusy) return true;");
+		if (busyAt < 0) throw new Error("源码契约：找不到 toggleSidebar 的 toggleBusy 连点护栏");
+		if (blurAt < busyAt) {
+			throw new Error("源码契约：blurEditableFocus() 必须晚于 toggleBusy 护栏，否则被护栏 return 掉的空调用也会收走用户焦点");
+		}
+	}
+	// ── T21 修复 2：焦点守卫——只有用户自己点输入框，输入框才允许持焦 ──
+	if (!src.includes("function bindFocusGuard") || !src.includes("function revokeStealthFocus")) {
+		throw new Error("源码契约：缺少焦点守卫 bindFocusGuard / revokeStealthFocus");
+	}
+	if (!src.includes("var USER_FOCUS_WINDOW_MS") || !src.includes("var userFocusWindowUntil")) {
+		throw new Error("源码契约：缺少「用户主动聚焦」窗口（userFocusWindowUntil）");
+	}
+	// 三个落指事件都必须捕获阶段登记窗口：少一个就会出现「点了输入框反而被收回」。
+	for (const EV of ["touchstart", "pointerdown", "mousedown"]) {
+		if (!src.includes(`addEventListener('${EV}', onDown, { capture: true, passive: true });`)) {
+			throw new Error(`源码契约：焦点守卫必须在 ${EV} 捕获阶段登记「用户主动聚焦」窗口`);
+		}
+	}
+	{
+		// focusin 捕获阶段：窗口内放行、窗口外收回。
+		const at = src.indexOf("addEventListener('focusin', function (event) {");
+		if (at < 0) throw new Error("源码契约：焦点守卫缺少 focusin 捕获阶段监听");
+		const body = src.slice(at, src.indexOf("\n\tfunction ", at));
+		if (!body.includes("isEditableFocus(el)")) {
+			throw new Error("源码契约：focusin 守卫必须只对可编辑元素生效");
+		}
+		if (!body.includes("if (Date.now() <= userFocusWindowUntil) return;")) {
+			throw new Error("源码契约：focusin 守卫必须放行「用户主动聚焦」窗口内的聚焦（否则用户点输入框会被收回）");
+		}
+		if (!body.includes("revokeStealthFocus(el)")) {
+			throw new Error("源码契约：focusin 守卫必须在窗口外调用 revokeStealthFocus(el)");
+		}
+	}
+	if (!src.includes("var FOCUS_REVOKE_MAX") || !/focusRevokeCount > FOCUS_REVOKE_MAX/.test(src)) {
+		throw new Error("源码契约：焦点守卫必须有防打环上限（不得无限 blur）");
+	}
+	if (!src.includes("function focusGuardActive()") || !/!isStrictOff\(\) && !!hookOn/.test(src)) {
+		throw new Error("源码契约：焦点守卫只能在 hook 生效档位动作（平板档严格 OFF / 手机横屏不得介入）");
+	}
+	// ── T21 修复 3：把「效果」上报给原生（T16 缺陷 #3 的配套）──
+	if (!src.includes("window.DshRemoteApp.setUiDiag(")) {
+		throw new Error("源码契约：缺少 DshRemoteApp.setUiDiag 上报（原生看不见「装了但没生效」）");
+	}
+	if (!src.includes("typeof window.DshRemoteApp.setUiDiag !== 'function'")) {
+		throw new Error("源码契约：setUiDiag 必须 typeof 判空后静默跳过（该桥由原生另一任务实现，缺失不得抛错）");
+	}
+	if (!src.includes("window.__dshrMobileDiag")) {
+		throw new Error("源码契约：缺少 window.__dshrMobileDiag（测试与排查需直读同一份数据）");
+	}
+	{
+		const at = src.indexOf("function collectUiDiag() {");
+		if (at < 0) throw new Error("源码契约：找不到 collectUiDiag");
+		const body = src.slice(at, src.indexOf("\n\tfunction ", at));
+		for (const FIELD of ["device", "on", "rootClass", "ready", "whale", "frame", "strictOff", "ts"]) {
+			if (!new RegExp(`\\b${FIELD}:`).test(body)) {
+				throw new Error(`源码契约：UI 诊断缺字段 ${FIELD}（device/on/rootClass/ready/whale/frame/strictOff/ts）`);
+			}
+		}
+	}
+	// 诊断必须在 boot 收敛与 syncDom 收敛后各报一次，且严格 OFF 档也要报。
+	if (!/if \(isStrictOff\(\)\) \{\s*\n\s*reportUiDiag\(\);/.test(src)) {
+		throw new Error("源码契约：严格 OFF（平板档）也必须上报 UI 诊断（那时 on=false）");
+	}
+	if (!/function boot\(\)[\s\S]{0,700}reportUiDiag\(\);/.test(src)) {
+		throw new Error("源码契约：boot 收敛后必须上报 UI 诊断");
+	}
+	if (!/function syncDom\(\)[\s\S]{0,9000}reportUiDiag\(\);\n\t\}/.test(src)) {
+		throw new Error("源码契约：syncDom 收敛后必须上报 UI 诊断");
+	}
+	// T27-D：判重必须排除 ts。载荷带 Date.now()，拿整份 payload 判重永不相等，
+	// 去抖会静默退化成「每轮 syncDom 都过桥」（死代码）。
+	if (!/function uiDiagDedupeKey\(diag\)/.test(src)
+		|| !/k === 'ts' \? undefined : v/.test(src)) {
+		throw new Error("源码契约：UI 诊断去抖键必须排除 ts（否则去抖是死代码）");
+	}
+	if (!/if \(key === lastUiDiagKey\) return false;/.test(src)) {
+		throw new Error("源码契约：reportUiDiag 必须用去抖键（不含 ts）判重");
+	}
+	// 桥是后到的：缺桥时**不得**记判重键，否则桥到位后永远补不上报。
+	{
+		const at = src.indexOf("function reportUiDiag() {");
+		if (at < 0) throw new Error("源码契约：找不到 reportUiDiag");
+		const body = src.slice(at, src.indexOf("\n\tfunction ", at));
+		const missing = body.slice(body.indexOf("typeof window.DshRemoteApp.setUiDiag"), body.indexOf("} catch (ignoredDiagProbe)"));
+		if (!/uiDiagBridgeMissing = true;/.test(missing) || /lastUiDiagKey = key;/.test(missing)) {
+			throw new Error("源码契约：JS 桥缺失时不得记判重键（桥后到要能补发一次）");
+		}
+	}
 	// ── WEB-05：抽屉接管接入横向滚动容器豁免 ──
 	if (!src.includes("if (isInHorizontallyScrollableContainer(target)) return false;")) {
 		throw new Error("源码契约：WEB-05 canStartDrawerTrack 必须接入横向可滚容器豁免");
@@ -267,6 +386,42 @@ function assertSourceContracts() {
 	}
 	if (!src.includes("return { count: hosts.length, changed: changed }")) {
 		throw new Error("源码契约：clampFloatingMenus 必须返回 { count, changed }");
+	}
+	// ── T24：输入联想浮层（`/`、`@`）必须留在官方锚点上，不得被钳位顶到屏幕顶端 ──
+	//
+	// 真机复现（scratch/t24/report.md）：官方把命令面板锚在输入卡上沿、留 4px 缝
+	// （实测浮层底边 461 / 输入卡顶边 465），而 clampFloatHost 的安全区把输入卡顶边
+	// **再减 8px** 当硬下界 → 一条 377px 高的面板每次都被判越界 → 被改写成
+	// position:fixed; inset:8px auto auto 16px，浮层从「贴着输入框」跳到安全区顶端
+	// （top 84 → 32，高 377 → 425）。原生还没写 --dshr-inset-top 时 pad.top=8，
+	// 浮层顶边就是 8px，直接压进状态栏——即用户报的「从屏幕最顶端、溢出状态栏弹出」。
+	if (!src.includes("function isInputTriggerPalette")) {
+		throw new Error("源码契约：缺少 isInputTriggerPalette——输入联想浮层必须与普通浮层分开判");
+	}
+	{
+		// 判据必须是官方**结构属性**，不得依赖 CSS Module 哈希类名（Z9Jnlq_menu / _surface_ri079_1 随发版会变）
+		const pred = src.match(/function isInputTriggerPalette\(node\) \{[\s\S]{0,400}?\n\t\}/);
+		if (!pred) throw new Error("源码契约：找不到 isInputTriggerPalette 函数体");
+		if (!/hasAttribute\('data-trigger-menu'\)/.test(pred[0])) {
+			throw new Error("源码契约：isInputTriggerPalette 必须认官方结构属性 data-trigger-menu");
+		}
+		if (!/closest\('\[data-trigger-menu\]'\)/.test(pred[0])) {
+			throw new Error("源码契约：isInputTriggerPalette 必须覆盖 data-trigger-menu 内部节点（role=listbox 视口、材质层）");
+		}
+		if (/Z9Jnlq|_surface_ri079|_material_ri079|className\s*===|classList\.contains/.test(pred[0])) {
+			throw new Error("源码契约：isInputTriggerPalette 不得依赖 CSS Module 哈希类名（官方发版会变）");
+		}
+	}
+	{
+		// 两道闸都要在：根节点收集处不收它 + 真正改写前再拦一次（防将来新增调用路径绕过）
+		const roots = src.match(/function looksLikeMenuRoot\(node\) \{[\s\S]{0,1200}?\n\t\}/);
+		if (!roots || !/if \(isInputTriggerPalette\(node\)\) return false;/.test(roots[0])) {
+			throw new Error("源码契约：looksLikeMenuRoot 必须放行输入联想浮层（内层 [role=listbox] 会命中菜单根判据）");
+		}
+		const clamp = src.match(/function clampFloatHost\(el\) \{[\s\S]{0,600}?\n\t\tvar pad = viewportPad\(\);/);
+		if (!clamp || !/if \(isInputTriggerPalette\(el\)\) return false;/.test(clamp[0])) {
+			throw new Error("源码契约：clampFloatHost 改写样式前必须再拦一次输入联想浮层");
+		}
 	}
 	if (!src.includes("interactive-widget=overlays-content")) {
 		throw new Error("源码契约：Android 壳必须 overlays-content，避免 layout viewport 再缩一次");

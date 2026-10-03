@@ -1000,6 +1000,19 @@
 	}
 
 	/**
+	 * T21 修复 1：把当前可编辑元素的焦点收回（判据复用 isEditableFocus，不另写一份）。
+	 * 没有可编辑元素持焦时零成本返回 false。
+	 */
+	function blurEditableFocus() {
+		var el = document.activeElement;
+		if (!isEditableFocus(el)) return false;
+		try {
+			el.blur();
+		} catch (ignoredBlur) { /* 节点已卸载：focus 已被浏览器自行清掉 */ }
+		return true;
+	}
+
+	/**
 	 * 键盘抬起的目标元素：焦点落在输入卡里时，取整块输入区
 	 * （[data-composer-seat] 含底栏与底部统计；退化到 [data-composer-card]）。
 	 * 官方输入卡是「文本框在上、四键底栏在下」，只报 textarea 的矩形时原生
@@ -1053,6 +1066,175 @@
 			window.setTimeout(onChange, 80);
 		});
 	}
+
+	// ── T21 修复 2：焦点守卫（用户口径：只有用户自己点输入框，输入框才允许持焦）──
+	//
+	// 现象：任何非「用户主动点击输入框」造成的聚焦都会抬起虚拟键盘。切会话后官方重渲染
+	// 会把 composer 重新聚焦 → 手机档 931ms 弹键盘（T18 K-3/K-4）。T18 已证明这是**官方
+	// 行为**（平板档 hook 关闭、纯官方 UI，929ms 照样弹），用户已拍板要压掉，属有意偏离
+	// 官方桌面行为，不是 bug 修复的副作用。
+	//
+	// 机制：
+	//   1) touchstart / pointerdown / mousedown 三个**捕获阶段**监听器：事件落点落在
+	//      可编辑元素内 → 记一个「用户主动聚焦」时间戳（USER_FOCUS_WINDOW_MS 窗口）。
+	//      三个都监听是因为 WebView/Chrome 的落指→聚焦顺序在这几种输入下不完全一致。
+	//   2) focusin 捕获阶段：目标是可编辑元素、且**不在**窗口内 → 当场 blur()。
+	//
+	// 不破坏的场景：
+	//   - 用户点输入框：touchstart/pointerdown/mousedown 的默认动作（聚焦）发生在事件
+	//     派发**之后**，而窗口在这之前就记好了 ⇒ 这次聚焦一定在窗口内，键盘照常弹。
+	//   - 用户连续操作输入框：每次落指都刷新窗口。
+	//   - 用户点输入框后官方自己再 focus 一次（同元素、窗口内）：放行。
+	//   - 正在输入/发送后官方保持焦点：那期间没有新的 focusin（焦点没变），守卫不动作。
+	// 防打环：同一元素在 FOCUS_REVOKE_SPAN_MS 内最多收回 FOCUS_REVOKE_MAX 次，超限就
+	// 放手并计数（最坏退回改动前行为），绝不无限 blur。
+	//
+	// 生效范围：只在 hook 真正生效的档位工作。平板档（严格 OFF，契约 3.5 零痕迹）与
+	// 手机横屏（hook OFF、官方桌面布局）一律不动作——本任务不碰这两个档。
+	var USER_FOCUS_WINDOW_MS = 800;
+	var FOCUS_REVOKE_MAX = 2;
+	var FOCUS_REVOKE_SPAN_MS = 1200;
+	var userFocusWindowUntil = 0;
+	var focusRevokeEl = null;
+	var focusRevokeCount = 0;
+	var focusRevokeSince = 0;
+	var focusGuardStats = { revoked: 0, capped: 0 };
+	var focusGuardBound = false;
+
+	/**
+	 * 落点是否在可编辑元素内：自身可编辑（判据复用 isEditableFocus），
+	 * 或祖先里有可编辑元素（contenteditable 的后代节点、包裹层等）。
+	 */
+	function isEditablePoint(target) {
+		if (isEditableFocus(target)) return true;
+		if (!isElement(target) || !target.closest) return false;
+		return !!target.closest('input, textarea, select, [contenteditable]');
+	}
+
+	/** 用户在可编辑元素上落指 → 开一个「主动聚焦」窗口。 */
+	function markUserFocusIntent() {
+		userFocusWindowUntil = Date.now() + USER_FOCUS_WINDOW_MS;
+	}
+
+	/**
+	 * 收回非用户主动的聚焦。返回 true = 已收回，false = 达到防打环上限后放手。
+	 */
+	function revokeStealthFocus(el) {
+		var now = Date.now();
+		if (el === focusRevokeEl && now - focusRevokeSince < FOCUS_REVOKE_SPAN_MS) {
+			focusRevokeCount += 1;
+			if (focusRevokeCount > FOCUS_REVOKE_MAX) {
+				focusGuardStats.capped += 1;
+				return false;
+			}
+		} else {
+			focusRevokeEl = el;
+			focusRevokeCount = 1;
+			focusRevokeSince = now;
+		}
+		try {
+			el.blur();
+		} catch (ignoredBlur) { /* 节点已卸载 */ }
+		focusGuardStats.revoked += 1;
+		return true;
+	}
+
+	function focusGuardActive() {
+		return !isStrictOff() && !!hookOn;
+	}
+
+	function bindFocusGuard() {
+		if (focusGuardBound) return;
+		focusGuardBound = true;
+		var onDown = function (event) {
+			if (!focusGuardActive()) return;
+			if (isEditablePoint(event.target)) markUserFocusIntent();
+		};
+		document.addEventListener('touchstart', onDown, { capture: true, passive: true });
+		document.addEventListener('pointerdown', onDown, { capture: true, passive: true });
+		document.addEventListener('mousedown', onDown, { capture: true, passive: true });
+		document.addEventListener('focusin', function (event) {
+			if (!focusGuardActive()) return;
+			var el = event.target;
+			if (!isEditableFocus(el)) return;
+			if (Date.now() <= userFocusWindowUntil) return;
+			revokeStealthFocus(el);
+		}, { capture: true });
+	}
+
+	// ── T21 修复 3：把「效果」上报给原生（诊断用）──
+	//
+	// T16 缺陷 #3：hook 只在 IIFE 顶部就置 window.__dshRemoteMobileInstalled（早于任何
+	// DOM 同步），原生注入自检读的就是这个变量 ⇒「装上了但没收敛」（无鲸鱼 / 无 frame /
+	// 无 data-dshr-ready）这种半吊子状态对原生**完全不可见**，也不会补注。
+	// 这里在 boot 完成 / syncDom 收敛后把真实状态过一遍 JS 桥，原生日志里就能一眼分清
+	// 「没装上」与「装上了但没生效」。严格 OFF（平板档）也要报，那时 on=false。
+	//
+	// DshRemoteApp.setUiDiag 由原生侧另一个任务实现；缺失时 typeof 判空、静默跳过，
+	// 绝不能因此抛错（旧 WebView 也没有这套桥）。
+	// 判重存的是**判重键**（不含 ts），不是整份 payload：载荷里带 Date.now()，
+	// 拿它判重会永不相等，去抖就成了空转（每轮 syncDom 都过桥）。
+	var lastUiDiagKey = null;
+	var uiDiagBridgeMissing = false;
+
+	function collectUiDiag() {
+		var root = document.documentElement;
+		return {
+			device: deviceMode,
+			on: !!hookOn,
+			rootClass: root.className || '',
+			ready: root.getAttribute('data-dshr-ready') === '1',
+			whale: isVisible(document.getElementById('dshr-mobile-whale')),
+			frame: !!findFrame(),
+			strictOff: isStrictOff(),
+			ts: Date.now(),
+		};
+	}
+
+	/**
+	 * 去抖键：整份载荷去掉 **ts** 后的序列化结果。
+	 * 时间戳每毫秒都变，带上它判重永不相等 ⇒ 旧实现（拿整份 payload 判重）的去抖是死代码。
+	 * 用 replacer 而不是手拼字段列表：以后新增诊断字段自动参与判重，不会漏。
+	 */
+	function uiDiagDedupeKey(diag) {
+		return JSON.stringify(diag, function (k, v) {
+			return k === 'ts' ? undefined : v;
+		});
+	}
+
+	function reportUiDiag() {
+		var payload, key;
+		try {
+			var diag = collectUiDiag();
+			payload = JSON.stringify(diag);
+			key = uiDiagDedupeKey(diag);
+		} catch (ignoredDiagJson) {
+			return false;
+		}
+		// 去抖：syncDom 由 MutationObserver 驱动（50ms 合并），收敛期会连跑很多次。
+		// 状态字段（device/on/rootClass/ready/whale/frame/strictOff）没变就不该再过桥。
+		if (key === lastUiDiagKey) return false;
+		try {
+			if (!window.DshRemoteApp || typeof window.DshRemoteApp.setUiDiag !== 'function') {
+				// 桥不存在：**不记判重键**——桥是后到的，记了就再也不会补发。
+				// 每轮只做一次 typeof 判空（无序列化开销），桥一到就补发。
+				uiDiagBridgeMissing = true;
+				return false;
+			}
+		} catch (ignoredDiagProbe) {
+			return false;
+		}
+		lastUiDiagKey = key;
+		if (uiDiagBridgeMissing) uiDiagBridgeMissing = false;
+		try {
+			window.DshRemoteApp.setUiDiag(payload);
+		} catch (ignoredDiagBridge) { /* 无 JS 桥时原生按既有自检兜底 */ }
+		return true;
+	}
+	// 供测试与排查直接读同一份数据（不经过桥）。
+	window.__dshrMobileDiag = function () {
+		return collectUiDiag();
+	};
 
 	function isPortraitViewport() {
 		try {
@@ -1250,6 +1432,9 @@
 		}
 		applyImeLift();
 		reportImeFocusToNative();
+		// T21 修复 3：档位/朝向每次重算都上报一次收敛状态（严格 OFF 时 on=false，
+		// 平板档同样要报——那正是「装了但没生效」最需要看见的档）。
+		reportUiDiag();
 	}
 
 	// ── 运行时档位切换 API（契约 3.3） ──
@@ -1272,6 +1457,7 @@
 	}
 	applyWidthScope();
 	bindImeLift();
+	bindFocusGuard();
 
 	// ── 原生 inset 变量（MainActivity 在页面加载/焦点变化时调用） ──
 	// 平板档由原生容器给 WebView 让位（契约 3.6），页面不再持有这两个行内变量；
@@ -1584,10 +1770,28 @@
 
 	function toggleSidebar() {
 		if (toggleBusy) return true;
+		// T21 修复 1：hook 发起的侧栏开合前，先把焦点收回可编辑元素。
+		//
+		// 根因（scratch/t18/keyboard.md §3，真实 AVD 两次复现）：鲸鱼 touchend 里的
+		// event.preventDefault()（压重复 click 用）会连带取消「点按按钮 → 焦点离开当前
+		// 可编辑元素」这条**默认行为**，composer 因而在动作后仍持焦；紧接着下面第 N 行的
+		// dispatchNativeClick 在**同一次真实触摸的用户激活窗口内**派发合成 click，
+		// Chromium 看到「可编辑元素仍持焦 + 刚发生用户手势」遂抬起虚拟键盘。
+		// 同设备同粘滞态三路对照：hook 鲸鱼弹（724ms / 760ms）、官方 Collapse sidebar 不弹
+		// （composer 失焦）、滚动不弹 —— 官方按钮靠的就是这条被吃掉的默认行为。
+		//
+		// 放在「确实要派发合成 click」之前：一处覆盖鲸鱼 touchend / click、官方开关兜底
+		// 重试、flushPendingSidebar 的重放等全部入口；连点护栏命中（toggleBusy）与
+		// 找不到官方开关（!button）这两条不派发动作的路径不受影响。
+		//
+		// 影响面：只在「IME 本来就收起」时才需要动作——此时用户看不到光标，视觉无变化；
+		// 用户正输入时点鲸鱼，焦点本来也会被官方侧栏切换带走（T18 K-7-4/K-7-6：平板档
+		// 官方 Collapse/Open sidebar 同样让 composer 失焦），故与官方桌面行为一致。
 		var frame = findFrame();
 		var before = frame ? frame.hasAttribute('data-sidebar-collapsed') : null;
 		var button = findToggleControl();
 		if (!button) return false;
+		blurEditableFocus();
 		toggleBusy = true;
 		var dispatched = dispatchNativeClick(button);
 		if (!dispatched) button.click();
@@ -2228,8 +2432,36 @@
 		return true;
 	}
 
+	/**
+	 * 输入联想浮层（`/`、`@` 触发的命令/技能/文件/目标面板）。
+	 *
+	 * 判据只用官方**结构属性** `data-trigger-menu`（以及「在它里面」这件事），
+	 * 不碰 `Z9Jnlq_menu` / `_surface_ri079_1` 这类 CSS Module 哈希类名——哈希随官方发版会变。
+	 * 官方自己在 `conversation.input.overlay` 槽里挂它，内层是 `[role="listbox"]`，
+	 * 所以原来它**确实**会被 collectMenuRoots 收进钳位集合（listbox 命中 looksLikeMenuRoot）。
+	 *
+	 * 为什么必须放行（2026-10-02 真机复现，见 scratch/t24/report.md）：
+	 * 官方锚点是「贴在输入卡上沿、留 4px 缝」，实测底边 461 / 输入卡顶边 465（对照臂 447 / 451）。
+	 * 而 clampFloatHost 的安全区把输入卡顶边**再减 8px** 当硬下界，于是
+	 *   rect.bottom(461) <= bottomLimit(465-8=457) + 0.5 → 不成立
+	 * 一条 377px 高的命令面板每次都被判成「越界」，于是被改写成
+	 *   position:fixed; inset:8px auto auto 16px; max-height:bottomLimit-pad.top
+	 * 结果浮层从「贴着输入框」跳到**安全区顶端**（实测 top 84 → 32，高 377 → 425），
+	 * 正是用户报的「不是从输入框弹出，而是从屏幕最顶端、且溢出状态栏那一侧开始」；
+	 * 原生还没写入 --dshr-inset-top 时 pad.top=8，浮层顶边就是 8px，直接压进状态栏。
+	 *
+	 * 对照臂（同一页面、同一视口、**不注入**）实测官方位置 top=84 / bottom=447，
+	 * 本身就在安全视口内 → 锚点归官方，本脚本不碰它。
+	 */
+	function isInputTriggerPalette(node) {
+		if (!isElement(node)) return false;
+		if (node.hasAttribute('data-trigger-menu')) return true;
+		return !!node.closest('[data-trigger-menu]');
+	}
+
 	function looksLikeMenuRoot(node) {
 		if (!isElement(node) || isLayoutChrome(node)) return false;
+		if (isInputTriggerPalette(node)) return false;
 		if (node.getAttribute('aria-hidden') === 'true') return false;
 		if (node.getAttribute('data-state') === 'closed') return false;
 		var role = (node.getAttribute('role') || '').toLowerCase();
@@ -2330,6 +2562,9 @@
 	 */
 	function clampFloatHost(el) {
 		if (!isMobileMode() || !isElement(el) || !isVisible(el) || isLayoutChrome(el)) return false;
+		// 输入联想浮层不归本脚本夹（见 isInputTriggerPalette 的实测记录）：
+		// 官方锚点本来就贴着输入卡且在安全视口内，这里只会把它顶到屏幕顶端。
+		if (isInputTriggerPalette(el)) return false;
 		var pad = viewportPad();
 		var vw = window.innerWidth || document.documentElement.clientWidth || 390;
 		var vh = window.innerHeight || document.documentElement.clientHeight || 844;
@@ -3154,6 +3389,8 @@
 		scheduleClampFloats();
 		syncPageTheme();
 		scheduleSessionNotice();
+		// T21 修复 3：本轮同步收敛后上报一次（值不变时 reportUiDiag 自身会去抖）。
+		reportUiDiag();
 	}
 
 	var lastPageDark = null;
@@ -3233,9 +3470,16 @@
 	var bootTicks = 0;
 	function boot() {
 		// 平板档：官方 DOM 探针与 hook 无关，不做有界重试（否则白烧 12s 定时器）。
-		if (isStrictOff()) return;
+		// 但状态仍要报给原生（on=false），否则「平板档装上了没生效」在原生侧不可见。
+		if (isStrictOff()) {
+			reportUiDiag();
+			return;
+		}
 		var observing = startObserver();
 		syncDom();
+		// boot 收敛判定之后补报一次：syncDom 里那次发生在 data-dshr-ready 落位之前，
+		// 这里才是「ready=1」的真值（同步时序上 ready 可能被同一轮末尾的标记改掉）。
+		reportUiDiag();
 		var ready = document.documentElement.getAttribute('data-dshr-ready') === '1';
 		if (ready && observing) return;
 		if (bootTicks < 40) {

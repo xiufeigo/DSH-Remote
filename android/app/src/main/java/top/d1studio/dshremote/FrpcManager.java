@@ -24,6 +24,23 @@ public class FrpcManager {
 
 	private static final String TAG = "dshr-frpc";
 
+	/**
+	 * T23-B：frpc 就绪日志的进程级回调。主 Activity 在等隧道就绪期间注册它，
+	 * 命中就绪关键字时立刻唤醒一次端口探测，而不是死等下一个 tick。
+	 * <p>
+	 * 【日志只是提前触发探测的信号，端口能不能连仍是唯一判据】——frp 的日志文案会随
+	 * 版本/语言漂移，所以这里绝不放行任何连接，判定逻辑一行都不在这里。
+	 * <p>
+	 * 静态字段持有 Activity，必须由注册方在 finally / onDestroy 里置回 null
+	 * （见 MainActivity.waitAndOpen）。
+	 */
+	private static volatile Runnable readyListener;
+
+	/** 注册/注销就绪回调（传 null 注销）。 */
+	public static void setReadyListener(Runnable listener) {
+		readyListener = listener;
+	}
+
 	private final File workDir;
 	private final File binFile;
 	private Process process;
@@ -73,14 +90,32 @@ public class FrpcManager {
 			BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
 			try {
 				String line;
+				// 每次 pump（= 每次 frpc 启动）只发一次就绪信号，避免刷屏；
+				// 崩溃重启后重新 pump，仍能再次触发。
+				boolean signaled = false;
 				while ((line = reader.readLine()) != null) {
 					log(line);
+					if (!signaled && TunnelReady.isReadyLine(line)) {
+						signaled = true;
+						log("frpc 就绪信号：" + TunnelReady.readyKeywordOf(line)
+							+ "（仅用于提前触发端口探测，判据仍是端口可连）");
+						notifyReady();
+					}
 				}
 			} catch (Exception ignored) {
 			}
 		}, "frpc-log");
 		t.setDaemon(true);
 		t.start();
+	}
+
+	private static void notifyReady() {
+		Runnable listener = readyListener;
+		if (listener == null) return;
+		try {
+			listener.run();
+		} catch (Exception ignored) {
+		}
 	}
 
 	private void watch(final VisitorConfig cfg, final int epoch) {

@@ -19,6 +19,22 @@
 #     口令来自 DSH_KEYSTORE_PASS / DSH_KEY_PASS（可选 DSH_KEY_ALIAS 指定别名）；
 #     缺 keystore 或口令立即报错退出，绝不回落生成临时密钥。
 #     CI 侧由 .github/workflows/release.yml 解码 GitHub secret 写入上述文件并设环境变量。
+#
+# 测试期可观测构建（-Debug，等价环境变量 DSH_DEBUG=1）：
+#   走 `aapt2 link --debug-mode` 产出可调试（debuggable）APK，产物另名为
+#   android/dist/dsh-remote-debug.apk，版本名带 `+debug` 后缀。仅供真机/模拟器
+#   取证用——MainActivity 只在 FLAG_DEBUGGABLE 时开 WebView DevTools，发布包
+#   不带该 flag，因此发布包不暴露调试口。**默认（无开关）路径逐字节不变**：
+#   不加 --debug-mode、产物名仍是 dsh-remote.apk、版本名不加后缀。
+#   用法：powershell -File android/build.ps1 -Debug
+
+param(
+	# 开关形式（-Debug）优先；未传时回落环境变量 DSH_DEBUG=1。
+	[switch]$Debug
+)
+if (-not $Debug -and $env:DSH_DEBUG -eq "1") { $Debug = $true }
+$DebugBuild = [bool]$Debug
+if ($DebugBuild) { Write-Host "== 测试期可观测构建（debuggable / dsh-remote-debug.apk）==" }
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -92,11 +108,21 @@ Write-Host "== aapt2 compile =="
 if ($LASTEXITCODE -ne 0) { throw "aapt2 compile 失败" }
 
 Write-Host "== aapt2 link（同时生成 R.java）=="
+# --debug-mode 只在测试期开关打开时传：它让 aapt2 在产物清单里写入
+# android:debuggable="true"，MainActivity 据此决定是否开 WebView DevTools。
+# 默认路径不传 ⇒ 产物清单里根本没有 debuggable 属性（与改动前逐字节一致）。
+$LinkDebugArgs = @()
+$ApkVersionName = $AppVersion
+if ($DebugBuild) {
+	$LinkDebugArgs = @("--debug-mode")
+	$ApkVersionName = "$AppVersion+debug"
+}
 & "$Bt/aapt2$exe" link -o "$OutDir/base.apk" -I $PlatformJar `
 	--manifest (Join-Path $AppDir "src/main/AndroidManifest.xml") `
 	--java "$OutDir/gen" `
 	--min-sdk-version 24 --target-sdk-version 34 `
-	--version-code $VersionCode --version-name $AppVersion `
+	--version-code $VersionCode --version-name $ApkVersionName `
+	@LinkDebugArgs `
 	"$OutDir/res.zip"
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link 失败" }
 
@@ -232,7 +258,8 @@ if ($ReleaseMode) {
 		$KeyPass = $StorePass
 	}
 }
-$Apk = Join-Path $DistDir "dsh-remote.apk"
+# 产物名：测试期开关打开时另存 dsh-remote-debug.apk，绝不覆盖发布产物。
+$Apk = if ($DebugBuild) { Join-Path $DistDir "dsh-remote-debug.apk" } else { Join-Path $DistDir "dsh-remote.apk" }
 $SignArgs = @("sign", "--ks", $Keystore, "--ks-pass", "pass:$StorePass")
 if ($KeyAlias) { $SignArgs += @("--ks-key-alias", $KeyAlias) }
 if ($KeyPass -ne $StorePass) { $SignArgs += @("--key-pass", "pass:$KeyPass") }
