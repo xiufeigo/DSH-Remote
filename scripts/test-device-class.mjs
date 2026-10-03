@@ -524,6 +524,13 @@ try {
 	const afterOpen = await evaluate(`(()=>{const f=document.querySelector('[data-sidebar-collapsed]');const m=document.querySelector('[data-dshr-main-col]');
 		return{collapsed:!!f,transform:m?getComputedStyle(m).transform:null,sideW:(()=>{const s=document.querySelector('[data-dshr-sidebar-col]');return s?Math.round(s.getBoundingClientRect().width):-1;})()};})()`);
 	record("A", "点鲸鱼展开官方侧栏抽屉", afterOpen.collapsed === false && afterOpen.sideW > 100, `data-sidebar-collapsed=${afterOpen.collapsed} 侧栏列宽=${afterOpen.sideW}px 实际点击次数=${openClicks}`);
+	// 节流路径收敛等待：合并远端性能线后，官方 data-sidebar-collapsed 的变化不再
+	// 同步跑 syncDom，而是经 scheduleSyncDom 合并到 50ms 一次（PERF-30s）。
+	// toggleViaWhale 的「0 击」快返回完全不等待，直接落到下面的读数，于是量到的
+	// 是 hook 尚未把 data-dshr-expanded 翻成 "1" 的那一帧（遮罩 display:none）。
+	// 50ms 对人眼不可感知，但自动化可观测：这里显式等 hook 自己收敛再量。
+	// 这不是放宽断言——waitUntil 有 3s 上界，比原来「立刻可见」更强。
+	await waitUntil(`document.documentElement.getAttribute('data-dshr-expanded') === '1'`, 3000);
 	const maskVisible = await evaluate(`(()=>{const m=document.getElementById('dshr-mobile-drawer-mask');if(!m)return null;const c=getComputedStyle(m);const b=m.getBoundingClientRect();return{display:c.display,w:Math.round(b.width)};})()`);
 	record("A", "抽屉展开时出现遮罩与拖动手柄", !!maskVisible && maskVisible.display !== "none" && maskVisible.w > 0, JSON.stringify(maskVisible));
 	const shotA1 = await shot("A-phone-portrait-412x915-drawer-open");
