@@ -27,11 +27,32 @@
 #   不带该 flag，因此发布包不暴露调试口。**默认（无开关）路径逐字节不变**：
 #   不加 --debug-mode、产物名仍是 dsh-remote.apk、版本名不加后缀。
 #   用法：powershell -File android/build.ps1 -Debug
+#
+# T51（R3）：未知/拼错的参数**必须报错退出**（T50 §7.3 实测 `-DebugBuild` 会 exit 0
+# 并静默产出**发布包** dsh-remote.apk，同时磁盘上留着一个**陈旧的** debug 包 ——
+# 按名字去装 debug 包的人会装到上一次的旧代码，在设备上测半天得出「改了没用」。
+# 静默出包比构建失败危险得多，所以这里宁可拒绝启动。
 
 param(
 	# 开关形式（-Debug）优先；未传时回落环境变量 DSH_DEBUG=1。
 	[switch]$Debug
 )
+
+# ── T51（R3）：参数白名单 ──
+# $args 收的是没有被 param() 绑定的一切：拼错的开关（-DebugBuild）、多写的值、
+# 位置参数都落在这里。有一个就报全部错，别让人猜。
+if ($args -and $args.Count -gt 0) {
+	Write-Host ""
+	Write-Host "构建参数错误：未知的参数 $($args -join ' ')" -ForegroundColor Red
+	Write-Host "本脚本只接受以下参数：" -ForegroundColor Red
+	Write-Host "  -Debug    产出可调试 APK（android/dist/dsh-remote-debug.apk，版本名带 +debug）" -ForegroundColor Red
+	Write-Host "环境变量：DSH_DEBUG=1 等价于 -Debug；DSH_RELEASE=1 走发布签名（缺密钥即报错）。" -ForegroundColor Red
+	Write-Host "例如 -DebugBuild 会被拒绝——它拼错了，PowerShell 不会当成 -Debug，"
+	Write-Host "而旧版本会照常产出**发布包**并留下陈旧的 debug 包（T50 §7.3 实测）。" -ForegroundColor Red
+	Write-Host "未产出任何产物。" -ForegroundColor Red
+	exit 2
+}
+
 if (-not $Debug -and $env:DSH_DEBUG -eq "1") { $Debug = $true }
 $DebugBuild = [bool]$Debug
 if ($DebugBuild) { Write-Host "== 测试期可观测构建（debuggable / dsh-remote-debug.apk）==" }
@@ -102,6 +123,21 @@ if (-not (Test-Path $MobileSrc)) { throw "移动适配脚本单一源缺失：$M
 New-Item -ItemType Directory -Force (Split-Path $MobileDst -Parent) | Out-Null
 Copy-Item -Force -LiteralPath $MobileSrc -Destination $MobileDst
 Write-Host "== 已同步 mobile.js 单一源（$((Get-Item $MobileSrc).Length) 字节）=="
+
+# T49：Service Worker 源码单一源 = packages/gateway/src/pwa.ts 的 renderServiceWorker()
+# （与网关 /__dsh_remote__/sw.js 下发的是同一份）。这里渲染成 res/raw/dsh_sw.js，
+# 供 App 用 ServiceWorkerClient 本地供给——SW 脚本抓取不经 WebViewClient，
+# 拿不到 SslErrorHandler 放行，自签证书下 register() 必失败（见 scratch/t45）。
+# 脚本不经网络 ⇒ 证书不参与 ⇒ pin/TOFU 流程一行不改。res/raw 副本禁止手改。
+$SwSyncScript = Join-Path $PSScriptRoot "sync-sw-asset.mjs"
+$SwDst = Join-Path $AppDir "src/main/res/raw/dsh_sw.js"
+if (-not (Test-Path $SwSyncScript)) { throw "SW 单一源渲染脚本缺失：$SwSyncScript" }
+$nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+if (-not $nodeCmd) { throw "渲染 SW 单一源需要 node>=24（直接 import .ts）；未在 PATH 找到 node" }
+& $nodeCmd.Source $SwSyncScript $SwDst
+if ($LASTEXITCODE -ne 0) { throw "渲染 SW 单一源失败" }
+if (-not (Test-Path $SwDst)) { throw "SW 资源未生成：$SwDst" }
+Write-Host "== 已渲染 dsh_sw.js（$((Get-Item $SwDst).Length) 字节）=="
 
 Write-Host "== aapt2 compile =="
 & "$Bt/aapt2$exe" compile --dir (Join-Path $AppDir "src/main/res") -o "$OutDir/res.zip"

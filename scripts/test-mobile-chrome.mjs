@@ -21,6 +21,60 @@ const MIME = {
 	".png": "image/png",
 };
 
+/**
+ * 去掉 Java 源码里的注释（`//` 行注释与 `/* *\/` 块注释），**保留字符串/字符字面量内容**。
+ *
+ * 为什么需要：源码契约要在**代码**上判据，但说明性注释里经常要**引用**被禁掉的写法
+ * （例如 R7 那条契约要禁 `url.contains(SW_SCRIPT_PATH)`，而修复说明里必须原样写出它）。
+ * 不去注释就匹配 ⇒ 契约被自己的注释触发（我第一版就踩了，当场红）。
+ *
+ * 用状态机而不是正则：正则分不清 `"//"` 里的斜杠和注释，而 MainActivity 里满是
+ * `"https://…"` 这类字面量，误删会把后面整行代码吃掉 ⇒ 制造假绿。
+ */
+function stripJavaComments(src) {
+	let out = "";
+	let i = 0;
+	const n = src.length;
+	while (i < n) {
+		const c = src[i];
+		const c2 = src[i + 1];
+		if (c === "/" && c2 === "/") {
+			while (i < n && src[i] !== "\n") i += 1;
+			continue;
+		}
+		if (c === "/" && c2 === "*") {
+			i += 2;
+			while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i += 1;
+			i += 2; // 跳过 */
+			// 保留换行，行号不变（后面的 indexOf("\n\t}") 之类切片才靠谱）
+			out += "\n";
+			continue;
+		}
+		if (c === '"' || c === "'") {
+			const quote = c;
+			out += c;
+			i += 1;
+			while (i < n) {
+				if (src[i] === "\\") {
+					out += src[i] + (src[i + 1] || "");
+					i += 2;
+					continue;
+				}
+				out += src[i];
+				if (src[i] === quote) {
+					i += 1;
+					break;
+				}
+				i += 1;
+			}
+			continue;
+		}
+		out += c;
+		i += 1;
+	}
+	return out;
+}
+
 function assertSourceContracts() {
 	const src = readFileSync(join(ROOT, "android/app/src/main/res/raw/mobile.js"), "utf8");
 	const block = src.match(/\[data-dshr-msg-actions\] \{\s*([^}]+)\}/);
@@ -128,6 +182,38 @@ function assertSourceContracts() {
 		if (!main.includes('directTarget = url;') || !main.includes("if (!TextUtils.isEmpty(directTarget))")) {
 			throw new Error("源码契约：直连重试必须回到原直连地址，不得误连 FRP 配置组");
 		}
+		// ── R7（T53）：SW 脚本请求必须按**路径精确匹配**，不得再用子串判定 ──
+		// 原来是 `url.contains(SW_SCRIPT_PATH)`：任何路径里含有这段文字的请求都会被当成
+		// SW 脚本供给（/plugins/x/__dsh_remote__/sw.js、/__dsh_remote__/sw.js.bak …），
+		// 把别的响应体喂给 ServiceWorker 子系统，且日志写着"本地供给"极具误导性。
+		//
+		// ⚠ 判据必须在**去掉注释后**的代码上做：这段说明文字本身就含 `url.contains(...)`
+		// 这个字面量，直接在原文上匹配 ⇒ 契约会被自己的注释触发（我第一版就踩了，当场红）。
+		const mainCode = stripJavaComments(main);
+		if (/url\s*\.\s*contains\(\s*SW_SCRIPT_PATH\s*\)/.test(mainCode)) {
+			throw new Error("源码契约（R7）：不得用 url.contains(SW_SCRIPT_PATH) 判 SW 脚本——必须走 isSwScriptRequest() 的路径精确匹配");
+		}
+		if (!mainCode.includes("private static boolean isSwScriptRequest(String url)")) {
+			throw new Error("源码契约（R7）：缺少 isSwScriptRequest()（SW 脚本请求的路径精确判定）");
+		}
+		// 判定本体必须真的比 **pathname**（Uri.parse(...).getPath()），不是整串 URL。
+		const isSwAt = mainCode.indexOf("private static boolean isSwScriptRequest(String url)");
+		const isSw = mainCode.slice(isSwAt, mainCode.indexOf("\n\t}", isSwAt));
+		if (!isSw.includes("Uri.parse(url).getPath()")) {
+			throw new Error("源码契约（R7）：isSwScriptRequest 必须用 Uri.parse(url).getPath() 取 pathname 比对");
+		}
+		if (!isSw.includes("SW_SCRIPT_PATH.equals(path)")) {
+			throw new Error("源码契约（R7）：isSwScriptRequest 必须对 pathname 做 equals 精确匹配（query 不影响判定）");
+		}
+		// 调用点必须用它，不能绕回子串判定。
+		if (!mainCode.includes("if (isSwScriptRequest(url)) {")) {
+			throw new Error("源码契约（R7）：ServiceWorkerClient 的 SW 分支必须调用 isSwScriptRequest(url)");
+		}
+		// Java 的 catch 必须写两个标识符（类型 + 变量名）。我第一版照 JS 的习惯写了
+		// `catch (ignoredParse)`，javac 报「需要<标识符>」——注释里得钉住，别再犯。
+		if (/catch\s*\(\s*(?:Throwable|Exception|Error|RuntimeException)\s+/.test(isSw) === false && /catch\s*\(\s*[A-Za-z_$][\w$]*\s*\)/.test(isSw)) {
+			throw new Error("源码契约（R7）：catch 必须写「类型 + 变量名」两个标识符（`catch (ignoredParse)` 编译不过）");
+		}
 	}
 	// ── 壳深色主题（values-night）──
 	{
@@ -202,11 +288,22 @@ function assertSourceContracts() {
 		if (!body.includes("isEditableFocus(el)")) {
 			throw new Error("源码契约：focusin 守卫必须只对可编辑元素生效");
 		}
-		if (!body.includes("if (Date.now() <= userFocusWindowUntil) return;")) {
-			throw new Error("源码契约：focusin 守卫必须放行「用户主动聚焦」窗口内的聚焦（否则用户点输入框会被收回）");
+		// T51（R1）：放行判据从「对整篇文档按时间窗放行」收窄成
+		// 「只对这次意图的目标元素放行」（inUserFocusWindow）。
+		// 旧写法 `if (Date.now() <= userFocusWindowUntil) return;` 就是 T50 §6.1
+		// 那个 800ms 外溢反例的放行口，必须已经不在守卫里。
+		if (body.includes("Date.now() <= userFocusWindowUntil")) {
+			throw new Error("源码契约：focusin 守卫不得再对整篇文档按时间窗放行（T51/R1：那是布防窗口外溢的根因）");
+		}
+		if (!body.includes("if (inUserFocusWindow(el)) return;")) {
+			throw new Error("源码契约：focusin 守卫必须放行「用户主动聚焦」窗口内、且属于该次意图目标元素的聚焦（否则用户点输入框会被收回）");
 		}
 		if (!body.includes("revokeStealthFocus(el)")) {
 			throw new Error("源码契约：focusin 守卫必须在窗口外调用 revokeStealthFocus(el)");
+		}
+		// T51（R4）：残留兜底必须挂在 focusin 上（浏览器决定 showSoftInput 的那一刻）。
+		if (!body.includes("sweepResidualInputMode()")) {
+			throw new Error("源码契约：focusin 守卫必须触发 inputmode 残留兜底 sweepResidualInputMode()（T51/R4）");
 		}
 	}
 	if (!src.includes("var FOCUS_REVOKE_MAX") || !/focusRevokeCount > FOCUS_REVOKE_MAX/.test(src)) {
@@ -214,6 +311,157 @@ function assertSourceContracts() {
 	}
 	if (!src.includes("function focusGuardActive()") || !/!isStrictOff\(\) && !!hookOn/.test(src)) {
 		throw new Error("源码契约：焦点守卫只能在 hook 生效档位动作（平板档严格 OFF / 手机横屏不得介入）");
+	}
+	// ── T51（R1/R2/R4）：布防窗口的生命周期 + 承重行契约 ──
+	// 背景：T48 用来实现「键盘不弹」的唯一承重行是 armComposerFocus 里的
+	// setAttribute('inputmode','none')。T50 §7.4 变异②证明：**删掉它，
+	// pnpm test:mobile 与 pnpm test:device 双双全绿**（grep inputmode scripts/ 零命中）。
+	// 下面这组断言就是补那个缺口——删承重行必须变红。
+	{
+		const bodyOf = (needle) => {
+			const at = src.indexOf(needle);
+			if (at < 0) throw new Error(`源码契约：找不到 ${needle}`);
+			return src.slice(at, src.indexOf("\n\tfunction ", at));
+		};
+		const arm = bodyOf("function armComposerFocus()");
+		// 承重三动作：登记意图窗口（且必须带目标元素）/ 打 inputmode=none / 自抢焦点。
+		if (!/markUserFocusIntent\(\s*composer\s*\)/.test(arm)) {
+			throw new Error("源码契约：armComposerFocus 必须 markUserFocusIntent(composer) —— 窗口必须绑定目标元素，不能对整篇文档放行（T51/R1）");
+		}
+		if (!/composer\.setAttribute\(\s*['\"]inputmode['\"]\s*,\s*['\"]none['\"]\s*\)/.test(arm)) {
+			throw new Error("源码契约：armComposerFocus 承重行——必须 composer.setAttribute('inputmode','none')，否则官方抢焦点会把软键盘弹起来（T46 NEG-1 / T50 R2）");
+		}
+		if (!/composer\.focus\(\s*\)/.test(arm)) {
+			throw new Error("源码契约：armComposerFocus 必须自己 composer.focus()（让官方那次抢焦点变成空操作）");
+		}
+
+		const disarm = bodyOf("function disarmComposerFocus()");
+		// 摘防清理路径：属性 + 布防态 + **放行窗口**。
+		if (!/removeAttribute\(\s*['\"]inputmode['\"]\s*\)/.test(disarm)) {
+			throw new Error("源码契约：disarmComposerFocus 必须 removeAttribute('inputmode')，否则用户点输入框打不了字（T46 实测）");
+		}
+		if (!disarm.includes("clearUserFocusWindow()")) {
+			throw new Error("源码契约：disarmComposerFocus 必须 clearUserFocusWindow() —— 否则布防的 800ms 放行窗口会外溢到面板的下一次交互（T50 §6.1 实测 5/6 命中）");
+		}
+		if (!disarm.includes("focusArmed = false")) {
+			throw new Error("源码契约：disarmComposerFocus 必须复位 focusArmed");
+		}
+
+		// 下一次落指：先无条件关窗口，再按这次的意图重开。
+		const onDownAt = src.indexOf("var onDown = function (event) {");
+		if (onDownAt < 0) throw new Error("源码契约：找不到焦点守卫的 onDown");
+		const onDown = src.slice(onDownAt, src.indexOf("addEventListener('touchstart'", onDownAt));
+		if (!onDown.includes("clearUserFocusWindow()")) {
+			throw new Error("源码契约：onDown 开头必须 clearUserFocusWindow()（下一次落指要收掉上一次窗口）");
+		}
+		if (!/markUserFocusIntent\(\s*intentEls\s*\)/.test(onDown)) {
+			throw new Error("源码契约：onDown 必须 markUserFocusIntent(intentEls) —— 窗口只能对用户这次点的那个输入区放行（T51/R1）");
+		}
+		// 用户落指分支必须把「落点解析出的可编辑宿主」和「当前 composer」都记进去。
+		// 漏掉 composer 的后果是实测过的：官方 Lexical 的真实持焦节点与落点 closest
+		// 到的可编辑元素未必互为祖先/后代 ⇒ 开不出窗口 ⇒ 守卫把用户自己的聚焦也收回
+		// ⇒ test:device 出现 4 条 SKIP「真实点按后输入框仍未持焦」。
+		if (!onDown.includes("editableOwnerOf(target)")) {
+			throw new Error("源码契约：onDown 必须用 editableOwnerOf(target) 解析落点宿主（官方 composer 是 Lexical，标准选择器会漏）");
+		}
+		if (!/intentEls\.push\(composerNow\)/.test(onDown)) {
+			throw new Error("源码契约：onDown 的意图集合必须同时包含当前 composer（否则用户真点输入框会丢焦点）");
+		}
+		if (!onDown.includes("sweepResidualInputMode()")) {
+			throw new Error("源码契约：onDown 必须触发 inputmode 残留兜底（浏览器默认聚焦前）");
+		}
+
+		// 窗口判据本身：必须同时要求「未过期」与「有目标元素集合」，且双向亲缘。
+		const win = bodyOf("function inUserFocusWindow(el)");
+		if (!win.includes("userFocusIntentEls")) {
+			throw new Error("源码契约：inUserFocusWindow 必须读 userFocusIntentEls");
+		}
+		if (!win.includes("Date.now() > userFocusWindowUntil")) {
+			throw new Error("源码契约：inUserFocusWindow 必须先判窗口是否过期");
+		}
+		if (!win.includes("inIntentScope(el,")) {
+			throw new Error("源码契约：inUserFocusWindow 必须逐个意图元素做亲缘判定");
+		}
+		const scope = bodyOf("function inIntentScope(el, intentEl)");
+		if (!scope.includes("contains(el)")) {
+			throw new Error("源码契约：inIntentScope 必须做亲缘判定（目标元素的后代）");
+		}
+		if (!scope.includes("node === intentEl")) {
+			throw new Error("源码契约：inIntentScope 必须做祖先链判定（官方把焦点放到 composer 的包裹层上）");
+		}
+		// 无目标元素时**不开**窗口：这是 R1 的根因判据。
+		const mark = bodyOf("function markUserFocusIntent(target)");
+		if (!/if\s*\(\s*!list\.length\s*\)\s*return false;/.test(mark)) {
+			throw new Error("源码契约：markUserFocusIntent 必须对解析不出目标元素的调用返回 false（否则就是一个对整篇文档的放行窗口）");
+		}
+		if (!/userFocusIntentEls\s*=\s*list/.test(mark)) {
+			throw new Error("源码契约：markUserFocusIntent 必须记录 userFocusIntentEls");
+		}
+
+		// R4 残留兜底：只在非布防态动手，且只清 'none'。
+		const sweep = bodyOf("function sweepResidualInputMode()");
+		if (!/if\s*\(focusArmed\)\s*return false;/.test(sweep)) {
+			throw new Error("源码契约：sweepResidualInputMode 必须在布防态下直接返回，否则会撤掉自己刚布的防");
+		}
+		if (!/removeAttribute\(\s*['\"]inputmode['\"]\s*\)/.test(sweep)) {
+			throw new Error("源码契约：sweepResidualInputMode 必须 removeAttribute('inputmode')");
+		}
+		if (!sweep.includes("!== 'none'")) {
+			throw new Error("源码契约：sweepResidualInputMode 只能清 inputmode=none，别动官方自己写的其它值");
+		}
+		if (!/attributeFilter:\s*\[\s*['\"]inputmode['\"]\s*\]/.test(src)) {
+			throw new Error("源码契约：必须挂 MutationObserver 盯 composer 的 inputmode 属性变化（第三方/摘除失败都要能兜住）");
+		}
+
+		// ── 可见性/导航也是窗口生命周期的一部分 ──
+		// T53（M5 假牙修复）：原来这两条是**全文件子串**判据 ——
+		//   `src.includes("addEventListener('pageshow'")` 被 mobile-web.js 里那个
+		//   「恢复自愈」（bfcache 探针）的 pageshow 监听**同样满足**，
+		//   而 `onVisibility` 那条正则只要求体内出现 `clearUserFocusWindow()`、
+		//   **不要求** `sweepResidualInputMode()`。
+		//   ⇒ T52 §8.2 实测：把守卫的 pageshow 处理器整个删掉 / 把 onVisibility 回前台的
+		//   sweep 分支删掉，全量套件都 EXIT=0、行为断言 EXIT=0、0 条失败（两处假牙）。
+		// 现在改成：在 **bindFocusGuard 函数体内**定位处理器本体，并逐个要求其动作。
+		const guardAt = src.indexOf("function bindFocusGuard() {");
+		if (guardAt < 0) throw new Error("源码契约：找不到 bindFocusGuard");
+		// bindFocusGuard 的收尾大括号是唯一一个「顶格一个 tab」的 `\n\t}\n`
+		// （内层块都是两个 tab 起，匹配不到）⇒ 精确切出函数体。
+		const guardEnd = src.indexOf("\n\t}\n", guardAt);
+		if (guardEnd < 0) throw new Error("源码契约：bindFocusGuard 函数体未闭合");
+		const guardBody = src.slice(guardAt, guardEnd);
+		if (!guardBody.includes("addEventListener('visibilitychange', onVisibility")) {
+			throw new Error("源码契约：焦点守卫必须监听 visibilitychange 并收掉放行窗口");
+		}
+		const pageshowAt = guardBody.indexOf("window.addEventListener('pageshow'");
+		if (pageshowAt < 0) {
+			throw new Error(
+				"源码契约：焦点守卫（bindFocusGuard 内）必须监听 pageshow 并收掉放行窗口 —— 原来的全文件子串判据被「恢复自愈」监听满足，是个假牙（T52 §8.2 M5：删掉守卫的 pageshow 处理器全量套件仍 EXIT=0）",
+			);
+		}
+		const pageshowHandler = guardBody.slice(pageshowAt, guardBody.indexOf("});", pageshowAt));
+		if (!pageshowHandler.includes("clearUserFocusWindow()")) {
+			throw new Error("源码契约：pageshow 处理器必须 clearUserFocusWindow()（导航回来时上一次意图的放行窗口不该继续有效）");
+		}
+		if (!pageshowHandler.includes("sweepResidualInputMode()")) {
+			throw new Error("源码契约：pageshow 处理器必须 sweepResidualInputMode()（回到前台看到残留 inputmode=none 要清掉）");
+		}
+		const onVisAt = guardBody.indexOf("var onVisibility = function");
+		if (onVisAt < 0) {
+			throw new Error("源码契约：焦点守卫（bindFocusGuard 内）必须有 onVisibility 处理器");
+		}
+		const onVis = guardBody.slice(onVisAt, guardBody.indexOf("};", onVisAt));
+		if (!onVis.includes("clearUserFocusWindow()")) {
+			throw new Error("源码契约：onVisibility（切到后台）必须 clearUserFocusWindow()");
+		}
+		// T53（M6）：原来**没有**这条要求 ⇒ 删掉回前台的残留兜底没人管。
+		if (!onVis.includes("sweepResidualInputMode()")) {
+			throw new Error(
+				"源码契约：onVisibility 切回前台的分支必须 sweepResidualInputMode() —— 原来只要求 clearUserFocusWindow()，删掉 else 分支的残留兜底全量套件仍 EXIT=0（T52 §8.2 M6）",
+			);
+		}
+		if (!/visibilityState\s*===\s*['"]hidden['"]/.test(onVis)) {
+			throw new Error("源码契约：onVisibility 必须按 document.visibilityState 分「切后台 / 回前台」两路");
+		}
 	}
 	// ── T21 修复 3：把「效果」上报给原生（T16 缺陷 #3 的配套）──
 	if (!src.includes("window.DshRemoteApp.setUiDiag(")) {
@@ -748,7 +996,239 @@ try {
 	});
 	await call("Page.navigate", { url: pageUrl });
 	await wait(2200);
+	// T51（R2）：headless 下文档默认**没有焦点**，此时 element.focus() 只会改
+	// document.activeElement、**不派发 focusin** ⇒ 焦点守卫的监听根本不跑。
+	// 打开焦点模拟，行为级断言才测得到真东西。
+	try {
+		await call("Emulation.setFocusEmulationEnabled", { enabled: true });
+	} catch (focusEmuErr) {
+		// 老版本 Chrome 没有这个域：让下面的断言自己红，而不是静默跳过。
+	}
 	const androidReport = await collectSelftest(call);
+
+	// ── T51（R2）：焦点守卫的**行为级**断言（真实页面 + 真实 hook + 真实 focusin）──
+	// 必须跑在 390 手机竖屏档：hook 生效（横屏/平板档 hook 严格 OFF，守卫是惰性的，
+	// 在那里测等于没测）。
+	// 承重行（armComposerFocus 的 setAttribute('inputmode','none')）此前**零覆盖**：
+	// T50 §7.4 变异②删掉它，test:mobile 与 test:device 双双全绿。
+	// 下面 4 条断言全部是「可观测差异」而不是源码字符串：
+	//   f1 布防后 composer 真的挂着 inputmode=none   ← 删承重行 ⇒ 红
+	//   f2 布防窗口内，面板搜索框抢焦点被收回           ← 窗口外溢 ⇒ 红（T50 §6.1）
+	//   f3 用户真点输入框仍能拿到焦点                   ← 防「修过头把面板/键盘弄没」
+	//   f4 非布防态的 inputmode 残留被兜底清掉          ← R4
+	//   f5 布防 500ms 定时器把放行窗口一起关掉            ← 窗口生命周期（T50 §6.3 根因）
+	async function focusGuardProbe() {
+		const evaluated = await call("Runtime.evaluate", {
+			expression: `(async function () {
+				function mk(tag, attrs, parent) {
+					var el = document.createElement(tag);
+					for (var k in attrs) el.setAttribute(k, attrs[k]);
+					(parent || document.body).appendChild(el);
+					return el;
+				}
+				function down(el) {
+					el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+				}
+				var out = {};
+				var fin = 0;
+				document.addEventListener('focusin', function () { fin += 1; }, true);
+				// 造一棵最小的「composer 卡片 + 输入区 + 工具条触发器」。
+				// 结构必须照抄真页面：触发器在工具条上，与输入区是**兄弟**。
+				// （若把触发器塞进 contenteditable 输入区里，isEditablePoint() 会判它
+				//  为可编辑落点，就走不到布防分支——那样测的就不是 arm 了。）
+				var host = mk('div', { 'data-composer-card': 'true', id: 't51-card' });
+				var composer = mk('div', { 'data-composer-input': 'true', 'contenteditable': 'true' }, host);
+				composer.textContent = 'dshr';
+				var row = mk('div', { 'data-dshr-composer-row': 'true' }, host);
+				var trigger = mk('button', { 'data-dshr-composer-model': 'true', 'aria-haspopup': 'menu' }, row);
+				trigger.textContent = 'M';
+				// 「模型」子面板那类**自带输入框**的弹层：与 composer 无亲缘关系。
+				var panel = mk('div', { role: 'listbox', id: 't51-panel' });
+				var panelInput = mk('input', { type: 'text', id: 't51-panel-search' }, panel);
+				// 中性落点：既不可编辑、也不是触发器 ⇒ 只用来收窗口，不布防。
+				var neutral = mk('div', { id: 't51-neutral', tabindex: '-1' });
+				function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+				// f1：布防真的打了 inputmode=none（承重行）。
+				down(trigger);
+				out.armedInputmode = composer.getAttribute('inputmode');
+
+				// f2：布防窗口**之内**（远小于 800ms）让面板搜索框抢焦点，必须被收回。
+				panelInput.focus();
+				out.panelFocused = document.activeElement === panelInput;
+				out.activeAfterPanel = document.activeElement ? document.activeElement.tagName : 'null';
+
+				// f3：用户真点输入框仍能拿到焦点（不许为了不弹键盘把输入也弄没）。
+				down(composer);
+				composer.focus();
+				out.composerFocused = document.activeElement === composer;
+
+				// f4：R4 残留兜底。先用中性落点把窗口关掉，再模拟「第三方/摘除失败」在
+				//     composer 身上写上 inputmode=none，然后走**用户真点输入框**那条路
+				//     （落指 + 默认聚焦）。属性必须在这一下里被清掉、且焦点必须留住 ——
+				//     T50 §5.2 实测：属性真残留时用户点输入框也弹不出键盘（mInputShown=false）。
+				down(neutral);
+				composer.setAttribute('inputmode', 'none');
+				out.residualWritten = composer.getAttribute('inputmode');
+				down(composer);
+				composer.focus();
+				out.residualAfter = composer.getAttribute('inputmode');
+				out.residualFocused = document.activeElement === composer;
+
+				// f5：放行窗口的**生命周期**。布防后 500ms 的摘防定时器必须把窗口一起关掉。
+				//     取 650ms 这个点：修复后窗口已关（程序化聚焦 composer 会被守卫收回）；
+				//     若 disarm 不关窗口，窗口还活到 800ms 且仍以 composer 为目标 ⇒ 放行。
+				down(trigger);
+				out.reArmInputmode = composer.getAttribute('inputmode');
+				neutral.focus();
+				await sleep(650);
+				out.inputmodeAfterTimer = composer.getAttribute('inputmode');
+				composer.focus();
+				out.composerFocusAfterTimer = document.activeElement === composer;
+
+				// ── T53：f6–f9 补三处覆盖缺口（每条都有行为判据，见下面各自的注释）──
+				// 探针自检：守卫内部认的 composer 是 document.querySelector('[data-composer-input]')，
+				// 必须确实是我们造的这棵，否则下面所有 inputmode 判据都读在别的节点上。
+				out.probeComposerIsFirst = document.querySelector('[data-composer-input]') === composer;
+
+				// f6：pageshow 必须收掉放行窗口（M5 的行为级牙齿）。
+				//     判据是「同一个聚焦动作，前后结果不同」，不是源码字符串：
+				//     先用「用户真点输入框」这条路上窗口（意图元素 = composer，自身命中），
+				//     窗口内聚焦 composer 必须**放行**；dispatch pageshow 之后做**同一个**动作，
+				//     必须变成**被收回**。删掉 pageshow 监听 ⇒ 第二次仍然放行 ⇒ 这条红。
+				//     用 persisted:false 派发：源码里「恢复自愈」那个 pageshow 监听带
+				//     if (!ev.persisted) return 的早退，persisted:false 只会打到焦点守卫这一个监听，
+				//     顺带排除 probeResumeRecovery 的干扰（它有 RESUME_PROBE_DELAY_MS 延时）。
+				down(composer);
+				composer.focus();
+				out.f6AllowedBeforeShow = document.activeElement === composer;
+				try {
+					window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: false }));
+					out.f6ShowDispatched = true;
+				} catch (ignoredPageShow) { out.f6ShowDispatched = false; }
+				composer.blur();
+				composer.focus();
+				out.f6DeniedAfterShow = document.activeElement !== composer;
+
+				// f7：切回前台必须扫 inputmode 残留（M6 的行为级牙齿）。
+				//     ⚠️ 必须先换一棵**没被 MutationObserver 盯上**的 composer：
+				//     watchComposerInputMode() 只在 armComposerFocus() 里被调、且 observe 的是
+				//     当时那个节点（就是上面这棵）。若不换，观察者会在写属性的微任务里
+				//     顺手把活干了 ⇒ 这条断言即使删掉 onVisibility 的 else 分支也会绿
+				//     —— 那就是**第二颗假牙**。换树之后残留只能被 visibilitychange 那条路摘掉。
+				//     同时 down(neutral) 收窗口 + 撤防（sweepResidualInputMode 在布防态下直接返回，
+				//     不撤防的话属性挂着也不会被清，测的就不是兜底了）。
+				host.remove();
+				var host2 = mk('div', { 'data-composer-card': 'true', id: 't53-card' });
+				var composer2 = mk('div', { 'data-composer-input': 'true', 'contenteditable': 'true' }, host2);
+				composer2.textContent = 'dshr2';
+				out.f7ComposerIsFirst = document.querySelector('[data-composer-input]') === composer2;
+				down(neutral);
+				composer2.setAttribute('inputmode', 'none');
+				await sleep(60);
+				// 空等一个宏任务（> 微任务）：观察者若还盯着这棵，这里就该被清干净了。
+				out.f7ResidualBefore = composer2.getAttribute('inputmode');
+				var visDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState');
+				function setVis(state) {
+					try {
+						Object.defineProperty(document, 'visibilityState', {
+							configurable: true, get: function () { return state; },
+						});
+					} catch (ignoredVis) { /* 平台不允许覆写：下面判据会红，不会假绿 */ }
+				}
+				setVis('visible');
+				document.dispatchEvent(new Event('visibilitychange'));
+				out.f7ResidualAfter = composer2.getAttribute('inputmode');
+				// 复位 + 顺手把「切后台」那条路也走一遍（它是 clearUserFocusWindow 的另一半）。
+				setVis('hidden');
+				document.dispatchEvent(new Event('visibilitychange'));
+				out.f7HiddenStillResidual = composer2.getAttribute('inputmode');
+				try { delete document.visibilityState; } catch (ignoredDel) { /* 回落 */ }
+				if (visDesc) {
+					try { Object.defineProperty(Document.prototype, 'visibilityState', visDesc); } catch (ignoredRestore) { /* 原样 */ }
+				}
+				setVis('visible');
+
+				// f8 / f9：inIntentScope 的**后代**分支与**祖先链**分支。
+				//
+				// ⚠ 形态选型踩了两次坑，都记在这里（照抄会重犯）：
+				//  ① <input> / tabindex=-1 的 div 当「意图元素的后代」—— Chrome 里 contenteditable
+				//     宿主会吞掉自己子树内**所有**节点的聚焦（实测 activeElement 原地不动、仍停在
+				//     之前的 ctrl 上），focus() 是空操作。嵌套 contenteditable 也不行：焦点只会落到
+				//     最外层编辑宿主，focusin 的 target 永远是宿主本身 ⇒ el === intentEl 短路，
+				//     压根到不了 contains 分支。⇒ **后代分支靠 contenteditable 宿主不可达。**
+				//  ② 树必须挂在 body 上：f7 为躲开 MutationObserver 把 host remove() 了，往已脱离
+				//     文档的节点上挂后代，focus() 同样是空操作，症状与「被守卫收回」一模一样。
+				//
+				// ⇒ 正确形态 = 源码注释里写的那条真实路径：意图元素是**非 contenteditable 的包装层**
+				//     （editableOwnerOf 的兜底 closest 认 [data-composer-input]，focusComposerEl() 也
+				//     只按这个属性取，所以它不必可编辑），真正可编辑的是它内部的子输入框。官方把焦点
+				//     落到「输入区内部的包装层/子输入框」正是 contains 分支存在的唯一理由。
+				// 先摘掉 f7 的 host2，让 wrap 成为文档里第一个 [data-composer-input]（否则
+				// focusComposerEl() 认的不是 wrap，意图集合里就没有它）。
+				host2.remove();
+				var host3 = mk('div', { 'data-composer-card': 'true', id: 't53-card3' });
+				var wrap = mk('div', { 'data-composer-input': 'true', id: 't53-wrap' }, host3);
+				var ta1 = mk('textarea', { id: 't53-ta1' }, wrap);   // 用户这次落的指
+				var ta2 = mk('textarea', { id: 't53-ta2' }, wrap);   // 官方随后把焦点挪到的子输入框
+				var outside = mk('textarea', { id: 't53-outside' }); // 包装层之外，必须**被拒**
+				out.f8WrapIsFirst = document.querySelector('[data-composer-input]') === wrap;
+
+				// f8 判据是**双向差分**（单边判据可能恒真）：窗口开着时，聚焦 wrap 的后代 ta2 必须
+				// **放行**；聚焦包装层之外的 outside 必须**被收回**。删掉 contains(el) 那两行 ⇒
+				// ta2 也被收回 ⇒ 这条红。
+				down(ta1);
+				ta2.focus();
+				out.f8DescendantAllowed = document.activeElement === ta2;
+				out.f8DescendantActive = document.activeElement ? document.activeElement.id : 'null';
+				outside.focus();
+				out.f8OutsideDenied = document.activeElement !== outside;
+				out.f8OutsideActive = document.activeElement ? document.activeElement.id : 'null';
+
+				// f9：inIntentScope 的**祖先链**分支（向上爬 node === intentEl）必须真的兜底。
+				//     这一支在正常 DOM 上与 contains 等价（都是问 intentEl 是不是 el 的祖先），
+				//     它的存在意义是 **contains 不可用时仍要给出通行证**（官方/框架自造宿主对象、
+				//     跨文档包装层，contains 可能抛或不存在；源码里那行正包在 try/catch 里）。
+				//     所以做故障注入：让 wrap 针对 ta2 的 contains 必然抛错，contains 分支因此
+				//     **必然失效**，此时只有祖先链能救。注入只针对 (ta2) 这一个参数，其它 contains
+				//     调用照常委托真实实现 —— 否则会误伤页面上别处对 wrap 的 contains。
+				//     把 while 循环里那行 if (node === intentEl) return true; 删掉 ⇒ 收回 ⇒ 这条红。
+				down(ta1);
+				var realContains = wrap.contains;
+				var containsInjected = false;
+				try {
+					Object.defineProperty(wrap, 'contains', {
+						configurable: true,
+						value: function (n) {
+							if (n === ta2) throw new Error('t53-injected-contains-failure');
+							return realContains.call(this, n);
+						},
+					});
+					containsInjected = true;
+				} catch (ignoredInject) { containsInjected = false; }
+				out.f9ContainsInjected = containsInjected;
+				ta2.focus();
+				out.f9AncestorWalkAllowed = document.activeElement === ta2;
+				out.f9Active = document.activeElement ? document.activeElement.id : 'null';
+				try {
+					Object.defineProperty(wrap, 'contains', {
+						configurable: true, value: realContains, writable: true,
+					});
+				} catch (ignoredRestoreContains) { /* 留着也不影响收尾 */ }
+
+				host3.remove(); panel.remove(); neutral.remove();
+				out.focusinCount = fin;
+				out.docHasFocus = document.hasFocus();
+				var dg = typeof window.__dshrMobileDiag === 'function' ? window.__dshrMobileDiag() : (window.__dshrMobileDiag || {});
+				out.diag = { on: dg.on, strictOff: dg.strictOff, device: dg.device, rootClass: dg.rootClass, mqlPhone: window.matchMedia('(max-width: 980px)').matches };
+				return out;
+			})()`,
+			returnByValue: true,
+			awaitPromise: true,
+		});
+		return evaluated.result && evaluated.result.value;
+	}
+	const focusProbe = await focusGuardProbe();
 
 	async function viewportProbe() {
 		const evaluated = await call("Runtime.evaluate", {
@@ -865,6 +1345,84 @@ try {
 		"tablet-drawer-not-fullscreen",
 		tabletOpen && tabletOpen.opened && tabletOpen.mainLeft >= 240 && tabletOpen.mainLeft <= 420,
 		tabletOpen ? `opened=${tabletOpen.opened} mainLeft=${tabletOpen.mainLeft} drawer=${tabletOpen.drawer}` : "no probe",
+	);
+	// ── T51（R2/R4）：焦点守卫行为级断言的判定 ──
+	extraCheck(
+		"focus-arm-sets-inputmode-none",
+		focusProbe && focusProbe.armedInputmode === "none",
+		focusProbe ? `inputmode=${JSON.stringify(focusProbe.armedInputmode)} diag=${JSON.stringify(focusProbe.diag)}` : "no probe",
+	);
+	extraCheck(
+		"focus-arm-window-not-leaked-to-panel-input",
+		focusProbe && focusProbe.panelFocused === false,
+		focusProbe ? `panelFocused=${focusProbe.panelFocused} active=${focusProbe.activeAfterPanel} fin=${focusProbe.focusinCount} hasFocus=${focusProbe.docHasFocus}` : "no probe",
+	);
+	extraCheck(
+		"focus-user-tap-still-focuses-composer",
+		focusProbe && focusProbe.composerFocused === true,
+		focusProbe ? `composerFocused=${focusProbe.composerFocused}` : "no probe",
+	);
+	extraCheck(
+		"focus-residual-inputmode-swept",
+		focusProbe && focusProbe.residualWritten === "none" && focusProbe.residualAfter === null
+			&& focusProbe.residualFocused === true,
+		focusProbe
+			? `written=${focusProbe.residualWritten} after=${JSON.stringify(focusProbe.residualAfter)} focused=${focusProbe.residualFocused}`
+			: "no probe",
+	);
+	extraCheck(
+		"focus-arm-window-closed-by-disarm-timer",
+		focusProbe && focusProbe.composerFocusAfterTimer === false,
+		focusProbe
+			? `reArm=${JSON.stringify(focusProbe.reArmInputmode)} im@650ms=${JSON.stringify(focusProbe.inputmodeAfterTimer)} composerFocusedAfterTimer=${focusProbe.composerFocusAfterTimer}`
+			: "no probe",
+	);
+	// ── T53：三条新行为级断言（每条都配了变异反证，见 scratch/t53/report.md §1）──
+	// 探针自检：守卫认的 composer 必须就是我们造的那棵，否则下面判据读错节点。
+	extraCheck(
+		"focus-probe-composer-is-first",
+		focusProbe && focusProbe.probeComposerIsFirst === true && focusProbe.f7ComposerIsFirst === true,
+		focusProbe
+			? `probeComposerIsFirst=${focusProbe.probeComposerIsFirst} f7ComposerIsFirst=${focusProbe.f7ComposerIsFirst}`
+			: "no probe",
+	);
+	// f6 —— pagesshow 收窗口（M5）。前后两次是**同一个**聚焦动作，结果必须一放一收。
+	extraCheck(
+		"focus-window-closed-by-pageshow",
+		focusProbe && focusProbe.f6ShowDispatched === true
+			&& focusProbe.f6AllowedBeforeShow === true
+			&& focusProbe.f6DeniedAfterShow === true,
+		focusProbe
+			? `dispatched=${focusProbe.f6ShowDispatched} allowedBefore=${focusProbe.f6AllowedBeforeShow} deniedAfter=${focusProbe.f6DeniedAfterShow}`
+			: "no probe",
+	);
+	// f7 —— 回前台扫残留（M6）。f7ResidualBefore 仍为 'none' 是关键：它证明
+	//      MutationObserver 没有替 visibilitychange 把活干了（观察者只盯旧那棵树）。
+	extraCheck(
+		"focus-residual-swept-on-return-to-foreground",
+		focusProbe && focusProbe.f7ResidualBefore === "none" && focusProbe.f7ResidualAfter === null,
+		focusProbe
+			? `before=${JSON.stringify(focusProbe.f7ResidualBefore)} after=${JSON.stringify(focusProbe.f7ResidualAfter)} hiddenPath=${JSON.stringify(focusProbe.f7HiddenStillResidual)}`
+			: "no probe",
+	);
+	// f8 —— inIntentScope 后代分支（contains）真的放行，且包装层之外仍被拒（双向差分）。
+	extraCheck(
+		"focus-intent-scope-descendant-allowed",
+		focusProbe && focusProbe.f8WrapIsFirst === true
+			&& focusProbe.f8DescendantAllowed === true
+			&& focusProbe.f8OutsideDenied === true,
+		focusProbe
+			? `wrapIsFirst=${focusProbe.f8WrapIsFirst} descendantAllowed=${focusProbe.f8DescendantAllowed} active=${focusProbe.f8DescendantActive} outsideDenied=${focusProbe.f8OutsideDenied} outsideActive=${focusProbe.f8OutsideActive}`
+			: "no probe",
+	);
+	// f9 —— contains 不可用时祖先链兜底（故障注入）。注入必须真的成功，
+	//      否则这条会在「没注入」的前提下假绿。
+	extraCheck(
+		"focus-intent-scope-ancestor-walk-fallback",
+		focusProbe && focusProbe.f9ContainsInjected === true && focusProbe.f9AncestorWalkAllowed === true,
+		focusProbe
+			? `injected=${focusProbe.f9ContainsInjected} ancestorWalkAllowed=${focusProbe.f9AncestorWalkAllowed} active=${focusProbe.f9Active}`
+			: "no probe",
 	);
 
 	console.log("  -- Chrome 390 视口 --");

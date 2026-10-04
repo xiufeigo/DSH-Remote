@@ -290,6 +290,8 @@ try {
 			const cur = await evaluate(RENDER_PROBE).catch(() => null);
 			if (cur) {
 				const snap = JSON.parse(cur);
+				// T51（R8）：记住最后一帧，失败时落盘（原来只留一行「header 高度=0」）。
+				lastRenderProbe = snap;
 				const gaps = renderCompleteGaps(snap);
 				lastUnmet = gaps;
 				if (gaps.length === 0 && cur === last) {
@@ -310,14 +312,57 @@ try {
 	}
 	const unmetText = () => (lastUnmet.length ? lastUnmet.join("，") : "无");
 	/**
-	 * 载入真实页面并等它**渲染完成**，返回渲染完成快照（对照 JSON 要用）。
-	 * 「导航成功但应用没起来 / 停在半渲染」的真实页重试一次；仍拿不到就抛错中止。
+	 * T51（R8）：「拿不到对照证据」专用错误。
+	 *
+	 * T50 §9.2 的判定二：**exit 1 = 有回归** 这个信号不可信。
+	 * 「证据不足而保护性中止」与「某条行为断言不成立」是两件不同的事，却共用退出码 1；
+	 * 而 `header 高度=0` 这个瞬态在 T50 的 3/3 次运行里都出现、只有 1/3 变成失败
+	 * ⇒ 约 1/3 概率把一次环境抖动放大成整轮 exit 1，CI 上表现为随机红。
+	 *
+	 * 本文件退出码约定（T51 起）：
+	 *   0 = 全部断言通过
+	 *   1 = **有行为断言不成立**（真回归，去查代码）
+	 *   2 = **没拿到对照证据**（页面没起来 / 视口没下发 / 环境抖动；本轮一条断言都没真跑，
+	 *       重跑或换环境，不代表代码有问题）
 	 */
+	class NoEvidenceError extends Error {
+		constructor(message) {
+			super(message);
+			this.name = "NoEvidenceError";
+			this.exitCode = 2;
+		}
+	}
+
+	/**
+	 * 载入真实页面并等它**渲染完成**，返回渲染完成快照（对照 JSON 要用）。
+	 * 「导航成功但应用没起来 / 停在半渲染」的真实页重试；仍拿不到就抛 NoEvidenceError。
+	 */
+	const LOAD_MAX_ATTEMPTS = 4; // T51（R8）：2 → 4
+	/**
+	 * T53：把「这套要跑多久」记在**真正决定最坏耗时的地方**，别只在报告里写。
+	 *
+	 * T52 §13 实测（emulator 5572）：失败快路径（拿不到对照证据，退出码 2）**19.1s**；
+	 * 成功路径（退出码 1，断言真红）**138.5s**。单次尝试的构成见 loadRealPage：
+	 * 导航 + 80×250ms 首屏轮询（最坏 20s）+ 8×250ms 视口轮询（最坏 2s）+ 2200ms 稳定等待
+	 * + waitForRenderComplete()。
+	 *
+	 * ⇒ **把本套件接进任何 CI 时，那个 step 的 timeout 必须 ≥ 240s。**
+	 * （不要按 T51 说的 290s：T52 §13.4 实测不支持那个数字，方向对但虚高。）
+	 *
+	 * T53 核查结论（别再照着"放宽 CI 超时"去找）：**仓库里现在没有任何 timeout 需要放宽** ——
+	 * `.github/workflows/{ci,android,release}.yml`、`package.json`、`android/build.ps1`、
+	 * `android/test-direct-nodes.ps1` 全库 grep `timeout` **0 命中**；且三个 workflow
+	 * **都不跑** `test:device`（它要真机/模拟器 + 已配对网关），所以「3 分钟超时」这个
+	 * T52 §18-6 的前提并不成立。此处留注释是为了：将来真把它接进 CI 时，
+	 * 预算数字不必重新测。
+	 */
+	/** 最后一次渲染探针快照（失败时落盘用；T50 §9.2 建议③：原来只留一行「header 高度=0」）。 */
+	let lastRenderProbe = null;
 	async function loadRealPage() {
 		// 真实页偶尔会「导航成功但应用没起来」（bodyScrollHeight≈15、关键元素全 null），
 		// 或停在 header 高 0 / 右栏未挂载的半渲染态。那种页面当对照臂会产出整屏 null
-		// 的假差异，所以最多重试两次，仍不行就中止。
-		for (let attempt = 1; attempt <= 2; attempt++) {
+		// 的假差异，所以最多重试 LOAD_MAX_ATTEMPTS 次，仍不行就中止。
+		for (let attempt = 1; attempt <= LOAD_MAX_ATTEMPTS; attempt++) {
 			await call("Page.navigate", { url: "about:blank" });
 			await wait(150);
 			if (currentViewport) await applyViewport(currentViewport.width, currentViewport.height);
@@ -339,18 +384,37 @@ try {
 					}
 					if (!ok) {
 						const got = await evaluate(`({w: innerWidth, h: innerHeight})`).catch(() => null);
-						throw new Error(`视口下发失败：期望 ${width}×${height}，页面实际 ${JSON.stringify(got)}`);
+						throw new NoEvidenceError(`视口下发失败：期望 ${width}×${height}，页面实际 ${JSON.stringify(got)}`);
 					}
 				}
 				await wait(2200); // React 首屏与官方过渡稳定
 				const snap = await waitForRenderComplete();
 				if (snap) return snap;
-				info("load", `第 ${attempt} 次加载未达渲染完成（未满足：${unmetText()}），重试`);
+				info("load", `第 ${attempt}/${LOAD_MAX_ATTEMPTS} 次加载未达渲染完成（未满足：${unmetText()}），重试`);
 				continue;
 			}
-			info("load", `第 ${attempt} 次加载连 #root 子节点都没有，重试`);
+			info("load", `第 ${attempt}/${LOAD_MAX_ATTEMPTS} 次加载连 #root 子节点都没有，重试`);
 		}
-		throw new Error(`真实页面两次加载都没达渲染完成状态（最后未满足：${unmetText()}）——中止，不产出对照证据`);
+		dumpRenderProbe(`loadRealPage-${LOAD_MAX_ATTEMPTS}x`);
+		throw new NoEvidenceError(
+			`真实页面 ${LOAD_MAX_ATTEMPTS} 次加载都没达渲染完成状态（最后未满足：${unmetText()}）——中止，不产出对照证据。`
+			+ `这是「拿不到对照证据」（退出码 2），不是行为断言失败；直接重跑即可。`,
+		);
+	}
+	/** T51（R8）：把最后一帧渲染探针落盘，供事后判断是首屏全白还是半渲染。 */
+	function dumpRenderProbe(tag) {
+		try {
+			mkdirSync(SCRATCH, { recursive: true });
+			const file = join(SCRATCH, `render-probe-${tag}.json`);
+			writeFileSync(file, JSON.stringify({
+				at: new Date().toISOString(),
+				tag,
+				unmet: lastUnmet,
+				probe: lastRenderProbe,
+			}, null, 2));
+			console.log(`\n渲染探针快照：${file}`);
+			console.log(`最后一帧：${JSON.stringify(lastRenderProbe)}`);
+		} catch { /* 落盘失败不该盖掉主错误 */ }
 	}
 	async function injectHook(device) {
 		await evaluate(`window.__DSHR_MOBILE__ = Object.assign(window.__DSHR_MOBILE__ || {}, { device: '${device}' }); true`);
@@ -359,7 +423,8 @@ try {
 		// 注入也会引起官方侧重排/重挂，注入后必须重新过同一道闸（两臂同闸）。
 		const snap = await waitForRenderComplete();
 		if (!snap) {
-			throw new Error(`注入 device=${device} 后未达渲染完成状态（未满足：${unmetText()}）——中止，不产出对照证据`);
+			dumpRenderProbe(`injectHook-${device}`);
+			throw new NoEvidenceError(`注入 device=${device} 后未达渲染完成状态（未满足：${unmetText()}）——中止，不产出对照证据（退出码 2，不是断言失败）`);
 		}
 		return snap;
 	}
@@ -1742,37 +1807,65 @@ try {
 	info("E", `截图：${shotE}`);
 	ws.close();
 } catch (err) {
-	exitCode = 1;
+	// T51（R8）：两类失败给出**不同**退出码。
+	//   1 = 有行为断言不成立（真回归）
+	//   2 = 没拿到对照证据（本轮一条断言都没真跑；重跑或换环境）
+	// 原来两者都是 1，CI 上无法区分「代码坏了」与「环境抖了一下」。
+	exitCode = err && Number.isInteger(err.exitCode) ? err.exitCode : 1;
 	console.error("\ntest:device 运行失败：");
 	console.error(err && err.stack ? err.stack : err);
+	if (exitCode === 2) {
+		console.error("\n========================================================");
+		console.error("退出码 2 = 没拿到对照证据（NOT an assertion failure）");
+		console.error("本轮**一条行为断言都没真跑**，不能据此判断代码好坏。");
+		console.error("解读：");
+		console.error("  · CI  ：退出码 2 判为「基础设施抖动」，自动重跑一次；");
+		console.error("         重跑仍为 2 再当失败处理（那时该查网关/环境，不是本轮代码）。");
+		console.error("  · 本地：直接重跑；页面快照已落盘（渲染探针），可判断是首屏全白还是半渲染。");
+		console.error("  · 对照：退出码 1 才是「有行为断言不成立」，那才需要查代码。");
+		console.error("========================================================");
+	} else {
+		console.error("\n退出码 1 = 有行为断言不成立（assertion failure）——按真回归处理。");
+	}
 } finally {
 	try { child.kill(); } catch { /* ignore */ }
 	try { rmSync(profile, { recursive: true, force: true }); } catch { /* ignore */ }
 	// ── 清理义务：吊销本次创建的测试设备 ──
+	// T51（R8）：清理失败只记录、不在这里直接改 exitCode；收尾处统一判定，
+	// 避免把「没拿到对照证据(2)」被降级成「断言失败(1)」。
+	let revokeFailed = false;
 	if (testDeviceId) {
 		try {
 			const rev = await fetch(`${GATEWAY}/__dsh_remote__/admin/revoke`, { method: "POST", headers: ADMIN_HEADERS, body: JSON.stringify({ id: testDeviceId }) });
 			console.log(`\n吊销测试设备 ${testDeviceId} → HTTP ${rev.status} ${JSON.stringify(await rev.json())}`);
 		} catch (err) {
+			revokeFailed = true;
 			console.error(`\n⚠ 吊销测试设备 ${testDeviceId} 失败：${String(err.message || err)}`);
 			console.error(`⚠ 残留设备 id=${testDeviceId}；请手工执行：`);
 			console.error(`⚠ curl -k -X POST https://127.0.0.1:18443/__dsh_remote__/admin/revoke -H "x-dshr-admin-token: <adminToken>" -H "content-type: application/json" -d '{"id":"${testDeviceId}"}'`);
-			exitCode = 1;
 		}
 	}
+	let leakedNow = null;
 	try {
 		const after = (await (await fetch(`${GATEWAY}/__dsh_remote__/admin/devices`, { headers: ADMIN_HEADERS })).json()).devices;
 		const leaked = after.filter((d) => !devicesBefore.some((b) => b.id === d.id) && !d.revokedAt);
 		console.log(`设备表：运行前 ${devicesBefore.length} 个 → 运行后 ${after.length} 个；未吊销的新设备 ${leaked.length} 个${leaked.length ? " → " + leaked.map((d) => d.id).join(",") : ""}`);
-		if (leaked.length) exitCode = 1;
+		if (leaked.length) leakedNow = leaked.map((d) => d.id);
 	} catch (err) {
 		console.error(`读取设备表失败：${String(err.message || err)}`);
 	}
 	const failed = results.filter((r) => r.ok === false);
 	const skipped = results.filter((r) => r.ok === null);
-	console.log(`\n断言合计 ${results.length}：通过 ${results.length - failed.length - skipped.length}，失败 ${failed.length}，跳过 ${skipped.length}`);
+	console.log(`断言合计 ${results.length}：通过 ${results.length - failed.length - skipped.length}，失败 ${failed.length}，跳过 ${skipped.length}`);
+	// T51（R8）：清理类问题只在「本来是 0」时提级为 1，**不得**把 2（没拿到对照证据）
+	// 降级成 1 —— 那正是本轮要消除的「两类失败共用一个码」。
+	if (exitCode === 0 && (leakedNow || revokeFailed)) {
+		exitCode = 1;
+		console.error(`\n⚠ 清理义务未完成（${[leakedNow ? `未吊销的新设备 ${leakedNow.join(",")}` : "", revokeFailed ? "吊销请求失败" : ""].filter(Boolean).join("；")}）→ 退出码提级为 1。`);
+	}
 	console.log(`截图目录：${SHOT_DIR}`);
 	console.log(`对照快照：${SCRATCH}\\dom-baseline-tablet-*.json`);
+	console.log(`退出码约定：0=断言全过 / 1=有行为断言不成立 / 2=没拿到对照证据（本轮一条断言都没真跑）`);
 	if (exitCode === 0) console.log("\ntest:device 通过：真实 0.2.0-rc.2 页面上的手机/平板/横屏/运行中切换矩阵全部符合契约。");
 	process.exitCode = exitCode;
 }

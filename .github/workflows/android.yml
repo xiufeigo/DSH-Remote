@@ -9,6 +9,10 @@ on:
       # WEB-02：APK 内嵌的 res/raw/mobile.js 由 packages/gateway/assets/mobile-web.js
       # 字节级同步（build.ps1），单一源变更也必须触发 Android 构建。
       - "packages/gateway/assets/**"
+      # T49：res/raw/dsh_sw.js 由 packages/gateway/src/pwa.ts 的 renderServiceWorker()
+      # 渲染（build.ps1），SW 策略变更同样必须触发 Android 构建。
+      - "packages/gateway/src/pwa.ts"
+      - "android/sync-sw-asset.mjs"
       - ".github/workflows/android.yml"
   workflow_dispatch:
 
@@ -23,6 +27,14 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+
+      # T49：build.ps1 现在还要把 packages/gateway/src/pwa.ts 的 renderServiceWorker()
+      # 渲染成 res/raw/dsh_sw.js（SW 脚本本地供给，单一源在 pwa.ts）⇒ 必须有 node>=24
+      # 才能直接 import .ts。runner 自带的 node 不足以 import .ts，故显式安装。
+      - name: Node 24（build.ps1 渲染 SW 单一源）
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
 
       # runner 预装 Android SDK（ANDROID_HOME 指向 /usr/local/lib/android/sdk）。
       # 不再用 android-actions/setup-android@v3：Node 24 强升后它内部接受 SDK 许可

@@ -1089,17 +1089,96 @@
 	// 防打环：同一元素在 FOCUS_REVOKE_SPAN_MS 内最多收回 FOCUS_REVOKE_MAX 次，超限就
 	// 放手并计数（最坏退回改动前行为），绝不无限 blur。
 	//
+	// T42 修订（根因修复）：上面这条「超限就放手」正是本缺陷的成因——官方打开快捷指令
+	// 面板时会在 17ms 内对同一个 composer 连续抢 3 次焦点（AVD 5594 实测），前两次被收回，
+	// 第 3 次撞上 FOCUS_REVOKE_MAX=2 就被**放过**，焦点粘住、软键盘弹起。
+	// 改成：超限不再放过，而是把该元素转入**粘性抑制**——只要判定过「这次聚焦不是用户
+	// 手势造成的」，就持续收回，直到用户真的点了它为止（见 bindFocusGuard 的 onDown）。
+	// 绝对安全阀仍在，只是阈值抬高到远高于官方真实抢占次数的量级（FOCUS_STICKY_MAX），
+	// 病态场景下依然会放手并计数，不会无限 blur。
+	//
 	// 生效范围：只在 hook 真正生效的档位工作。平板档（严格 OFF，契约 3.5 零痕迹）与
 	// 手机横屏（hook OFF、官方桌面布局）一律不动作——本任务不碰这两个档。
+	// T48：命令面板的「布防 → 抢焦点」形态。
+	//
+	// 为什么必须单独一条路：官方命令面板（「+」菜单）的**打开与 composer 持焦同步耦合**
+	// （T42 运行时 A/B 实测：收回焦点 → 面板不开），所以 T42 的粘性抑制会把它打没，
+	// 冷启动第一次点「+」无响应。T46 又复验了「延迟收回」在 16/50/150/300ms 四档下
+	// **全都**开不出面板（面板开不开是同步耦合，不是焦点维持时长）⇒ 只能走下面这条。
+	//
+	// 形态（纯 hook，不动原生）：
+	//   1. 用户落指在 composer 卡片里的**非可编辑触发器**（「+」、模型、访问模式…）：
+	//      放行这次聚焦 + 给 composer 打 inputmode="none" + **我们自己立刻 focus()**；
+	//   2. 官方随后打开面板时再抢焦点：焦点没变 ⇒ 无新 focusin ⇒ 无新 showSoftInput ⇒ 键盘不弹；
+	//   3. 面板渲染完（~500ms）或下一次用户手势就摘掉 inputmode ⇒ 用户之后点输入框时属性本是 null，
+	//      走完全干净的原生聚焦路径（解除路径由官方重渲染天然提供，§6 实测）。
+	//
+	// 与 T42 粘性抑制的共存边界（**本改动最要紧的一条**）：
+	//   - 布防只发生在「composer 卡片内的非可编辑触发器」上，且**不**进入粘性抑制
+	//     （进站即 clearFocusSticky），否则刚抢到的焦点会被自己收回去、面板照样打不开；
+	//   - 会话切换 / 左侧栏 / 鲸鱼抽屉等「非用户手势造成的聚焦」**不**在布防范围内，
+	//     仍由 T42 的粘性抑制收回，键盘照常不弹 ⇒ 产品口径不变。
+	//
+	// 为什么 `inputmode="none"` 而不是别的：T46 实测 `contenteditable=true` 的元素支持
+	// inputmode，Chromium/Android WebView 会因此**不向 IME 请求 showSoftInput**，
+	// 同时 DOM 焦点原封不动留在 composer 上 —— 正是官方命令面板要的那个焦点。
+	var FOCUS_ARM_MS = 500;
+	// 往上找 composer 卡片时的深度封顶。冷启动时 hook 的标记可能还没打上，
+	// 没有这道封顶就会一路走到 <body>，让整页（鲸鱼、侧边栏、消息气泡）都变成布防范围。
+	var FOCUS_ARM_HOST_MAX_DEPTH = 8;
+	var focusArmTimer = 0;
+	var focusArmEl = null;
+	var focusArmed = false;
+	var focusArmUntil = 0;
 	var USER_FOCUS_WINDOW_MS = 800;
 	var FOCUS_REVOKE_MAX = 2;
 	var FOCUS_REVOKE_SPAN_MS = 1200;
+	var FOCUS_STICKY_MAX = 12;
+	var FOCUS_STICKY_SPAN_MS = 5000;
 	var userFocusWindowUntil = 0;
+	// T51（R1）：放行窗口的**目标元素**。旧实现里窗口是「对整个文档放行」，
+	// 于是「＋」那一下 markUserFocusIntent() 撑开的 800ms 通行证会外溢到面板的
+	// 下一次交互：用户 1 秒内点「模型」⇒ 子面板的 input.EhuiKa_search 抢到焦点 ⇒
+	// 守卫按设计放行 ⇒ 键盘弹（T50 §6.1 实测 5/6 命中，间隔阈值 800ms 精确吻合
+	// USER_FOCUS_WINDOW_MS）。现在窗口只对**这次意图指向的那个元素**生效。
+	var userFocusIntentEls = null;
 	var focusRevokeEl = null;
 	var focusRevokeCount = 0;
 	var focusRevokeSince = 0;
-	var focusGuardStats = { revoked: 0, capped: 0 };
+	var focusGuardStats = { revoked: 0, capped: 0, sticky: 0, armed: 0, disarmed: 0, residualSwept: 0 };
 	var focusGuardBound = false;
+	// 粘性抑制的登记处。键用「稳定签名」而不是节点引用：官方 composer 会被重渲染换掉
+	// 节点实例，只按节点认，换节点后的继续抢焦点就漏了（实测 3 连抢是同一节点，但重渲染
+	// 之后未必）。节点弱引用只作为签名取不到时的兜底。
+	var focusStickyKeys = Object.create(null);
+	var focusStickyCounts = Object.create(null);
+	var focusStickySince = Object.create(null);
+	var focusStickyNodes = typeof WeakSet === 'function' ? new WeakSet() : null;
+
+	/**
+	 * T48：算「打开命令面板/弹层的非可编辑触发器」的选择器。
+	 * 用官方 aria-label（中英都列）而不是只靠 hook 自己打的 data-dshr-* 标记 ——
+	 * 那些标记由 syncComposerChrome 写，冷启动第一次点「+」时可能还没写上。
+	 */
+	var COMPOSER_TRIGGER_SELECTOR = [
+		'button[aria-label="Add files or run commands"]',
+		'button[aria-label="添加文件或运行命令"]',
+		'button[aria-label="命令"]',
+		'button[aria-label="Commands"]',
+		'[data-dshr-composer-add]',
+		'[data-dshr-composer-model]',
+		'[data-dshr-composer-access]',
+		'[data-dshr-composer-send]',
+		'[data-dshr-composer-trailing]'
+	].join(', ');
+
+	/**
+	 * T48：已经打开的官方面板/弹层。落在这些容器里的落指**一律不布防** ——
+	 * 官方把命令面板挂在 composer 卡片内部，不排除的话面板条目会被误判成触发器。
+	 * AVD 实测：布防会让「模型」子面板里的搜索框 input.EhuiKa_search 抢到焦点、
+	 * 把软键盘弹起来（见 t48-report §5）。
+	 */
+	var OPEN_PANEL_SELECTOR = '[role="listbox"], [role="dialog"], [role="menu"]';
 
 	/**
 	 * 落点是否在可编辑元素内：自身可编辑（判据复用 isEditableFocus），
@@ -1111,21 +1190,361 @@
 		return !!target.closest('input, textarea, select, [contenteditable]');
 	}
 
-	/** 用户在可编辑元素上落指 → 开一个「主动聚焦」窗口。 */
-	function markUserFocusIntent() {
+	/**
+	 * 用户在可编辑元素上落指 → 开一个「主动聚焦」窗口。
+	 *
+	 * T51（R1）：窗口**必须带目标元素**。`target` 缺省（或解析不出元素）时不开窗口
+	 * （返回 false）—— 一个「对整个文档放行」的窗口就是 T50 §6.1 那个反例本身。
+	 * `target` 可以是一个元素，也可以是一组元素（见 onDown 的用户落指分支）。
+	 */
+	function markUserFocusIntent(target) {
+		var list = [];
+		var add = function (el) {
+			if (isElement(el) && list.indexOf(el) === -1) list.push(el);
+		};
+		if (isElement(target)) add(target);
+		else if (target && typeof target.length === 'number') {
+			for (var i = 0; i < target.length; i++) add(target[i]);
+		}
+		if (!list.length) return false;
 		userFocusWindowUntil = Date.now() + USER_FOCUS_WINDOW_MS;
+		userFocusIntentEls = list;
+		return true;
 	}
 
 	/**
-	 * 收回非用户主动的聚焦。返回 true = 已收回，false = 达到防打环上限后放手。
+	 * T51（R1）：关掉放行窗口。生命周期必须收干净 —— 见 disarmComposerFocus /
+	 * onDown / visibilitychange / pageshow 的调用点。
+	 */
+	function clearUserFocusWindow() {
+		userFocusWindowUntil = 0;
+		userFocusIntentEls = null;
+	}
+
+	/** 目标元素是否落在这一次意图的亲缘范围内（自身 / 后代 / 祖先链）。 */
+	function inIntentScope(el, intentEl) {
+		if (el === intentEl) return true;
+		try {
+			if (intentEl.contains && intentEl.contains(el)) return true;
+		} catch (ignoredContains) { /* 节点已卸载 */ }
+		var node = el;
+		var depth = 0;
+		while (isElement(node) && node !== document.body && depth < FOCUS_ARM_HOST_MAX_DEPTH) {
+			if (node === intentEl) return true;
+			node = node.parentElement;
+			depth += 1;
+		}
+		return false;
+	}
+
+	/**
+	 * T51（R1）：这次聚焦是否落在「用户刚才那一下意图」的目标范围里。
+	 *
+	 * 范围 = 每个目标元素自身 + 后代 + 祖先（深度封顶 FOCUS_ARM_HOST_MAX_DEPTH）。
+	 * 双向包含都收，因为两种官方行为都得放行：
+	 *   - 官方把焦点放回输入区**内部**的包装层/子输入框（后代）；
+	 *   - 官方把焦点放到 composer 的**包裹层/卡片**上（祖先，见 isPanelTriggerPoint 的爬卡逻辑）。
+	 *
+	 * 「模型」子面板的 input.EhuiKa_search 与 composer 既无祖先也无后代关系
+	 * （它是 composer 卡片里的另一棵兄弟子树）⇒ 不在窗口内 ⇒ 被守卫正常收回。
+	 */
+	function inUserFocusWindow(el) {
+		if (!isElement(el) || !userFocusIntentEls) return false;
+		if (Date.now() > userFocusWindowUntil) return false;
+		for (var i = 0; i < userFocusIntentEls.length; i++) {
+			if (inIntentScope(el, userFocusIntentEls[i])) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * T51：落点对应的可编辑宿主。
+	 *
+	 * 不能只靠 `closest('input, textarea, select, [contenteditable]')`：官方 composer
+	 * 是 Lexical，真实持焦的节点可能是 `contenteditable="plaintext-only"` 的深层子节点、
+	 * 或带 `data-lexical-editor` / `data-composer-input` 的包装层，标准选择器会漏。
+	 * 漏掉的后果实测过（test:device 106 条里 4 条 SKIP，原因「真实点按后输入框仍未持焦」）：
+	 * 拿不到 owner ⇒ 开不出窗口 ⇒ 守卫把用户自己那一下聚焦也收回了。
+	 * 所以再兜一层：沿祖先链找第一个 isEditableFocus 认得的元素。
+	 */
+	function editableOwnerOf(node) {
+		if (!isElement(node)) return null;
+		if (isEditableFocus(node)) return node;
+		if (node.closest) {
+			var m = node.closest('input, textarea, select, [contenteditable], [data-composer-input], [data-lexical-editor]');
+			if (m) return m;
+		}
+		var p = node.parentElement;
+		var depth = 0;
+		while (isElement(p) && p !== document.body && depth < FOCUS_ARM_HOST_MAX_DEPTH) {
+			if (isEditableFocus(p)) return p;
+			p = p.parentElement;
+			depth += 1;
+		}
+		return null;
+	}
+
+	/**
+	 * T51（R4）：`inputmode="none"` 残留兜底。
+	 *
+	 * T50 §5.2 实测：属性只要**真的**留在 composer 上，用户点输入框也弹不出键盘
+	 * （mInputShown=false）。hook 自己造不出这个状态（focusArmed 与属性同生共死），
+	 * 但「官方/第三方给 composer 写 inputmode」或「摘除被节流」都能造成它，
+	 * 而当时**没有任何东西在守**。这里加一道：非布防态下，一旦发现 composer
+	 * 身上挂着 `none`，立刻摘掉。
+	 *
+	 * 只在 `!focusArmed` 时动手 —— 否则会把自己刚布的防当场撤掉。
+	 */
+	function sweepResidualInputMode() {
+		if (focusArmed) return false;
+		var composer = focusComposerEl();
+		if (!isElement(composer)) return false;
+		var mode = null;
+		try {
+			mode = composer.getAttribute('inputmode');
+		} catch (ignoredGet) { return false; }
+		// T50 §5.2 模拟的残留值就是 'none'。别的值（text / numeric …）是官方自己写的，
+		// 不归我们管，只清 'none'。
+		if (!mode || String(mode).toLowerCase() !== 'none') return false;
+		try {
+			composer.removeAttribute('inputmode');
+			if (focusGuardStats.residualSwept !== undefined) focusGuardStats.residualSwept += 1;
+		} catch (ignoredRm) { return false; }
+		return true;
+	}
+
+	// T51（R4）：盯住 composer 的 inputmode 属性变化。第三方/官方写、或摘除被节流，
+	// 都会走到这里；观察者回调是微任务，浏览器按节点上的 inputmode 决定
+	// showSoftInput 之前基本能摘掉。composer 节点被换掉时重新挂。
+	var inputModeWatcher = null;
+	var inputModeWatchEl = null;
+	function watchComposerInputMode() {
+		var composer = focusComposerEl();
+		if (!isElement(composer) || composer === inputModeWatchEl) return;
+		if (inputModeWatcher) {
+			try { inputModeWatcher.disconnect(); } catch (ignoredDisc) { /* 已断开 */ }
+			inputModeWatcher = null;
+			inputModeWatchEl = null;
+		}
+		if (typeof MutationObserver !== 'function') return;
+		try {
+			inputModeWatcher = new MutationObserver(function () { sweepResidualInputMode(); });
+			inputModeWatcher.observe(composer, { attributes: true, attributeFilter: ['inputmode'] });
+			inputModeWatchEl = composer;
+		} catch (ignoredObserve) { inputModeWatcher = null; }
+	}
+
+	// ── T48：布防 / 摘防 ──
+
+	/**
+	 * composer 输入元素。官方命令面板要的就是这个元素上的焦点。
+	 */
+	function focusComposerEl() {
+		return document.querySelector('[data-composer-input]');
+	}
+
+	/**
+	 * 落点算不算「会打开命令面板/弹层的那类非可编辑触发器」。
+	 *
+	 * 判据用**官方 aria-label**（中英都列）而不是 hook 自己打的标记：
+	 * hook 标记（data-dshr-composer-add 等）由 syncComposerChrome 写，
+	 * 冷启动第一次点「+」时它可能还没写上，用它会漏掉最关键的那一次。
+	 * 其次再兜一层：落点位于 composer 卡片内、且是可交互控件（按钮/菜单项等）。
+	 */
+	function isPanelTriggerPoint(target) {
+		if (!isElement(target) || !target.closest) return false;
+		// **先**排除「已经打开的面板/弹层里的条目」，再谈布防。
+		// 官方把命令面板挂在 composer 卡片内部，所以这些条目同样落在 composer 卡片里；
+		// 一旦对它们布防，就会顺手 markUserFocusIntent() 撑开守卫的放行窗口，
+		// 于是面板**下游**自己的输入框（例如「模型」子面板里的搜索框
+		// input.EhuiKa_search）就能抢到焦点并把软键盘弹起来 —— 正是本任务要消灭的
+		// 那类「非用户点输入框造成的聚焦」。AVD 实测（t48-report §5）就是这个坑。
+		// 面板条目本身不需要布防：面板此刻已经开着，composer 的焦点早就到位。
+		// ⇒ 排除掉，维持 T42 对它们的原有行为。
+		if (target.closest(OPEN_PANEL_SELECTOR)) return false;
+		if (target.closest(COMPOSER_TRIGGER_SELECTOR)) return true;
+		// 兜底：composer 卡片内的可交互控件。
+		// 用 contains 而不是 closest(元素) —— closest 只接受**字符串**选择器，
+		// 传元素会被转成 "[object HTMLDivElement]" 这种非法选择器并抛 SyntaxError。
+		if (!target.closest('button, [role="button"], [role="menuitem"], [role="option"]')) return false;
+		var composer = focusComposerEl();
+		if (!composer) return false;
+		var card = composer.parentElement;
+		var depth = 0;
+		while (isElement(card) && card !== document.body && depth < FOCUS_ARM_HOST_MAX_DEPTH) {
+			if (card.contains(target)) return true;
+			card = card.parentElement;
+			depth += 1;
+		}
+		return false;
+	}
+
+	/**
+	 * 布防：打 inputmode="none" + 自己把焦点抢过来。
+	 *
+	 * 顺序要点：markUserFocusIntent() 必须在 focus() **之前** ——
+	 * 否则守卫自己的 focusin 监听会在我们抢到焦点的同一刻把它收回去，
+	 * 那就退回 T42 的行为（面板开不出来）。
+	 *
+	 * T51（R1）：窗口现在**只对 composer 这一棵树**放行（见 inUserFocusWindow），
+	 * 不再是对整个文档放行。面板里那些自带输入框的子面板（模型搜索框）与 composer
+	 * 无亲缘关系 ⇒ 拿不到这张通行证 ⇒ T50 §6.1 的键盘弹出被根除。
+	 */
+	function armComposerFocus() {
+		var composer = focusComposerEl();
+		if (!isElement(composer)) return false;
+		// 兜底：官方换节点实例时旧属性会跟着旧节点走，这里确保布防落在当前节点上。
+		if (focusArmEl && focusArmEl !== composer) disarmComposerFocus();
+		// T51：换节点 ⇒ 观察者跟着换。
+		watchComposerInputMode();
+		markUserFocusIntent(composer);
+		try {
+			composer.setAttribute('inputmode', 'none');
+		} catch (ignoredArm) { /* 节点已卸载 */ }
+		focusArmed = true;
+		focusArmEl = composer;
+		focusArmUntil = Date.now() + FOCUS_ARM_MS;
+		// 自己先拿焦点：官方随后那次抢焦点就成了空操作 ⇒ 无新 focusin ⇒ 无新 showSoftInput。
+		//
+		// ⚠️ 负控制实测（T48 §7）：**这一步在当前实测范围内是冗余的**。
+		// 删掉它之后，面板照样 3/3 打开、键盘照样 0/3 弹（NEG-2）——
+		// 因为 markUserFocusIntent() 已经把官方那次抢焦点放行了，而 inputmode 也还在节点上。
+		// 真正承重的是另外两步：意图窗口（没有它面板开不开，T46 §1 R1）与 inputmode（没有它键盘弹，NEG-1）。
+		// **仍然保留这一步**：它是「官方抢焦点变成空操作」这件事不依赖 800ms 窗口时序的唯一兜底，
+		// 且实测零副作用（删掉它行为不变）。改动前请重跑 NEG-2，别凭直觉删。
+		try {
+			composer.focus();
+		} catch (ignoredFocus) { /* 节点已卸载 */ }
+		if (focusArmTimer) clearTimeout(focusArmTimer);
+		focusArmTimer = setTimeout(function () {
+			focusArmTimer = 0;
+			disarmComposerFocus();
+		}, FOCUS_ARM_MS);
+		focusGuardStats.armed += 1;
+		return true;
+	}
+
+	/**
+	 * 摘防。四条路都会走到这里，保证 inputmode **不会**长期留在 composer 上
+	 * （T46 实测：留着的话用户点输入框也不弹键盘）：
+	 *   1. 面板渲染完（~500ms 定时）；
+	 *   2. 下一次用户手势（onDown 开头无条件先摘一次）；
+	 *   3. 节点被官方换掉（arm 时发现旧节点不是当前节点）；
+	 *   4. T51：页面可见性/导航（visibilitychange / pageshow），见 bindFocusGuard。
+	 *
+	 * T51（R1）：这里**同时关掉放行窗口**。旧实现只摘 inputmode、不动
+	 * userFocusWindowUntil，于是「＋」撑开的 800ms 通行证活过了 500ms 定时器，
+	 * 外溢到面板的下一次交互 —— 这就是 T50 §6 那个反例的根因。T50 §6.6 的修法建议
+	 * 正是这一句；本轮还额外把窗口收窄到「目标元素」（inUserFocusWindow），
+	 * 两道一起上：窗口既不外溢、也不覆盖无关元素。
+	 */
+	function disarmComposerFocus() {
+		if (focusArmTimer) {
+			clearTimeout(focusArmTimer);
+			focusArmTimer = 0;
+		}
+		if (focusArmEl && isElement(focusArmEl)) {
+			try {
+				focusArmEl.removeAttribute('inputmode');
+			} catch (ignoredDisarm) { /* 节点已卸载 */ }
+		}
+		focusArmEl = null;
+		if (focusArmed) focusGuardStats.disarmed += 1;
+		focusArmed = false;
+		focusArmUntil = 0;
+		// T51（R1）：通行证与布防同生共死。
+		clearUserFocusWindow();
+	}
+
+	/**
+	 * 可编辑元素的「稳定签名」：同一个输入区即使被重渲染换掉节点实例，签名不变。
+	 * 只用稳定标记（data-composer-input / data-lexical-editor）+ 标签/角色/contenteditable
+	 * + 前两个 class，不掺绝对位置或节点引用。
+	 */
+	function focusIdentity(el) {
+		if (!isElement(el)) return '';
+		var tag = (el.tagName || '').toLowerCase();
+		var role = el.getAttribute('role') || '';
+		var ceAttr = el.getAttribute('contenteditable') || '';
+		var stable = el.getAttribute('data-composer-input') || el.getAttribute('data-lexical-editor') || '';
+		var cls = typeof el.className === 'string' ? el.className.trim().split(/\s+/).slice(0, 2).join('.') : '';
+		return tag + '|' + role + '|' + ceAttr + '|' + stable + '|' + cls;
+	}
+
+	function isFocusSticky(el) {
+		if (!isElement(el)) return false;
+		if (focusStickyNodes && focusStickyNodes.has(el)) return true;
+		var key = focusIdentity(el);
+		return !!key && focusStickyKeys[key] === true;
+	}
+
+	function markFocusSticky(el) {
+		if (focusStickyNodes) focusStickyNodes.add(el);
+		var key = focusIdentity(el);
+		if (!key) return;
+		focusStickyKeys[key] = true;
+		focusStickyCounts[key] = 0;
+		focusStickySince[key] = Date.now();
+	}
+
+	function clearFocusSticky(el) {
+		if (focusStickyNodes && isElement(el)) focusStickyNodes.delete(el);
+		var key = focusIdentity(el);
+		if (!key) return;
+		delete focusStickyKeys[key];
+		delete focusStickyCounts[key];
+		delete focusStickySince[key];
+	}
+
+	/**
+	 * 粘性抑制的绝对安全阀：同一签名在 FOCUS_STICKY_SPAN_MS 内被收回超过
+	 * FOCUS_STICKY_MAX 次就放手（最坏退回改动前行为）并计数，绝不无限 blur。
+	 * 正常路径远达不到：官方打开快捷指令面板只抢 3 次，阈值为 12。
+	 */
+	function withinStickyBudget(el) {
+		var key = focusIdentity(el);
+		if (!key) return true;
+		var now = Date.now();
+		if (!(key in focusStickySince) || now - focusStickySince[key] > FOCUS_STICKY_SPAN_MS) {
+			focusStickySince[key] = now;
+			focusStickyCounts[key] = 0;
+		}
+		focusStickyCounts[key] += 1;
+		if (focusStickyCounts[key] > FOCUS_STICKY_MAX) {
+			focusGuardStats.capped += 1;
+			clearFocusSticky(el);
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * 收回非用户主动的聚焦。返回 true = 已收回，false = 绝对安全阀放手。
 	 */
 	function revokeStealthFocus(el) {
 		var now = Date.now();
+		// 已在粘性抑制中：不再因为计数而放手，持续收回（这正是 T42 要修的行为）。
+		if (isFocusSticky(el)) {
+			if (!withinStickyBudget(el)) return false;
+			try {
+				el.blur();
+			} catch (ignoredBlur) { /* 节点已卸载 */ }
+			focusGuardStats.revoked += 1;
+			focusGuardStats.sticky += 1;
+			return true;
+		}
 		if (el === focusRevokeEl && now - focusRevokeSince < FOCUS_REVOKE_SPAN_MS) {
 			focusRevokeCount += 1;
 			if (focusRevokeCount > FOCUS_REVOKE_MAX) {
+				// T42：不再放手，转粘性抑制（旧的 return false 就是本缺陷的根因）。
 				focusGuardStats.capped += 1;
-				return false;
+				markFocusSticky(el);
+				try {
+					el.blur();
+				} catch (ignoredBlur) { /* 节点已卸载 */ }
+				focusGuardStats.revoked += 1;
+				focusGuardStats.sticky += 1;
+				return true;
 			}
 		} else {
 			focusRevokeEl = el;
@@ -1148,7 +1567,51 @@
 		focusGuardBound = true;
 		var onDown = function (event) {
 			if (!focusGuardActive()) return;
-			if (isEditablePoint(event.target)) markUserFocusIntent();
+			var target = event.target;
+			// T51（R1）：任何一次落指都先把放行窗口关掉。
+			// 旧实现不清它，于是「＋」那一下撑开的窗口会活到 800ms 自然过期，
+			// 覆盖掉用户接下来在面板里的那一下 —— T50 §6.1 反例的直接来源。
+			// 关掉之后，下面 armComposerFocus() / markUserFocusIntent(owner) 会
+			// 按**这次**落指的意图重新开一个（且只对这次的目标元素生效）。
+			clearUserFocusWindow();
+			// T48：任何一次落指都先无条件摘一次防。
+			// 这是「inputmode 不得长期留在 composer 上」的第二道保障（第一道是 500ms 定时）：
+			// 用户落指在输入框上时，属性必须在浏览器默认聚焦动作发生**之前**就没了，
+			// 否则这次真实点击也会被 inputmode=none 压住、键盘不弹（T46 实测）。
+			if (focusArmed) disarmComposerFocus();
+			// T51（R4）：非布防态下若 composer 身上还挂着 inputmode=none（第三方写的、
+			// 或摘除被节流），在浏览器按节点决定 showSoftInput 之前先摘掉。
+			sweepResidualInputMode();
+			if (!isEditablePoint(target)) {
+				// T48：落指在「会打开命令面板/弹层」的非可编辑触发器上（「+」这类）
+				//   => 走布防形态：打 inputmode="none" + 我们自己抢焦点。
+				// 这样官方随后打开面板时那次抢焦点是**空操作**（焦点没变），
+				// 既不会无新 focusin 触发 showSoftInput，也不会被粘性抑制收回去。
+				// **不能**在这里 clearFocusSticky：粘性抑制是给「非用户手势造成的聚焦」用的，
+				// 而这条落指确实是用户手势，放行窗口（markUserFocusIntent）已经足够。
+				if (isPanelTriggerPoint(target)) armComposerFocus();
+				return;
+			}
+			// T51（R1）：窗口记「用户这次点的那个输入区」，而不是对整页放行。
+			// 用户点 A 之后 800ms 内官方若把焦点抢到 B 输入框，B 拿不到通行证 ⇒ 被收回。
+			//
+			// 目标取**两个**：落点解析出的可编辑宿主 + 当前 composer。
+			// 官方 composer 是 Lexical，真实持焦节点与落点 closest 到的那个可编辑元素
+			// 未必互为祖先/后代（实测：漏掉时 test:device 有 4 条 SKIP，
+			// 原因「真实点按后输入框仍未持焦」）。两个都记上就覆盖了官方
+			// 「把焦点落到真实输入节点」和「落点本身是输入节点」两种形态。
+			// 仍然安全：面板子输入框与 composer 无亲缘关系，拿不到这张通行证。
+			var intentEls = [editableOwnerOf(target)];
+			var composerNow = focusComposerEl();
+			if (isElement(composerNow)) intentEls.push(composerNow);
+			markUserFocusIntent(intentEls);
+			// 用户真的落指在这个输入区上 => 解除它的粘性抑制，这次聚焦与后续键盘照常。
+			// 落点可能是可编辑元素本身，也可能是它内部的子节点，两处都要清。
+			if (isElement(target)) clearFocusSticky(target);
+			if (isElement(target) && target.closest) {
+				var owner = target.closest('input, textarea, select, [contenteditable]');
+				if (owner) clearFocusSticky(owner);
+			}
 		};
 		document.addEventListener('touchstart', onDown, { capture: true, passive: true });
 		document.addEventListener('pointerdown', onDown, { capture: true, passive: true });
@@ -1156,9 +1619,29 @@
 		document.addEventListener('focusin', function (event) {
 			if (!focusGuardActive()) return;
 			var el = event.target;
+			// T51（R4）：聚焦发生的这一刻就是浏览器按节点上的 inputmode 决定
+			// 要不要 showSoftInput 的那一刻，所以残留兜底挂在这里。
+			sweepResidualInputMode();
 			if (!isEditableFocus(el)) return;
-			if (Date.now() <= userFocusWindowUntil) return;
+			// T51（R1）：窗口只对「这次意图的目标元素及其亲缘」放行，不再对整篇文档放行。
+			if (inUserFocusWindow(el)) return;
 			revokeStealthFocus(el);
+		}, { capture: true });
+		// T51（R1）：可见性/导航也是窗口生命周期的一部分。
+		// 切走再切回来、或发生同文档导航，之前的通行证不该继续有效；
+		// 同时 R4 的残留兜底要在「切回来看到输入框」时被触发一次。
+		var onVisibility = function () {
+			if (document.visibilityState === 'hidden') {
+				clearUserFocusWindow();
+				if (focusArmed) disarmComposerFocus();
+			} else {
+				sweepResidualInputMode();
+			}
+		};
+		document.addEventListener('visibilitychange', onVisibility, { capture: true });
+		window.addEventListener('pageshow', function () {
+			clearUserFocusWindow();
+			sweepResidualInputMode();
 		}, { capture: true });
 	}
 
@@ -1956,6 +2439,61 @@
 		return true;
 	}
 
+	/**
+	 * 关闭官方右侧栏——与 openOfficialRightbar 完全对称：同一颗官方折叠按钮
+	 * （panel 内 button[data-sidebar-right-toggle]，官方实现只有 onClick →
+	 * actions.toggleExpanded），同一条 dispatchNativeClick 通道，所以开/关可逆。
+	 * T47 补它是因为**官方右栏没有 swipe-to-close**：app.asar 右栏模块字节区间
+	 * touchstart/touchmove/touchend/swipe 全部零命中（scratch/t43/diagnosis.md §6），
+	 * 右滑关闭只能由本 hook 提供。
+	 * 返回是否真的把意图派发出去了（调用方不要再据此判断成功与否：React 异步提交）。
+	 */
+	function closeOfficialRightbar() {
+		var panel = findRightbarPanel();
+		if (!panel) return false;
+		var toggle = panel.querySelector('button[data-sidebar-right-toggle]');
+		if (!toggle || toggle.disabled) return false;
+		if (!dispatchNativeClick(toggle)) toggle.click();
+		return true;
+	}
+
+	/**
+	 * T47：右栏「右滑关闭」的起手带宽。视口的 11%，夹到 [24,48]；
+	 * 393px 手机视口 → round(393×0.11)=43px。
+	 */
+	function rightbarCloseBandPx() {
+		var w = window.innerWidth || 0;
+		if (!w) return 24;
+		return Math.max(24, Math.min(48, Math.round(w * 0.11)));
+	}
+
+	/**
+	 * T47：右栏**打开**态下「右滑关闭」手势的**起手门**（全部满足才接管这一笔）。
+	 * 放在 onDragStart 里、canStartDrawerTrack 之前调用——既有 WEB-09 守卫
+	 * （canStartDrawerTrack 的 `isRightbarOpen() → false`）语义一个字没变，
+	 * 只是原本被整笔丢弃的手势多了一个兑现点。
+	 *   1) 右栏确实打开（读 data-sidebar-right-open + aria-hidden，与 isRightbarOpen 逐字一致）；
+	 *   2) 起点落在面板**水平范围内**（面板非全屏的 push/Split 态也正确）；
+	 *   3) 起点落在面板**左缘带**内：x0 <= panelRect.left + band（band 见上）；
+	 *   4) 不在横向可滚容器内（WEB-05 同款豁免，保护 pre/code/表格与横向溢出区）；
+	 *   5) 不是 isIgnoredSwipeTarget（输入框/输入卡/鲸鱼/状态栏/统计行）。
+	 * 门 3 是"不劫持面板内横向内容"的关键：面板**中部**右滑（x0 > left+band）
+	 * 拿不到候选 ⇒ 维持 no-op（scratch/t43/diagnosis.md §7 T3）。
+	 */
+	function isRightbarCloseTrackTarget(target, x0) {
+		if (!isElement(target)) return false;
+		if (!isRightbarOpen()) return false;
+		var panel = findRightbarPanel();
+		if (!panel) return false;
+		var rect = panel.getBoundingClientRect();
+		if (!rect || !rect.width) return false;
+		if (x0 < rect.left || x0 > rect.right) return false;
+		if (x0 > rect.left + rightbarCloseBandPx()) return false;
+		if (isIgnoredSwipeTarget(target)) return false;
+		if (isInHorizontallyScrollableContainer(target)) return false;
+		return true;
+	}
+
 	function isDialogOpen() {
 		return document.documentElement.getAttribute('data-dshr-dialog') === '1';
 	}
@@ -2301,6 +2839,10 @@
 		// WEB-09：抽屉关闭时的左滑候选。方向门命中时**只记不动**，
 		// 真正的开关动作留到 touchend 再兑现（原因见 considerRightbarSwipe 的注释）。
 		var rightbarCandidate = null;
+		// T47：右栏**打开**态下「右滑关闭」的候选。方向与 rightbarCandidate 相反
+		// （那条 dx<0 开右栏、这条 dx>0 关右栏），两笔手势互斥且状态互斥，
+		// 所以用**独立变量**，绝不复用同一个槽位。
+		var rightbarCloseCandidate = null;
 
 		function resetTrack() {
 			tracking = false;
@@ -2317,6 +2859,20 @@
 
 		function onDragStart(clientX, clientY, target, pointerId) {
 			if (!isMobileMode() || isDrawerLocked()) {
+				resetTrack();
+				return false;
+			}
+			// T47：右栏打开态——把这一笔手势**转交**给「右滑关闭」，但仍然**不武装**左抽屉。
+			// 语义与既有守卫完全一致（canStartDrawerTrack 的 `isRightbarOpen() → false`
+			// 在此之后依然成立，右栏打开期间左抽屉手势仍然彻底不武装）；
+			// 区别只是原本被整笔丢弃的手势现在多了一个 touchend 兑现点。
+			// toggleBusy（官方折叠正在提交）时不接管：避免连点两次把状态又翻回去。
+			if (isRightbarOpen()) {
+				if (!toggleBusy && isRightbarCloseTrackTarget(target, clientX)) {
+					rightbarCloseCandidate = { x0: clientX, y0: clientY, target: target };
+				} else {
+					rightbarCloseCandidate = null;
+				}
 				resetTrack();
 				return false;
 			}
@@ -2414,6 +2970,35 @@
 			return openOfficialRightbar();
 		}
 
+		/**
+		 * T47：右栏**打开**态的右滑 → 关闭官方右栏（与 considerRightbarSwipe 镜像）。
+		 *
+		 * 为什么也在 **touchend** 兑现，而不是在 onDragMove 的方向门里就点：
+		 * 与 considerRightbarSwipe 同理由——阈值要**终点**坐标，且不该把「手指划过」
+		 * 的起手动作变成状态翻转。候选只存起点，全程不 preventDefault、不写
+		 * --dshr-drawer-x、不 setDrawerVisual、不 setSidebarOpen ⇒ 右栏打开态的右滑
+		 * 既不会点亮左抽屉（守住 WEB-09 的 expanded=0 断言），也不会吃掉事件。
+		 *
+		 * 方向门 `dx <= 0 一律不处理` 是**故意的**：右栏打开态的左滑必须仍是 no-op
+		 * （守住 scratch/t43/E5-leftswipe-while-open.json 的 72 条基线），
+		 * 绝不能顺手让左滑变成别的动作。
+		 */
+		function considerRightbarCloseSwipe(candidate, endX, endY) {
+			if (!candidate) return false;
+			if (!isMobileMode() || isDrawerLocked() || toggleBusy) return false;
+			if (isSidebarOpen()) return false;    // 抽屉展开中不碰右栏（与 :2510 同款）
+			if (!isRightbarOpen()) return false;  // 只关不开：二次校验，防抖动双触
+			var dx = endX - candidate.x0;
+			var dy = endY - candidate.y0;
+			if (dx <= 0) return false;           // 只认右滑；dx<=0 保持 no-op
+			// 阈值与 considerSwipe（:2278-2280）、considerRightbarSwipe（:2516-2518）逐字一致：
+			// 位移 48px、横向占优 1.4 倍、纵向不超过 96px。
+			if (Math.abs(dx) < 48) return false;
+			if (Math.abs(dx) < Math.abs(dy) * 1.4) return false;
+			if (Math.abs(dy) > 96) return false;
+			return closeOfficialRightbar();
+		}
+
 		function onDragEnd(clientX, clientY) {
 			if (!tracking) return;
 			var endX = clientX;
@@ -2458,6 +3043,7 @@
 		document.addEventListener('touchstart', function (event) {
 			// WEB-09：新一次触摸先清掉上一次没走完流程的候选（防残留误触发）。
 			rightbarCandidate = null;
+			rightbarCloseCandidate = null;
 			if (event.touches && event.touches.length !== 1) {
 				onDragCancel();
 				return;
@@ -2481,12 +3067,20 @@
 			var candidate = rightbarCandidate;
 			rightbarCandidate = null;
 			if (candidate) considerRightbarSwipe(candidate, endX, endY);
+			// T47：右栏打开态的「右滑关闭」候选在同一处兑现。两条路径互斥——
+			// 开右栏的候选要求右栏**关**、关右栏的候选要求右栏**开**，
+			// 而且本函数入口已判断 isRightbarOpen()，所以同一笔手势最多命中一条。
+			var closeCandidate = rightbarCloseCandidate;
+			rightbarCloseCandidate = null;
+			if (closeCandidate) considerRightbarCloseSwipe(closeCandidate, endX, endY);
 			onDragEnd(endX, endY);
 		}, { capture: true, passive: true });
 		document.addEventListener('touchcancel', function () {
 			// touchcancel 一律不兑现候选：它意味着滚动/系统已经把这次触摸接管走，
 			// 且这条路径的坐标是 lastX 而不是真实终点，拿它开右栏是假阳性。
 			rightbarCandidate = null;
+			// T47：关右栏的候选同样不兑现（理由相同）。
+			rightbarCloseCandidate = null;
 			if (!tracking) return;
 			var dx = lastX - startX;
 			if (dragging || Math.abs(dx) >= 48) onDragEnd(lastX, startY);
@@ -3762,12 +4356,10 @@
 			// 以展开标记而非显示模式判断；只收起面板，保留文件标签和路由。
 			var rightPanel = document.querySelector('[data-sidebar-right-panel][data-sidebar-right-open]');
 			if (rightPanel && rightPanel.getAttribute('aria-hidden') !== 'true') {
-				var rightToggle = rightPanel.querySelector('button[data-sidebar-right-toggle]');
-				if (rightToggle && !rightToggle.disabled) {
-					if (!dispatchNativeClick(rightToggle)) rightToggle.click();
-				}
+				// T47：与「右滑关闭」共用同一个动作函数（同一颗官方折叠按钮）。
+				closeOfficialRightbar();
 				// React 状态更新可能异步提交；不能因 DOM 尚未更新再 toggle 一次。
-				// 展开时即使控件暂不可用也消费返回，避免误退桌面。
+				// 展开时即使控件暂不可用（closeOfficialRightbar 返回 false）也消费返回，避免误退桌面。
 				return true;
 			}
 			if (isSidebarOpen()) return setSidebarOpen(false);

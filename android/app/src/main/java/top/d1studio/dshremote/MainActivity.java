@@ -39,6 +39,8 @@ import android.view.inputmethod.EditorInfo;
 import android.webkit.JavascriptInterface;
 import android.webkit.CookieManager;
 import android.webkit.HttpAuthHandler;
+import android.webkit.ServiceWorkerClient;
+import android.webkit.ServiceWorkerController;
 import android.webkit.SslErrorHandler;
 import android.webkit.ValueCallback;
 import android.webkit.WebBackForwardList;
@@ -62,6 +64,8 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -79,6 +83,8 @@ import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.HashMap;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -209,6 +215,13 @@ public class MainActivity extends Activity {
 	 * 不跨连接残留。
 	 */
 	private String activeProfileId = "";
+	/**
+	 * T49：当前网关的 host/port。Service Worker 的子资源必须由 App 自己按已锁定
+	 * 指纹去取（SW 自己的 fetch 拿不到 proceed 放行），而那条通道只对**当前网关**
+	 * 开放——绝不能变成一个可以随便连别处的通用代理。每次 openGateway 一次性赋值。
+	 */
+	private volatile String activeGatewayHost = "";
+	private volatile int activeGatewayPort = -1;
 	/** 会话页沉浸状态栏；注入失败时退回实色。 */
 	private boolean edgeToEdgeChrome = true;
 	/**
@@ -289,6 +302,8 @@ public class MainActivity extends Activity {
 		installImeInsetHandling();
 		buildHomeView();
 		buildEditView();
+		// T49：必须早于任何页面加载装（Service Worker 的脚本抓取随时可能发生）。
+		installServiceWorkerClient();
 		ensureWebView();
 		ProfileStore.migrateLegacy(prefs());
 		ProfileStore.migrateDirect(prefs());
@@ -1631,6 +1646,12 @@ public class MainActivity extends Activity {
 		submittedHttpAuthThisConnection.clear();
 		final String target = url.trim();
 		activeProfileId = profileId == null ? "" : profileId;
+		// T49：记下本轮网关的 host/port，供 ServiceWorkerClient 的可信取数通道限定范围。
+		Uri targetUri = Uri.parse(target);
+		activeGatewayHost = targetUri.getHost() == null ? "" : targetUri.getHost();
+		activeGatewayPort = targetUri.getPort() == -1
+			? ("http".equals(targetUri.getScheme()) ? 80 : 443)
+			: targetUri.getPort();
 		connectStartMs = System.currentTimeMillis();
 		// 一轮新的连接尝试 = 失败标记的唯一清零点。「重新连接」也走这里，故
 		// 重试不会被上一轮的失败标记挡住；而同一次尝试内 showGatewayFailure 换出的
@@ -1665,6 +1686,176 @@ public class MainActivity extends Activity {
 
 	private SharedPreferences prefs() {
 		return getSharedPreferences(PREFS, MODE_PRIVATE);
+	}
+
+	// ---------- WebView ----------
+
+	// ---------- Service Worker（T49）----------
+
+	/** SW 脚本在网关侧的路径（与 pwa.ts 的 SW_PATH、server.ts 路由同名）。 */
+	private static final String SW_SCRIPT_PATH = "/__dsh_remote__/sw.js";
+	/** res/raw/dsh_sw.js 的字节缓存（只读一次；SW 源码随 APK 发布，运行期不变）。 */
+	private static volatile byte[] swScriptBytes;
+
+	/**
+	 * 用本地资源供给 Service Worker 脚本。
+	 *
+	 * 为什么必须有这一步（T45 §2/§4 实测，勿删）：WebView 的 SW 脚本抓取由
+	 * **浏览器进程的 ServiceWorker 子系统**发起，不经过 WebViewClient，因此
+	 * {@code onReceivedSslError → handler.proceed()} 放行不到它。网关用的是自签
+	 * 证书 ⇒ 这条抓取必然死在证书校验上：
+	 * {@code SecurityError: An SSL certificate error occurred when fetching the script.}
+	 * （同一个 URL 用页面 fetch/XHR 拿得到 200，因为那两条走 WebViewClient。）
+	 *
+	 * 做法：ServiceWorkerClient.shouldInterceptRequest 命中该路径时，从 APK 的
+	 * res/raw/dsh_sw.js 返回。**脚本不经网络 ⇒ 证书不参与 ⇒ pin/TOFU 一行不改**
+	 * —— 刻意**不**把自签根装成受信任锚：那会让 onReceivedSslError 不再触发，
+	 * CertPin 的 TOFU 与「证书已变更！」告警整条失效（T45 §6.2 已判定不推荐）。
+	 *
+	 * 其余请求一律返回 null 走原路径，SW 对我们 fetch 的代理行为完全不变。
+	 */
+	/**
+	 * R7（T53）：判定「这个请求是不是 SW 脚本本身」。
+	 *
+	 * 原来写的是 {@code url.contains(SW_SCRIPT_PATH)} —— **子串**判定。任何路径里
+	 * 恰好含有这段文字的请求都会被当成本地 SW 脚本供给，例如
+	 * {@code /plugins/x/__dsh_remote__/sw.js}、{@code /__dsh_remote__/sw.js.bak}、
+	 * 甚至 query 里带这段文字的普通资源。那会把**别的响应体**当 SW 脚本回给
+	 * ServiceWorker 子系统（内容不是 SW 就注册失败，且日志写着"本地供给"极具误导性）。
+	 *
+	 * 改成**路径精确匹配**：只认 pathname 恰好等于 {@link #SW_SCRIPT_PATH} 的请求。
+	 * query（{@code ?v=…}）不影响判定 —— SW 脚本 URL 带 query 也仍是同一个脚本。
+	 * Uri 解析不了就退化成"去掉 query 后的字符串等于 SW_SCRIPT_PATH"，宁可放过、
+	 * 也不误判（放过的后果只是回落到网络路径，与改动前一致）。
+	 */
+	private static boolean isSwScriptRequest(String url) {
+		if (url == null) return false;
+		try {
+			String path = Uri.parse(url).getPath();
+			if (path != null) return SW_SCRIPT_PATH.equals(path);
+		} catch (Throwable ignoredParse) { /* URL 解析不了：走下面的退化判定 */ }
+		int cut = url.indexOf('?');
+		return SW_SCRIPT_PATH.equals(cut >= 0 ? url.substring(0, cut) : url);
+	}
+
+	private void installServiceWorkerClient() {
+		try {
+			ServiceWorkerController.getInstance().setServiceWorkerClient(new ServiceWorkerClient() {
+				@Override
+				public WebResourceResponse shouldInterceptRequest(WebResourceRequest request) {
+					// 回调在**后台线程**：只做字符串判定 + 读已缓存字节，绝不碰 UI。
+					if (request == null || request.getUrl() == null) return null;
+					String url = request.getUrl().toString();
+					if (isSwScriptRequest(url)) {
+						byte[] body = loadSwScript();
+						if (body == null) {
+							// 本地没有就放行网络（回到改动前的行为，只是 SW 装不上）。
+							Log.w("dshr-perf", "swIntercept 命中但本地 SW 源码缺失，放行网络 url=" + url);
+							return null;
+						}
+						Log.i("dshr-perf", "swIntercept 本地供给 SW 脚本 bytes=" + body.length + " url=" + url);
+						// 头必须与网关 /__dsh_remote__/sw.js 一致：Service-Worker-Allowed
+						// 决定 scope 能否扩到 "/"（脚本在 /__dsh_remote__/ 下，默认 scope
+						// 只有该目录，页面注册用的正是 scope:"/"）。
+						Map<String, String> headers = new HashMap<String, String>();
+						headers.put("Content-Type", "text/javascript; charset=utf-8");
+						headers.put("Service-Worker-Allowed", "/");
+						headers.put("Cache-Control", "no-cache");
+						headers.put("X-Content-Type-Options", "nosniff");
+						return new WebResourceResponse("text/javascript", "utf-8", 200, "OK", headers,
+							new ByteArrayInputStream(body));
+					}
+					// T49：SW 的**子资源** fetch 同样不经 WebViewClient、同样拿不到
+					// proceed() 放行（实测全部 TypeError: Failed to fetch，见 PinnedFetch
+					// 类注释）。它填不满自己的缓存 ⇒ 页面 net::ERR_FAILED 白屏。
+					// 这里改由 App 用**已锁定的指纹**自己取（只复用主框架 TOFU 弹窗已经
+					// 落盘的那把锁；未信任/已变更一律不放行）。
+					WebResourceResponse fetched = fetchForServiceWorker(url);
+					if (fetched != null) return fetched;
+					Log.i("dshr-perf", "swIntercept passthrough url=" + url);
+					return null;
+				}
+			});
+			Log.i("dshr-perf", "ServiceWorkerClient 已装（SW 脚本本地供给 " + SW_SCRIPT_PATH + "）");
+		} catch (Throwable t) {
+			// 装不上只是退回「SW 不生效」，页面照常用 —— 不能因此崩。
+			Log.w("dshr-perf", "ServiceWorkerClient 安装失败（SW 将不可用）：" + t);
+		}
+	}
+
+	/**
+	/**
+	 * SW 子资源的可信取数（见 PinnedFetch 类注释：这是 SW 唯一能拿到字节的路）。
+	 * 只处理**当前网关**自己的 host:port，别的一律放行。返回 null = 放行原路径。
+	 * 回调在后台线程，阻塞取数是允许的（SW 本来就在等这次响应）。
+	 */
+	private WebResourceResponse fetchForServiceWorker(String url) {
+		String host = activeGatewayHost;
+		int port = activeGatewayPort;
+		if (host.isEmpty() || port <= 0) return null;
+		Uri uri = Uri.parse(url);
+		if (!"https".equals(uri.getScheme())) return null;
+		String reqHost = uri.getHost() == null ? "" : uri.getHost();
+		int reqPort = uri.getPort() == -1 ? 443 : uri.getPort();
+		if (!host.equalsIgnoreCase(reqHost) || port != reqPort) return null;
+
+		final CertPin.Store store = new CertPin.Store() {
+			@Override
+			public String get(String key) {
+				return prefs().getString(key, null);
+			}
+		};
+		PinnedFetch.Result r = PinnedFetch.get(url, host, port, activeProfileId, store, "sw");
+		if (r == null) return null;
+		Map<String, String> headers = new HashMap<String, String>();
+		if (r.contentType != null) headers.put("Content-Type", r.contentType);
+		// 透传 cache-control：SW 靠它决定「no-cache 响应不进缓存」，
+		// 抹掉会让本该穿透的资源被缓存住。
+		if (r.cacheControl != null) headers.put("Cache-Control", r.cacheControl);
+		String mime = "application/octet-stream";
+		String enc = null;
+		if (r.contentType != null) {
+			String lower = r.contentType.toLowerCase(Locale.US);
+			int semi = lower.indexOf(';');
+			mime = (semi > 0 ? lower.substring(0, semi) : lower).trim();
+			int cs = lower.indexOf("charset=");
+			if (cs > 0) {
+				enc = r.contentType.substring(cs + 8).trim();
+				int sp = enc.indexOf(';');
+				if (sp > 0) enc = enc.substring(0, sp).trim();
+			}
+		}
+		Log.i("dshr-perf", "swIntercept 可信链供给子资源 bytes=" + r.body.length + " mime=" + mime + " url=" + url);
+		return new WebResourceResponse(mime, enc, r.status, "OK", headers, new ByteArrayInputStream(r.body));
+	}
+
+	/**
+	 * 读 res/raw/dsh_sw.js。构建期由 android/sync-sw-asset.mjs 从
+	 * packages/gateway/src/pwa.ts 的 renderServiceWorker() 渲染（单一源，禁止手改）。
+	 * 用 openRawResource 而不是 getResourceAsStream("/raw/...")：后者依赖 aapt2
+	 * 打包后保留的目录名，raw 的目录布局不是稳定契约。
+	 */
+	private byte[] loadSwScript() {
+		byte[] cached = swScriptBytes;
+		if (cached != null) return cached;
+		InputStream in = null;
+		try {
+			in = getResources().openRawResource(R.raw.dsh_sw);
+			ByteArrayOutputStream out = new ByteArrayOutputStream(8192);
+			byte[] buf = new byte[8192];
+			int n;
+			while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+			cached = out.toByteArray();
+			swScriptBytes = cached;
+			return cached;
+		} catch (Exception e) {
+			Log.w("dshr-perf", "读取 res/raw/dsh_sw.js 失败：" + e);
+			return null;
+		} finally {
+			if (in != null) {
+				try { in.close(); } catch (IOException ignored) { }
+			}
+		}
 	}
 
 	// ---------- WebView ----------
