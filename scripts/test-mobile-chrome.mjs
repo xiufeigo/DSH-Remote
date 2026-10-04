@@ -13,6 +13,8 @@ import net from "node:net";
 
 const ROOT = resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
 const FIXTURE = "/scripts/fixtures/mobile-selftest.html";
+// T56：hook 缺席页（同 fixture 摘掉自带的那行 <script src=mobile.js>），由 server 现场合成。
+const NO_HOOK_FIXTURE = "/scripts/fixtures/mobile-selftest-noinject.html";
 const SCREENSHOT = join(ROOT, "scripts/fixtures/mobile-selftest-390.png");
 const MIME = {
 	".html": "text/html; charset=utf-8",
@@ -568,6 +570,55 @@ function assertSourceContracts() {
 	if (!src.includes("window.__dshRemoteMobileInstalled")) {
 		throw new Error("源码契约：WEB-07 缺重复执行护栏 __dshRemoteMobileInstalled（壳内+edge 双注入会叠 hook）");
 	}
+	// ── T56：半装守卫竞态必须治本——守卫不得在第一行无条件置位 ──
+	//
+	// 根因（mobile-web.js 旧形态）：IIFE 第一行就 `window.__dshRemoteMobileInstalled = true`，
+	// 而整份文件第一处写 DOM 的语句是 ~(document.head || document.documentElement).appendChild。
+	// 原生在 onPageStarted（document-start）注入，此刻 documentElement 仍可为 null ⇒
+	// 抛 appendChild of null，而守卫已置位 ⇒ 本文档此后每次注入都是空操作，hook 永远装不上。
+	// 下面 4 条把「治本」的形态钉死：退回旧形态必须逐条变红。
+	{
+		// C1：入口必须是**具名函数表达式**——靠函数名在自身作用域内可见来实现「原地重入」，
+		//    这样 4300 行正文一行不改、执行顺序完全不变（不重排、不缩进、不改语义）。
+		const bootFn = src.match(/\(function ([A-Za-z_$][\w$]*)\(\)\s*\{\s*'use strict';/);
+		if (!bootFn) {
+			throw new Error("源码契约：T56 入口必须是具名函数表达式（document-start 挂起的重启要能原地重入同一份正文）");
+		}
+		// C2：正文入口处必须有 <html> 就绪闸门，且**守卫置位必须落在闸门之后**。
+		//     旧形态是「第一行无条件置位」，这里显式禁止。
+		const head = src.slice(0, src.indexOf("var ROOT_CLASS = 'dshr-mobile';"));
+		const gateAt = head.indexOf("if (document.documentElement) {");
+		const setAt = head.indexOf("window.__dshRemoteMobileInstalled = true;");
+		if (gateAt < 0) {
+			throw new Error("源码契约：T56 缺 documentElement 就绪闸门（document-start 注入会走到 appendChild of null）");
+		}
+		if (setAt < 0) {
+			throw new Error("源码契约：T56 找不到守卫置位点");
+		}
+		if (setAt < gateAt) {
+			throw new Error("源码契约：T56 守卫置位必须晚于 documentElement 就绪闸门（旧形态是 IIFE 第一行无条件置位，抛了就再也装不上）");
+		}
+		if (!/if \(window\.__dshRemoteMobileInstalled\) return;/.test(head)) {
+			throw new Error("源码契约：T56 幂等闸①（已装上直接 return）缺失");
+		}
+		if (!/__dshRemoteMobilePending/.test(head)) {
+			throw new Error("源码契约：T56 幂等闸②缺失：document-start 窗口内的重复注入会排第二份挂起重启");
+		}
+		// C3：重入必须真的发生——函数名要在文件里被调用一次，否则挂起后无人重启。
+		const bootName = bootFn[1];
+		const relaunchAt = src.indexOf(`${bootName}();`);
+		if (relaunchAt < 0) {
+			throw new Error(`源码契约：T56 就绪后必须重启同一个函数（找不到 ${bootName}() 的重入调用）`);
+		}
+		// C4：不再裸调 appendChild。旧形态那一行必须消失，否则闸门与它之间仍有
+		//     「document 被整体换掉」的窄缝（正是本 bug 的成因类别）。
+		if (src.includes("(document.head || document.documentElement).appendChild")) {
+			throw new Error("源码契约：T56 不得再裸调 (document.head || document.documentElement).appendChild（必须先做能力检查）");
+		}
+		if (!src.includes("var mount = document.head || document.documentElement;") || !src.includes("if (!mount) return false;")) {
+			throw new Error("源码契约：T56 样式挂载必须先做能力检查并在拿不到挂载点时延后重试");
+		}
+	}
 	{
 		const pwaSrc = readFileSync(join(ROOT, "packages/gateway/src/pwa.ts"), "utf8");
 		if (!pwaSrc.includes("!text.includes(SW_PATH)") || !pwaSrc.includes('!text.includes("/__dsh_remote__/mobile.js")')) {
@@ -930,6 +981,23 @@ assertSourceContracts();
 
 const server = createServer((req, res) => {
 	const url = decodeURIComponent((req.url || "/").split("?")[0]);
+	// T56：hook 缺席页。fixture 自带一行 <script src=".../mobile.js">（那本身就是
+	// 「late 注入」的样本），若用它测 document-start，页面里那份 late 注入会把
+	// 断言喂饱——测的就不是「只有 document-start 一条路」了，断言没有牙齿。
+	// 这里同源同内容、只摘掉那一行，于是页面上**唯一**的装上途径是本测试注入的那一条。
+	if (url === NO_HOOK_FIXTURE) {
+		const stripped = readFileSync(join(ROOT, ...FIXTURE.split("/").filter(Boolean)), "utf8").replace(
+			/[ \t]*<script src="\/android\/app\/src\/main\/res\/raw\/mobile\.js"><\/script>\r?\n?/,
+			"",
+		);
+		if (stripped.includes("/android/app/src/main/res/raw/mobile.js")) {
+			res.writeHead(500).end("no-hook fixture strip failed");
+			return;
+		}
+		res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+		res.end(stripped);
+		return;
+	}
 	const file = join(ROOT, ...url.replace(/^\//, "").split("/").filter(Boolean));
 	if (!file.startsWith(ROOT) || !existsSync(file)) {
 		res.writeHead(404).end("not found");
@@ -942,6 +1010,7 @@ const server = createServer((req, res) => {
 await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
 const { port } = server.address();
 const pageUrl = `http://127.0.0.1:${port}${FIXTURE}`;
+const noHookUrl = `http://127.0.0.1:${port}${NO_HOOK_FIXTURE}`;
 const browser = findBrowser();
 if (!browser) {
 	server.close();
@@ -1028,6 +1097,35 @@ try {
 				}
 				function down(el) {
 					el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+					// T76：把这一次落指补成一次**完整手势**（收尾一个 click）。
+					//
+					// 为什么必须补：只派发 pointerdown、既不 pointerup 也不 click，
+					// 这条事件流任何真实输入管线都不会产生 —— 真机上一次点按是
+					//     pointerdown → touchstart → pointerup → touchend → mousedown → mouseup → click
+					// （顺序与实测见 scratch/t76/report.md 2.1 节；注意兼容 mousedown 在抬手之后）。
+					// 而 T76 起 hook 用「手势是否收尾」区分新手势/同手势，收尾信号就是 click。
+					// 不补 click ⇒ 本探针里 9 次 down 全被算成同一次手势的后续落指，
+					// 于是 onDown 里的 clearUserFocusWindow() 不再触发，
+					// 那条 focus-arm-window-closed-by-disarm-timer 会因为「窗口还活着」而红 ——
+					// 而它要测的是「500ms 定时器把窗口关掉」，与手势划分毫无关系。
+					//
+					// 这不是把断言放宽：补 click 后每一步都回到「一次 down = 一次新手势」，
+					// f5 那一步照样先 clearUserFocusWindow()，断言测的仍然是
+					// 「布防 500ms 后窗口确实关着 ⇒ 程序化 focus 被收回」。
+					// 基线 hook 与 T76 hook 都必须绿（两臂实测见 scratch/t76/report.md 5 节）。
+					el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+				}
+				// T64：造一个「会打开命令面板的非可编辑触发器」。必须是 host 的**兄弟**
+				// （放在工具条 row 上），与 f1 的理由相同：塞进输入区会被 isEditablePoint()
+				// 判成可编辑落点，就走不到布防分支，测的就不是「选择器往返」了。
+				function trigger2() {
+					var h = mk('div', { 'data-composer-card': 'true', id: 't64-trg-card' });
+					var c = mk('div', { 'data-composer-input': 'true', id: 't64-trg-wrap' }, h);
+					c.textContent = 't64trg';
+					var r = mk('div', { 'data-dshr-composer-row': 'true' }, h);
+					var b = mk('button', { 'data-dshr-composer-model': 'true' }, r);
+					b.textContent = 'M';
+					return b;
 				}
 				var out = {};
 				var fin = 0;
@@ -1216,6 +1314,73 @@ try {
 					});
 				} catch (ignoredRestoreContains) { /* 留着也不影响收尾 */ }
 
+				// ── T64：文件选择器往返（选完文件返回**不得**弹键盘）────────────────────
+				//
+				// 产品口径：只有「用户主动点输入框」才允许弹键盘；选完文件返回不是这种手势。
+				// T58 在**发布包**上实测到「选择器返回、芯片出现 ⇒ mInputShown false→true」。
+				// T64 在 rc.2.5 真机（debug 包 + CDP + dumpsys）复跑同一链路，
+				// 终态 mInputShown=false、芯片正常出现 ⇒ 该跳已符合口径
+				// （机制：选择器把页面切后台时 visibilitychange 收掉放行窗口与布防，
+				//   见 bindFocusGuard 的 onVisibility；rc.2.5 已含 T51/T52 这两轮收口）。
+				//
+				// 这里把这条口径钉成**行为断言**，因为它一旦回退，肉眼要连点四层
+				// （＋ → File → 系统选择器 → 选文件）才看得见，且极易被误读成"偶发"。
+				//
+				// f10：模拟一次真实的「选择器往返」—— 页面 hidden 再 visible。
+				//      关键判据：回来之后官方那次 focus() **拿不到** inputmode=none 的保护，
+				//      也**不在** 800ms 放行窗口内 ⇒ 必须被粘性抑制收回（焦点不落在 composer 上）。
+				//      ⚠️ 必须用**没被 MutationObserver 盯上**的新树（同 f7 的理由）：
+				//      否则观察者会在写属性的微任务里顺手把活干完，这条就成假牙。
+				host3.remove();
+				var host4 = mk('div', { 'data-composer-card': 'true', id: 't64-card' });
+				var wrap4 = mk('div', { 'data-composer-input': 'true', id: 't64-wrap' }, host4);
+				// ⚠️ class 是**承重**的，不是装饰：粘性抑制按 focusIdentity() 的**稳定签名**登记，
+				// 而签名 = tag|role|contenteditable|稳定标记|前两个 class。f8/f9 的 ta1/ta2 是
+				// 裸 textarea，签名同为 "textarea||||"。若 ta4 也不带 class，它会**继承**
+				// f8/f9 留下的粘性抑制 ⇒ 基线探针永远拿不到焦点（假阴性），整条断言永远红。
+				// 给一个独有的 class 让签名分离 —— 这也正是官方 composer「被重渲染换掉节点实例
+				// 仍认得出来」的那套机制（mobile-web.js:1531 focusIdentity 注释）。
+				var ta4 = mk('textarea', { id: 't64-ta', class: 't64field' }, wrap4);
+				// ⚠️ 千万别对 wrap4 写 textContent：textContent 赋值会**清空所有子节点**，
+				// ta4 会被当场摘出文档 ⇒ focus() 变成空操作 ⇒ f10/f11 判据全部失去意义
+				// （第一版就踩了这个：f10 因为「焦点当然拿不到」而假绿，f11 因为同一个原因假红）。
+				// 内容写在 ta4 自己身上，与 f8/f9 的 ta1/ta2 形态保持一致。
+				ta4.value = 't64';
+				out.f10WrapIsFirst = document.querySelector('[data-composer-input]') === wrap4;
+				out.f10TaInDoc = document.getElementById('t64-ta') === ta4;
+				// ⚠️ 这里**故意没有**「先无手势 focus() 一次当基线」这一步。
+				// 守卫的设计就是：focusin 落在可编辑元素上、且不在用户放行窗口内 ⇒ 一律收回
+				// （mobile-web.js:1694-1695）。所以「无手势的基线聚焦」在守卫活着时
+				// **永远拿不到焦点**——第一版把它当前置，拿到的是假阴性（f10 永远红），
+				// 而它证明不了任何事。真正的「这棵树可聚焦」证据是 f11：
+				// 同一个元素、同一个时刻，**带手势**就能聚焦。两者构成双向差分。
+				// 布防态起步：模拟「点 + 之后面板开着、composer 被打上 inputmode=none」。
+				down(trigger2());
+				out.f10ArmedInputmode = wrap4.getAttribute('inputmode');
+				// 往返：hidden → visible（选择器就是这样一个原生 Activity）。
+				setVis('hidden');
+				document.dispatchEvent(new Event('visibilitychange'));
+				out.f10AfterHideInputmode = wrap4.getAttribute('inputmode');
+				setVis('visible');
+				document.dispatchEvent(new Event('visibilitychange'));
+				await sleep(60);
+				out.f10AfterShowInputmode = wrap4.getAttribute('inputmode');
+				// 官方在 change 之后抢焦点（这一步在真机上就是"键盘自动弹起"的来源）。
+				ta4.focus();
+				await sleep(40);
+				out.f10OfficialFocusDenied = document.activeElement !== ta4;
+				out.f10ActiveAfterReturn = document.activeElement ? document.activeElement.id : 'null';
+				// f11：对照 —— 用户**真的**再点一次输入框，必须能拿到焦点（键盘才弹得出来）。
+				//      这条是 f10 的反向牙齿：防止"为了不弹键盘把真点击也一起关掉"。
+				//      走完整的 pointerdown 路径（onDown 里会 clearFocusSticky + 开放行窗口）。
+				down(ta4);
+				ta4.focus();
+				await sleep(40);
+				out.f11UserTapGetsFocus = document.activeElement === ta4;
+				out.f11ActiveAfterUserTap = document.activeElement ? document.activeElement.id : 'null';
+				setVis('visible');
+
+				host4.remove();
 				host3.remove(); panel.remove(); neutral.remove();
 				out.focusinCount = fin;
 				out.docHasFocus = document.hasFocus();
@@ -1306,6 +1471,139 @@ try {
 	});
 	await wait(500);
 	const tabletOpen = await viewportProbe();
+
+	// ── T56：document-start 注入的行为级断言（半装守卫竞态）──
+	//
+	// 承重场景：原生在 onPageStarted 注入 mobile.js，那一刻 documentElement 可能还不存在。
+	// 旧形态（守卫第一行无条件置位 + 裸调 appendChild）在这里必然抛
+	// 「Cannot read properties of null (reading 'appendChild')」且**守卫已置位**，
+	// 于是 hook 永远装不上 ⇒ 界面退回官方桌面布局、鲸鱼消失。
+	//
+	// 怎么把这一刻造出来：Page.addScriptToEvaluateOnNewDocument —— 它在**任何**页面脚本
+	// 之前、新文档刚建好时执行，此刻 document.readyState === 'loading' 且
+	// document.documentElement === null，正是 onPageStarted 的等价时序
+	// （Android WebView 上这条命令不执行，T28 已实测过，所以这里用桌面 Chrome 做等价构造）。
+	// 注入内容按原生 injectMobileAdaptation 的顺序：先写档位配置，再跑 mobile.js 本体。
+	const docStartExceptions = [];
+	ws.addEventListener("message", (event) => {
+		let msg;
+		try {
+			msg = JSON.parse(String(event.data));
+		} catch {
+			return;
+		}
+		if (msg.method === "Runtime.exceptionThrown") {
+			docStartExceptions.push(String(msg.params?.exceptionDetails?.exception?.description || "").slice(0, 200));
+		} else if (msg.method === "Log.entryAdded" && msg.params?.entry?.level === "error") {
+			docStartExceptions.push("log[error] " + String(msg.params.entry.text).slice(0, 200));
+		}
+	});
+	// 注入载荷：与原生一致——档位配置先行，然后 mobile.js 本体。
+	// 取「单一源」那份（WEB-02 已断言它与 res/raw 字节级相同）。
+	const hookSrc = readFileSync(join(ROOT, "packages/gateway/assets/mobile-web.js"), "utf8");
+	const injectedPayload =
+		"window.__DSHR_MOBILE__ = Object.assign(window.__DSHR_MOBILE__ || {}, { device: 'phone' });\n" + hookSrc;
+	// 故意注册**两份**一模一样的 document-start 载荷：同一次导航里被注入两次，
+	// 正是原生 onPageStarted + onPageCommitVisible 连着来的形态。
+	// 它同时验证 Pending 去重——两次都撞上 documentElement=null 时只能排一份重启。
+	const ids = [];
+	for (let i = 0; i < 2; i++) {
+		const added = await call("Page.addScriptToEvaluateOnNewDocument", { source: injectedPayload });
+		ids.push(added && added.identifier);
+	}
+	await call("Runtime.enable");
+	await call("Log.enable");
+	await call("Emulation.setDeviceMetricsOverride", {
+		width: 390,
+		height: 844,
+		deviceScaleFactor: 2,
+		mobile: true,
+		screenOrientation: { type: "portraitPrimary", angle: 0 },
+	});
+	await call("Page.navigate", { url: `${noHookUrl}?t56=docstart` });
+	await wait(2500);
+	// 兜住：若 hook 压根没装上，fixture 的 waitAndRun 会一直等 `__dshRemoteMobileInstalled`，
+	// collectSelftest 就会抛「自测页未写出 window.__dshrSelftest」。
+	// 那种情况**正是** T56 要抓的失败——必须变成一条命名的红断言并把后面几条继续跑完，
+	// 而不是让整个 harness 抛异常中断（那样拿不到任何可读的判据）。
+	const docStartProbe = await collectSelftest(call).catch((err) => ({
+		ok: false,
+		checks: [],
+		error: String((err && err.message) || err),
+	}));
+	const docStartFacts = await call("Runtime.evaluate", {
+		expression: `(function () {
+			try {
+				var root = document.documentElement;
+				var whale = document.querySelector('[data-dshr-float]');
+				var diag = null;
+				try { diag = typeof window.__dshrMobileDiag === 'function' ? window.__dshrMobileDiag() : null; } catch (e) { diag = 'DIAG_THREW:' + e; }
+				return JSON.stringify({
+					readyState: document.readyState,
+					rootClass: (root && root.className) || '',
+					guard: window.__dshRemoteMobileInstalled === true,
+					api: typeof window.__dshRemoteAndroidMobile,
+					whale: !!whale,
+					whaleVisible: whale ? getComputedStyle(whale).display !== 'none' : false,
+					styleTag: !!document.querySelector('style[data-dshr-mobile-css]'),
+					diagOk: !!diag && typeof diag === 'object',
+					diag: diag
+				});
+			} catch (e) { return JSON.stringify({ evalThrew: String(e) }); }
+		})()`,
+		returnByValue: true,
+	});
+	const docStart = docStartFacts.result && docStartFacts.result.value ? JSON.parse(docStartFacts.result.value) : {};
+
+	// 幂等性（硬要求①）：document-start 装上之后，**再**注入一次同一份本体，
+	// 必须不产生第二份样式、也不重装（style 标签数仍为 1、__dshrMobileDiag 仍可调）。
+	// 幂等性（硬要求①）：document-start 装上之后，**再**注入一次同一份本体，
+	// 必须不产生第二份样式、也不重装（style 标签数仍为 1、__dshrMobileDiag 仍可调）。
+	// 前置条件也钉上：若 document-start 根本没装上，这条会**假绿**
+	// （styleTags=1 只是因为「一直只有 late 注入那一份」），所以要求 before 已是装上态。
+	const beforeRepeat = docStart;
+	await call("Runtime.evaluate", { expression: hookSrc, returnByValue: true });
+	await wait(600);
+	const repeatFacts = await call("Runtime.evaluate", {
+		expression: `(function () {
+			try {
+				return JSON.stringify({
+					styleTags: document.querySelectorAll('style[data-dshr-mobile-css]').length,
+					api: typeof window.__dshRemoteAndroidMobile,
+					whaleCount: document.querySelectorAll('[data-dshr-float]').length,
+					diagOk: typeof window.__dshrMobileDiag === 'function'
+				});
+			} catch (e) { return JSON.stringify({ evalThrew: String(e) }); }
+		})()`,
+		returnByValue: true,
+	});
+	const repeat = repeatFacts.result && repeatFacts.result.value ? JSON.parse(repeatFacts.result.value) : {};
+
+	// 第二条路径：late 注入（文档就绪后 evaluateJavascript，与原生
+	// onPageCommitVisible / onPageFinished / onConfigurationChanged 同一条路）。
+	const latePage = await (async () => {
+		for (const id of ids) {
+			if (id) await call("Page.removeScriptToEvaluateOnNewDocument", { identifier: id }).catch(() => {});
+		}
+		await call("Page.navigate", { url: `${noHookUrl}?t56=late` });
+		await wait(1800);
+		const before = await call("Runtime.evaluate", {
+			expression: `(function(){try{return JSON.stringify({guard:window.__dshRemoteMobileInstalled===true,api:typeof window.__dshRemoteAndroidMobile});}catch(e){return '{}';}})()`,
+			returnByValue: true,
+		});
+		const b = before.result && before.result.value ? JSON.parse(before.result.value) : {};
+		await call("Runtime.evaluate", { expression: injectedPayload, returnByValue: true });
+		await wait(1200);
+		const after = await call("Runtime.evaluate", {
+			expression: `(function(){try{
+				var root=document.documentElement;
+				return JSON.stringify({guard:window.__dshRemoteMobileInstalled===true,api:typeof window.__dshRemoteAndroidMobile,rootClass:(root&&root.className)||'',whale:!!document.querySelector('[data-dshr-float]'),styleTag:!!document.querySelector('style[data-dshr-mobile-css]'),diagOk:typeof window.__dshrMobileDiag==='function'});
+			}catch(e){return '{}';}})()`,
+			returnByValue: true,
+		});
+		return { before: b, after: after.result && after.result.value ? JSON.parse(after.result.value) : {}, ids };
+	})();
+
 	ws.close();
 
 	const extra = [];
@@ -1423,6 +1721,114 @@ try {
 		focusProbe
 			? `injected=${focusProbe.f9ContainsInjected} ancestorWalkAllowed=${focusProbe.f9AncestorWalkAllowed} active=${focusProbe.f9Active}`
 			: "no probe",
+	);
+
+	// ── T64 断言组：文件选择器往返不得弹键盘（产品口径）──
+	//
+	// 承重行 f10：模拟「点 + → File → 系统选择器 → 选文件 → 返回」这一跳。
+	//   选择器是原生 Activity，来回必然触发 visibilitychange；官方在 change 之后
+	//   会把焦点抢回 composer —— 真机上那正是软键盘自动弹起的来源。
+	//   判据是**焦点**：官方那次 focus() 拿不到焦点 ⇒ 不会有新的 showSoftInput。
+	//   依赖的机制：onVisibility 在 hidden 时 clearUserFocusWindow() + disarmComposerFocus()，
+	//   所以 800ms 放行窗口与 inputmode=none 布防都不会活过「离开页面」这段。
+	//   ⇒ 把 onVisibility 的 hidden 分支删掉 ⇒ 窗口/布防残留 ⇒ f10 变红。
+	//
+	// ⚠️ 判据是**双向差分**，且 f10 显式依赖 f11：同一个元素 ta4、同一个页面状态下，
+	//   「官方无手势抢焦点 ⇒ 被收回」而「用户带手势点 ⇒ 拿到焦点」。
+	//   少了 f11 这半个，f10 会退化成「这个元素压根聚焦不了」的同义反复（第一版就踩了：
+	//   用无手势 focus() 当基线，而守卫设计上就永远收回它 ⇒ 假阴性）。
+	extraCheck(
+		"t64-filechooser-return-no-keyboard",
+		focusProbe
+			&& focusProbe.f10WrapIsFirst === true
+			&& focusProbe.f10TaInDoc === true
+			// 前置（来自 f11）：证明 ta4 在同一时刻**带手势能聚焦** ⇒ f10 的「被收回」不是空话。
+			&& focusProbe.f11UserTapGetsFocus === true
+			&& focusProbe.f10ArmedInputmode === "none"
+			&& focusProbe.f10AfterHideInputmode === null
+			&& focusProbe.f10AfterShowInputmode === null
+			&& focusProbe.f10OfficialFocusDenied === true,
+		focusProbe
+			? `taInDoc=${focusProbe.f10TaInDoc} 同元素带手势可聚焦=${focusProbe.f11UserTapGetsFocus} armed=${JSON.stringify(focusProbe.f10ArmedInputmode)} afterHide=${JSON.stringify(focusProbe.f10AfterHideInputmode)} afterShow=${JSON.stringify(focusProbe.f10AfterShowInputmode)} officialFocusDenied=${focusProbe.f10OfficialFocusDenied} active=${JSON.stringify(focusProbe.f10ActiveAfterReturn)}`
+			: "no probe",
+	);
+	// 反向牙齿 f11：用户**主动点**输入框仍必须能拿到焦点（键盘才弹得出来）。
+	//   防止"为了不弹键盘把真点击一起关掉"这种过度修复 —— 那会把 rc.2.5 已有的
+	//   「用户点输入框能打字」（T58 §3.c）悄悄弄没。
+	extraCheck(
+		"t64-user-tap-input-still-focuses",
+		focusProbe && focusProbe.f11UserTapGetsFocus === true,
+		focusProbe
+			? `userTapGetsFocus=${focusProbe.f11UserTapGetsFocus} active=${JSON.stringify(focusProbe.f11ActiveAfterUserTap)}`
+			: "no probe",
+	);
+
+	// ── T56 断言组（document-start 注入）──
+	// 顺序即证据链：先证明场景真的被造出来了（前置），再证明 hook 真的装上了，最后证明没抛。
+	extraCheck(
+		"t56-docstart-scene-is-real",
+		docStart && docStart.readyState === "complete",
+		`readyState=${docStart.readyState}（注入时为 loading/documentElement=null，断言在 load 后取）`,
+	);
+	extraCheck(
+		"t56-docstart-no-exception",
+		docStartExceptions.length === 0,
+		`exceptions=${docStartExceptions.length} ${JSON.stringify(docStartExceptions.slice(0, 3))}`,
+	);
+	extraCheck(
+		"t56-docstart-root-class",
+		typeof docStart.rootClass === "string" && docStart.rootClass.indexOf("dshr-mobile") >= 0,
+		`rootClass=${JSON.stringify(docStart.rootClass)}`,
+	);
+	extraCheck(
+		"t56-docstart-whale",
+		docStart.whale === true && docStart.whaleVisible === true,
+		`whale=${docStart.whale} visible=${docStart.whaleVisible}`,
+	);
+	extraCheck(
+		"t56-docstart-style-mounted",
+		docStart.styleTag === true,
+		`styleTag=${docStart.styleTag}`,
+	);
+	extraCheck(
+		"t56-docstart-api-exported",
+		docStart.api === "object",
+		`typeof __dshRemoteAndroidMobile=${docStart.api}`,
+	);
+	extraCheck(
+		"t56-docstart-diag-callable",
+		docStart.diagOk === true,
+		`__dshrMobileDiag()=${JSON.stringify(docStart.diag).slice(0, 220)}`,
+	);
+	// 幂等性（硬要求①）：document-start 装上后重复注入同一份本体，不得叠第二份。
+	extraCheck(
+		"t56-idempotent-after-docstart",
+		beforeRepeat && beforeRepeat.api === "object" && beforeRepeat.styleTag === true
+			&& repeat.styleTags === 1 && repeat.api === "object" && repeat.diagOk === true,
+		`beforeInstalled=${!!(beforeRepeat && beforeRepeat.api === "object")} styleTags=${repeat.styleTags} whaleCount=${repeat.whaleCount} api=${repeat.api} diagOk=${repeat.diagOk} (before rootClass=${JSON.stringify(beforeRepeat.rootClass)})`,
+	);
+	// 第二条路径：late 注入也必须装得上（硬要求②）。
+	extraCheck(
+		"t56-late-path-installs",
+		latePage.before.guard === false
+			&& latePage.after.guard === true
+			&& latePage.after.api === "object"
+			&& typeof latePage.after.rootClass === "string"
+			&& latePage.after.rootClass.indexOf("dshr-mobile") >= 0
+			&& latePage.after.whale === true
+			&& latePage.after.styleTag === true
+			&& latePage.after.diagOk === true,
+		`before=${JSON.stringify(latePage.before)} after=${JSON.stringify(latePage.after)}`,
+	);
+	// 行为级：fixture 自测在 document-start 注入下也全绿（版面能力未因推迟启动而丢）。
+	extraCheck(
+		"t56-docstart-selftest-green",
+		docStartProbe && docStartProbe.ok === true,
+		docStartProbe
+			? docStartProbe.error
+				? `自测页没写出结果：${docStartProbe.error}（hook 很可能压根没装上）`
+				: `ok=${docStartProbe.ok} checks=${(docStartProbe.checks || []).filter((c) => !c.ok).length} 项红: ${JSON.stringify((docStartProbe.checks || []).filter((c) => !c.ok).map((c) => c.name).slice(0, 6))}`
+			: "no report",
 	);
 
 	console.log("  -- Chrome 390 视口 --");

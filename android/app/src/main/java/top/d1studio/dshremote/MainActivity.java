@@ -32,6 +32,7 @@ import android.view.DisplayCutout;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsAnimation;
 import android.view.WindowManager;
@@ -163,19 +164,51 @@ public class MainActivity extends Activity {
 	private String editingProfileId = "";
 	private WebView webView;
 	private ValueCallback<Uri[]> fileCallback;
+	/**
+	 * T78：主界面可见的重连状态横幅（原生覆盖条）。与 WebView 同级、{@code layout_gravity=top}，
+	 * 页面 DOM 一个字节都不写 ⇒ 手机档 / 平板档同一条路径，平板档天然零痕迹。
+	 * 状态信号来自**只读** {@code evaluateJavascript} 探针（{@link ReconnectBanner#PROBE_JS}），
+	 * 不依赖 hook，也不读 hook 的诊断载荷。
+	 */
+	private ReconnectBanner.Bar reconnectBanner;
+	/**
+	 * T78：防抖状态机（连续 2 次真才显示 / 连续 3 次假才隐藏 / UNKNOWN 不计数）。
+	 * **只允许经 {@link #hideReconnectBannerNow()} 清零**，避免上一页的累计带到新页面。
+	 */
+	private final ReconnectBanner.Debouncer reconnectDebounce = new ReconnectBanner.Debouncer();
+	/** T78：轮询是否在推进（onResume 起、onPause 停）。 */
+	private boolean reconnectPolling = false;
+	/**
+	 * T78：系统栏/挖孔/任务栏的逐方向并集（px）。T72 的平板让位与 T78 的横幅外边距
+	 * **共用这一份取值**，不各自算一套——否则两处会各自漂移。
+	 */
+	private final int[] systemBarInsetsPx = new int[4];
 	/** 当前 WebView 加载的远端地址；本地启动壳不参与证书与同源判断。 */
 	private String activeUrl = "";
 	/** 从会话进入连接设置时暂存，用于「返回会话」而不必重连。 */
 	private String resumeUrl = "";
 	private boolean canResumeSession = false;
 	/**
-	 * 本次连接设置页是不是「平板档 + 会话根返回键」进来的（D6.1）。为 true 时设置页的
-	 * 返回键退到后台而不是回会话——否则平板档下「会话根 → 设置 → 返回 → 会话 → 返回 →
+	 * 本次连接设置页是不是「会话根返回键」进来的（D6.1）。为 true 时设置页的
+	 * 返回键退到后台而不是回会话——否则「会话根 → 设置 → 返回 → 会话 → 返回 →
 	 * 设置」死循环，用返回键退不出 App。一次性消费：退后台那一刻立即清零，任何离开设置页
 	 * 的路径也都经 clearResumeSession() 清零，故再次进入会话/设置不会残留。
-	 * 手机档永不置位（唯一置位点在 finishWebBack() 的 isTabletClass() 分支内）。
+	 *
+	 * <p><b>T65：置位点从「平板档」放宽到「任意档位」</b>。改前唯一置位点在
+	 * {@code finishWebBack()} 的 {@code if (isTabletClass())} 分支内 ⇒ 手机档恒为 false
+	 * ⇒ 手机档会话根按返回键落到 {@code moveTaskToBack(true)} 直接退到桌面，而设置页文案
+	 * 却在承诺「点上方「返回当前会话」或系统返回键继续」⇒ <b>行为与承诺不一致</b>
+	 * （T48/T58/T59 三轮都踩到同一个现象：会话页里按返回键直接回桌面）。
+	 * 现在两档一致：会话根按返回键 → 连接设置页（隧道/会话活性保持），
+	 * 设置页再按一次才退到后台。平板档语义（D6.1）**逐字不变**，
+	 * 只是手机档从此也适用同一套判据。
 	 */
 	private boolean settingsViaBackKey = false;
+	/**
+	 * 当前页面状态。**只允许通过 {@link #setUiState(UiState)} 写入**：
+	 * 平板档的系统栏让位绑在这个跃迁上（见 setUiState 的注释），直接赋值会漏掉让位重算。
+	 * 字段初始化是唯一例外（那时还没有 WebView，setUiState 的门禁本来也会直接返回）。
+	 */
 	private UiState uiState = UiState.BOOTSTRAP;
 	/** 每次重新配置/断开都递增，过期的隧道等待线程不得再打开旧页面。 */
 	private int connectionGeneration = 0;
@@ -325,6 +358,10 @@ public class MainActivity extends Activity {
 	@Override
 	protected void onPause() {
 		super.onPause();
+		// T78：退后台即停轮询并立即收起横幅——后台不该留一条"重新连接中"，
+		// 也不该继续每 500ms 往页面里跑只读探针。
+		stopReconnectPolling();
+		hideReconnectBannerNow();
 		CookieManager.getInstance().flush();
 		// PERF-03：退后台即挂起 WebView 渲染与全 WebView JS 定时器（含 DSH 的
 		// token 流 MutationObserver/rAF、mobile.js 通知扫描），让射频/CPU 能睡；
@@ -353,6 +390,14 @@ public class MainActivity extends Activity {
 	protected void onResume() {
 		super.onResume();
 		appInForeground = true;
+		// T72：平板档系统栏让位的最后一层兜底。insets listener（2342 附近）已覆盖
+		// 任务栏显隐/导航模式/旋转，但「冷启动 + 后台期间状态变化」这条路上未必有新 insets
+		// 事件；这里 post 一次重算（幂等，成本一次 setPadding），保证冷启动首帧就避让。
+		if (rootLayout != null) rootLayout.post(this::applyDeviceClassInsets);
+		// T78：横幅的四向外边距与平板让位同源同值，回前台补算一次（幂等）。
+		if (rootLayout != null) rootLayout.post(this::applyReconnectBannerInsets);
+		// T78：回前台重启重连状态轮询（onPause 停掉的那条）。
+		startReconnectPolling();
 		// PERF-03：与 onPause 成对恢复；在 WEB 态补一次 inset/注入（暂停期间
 		// 键盘/旋转事件可能漏掉），已有 resumeLiveSession 保证不断整页重载。
 		if (webView != null) {
@@ -403,6 +448,9 @@ public class MainActivity extends Activity {
 		// AND-03/AND-06：先关统一线程池——中断在途的隧道就绪轮询与返回会话探测，
 		// 等待轮询线程不再持有 Activity 空转。
 		destroyed = true;
+		// T78：停掉重连状态轮询并摘掉横幅引用（rootLayout 随 Activity 一起销毁）。
+		stopReconnectPolling();
+		reconnectBanner = null;
 		bgExecutor.shutdownNow();
 		// T23-B：frpc 就绪回调是静态字段且持有本 Activity，销毁即注销
 		//（正常路径由 waitAndOpen 的 finally 注销，这里兜底重建/异常路径）。
@@ -953,7 +1001,7 @@ public class MainActivity extends Activity {
 		awaitingCertificateDecision = false;
 		dismissPendingHttpAuth();
 		clearResumeSession();
-		uiState = UiState.HOME;
+		setUiState(UiState.HOME);
 		activeUrl = "";
 		directTarget = "";
 		refreshProfileCards();
@@ -987,17 +1035,20 @@ public class MainActivity extends Activity {
 			clearResumeSession();
 		}
 		if (webView != null) webView.setVisibility(View.GONE);
-		uiState = UiState.HOME;
+		setUiState(UiState.HOME);
 		refreshProfileCards();
 		refreshDirectNodes();
 		if (resumeSessionBtn != null) {
 			resumeSessionBtn.setVisibility(canResumeSession ? View.VISIBLE : View.GONE);
 		}
 		if (tvTunnelState != null && canResumeSession) {
-			// D6.1：平板档由返回键进入时，返回键 = 退到后台（不回会话，否则死循环），
+			// D6.1：由返回键进入设置时，返回键 = 退到后台（不回会话，否则死循环），
 			// 这时不能再承诺「系统返回键继续」——只承诺上方按钮。其余入口（通知动作 /
-			// 长按鲸鱼 / 手机档）返回键确实回会话，原文案成立。
-			tvTunnelState.setText(settingsViaBackKey && isTabletClass()
+			// 长按鲸鱼等）返回键确实回会话，原文案成立。
+			// T65：判据从 `settingsViaBackKey && isTabletClass()` 收窄为 `settingsViaBackKey`
+			// —— 置位点已放宽到任意档位（见字段注释），再加 isTabletClass() 会让手机档
+			// 重新落进「承诺系统返回键、实际退桌面」的旧坑，正是本任务要修的那条。
+			tvTunnelState.setText(settingsViaBackKey
 				? "隧道仍在运行。点上方「返回当前会话」继续，无需重新连接。"
 				: "隧道仍在运行。点上方「返回当前会话」或系统返回键继续，无需重新连接。");
 		}
@@ -1016,6 +1067,10 @@ public class MainActivity extends Activity {
 	 * 分两段而不是揉进 {@link #formatUiDiag}：那份载荷字段集合被 test:device 全等钉死
 	 * （9 字段 + ts），原生这段不属于 hook 契约，揉进去会破坏那条断言。
 	 * 这样用户远程复现一次后，回设置页看一眼就能告诉我们卡在选择器链路的哪一环。
+	 *
+	 * <p>T60：第三段接上 {@link PinnedFetch#statsSummary()}（并发峰值/排队/拒绝/累计字节），
+	 * 同样只读、无新增可点控件。刻意做成**独立一段**而不是揉进 {@link #formatUiDiag}：
+	 * 后者的载荷字段集合被 test:device 全等钉死。
 	 */
 	private void refreshUiDiagLine() {
 		if (tvUiDiag == null) return;
@@ -1026,7 +1081,18 @@ public class MainActivity extends Activity {
 		String chooser = TextUtils.isEmpty(chooserDiag)
 			? "文件选择：未选择过"
 			: "文件选择：" + chooserDiag;
-		tvUiDiag.setText(base + "\n" + chooser);
+		// T60：PinnedFetch 那一行（只读纯文本，与上面两段同一 TextView、同样不新增控件）。
+		// 「并发峰值 / 排队 / 拒绝 / 本次累计字节」四项是并发闸门唯一能被用户
+		// 自证的证据——没它们就只能翻 logcat（远程场景下用户拿不到）。
+		// 计数器在后台线程变，这里只在刷新时读一次，不做主动推送。
+		//
+		// T65：追加两段——落盘缓存的命中/取回/淘汰，以及**未拦**计数。
+		// 后者是「/api 与主文档没被接管」的唯一用户自证：远程场景下用户拿不到 logcat，
+		// 而这恰恰是最该被怀疑的一处（拦错 = 白屏 / 登录态坏掉）。
+		// 同样只读纯文本、同样不新增可点控件，formatUiDiag 的载荷契约一个字没动。
+		tvUiDiag.setText(base + "\n" + chooser + "\n" + PinnedFetch.statsSummary()
+			+ "\n" + StaticDiskCache.statsSummary()
+			+ "\n" + staticPassthroughSummary());
 	}
 
 	/**
@@ -1114,7 +1180,7 @@ public class MainActivity extends Activity {
 		// 直连不依赖本地 FRP 端口；保留现有文档，不因端口未开而整页重连。
 		if (!TextUtils.isEmpty(directTarget)) {
 			activeUrl = target;
-			uiState = UiState.WEB;
+			setUiState(UiState.WEB);
 			hideSettings();
 			webView.setVisibility(View.VISIBLE);
 			if (!isSessionUrl(webView.getUrl())) webView.loadUrl(target);
@@ -1138,7 +1204,7 @@ public class MainActivity extends Activity {
 					return;
 				}
 				activeUrl = target;
-				uiState = UiState.WEB;
+				setUiState(UiState.WEB);
 				if (homeScroll != null) homeScroll.setVisibility(View.GONE);
 				if (setupScroll != null) setupScroll.setVisibility(View.GONE);
 				webView.setVisibility(View.VISIBLE);
@@ -1154,7 +1220,7 @@ public class MainActivity extends Activity {
 	private void showEditor(ProfileStore.Profile existing) {
 		awaitingCertificateDecision = false;
 		dismissPendingHttpAuth();
-		uiState = UiState.EDIT;
+		setUiState(UiState.EDIT);
 		if (existing == null) {
 			editingProfileId = "";
 			etName.setText("");
@@ -1305,7 +1371,7 @@ public class MainActivity extends Activity {
 		activeUrl = "";
 		awaitingCertificateDecision = false;
 		dismissPendingHttpAuth();
-		uiState = nextState;
+		setUiState(nextState);
 		pageDark = isSystemDark();
 		edgeToEdgeChrome = true;
 		webView.setBackgroundColor(shellColor(R.color.shell_background));
@@ -1653,6 +1719,17 @@ public class MainActivity extends Activity {
 			? ("http".equals(targetUri.getScheme()) ? 80 : 443)
 			: targetUri.getPort();
 		connectStartMs = System.currentTimeMillis();
+		// T60：一轮新连接尝试 = PinnedFetch 全部计数器的唯一清零点。
+		// 这样「首连（全部子资源都要走可信链）」与「二次进入（warm、几乎 0 传输）」
+		// 的差别能直接在这行诊断里读出来，不用去翻 logcat。
+		PinnedFetch.resetStats();
+		// T65：落盘缓存与「未拦」计数器同一零点（同一行注释的理由）。
+		StaticDiskCache.resetStats();
+		passthroughMainDoc.set(0);
+		passthroughApi.set(0);
+		passthroughOther.set(0);
+		passthroughNonGet.set(0);
+		passthroughOrigin.set(0);
 		// 一轮新的连接尝试 = 失败标记的唯一清零点。「重新连接」也走这里，故
 		// 重试不会被上一轮的失败标记挡住；而同一次尝试内 showGatewayFailure 换出的
 		// 失败壳不得清它，否则紧随的 onPageFinished 又会把错误页判成会话页。
@@ -1788,6 +1865,13 @@ public class MainActivity extends Activity {
 	 * SW 子资源的可信取数（见 PinnedFetch 类注释：这是 SW 唯一能拿到字节的路）。
 	 * 只处理**当前网关**自己的 host:port，别的一律放行。返回 null = 放行原路径。
 	 * 回调在后台线程，阻塞取数是允许的（SW 本来就在等这次响应）。
+	 *
+	 * <p><b>T65</b>：这一条通道会**先查 App 私有目录的落盘缓存**。原因见
+	 * {@link #interceptStaticAsset} 的注释——SW 一旦激活就接管全部子资源，
+	 * {@code WebViewClient.shouldInterceptRequest} 根本不会被调用；只改 WebViewClient
+	 * 那一侧的话，落盘写进去了却**永远读不到**，「第二次进入」仍要全量重下。
+	 * 两条通道共用同一个 {@link StaticDiskCache}，所以首屏那份字节在哪条路上被要，
+	 * 都在另一条路上命中。
 	 */
 	private WebResourceResponse fetchForServiceWorker(String url) {
 		String host = activeGatewayHost;
@@ -1799,34 +1883,210 @@ public class MainActivity extends Activity {
 		int reqPort = uri.getPort() == -1 ? 443 : uri.getPort();
 		if (!host.equalsIgnoreCase(reqHost) || port != reqPort) return null;
 
-		final CertPin.Store store = new CertPin.Store() {
+		// T65：只有白名单静态资源才查盘。/api/*、/favicon.svg、SW 脚本等照旧走可信链取数。
+		if (isStaticCachePath(uri.getPath() == null ? "" : uri.getPath())) {
+			StaticDiskCache.Hit hit = StaticDiskCache.get(staticCacheDir(), url);
+			if (hit != null) {
+				Log.i("dshr-perf", "swIntercept 落盘命中 bytes=" + hit.body.length + " url=" + url);
+				// 这里**不能**用 no-store：SW 正是靠 cache-control 决定要不要
+				// 把这条响应写进自己的 CacheStorage，抹掉会让该缓存的不缓存。
+				return webResourceResponse(hit.contentType, hit.cacheControl, hit.body, false);
+			}
+			PinnedFetch.Result r = PinnedFetch.get(url, host, port, activeProfileId, certPinStore(), "sw");
+			if (r == null) return null;
+			StaticDiskCache.noteFetched(r.body.length);
+			StaticDiskCache.put(staticCacheDir(), url, r.body, r.contentType, r.cacheControl);
+			Map<String, String> h = new HashMap<String, String>();
+			if (r.contentType != null) h.put("Content-Type", r.contentType);
+			if (r.cacheControl != null) h.put("Cache-Control", r.cacheControl);
+			Log.i("dshr-perf", "swIntercept 可信链供给子资源 bytes=" + r.body.length
+				+ " mime=" + r.contentType + " url=" + url);
+			return webResourceResponse(r.contentType, r.cacheControl, r.body, false);
+		}
+
+		PinnedFetch.Result r = PinnedFetch.get(url, host, port, activeProfileId, certPinStore(), "sw");
+		if (r == null) return null;
+		Log.i("dshr-perf", "swIntercept 可信链供给子资源 bytes=" + r.body.length
+			+ " mime=" + r.contentType + " url=" + url);
+		return webResourceResponse(r.contentType, r.cacheControl, r.body, false);
+	}
+
+	// ───────────────────── T65：首屏静态资源落盘（WebViewClient 侧） ─────────────────────
+
+	/**
+	 * T65 静态白名单：<b>只有这两个前缀</b>的 GET 会被接管。
+	 *
+	 * <p>与浏览器侧 {@code pwa.ts} 的白名单同源但**更窄**：那边是
+	 * 「扩展名正则 + {@code /plugins/}」，这边只用两个前缀。理由是这一条通道
+	 * 走的是 {@link PinnedFetch}（每条都要过证书 pin 与并发闸门），把判据收到
+	 * 「构建产物只有这两个目录」这种程度，比维护一份正则更不容易漂。
+	 *
+	 * <p>刻意**不**包含：{@code /}（主文档，必须永远新鲜——它是唯一说出新版资源 URL 的地方，
+	 * 见 {@code pwa.ts} 的 T63 注释）、{@code /api/*}（动态面：认证/配对/会话列表/工作区）、
+	 * {@code /__dsh_remote__/*}（App 本地供给的 SW 脚本，不经网络）、
+	 * {@code /favicon.svg} 等其余路径（数量小、不在首屏关键路径上，交给浏览器侧缓存）。
+	 */
+	private static final String[] STATIC_CACHE_PREFIXES = {"/assets/", "/plugins/"};
+
+	/** 落盘目录名（相对 {@code getFilesDir()}）。 */
+	private static final String STATIC_CACHE_DIR = "static-cache";
+
+	private File staticCacheDir;
+	// 放行计数器：用来**证明**没拦到不该拦的东西（验收项 4）。非白名单一律回 0。
+	private final java.util.concurrent.atomic.AtomicInteger passthroughMainDoc =
+		new java.util.concurrent.atomic.AtomicInteger();
+	private final java.util.concurrent.atomic.AtomicInteger passthroughApi =
+		new java.util.concurrent.atomic.AtomicInteger();
+	private final java.util.concurrent.atomic.AtomicInteger passthroughOther =
+		new java.util.concurrent.atomic.AtomicInteger();
+	private final java.util.concurrent.atomic.AtomicInteger passthroughNonGet =
+		new java.util.concurrent.atomic.AtomicInteger();
+	private final java.util.concurrent.atomic.AtomicInteger passthroughOrigin =
+		new java.util.concurrent.atomic.AtomicInteger();
+
+	private File staticCacheDir() {
+		if (staticCacheDir == null) {
+			File d = new File(getFilesDir(), STATIC_CACHE_DIR);
+			if (!d.isDirectory()) //noinspection ResultOfMethodCallIgnored
+				d.mkdirs();
+			staticCacheDir = d;
+		}
+		return staticCacheDir;
+	}
+
+	/** 设置页那行只读诊断里的放行计数（纯展示，无点击）。 */
+	private String staticPassthroughSummary() {
+		return "未拦 主文档 " + passthroughMainDoc.get() + " · /api " + passthroughApi.get()
+			+ " · 非白名单 " + passthroughOther.get() + " · 非GET " + passthroughNonGet.get()
+			+ " · 非本网关 " + passthroughOrigin.get();
+	}
+
+	/**
+	 * T65 主逻辑。返回 {@code null} = **放行**，交回 WebView 自己的网络栈
+	 * （与改动前逐字节同构）。
+	 *
+	 * <p>顺序刻意是「便宜的判定在前」：方法 → 主框架 → origin → 路径白名单。
+	 * 前三道任何一道不过就记账并放行，<b>绝不</b>因为判据拿不准就去猜。
+	 *
+	 * <p>WS 升级：{@code shouldInterceptRequest} 只对 http(s) 子资源回调，
+	 * 且 WS 走的是 {@code Upgrade:} 握手而非 GET；即便将来有非 GET 进来，
+	 * {@code passthroughNonGet} 那道也先把它放行了。
+	 */
+	private WebResourceResponse interceptStaticAsset(WebResourceRequest request) {
+		if (request == null || request.getUrl() == null) return null;
+		Uri uri = request.getUrl();
+		String path = uri.getPath() == null ? "" : uri.getPath();
+
+		// ① 只 GET。POST/PUT/HEAD 一律放行。
+		if (!"GET".equalsIgnoreCase(request.getMethod())) {
+			passthroughNonGet.incrementAndGet();
+			return null;
+		}
+		// ② 主框架（主文档）永不落盘：它必须永远新鲜。
+		if (request.isForMainFrame()) {
+			passthroughMainDoc.incrementAndGet();
+			return null;
+		}
+		// ③ 只当前网关自己的 origin，且只 https（PinnedFetch 只走 HttpsURLConnection）。
+		String host = activeGatewayHost;
+		int port = activeGatewayPort;
+		if (host.isEmpty() || port <= 0 || !"https".equals(uri.getScheme())) {
+			passthroughOrigin.incrementAndGet();
+			return null;
+		}
+		String reqHost = uri.getHost() == null ? "" : uri.getHost();
+		int reqPort = uri.getPort() == -1 ? 443 : uri.getPort();
+		if (!host.equalsIgnoreCase(reqHost) || port != reqPort) {
+			passthroughOrigin.incrementAndGet();
+			return null;
+		}
+		// ④ 动态面与 SW 脚本：显式记账后放行（验收要看到 /api 计数为 0 拦截）。
+		if (path.startsWith("/api/") || path.startsWith("/__dsh_remote__/")) {
+			passthroughApi.incrementAndGet();
+			return null;
+		}
+		// ⑤ 静态白名单（两个前缀）。
+		if (!isStaticCachePath(path)) {
+			passthroughOther.incrementAndGet();
+			return null;
+		}
+
+		// ---- 到这里才接管 ----
+		final String url = uri.toString();
+		File dir = staticCacheDir();
+		// 命中：直接回盘上字节（0 传输）。这正是把「第二次进入」从 ~6.2 MB 打到 ≈0 的那一步。
+		StaticDiskCache.Hit hit = StaticDiskCache.get(dir, url);
+		if (hit != null) {
+			Log.i("dshr-perf", "静态落盘 命中 bytes=" + hit.body.length + " url=" + url);
+			return webResourceResponse(hit.contentType, hit.cacheControl, hit.body, true);
+		}
+		// 未命中：用**既有** PinnedFetch 取（复用它的 MAX_INFLIGHT 闸门、32 MB 硬顶、
+		// 45 s 总量预算与证书 pin 语义），落盘再返回。
+		PinnedFetch.Result r = PinnedFetch.get(url, host, port, activeProfileId, certPinStore(), "page");
+		if (r == null) {
+			// 取不到（未信任/已变更/超时）⇒ 放行，行为与改动前一致。
+			return null;
+		}
+		StaticDiskCache.noteFetched(r.body.length);
+		StaticDiskCache.put(dir, url, r.body, r.contentType, r.cacheControl);
+		Log.i("dshr-perf", "静态落盘 取回并落盘 bytes=" + r.body.length + " mime=" + r.contentType
+			+ " url=" + url);
+		return webResourceResponse(r.contentType, r.cacheControl, r.body, true);
+	}
+
+	/** T65 静态白名单判定（两个前缀）。WebViewClient 与 ServiceWorkerClient 两条通道共用。 */
+	private static boolean isStaticCachePath(String path) {
+		for (String p : STATIC_CACHE_PREFIXES) {
+			if (path.startsWith(p)) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * 由**解压后**字节构造响应。
+	 *
+	 * <p>⚠️ 刻意<b>不</b>声明任何 {@code content-encoding}：{@link PinnedFetch} 已经
+	 * 把 gzip/deflate 解掉了（{@code PinnedFetch.java:237-250}），再声明一次就是让
+	 * WebView 对已解码字节再解一遍 ⇒ 垃圾内容。T60 已经在 SW 那条通道上踩过同一类坑。
+	 *
+	 * @param forceNoStore {@code true} = 走 WebViewClient 那一侧，本目录**就是**这条路
+	 *                     径的缓存，让 WebView 的 HTTP 缓存再存一份只会变成第三份副本
+	 *                     （自签证书下它本来也不落盘，T62 实测 {@code Cache_Data} 仅 32 KB），
+	 *                     并且会把「第二次进入 ≈0 传输」这个结论搅浑。
+	 *                     {@code false} = 走 ServiceWorkerClient 那一侧，<b>必须</b>透传
+	 *                     原始 cache-control：SW 靠它决定「no-cache 响应不进缓存」，
+	 *                     抹掉会让本该穿透的资源被缓存住（T49 原注释的理由，逐字保留）。
+	 */
+	private WebResourceResponse webResourceResponse(String contentType, String cacheControl,
+			byte[] body, boolean forceNoStore) {
+		String mime = "application/octet-stream";
+		String enc = null;
+		if (contentType != null) {
+			String lower = contentType.toLowerCase(Locale.US);
+			int semi = lower.indexOf(';');
+			mime = (semi > 0 ? lower.substring(0, semi) : lower).trim();
+			int cs = lower.indexOf("charset=");
+			if (cs > 0) {
+				enc = contentType.substring(cs + 8).trim();
+				int sp = enc.indexOf(';');
+				if (sp > 0) enc = enc.substring(0, sp).trim();
+			}
+		}
+		Map<String, String> headers = new HashMap<String, String>();
+		if (contentType != null) headers.put("Content-Type", contentType);
+		if (forceNoStore) headers.put("Cache-Control", "no-store");
+		else if (cacheControl != null) headers.put("Cache-Control", cacheControl);
+		return new WebResourceResponse(mime, enc, 200, "OK", headers, new ByteArrayInputStream(body));
+	}
+
+	/** 指纹存储适配器：与 {@link #fetchForServiceWorker} 用的是同一把锁。 */
+	private CertPin.Store certPinStore() {
+		return new CertPin.Store() {
 			@Override
 			public String get(String key) {
 				return prefs().getString(key, null);
 			}
 		};
-		PinnedFetch.Result r = PinnedFetch.get(url, host, port, activeProfileId, store, "sw");
-		if (r == null) return null;
-		Map<String, String> headers = new HashMap<String, String>();
-		if (r.contentType != null) headers.put("Content-Type", r.contentType);
-		// 透传 cache-control：SW 靠它决定「no-cache 响应不进缓存」，
-		// 抹掉会让本该穿透的资源被缓存住。
-		if (r.cacheControl != null) headers.put("Cache-Control", r.cacheControl);
-		String mime = "application/octet-stream";
-		String enc = null;
-		if (r.contentType != null) {
-			String lower = r.contentType.toLowerCase(Locale.US);
-			int semi = lower.indexOf(';');
-			mime = (semi > 0 ? lower.substring(0, semi) : lower).trim();
-			int cs = lower.indexOf("charset=");
-			if (cs > 0) {
-				enc = r.contentType.substring(cs + 8).trim();
-				int sp = enc.indexOf(';');
-				if (sp > 0) enc = enc.substring(0, sp).trim();
-			}
-		}
-		Log.i("dshr-perf", "swIntercept 可信链供给子资源 bytes=" + r.body.length + " mime=" + mime + " url=" + url);
-		return new WebResourceResponse(mime, enc, r.status, "OK", headers, new ByteArrayInputStream(r.body));
 	}
 
 	/**
@@ -1922,6 +2182,24 @@ public class MainActivity extends Activity {
 		});
 		webView.setVisibility(View.GONE);
 		webView.setWebViewClient(new WebViewClient() {
+			/**
+			 * T65：首屏静态资源落盘。
+			 *
+			 * <p>回调在**后台线程**（不是 UI 线程），所以只做字符串判定 + 磁盘 IO +
+			 * 可信取数，<b>绝不碰 UI</b>——与 {@code ServiceWorkerClient} 那条通道同一纪律。
+			 *
+			 * <p>范围被刻意收得很窄：<b>只</b>当前网关 origin + <b>只</b>静态白名单前缀
+			 * + <b>只</b> GET。主文档、{@code /api/*}、WS 升级、非白名单路径一律
+			 * {@code return null} 交回 WebView 自己的网络栈（计数见
+			 * {@link #staticPassthroughSummary()}）。收窄的理由是 T49 踩过的坑：
+			 * 「拦不拦截」与「用什么键存」是必须同批决定的一对，判宽了就会把
+			 * 5 MB 大包喂给只想要 40 KB 的 {@code __ModuleLoader__.load()} ⇒ 白屏。
+			 */
+			@Override
+			public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+				return interceptStaticAsset(request);
+			}
+
 			@Override
 			public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
 				Uri uri = request.getUrl();
@@ -1968,6 +2246,9 @@ public class MainActivity extends Activity {
 
 			@Override
 			public void onPageCommitVisible(WebView view, String url) {
+				// T78：新文档这一刻立即收起横幅并把防抖清零——上一页的"重新连接中"
+				// 一律不许带到新页面（也不许把上一页累计的"连续为真"带过来）。
+				hideReconnectBannerNow();
 				if (Build.VERSION.SDK_INT >= 23) enterSessionPage(view, url);
 			}
 
@@ -2088,6 +2369,213 @@ public class MainActivity extends Activity {
 		});
 		rootLayout.addView(webView,
 			new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+		installReconnectBanner();
+	}
+
+	/**
+	 * T78：把原生重连横幅挂进根布局。
+	 *
+	 * <p>挂在 WebView **之后**（同级、z 序在上）、{@code layout_gravity=top}：
+	 * 只叠与 WebView 无关的一条 View，页面侧零写入。初始 {@code GONE}——
+	 * 不显示时既不占位、也不参与触摸派发。
+	 */
+	private void installReconnectBanner() {
+		if (rootLayout == null || reconnectBanner != null) return;
+		ReconnectBanner.Bar bar = new ReconnectBanner.Bar(this);
+		bar.setId(R.id.dshrReconnectBanner);
+		rootLayout.addView(bar, new FrameLayout.LayoutParams(
+			FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP));
+		reconnectBanner = bar;
+		applyReconnectBannerInsets();
+	}
+
+	/**
+	 * T78：系统栏/挖孔/任务栏的逐方向并集（px）。与 T72 平板让位**同一份取值**。
+	 *
+	 * <p>逐方向并集（T72 / T67 §6.1）。{@code getInsets(mask)} 对 mask 内各来源**逐边取 max**，
+	 * 所以「状态栏在顶」与「状态栏/导航栏在左右」两种形态一次覆盖，不再有竖屏假设：
+	 * <ul>
+	 *   <li>{@code systemBars()} 状态栏 + 导航栏，四个方向都读（横屏落左右也拿得到）；</li>
+	 *   <li>{@code displayCutout()} 挖孔（横屏在左右、竖屏在顶）；</li>
+	 *   <li>{@code tappableElement()} 12L+ 任务栏：部分 ROM 把任务栏报成 tappableElement 而非
+	 *       navigationBars，只认 navigationBars 时 bottom 会恒为 0。</li>
+	 * </ul>
+	 * 取 max 不求和 ⇒ 任务栏与状态栏同时存在时不会重复叠加。
+	 * 注意 mask 里**不含 ime()**：键盘仍只由 applyImeShift 的 translationY 抬页处理。
+	 *
+	 * <p>API 24-29 无 taskbar，按四向取系统栏，**不用 getStableInsetBottom()**：
+	 * stable 在栏隐藏时不收缩，导航栏一隐藏就多垫一块（方向相反的错位）。
+	 */
+	private int[] readSystemBarInsetsPx() {
+		int[] out = systemBarInsetsPx;
+		out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+		if (getWindow() == null) return out;
+		WindowInsets insets = getWindow().getDecorView().getRootWindowInsets();
+		if (insets == null) return out;
+		if (Build.VERSION.SDK_INT >= 30) {
+			Insets all = insets.getInsets(WindowInsets.Type.systemBars()
+				| WindowInsets.Type.displayCutout()
+				| WindowInsets.Type.tappableElement());
+			out[0] = all.left; out[1] = all.top; out[2] = all.right; out[3] = all.bottom;
+		} else {
+			out[0] = insets.getSystemWindowInsetLeft();
+			out[1] = insets.getSystemWindowInsetTop();
+			out[2] = insets.getSystemWindowInsetRight();
+			out[3] = insets.getSystemWindowInsetBottom();
+			if (Build.VERSION.SDK_INT >= 28) {
+				DisplayCutout cut = insets.getDisplayCutout();
+				if (cut != null) {
+					out[0] = Math.max(out[0], cut.getSafeInsetLeft());
+					out[1] = Math.max(out[1], cut.getSafeInsetTop());
+					out[2] = Math.max(out[2], cut.getSafeInsetRight());
+					out[3] = Math.max(out[3], cut.getSafeInsetBottom());
+				}
+			}
+		}
+		return out;
+	}
+
+	/** T78：把系统栏 inset 作为外边距写给横幅 ⇒ 横幅顶边不低于系统栏底边（不压状态栏）。 */
+	private void applyReconnectBannerInsets() {
+		if (reconnectBanner == null) return;
+		int[] i = readSystemBarInsetsPx();
+		reconnectBanner.applySystemBarInsets(i[0], i[1], i[2], i[3]);
+	}
+
+	/** T78：启动重连状态轮询（幂等）。 */
+	private void startReconnectPolling() {
+		if (rootLayout == null || destroyed || reconnectPolling) return;
+		reconnectPolling = true;
+		rootLayout.removeCallbacks(reconnectPollTick);
+		rootLayout.postDelayed(reconnectPollTick, ReconnectBanner.POLL_INTERVAL_MS);
+	}
+
+	/** T78：停止重连状态轮询（幂等）。 */
+	private void stopReconnectPolling() {
+		reconnectPolling = false;
+		if (rootLayout != null) rootLayout.removeCallbacks(reconnectPollTick);
+	}
+
+	/**
+	 * T78：轮询节拍。守卫照抄既有会话页判据（{@code uiState == WEB && webView 可见}）：
+	 * 不满足即立即收起横幅并清零计数，不推进状态机。
+	 */
+	private final Runnable reconnectPollTick = new Runnable() {
+		@Override
+		public void run() {
+			if (destroyed) return;
+			pollReconnectOnce();
+			if (reconnectPolling) rootLayout.postDelayed(this, ReconnectBanner.POLL_INTERVAL_MS);
+		}
+	};
+
+	/** T78：跑一次只读探针。回调里的空值/异常**一律记 UNKNOWN**，既不显示也不累计。 */
+	private void pollReconnectOnce() {
+		if (destroyed) return;
+		if (uiState != UiState.WEB || webView == null || webView.getVisibility() != View.VISIBLE) {
+			hideReconnectBannerNow();
+			return;
+		}
+		try {
+			webView.evaluateJavascript(ReconnectBanner.PROBE_JS, this::handleReconnectProbe);
+		} catch (Exception e) {
+			handleReconnectProbe(null);
+		}
+	}
+
+	/** T78：立即收起横幅并把防抖清零（onPageCommitVisible / 退后台 / 离开会话页）。 */
+	private void hideReconnectBannerNow() {
+		reconnectDebounce.reset();
+		if (reconnectBanner != null) reconnectBanner.hideNow();
+	}
+
+	/**
+	 * T78：消费一次探针结果。
+	 *
+	 * <p>{@code ok=0} / 空串 / {@code null} / 解析失败 ⇒ {@code UNKNOWN}（导航期静默，不累计）。
+	 * 探针为真时再看**官方状态元素是否已经真的可见且不与横幅重叠**——是则抑制横幅，
+	 * 同一条信息不显示两遍。
+	 */
+	private void handleReconnectProbe(String value) {
+		if (destroyed || reconnectBanner == null) return;
+		ReconnectBanner.Observed observed = ReconnectBanner.Observed.UNKNOWN;
+		String detail = "";
+		if (value != null && !value.isEmpty() && !"null".equals(value)) {
+			try {
+				JSONObject o = new JSONObject(value);
+				if (o.optInt("ok", 0) == 1) {
+					if (o.optInt("re", 0) != 1) {
+						observed = ReconnectBanner.Observed.OK;
+					} else {
+						detail = officialStatusDetail(o);
+						observed = detail.startsWith("SUPPRESS|")
+							? ReconnectBanner.Observed.OK
+							: ReconnectBanner.Observed.RECONNECTING;
+					}
+				}
+			} catch (Exception e) {
+				observed = ReconnectBanner.Observed.UNKNOWN;
+			}
+		}
+		// 只在观测值**变化**时打一行，避免每 500ms 刷屏；这一行是设备侧"原生看到了什么"的唯一原始证据。
+		if (observed != lastProbeObserved) {
+			lastProbeObserved = observed;
+			Log.i("dshr-reconnect", "probe=" + observed + " " + detail);
+		}
+		if (!reconnectDebounce.feed(observed)) return;
+		if (reconnectDebounce.state() == ReconnectBanner.State.SHOWN) {
+			reconnectBanner.show();
+			Log.i("dshr-reconnect", "横幅显示（文案=" + ReconnectBanner.TEXT + "）");
+		} else {
+			reconnectBanner.hide();
+			Log.i("dshr-reconnect", "横幅隐藏");
+		}
+	}
+
+	/** T78：上一次探针观测值，只为"变化时才打日志"。 */
+	private ReconnectBanner.Observed lastProbeObserved = ReconnectBanner.Observed.UNKNOWN;
+
+	/**
+	 * T78：官方那条重连文案是不是已经"用户看得见"（在视口内）且不被横幅压住。
+	 *
+	 * <p>⚠️ 只有 {@code getClientRects().length > 0} 是不够的：侧栏用 {@code left:-320px}
+	 * 收起时元素仍有布局盒、仍算"可见"（T68 §2.6 实测），但用户根本看不见。
+	 * 探针回的是 CSS 像素矩形，这里按 WebView **实际内容宽度 / CSS 视口宽度**换算成设备像素
+	 * （不用 density，缩放下才准），再与横幅在 rootLayout 里的矩形比对。
+	 *
+	 * @return {@code "SUPPRESS|…"} 表示抑制横幅；{@code "SHOW|…"} 表示照常显示；
+	 *         后缀是原始判据（进 logcat，便于事后对账）
+	 */
+	private String officialStatusDetail(JSONObject o) {
+		if (webView == null || reconnectBanner == null) return "SHOW|no-webview";
+		int vw = o.optInt("vw", 0);
+		int vh = o.optInt("vh", 0);
+		int webW = webView.getWidth();
+		double cx = o.optDouble("x", 0);
+		double cy = o.optDouble("y", 0);
+		double cw = o.optDouble("w", 0);
+		double ch = o.optDouble("h", 0);
+		String raw = "css=[" + Math.round(cx) + "," + Math.round(cy) + ","
+			+ Math.round(cw) + "," + Math.round(ch) + "] vp=" + vw + "x" + vh
+			+ " banner=[" + reconnectBanner.getLeft() + "," + reconnectBanner.getTop() + ","
+			+ reconnectBanner.getWidth() + "," + reconnectBanner.getHeight() + "]";
+		if (vw <= 0 || vh <= 0 || webW <= 0) return "SHOW|" + raw + " reason=no-scale";
+		double scale = (double) webW / (double) vw;
+		int x = (int) Math.round(cx * scale);
+		int y = (int) Math.round(cy * scale);
+		int w = (int) Math.round(cw * scale);
+		int h = (int) Math.round(ch * scale);
+		boolean onScreen = ReconnectBanner.isOnScreen(
+			(int) Math.round(cx), (int) Math.round(cy), (int) Math.round(cw), (int) Math.round(ch), vw, vh);
+		// 页面内容原点 = WebView 在 rootLayout 里的左上角（T80 起让位走**外边距**，
+		// 已体现在 getLeft/getTop 里）+ 自身 padding（恒 0，保留表达式以兼容历史形态）。
+		int ox = webView.getLeft() + webView.getPaddingLeft() + x;
+		int oy = webView.getTop() + webView.getPaddingTop() + y;
+		boolean suppress = ReconnectBanner.shouldSuppress(onScreen, ox, oy, w, h,
+			reconnectBanner.getLeft(), reconnectBanner.getTop(),
+			reconnectBanner.getWidth(), reconnectBanner.getHeight());
+		return (suppress ? "SUPPRESS|" : "SHOW|") + raw + " device=[" + ox + "," + oy + "," + w + "," + h
+			+ "] onScreen=" + onScreen;
 	}
 
 	/**
@@ -2102,6 +2590,8 @@ public class MainActivity extends Activity {
 			applyImeShift(imeBottomPx(insets));
 			// 平板档的让位量直接取系统栏/挖孔，导航模式与横竖屏变化都要跟上。
 			applyDeviceClassInsets();
+			// T78：横幅的四向外边距与上面同一份取值（旋转/任务栏显隐/挖孔变化一起跟上）。
+			applyReconnectBannerInsets();
 			// 导航模式 / 平板任务栏变化未必触发页面加载或焦点事件。
 			// 下一帧读取最新 root insets；IME 动画中不注入 JS，避免重排。
 			if (!imeAnimating && webView != null) {
@@ -2343,51 +2833,103 @@ public class MainActivity extends Activity {
 		view.evaluateJavascript(readMobileAdaptJs(), null);
 	}
 
+	/** T72：上次写入 WebView 的让位四向，只为让 dshr-inset 日志在变化时才打。 */
+	private int lastAvoidL = -1, lastAvoidT = -1, lastAvoidR = -1, lastAvoidB = -1;
+
 	/**
-	 * 平板档位的系统栏让位（契约 3.6 / 验收 G5）：用 WebView 自身的 padding 收缩内容视口，
+	 * 平板档位的系统栏让位（契约 3.6 / 验收 G5）：用 WebView 的**布局盒**（外边距）收缩内容视口，
 	 * 官方布局拿到的是一个「本来就小一号」的视口——不写任何 DOM/CSS。
-	 * 手机档位恒为 0 padding，现有 edge-to-edge + --dshr-inset-* 透传完全不变；
+	 *
+	 * <p><b>T80 起让位落「外边距」而不是「内边距」</b>：T79 在平板上抓到「原生账面 72/64 与
+	 * dumpsys 逐值一致、页面却仍压进导航栏带 16px」，T80 做了决定性实验
+	 * （把 top 让位从 72 放大到 372）：{@code webView.setPadding()} 让页面 {@code innerHeight}
+	 * 仍为整屏 800、目标元素矩形逐字节不变、两张截图互相关最佳位移 **0px**；
+	 * 而把同样的数字写到 WebView 的 {@code FrameLayout} 外边距上，
+	 * 视口立刻变成 {@code (1600−72−64)/2 = 732}、内容恰好下移 72px（再加 300 就下移 300px）。
+	 * 根因：内边距既不改 View 自身的测量尺寸、也不被 Chromium 用来推导渲染视口。
+	 * 详见 {@link #setWebViewInsetsBox(int, int, int, int)} 与 {@code scratch/t80/report.md}。
+	 *
+	 * <p>手机档位恒为 0 让位，现有 edge-to-edge + --dshr-inset-* 透传完全不变；
 	 * 本地壳页（uiState != WEB）自带同名 CSS 变量接收端，也不走这里，避免双重留白。
 	 */
 	private void applyDeviceClassInsets() {
 		if (webView == null) return;
 		boolean pad = isTabletClass() && uiState == UiState.WEB;
 		if (!pad) {
-			if (webView.getPaddingLeft() != 0 || webView.getPaddingTop() != 0
-					|| webView.getPaddingRight() != 0 || webView.getPaddingBottom() != 0) {
-				webView.setPadding(0, 0, 0, 0);
-			}
+			setWebViewInsetsBox(0, 0, 0, 0);
 			return;
 		}
 		WindowInsets insets = getWindow().getDecorView().getRootWindowInsets();
 		if (insets == null) {
-			webView.setPadding(0, 0, 0, 0);
+			setWebViewInsetsBox(0, 0, 0, 0);
 			return;
 		}
-		int left, top, right, bottom;
-		if (Build.VERSION.SDK_INT >= 30) {
-			Insets cut = insets.getInsets(WindowInsets.Type.displayCutout());
-			left = cut.left;
-			right = cut.right;
-			// 横屏挖孔在左右、竖屏在顶部；导航模式切换会变，所以只靠 statusBars 不够。
-			top = Math.max(insets.getInsets(WindowInsets.Type.statusBars()).top, cut.top);
-			bottom = Math.max(insets.getInsets(WindowInsets.Type.navigationBars()).bottom, cut.bottom);
-		} else {
-			left = 0;
-			right = 0;
-			top = insets.getSystemWindowInsetTop();
-			bottom = insets.getStableInsetBottom();
-			if (Build.VERSION.SDK_INT >= 28) {
-				DisplayCutout cut = insets.getDisplayCutout();
-				if (cut != null) {
-					left = cut.getSafeInsetLeft();
-					right = cut.getSafeInsetRight();
-					top = Math.max(top, cut.getSafeInsetTop());
-					bottom = Math.max(bottom, cut.getSafeInsetBottom());
-				}
-			}
+		// T78：取值本体抽到 readSystemBarInsetsPx()，与重连横幅的四向外边距同源。
+		// 语义与抽出来之前**逐值相同**（readSystemBarInsetsPx 的注释保留原 T72/T67 的逐方向并集依据）。
+		int[] avoid = readSystemBarInsetsPx();
+		int left = avoid[0], top = avoid[1], right = avoid[2], bottom = avoid[3];
+		setWebViewInsetsBox(left, top, right, bottom);
+		// T72：让位量本身**上 logcat**。T67 之所以只能做代码路径级证明、拿不到像素级证据，
+		// 根因就是 padding 算完就丢、谁也看不见：这行日志让"系统栏占位 vs 应用留白"在真机上
+		// 直接可对账（dshr-inset 标签）。只在平板会话档且四向变化时打，避免刷屏。
+		if (pad && (left != lastAvoidL || top != lastAvoidT || right != lastAvoidR || bottom != lastAvoidB)) {
+			lastAvoidL = left; lastAvoidT = top; lastAvoidR = right; lastAvoidB = bottom;
+			Log.i("dshr-inset", "avoid l=" + left + " t=" + top + " r=" + right + " b=" + bottom
+				+ " tablet=" + isTabletClass() + " uiState=" + uiState);
 		}
-		webView.setPadding(left, top, right, bottom);
+	}
+
+	/**
+	 * T80：把让位四向写到 WebView 的**布局盒**（{@code FrameLayout} 外边距）上。唯一写入口。
+	 *
+	 * <p><b>为什么必须是布局盒</b>：外部测试两轮真机取证（T79 §4.1 / T80 §1）证明
+	 * {@code webView.setPadding()} 对页面**完全无效**——padding 是 View **自己**的内边距，
+	 * 父容器给 {@code MATCH_PARENT} 的是整屏，View 自身的测量尺寸一点没变，
+	 * Chromium 也不拿它推导渲染视口。外边距则被父容器从 {@code MATCH_PARENT} 里扣掉
+	 * ⇒ WebView 自身真的变小 ⇒ 页面拿到的就是「本来就小一号」的视口，且页面侧零写入。
+	 *
+	 * <p><b>不能与 setPadding 同时写</b>：两者都生效的设备上会叠加成双倍留白；
+	 * 而 T80 已实测内边距既不改视口也不挪内容，留着只会误导下一个人。
+	 *
+	 * <p>幂等：四向未变时直接返回，不触发多余的 {@code requestLayout()}
+	 * （{@code rootLayout} 上挂着 GlobalLayout 监听做 IME 兜底，无谓重排会把它拖成自激）。
+	 */
+	private void setWebViewInsetsBox(int left, int top, int right, int bottom) {
+		if (webView == null) return;
+		ViewGroup.LayoutParams raw = webView.getLayoutParams();
+		FrameLayout.LayoutParams lp = (raw instanceof FrameLayout.LayoutParams)
+			? (FrameLayout.LayoutParams) raw
+			: new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT,
+				FrameLayout.LayoutParams.MATCH_PARENT);
+		if (lp.leftMargin == left && lp.topMargin == top
+				&& lp.rightMargin == right && lp.bottomMargin == bottom) return;
+		lp.setMargins(left, top, right, bottom);
+		webView.setLayoutParams(lp);
+	}
+
+	/**
+	 * {@code uiState} 的**唯一写入口**（T72）。
+	 *
+	 * <p><b>为什么必须收敛到这一个方法</b>：平板档的系统栏让位只有「重算 padding」这一个动作，
+	 * 而 {@code webView.setVisibility(VISIBLE)} **不触发 insets 分发** ⇒ 冷启动 BOOTSTRAP 期
+	 * 那次 insets 分发按门禁把 padding 写成 0 之后，**进入会话页这一刻没有任何新 insets 事件**
+	 * 会把 padding 补上。T67 实测：4 条 {@code uiState→WEB} 路径里有 3 条各自记得补调，
+	 * 唯独本地端口探测（FRP/隧道）那条没补 ⇒ 整会话 padding 恒 0，内容同时压状态栏、被任务栏盖住。
+	 * 「每个调用点自己记得补」这种约定在 rc.2.1 到 rc.2.5 之间已经被证伪过一次。
+	 *
+	 * <p><b>结构上不可能再漏</b>：把赋值本身封进这个 setter，任何新的状态跃迁只要能编译通过，
+	 * 就一定经过它；配合 {@code onResume} 的 post 兜底与 §4 的枚举式源码契约断言
+	 * （枚举所有 {@code uiState = } 写入点、断言除本方法外没有第二个写入口），
+	 * 「新增进会话路径漏调让位」从"靠人记得"变成"编译期 + 断言期双重兜住"。
+	 */
+	private void setUiState(UiState next) {
+		uiState = next;
+		applyDeviceClassInsets();
+		if (next == UiState.WEB && webView != null) {
+			// 冷启动首帧兜底：此刻 rootWindowInsets 可能还没分发/刚变（旋转、折叠、
+			// 任务栏拉出都算），下一帧再算一次。setPadding 幂等，成本一次。
+			webView.post(this::applyDeviceClassInsets);
+		}
 	}
 
 	/**
@@ -2601,8 +3143,9 @@ public class MainActivity extends Activity {
 			tintShell(homeScroll);
 			tintShell(setupScroll);
 		}
-		// 平板档下状态栏/导航栏露出的是 WebView padding 区（背景即页面底色），
-		// 这里把 WebView 底色钉到页面深浅色，避免出现壳色色块。
+		// T80：平板档下状态栏/导航栏露出的是「让位外边距」那圈**父容器底色**（rootLayout 已钉成
+		// 页面深浅色，见上），不再指望 WebView 自己的 padding 区；WebView 底色仍钉到页面深浅色，
+		// 用来盖住页面首帧前的空白。
 		if (tabletSession && webView != null) {
 			webView.setBackgroundColor(dark ? 0xFF141414 : Color.WHITE);
 		}
@@ -2705,7 +3248,7 @@ public class MainActivity extends Activity {
 				+ (System.currentTimeMillis() - connectStartMs) + "ms url=" + url);
 		}
 		hideSettings();
-		uiState = UiState.WEB;
+		setUiState(UiState.WEB);
 		applySystemBars();
 		if (webView != null && webView.getVisibility() != View.VISIBLE) {
 			webView.setVisibility(View.VISIBLE);
@@ -2739,7 +3282,7 @@ public class MainActivity extends Activity {
 		hideSettings();
 		clearResumeSession();
 		activeUrl = target;
-		uiState = UiState.WEB;
+		setUiState(UiState.WEB);
 		applySystemBars();
 		webView.setVisibility(View.VISIBLE);
 		injectMobileAdaptation(webView);
@@ -3679,10 +4222,11 @@ public class MainActivity extends Activity {
 		}
 		if (uiState == UiState.HOME) {
 			if (canResumeSession) {
-				// D6.1：只有「平板档 && 本次由返回键路径进入设置」才退后台；其余一切
-				// （手机档任意路径、平板档下通知动作/长按鲸鱼进入）仍回会话。
+				// D6.1：只有「本次由返回键路径进入设置」才退后台；其余入口
+				// （通知动作 / 长按鲸鱼等）仍回会话。
 				// 读取即消费：退后台前清零，标记不会带到下一次进入。
-				if (settingsViaBackKey && isTabletClass()) {
+				// T65：去掉 `&& isTabletClass()`，两档同一判据（见 settingsViaBackKey 注释）。
+				if (settingsViaBackKey) {
 					settingsViaBackKey = false;
 					moveTaskToBack(true);
 					return;
@@ -3711,8 +4255,11 @@ public class MainActivity extends Activity {
 
 	/**
 	 * 会话内返回：先关官方弹层/侧栏（由 JS 处理）；再仅在同一网关内 goBack。
-	 * 平板档在会话根改为打开 App 连接设置（D6 ①）；手机档沿用旧行为——
-	 * 已在会话根时把 App 放到后台，隧道继续跑。
+	 * 在会话根改为打开 App 连接设置（D6 ①，<b>两档一致</b>）；设置页再按一次才退到后台。
+	 *
+	 * <p>T65：改前 {@code if (isTabletClass())} 把「打开连接设置」限死在平板档，
+	 * 手机档直接落到 {@code moveTaskToBack(true)} 退到桌面，与设置页文案承诺的
+	 * 「系统返回键继续」不一致（T48/T58/T59 三轮复现）。平板档判据本身一字未改。
 	 */
 	private void finishWebBack() {
 		if (uiState != UiState.WEB || webView == null || webView.getVisibility() != View.VISIBLE) {
@@ -3734,22 +4281,21 @@ public class MainActivity extends Activity {
 		}
 		// 走到这里就是「会话根」：上面已判定没有官方弹层要关（JS 回调没关掉任何东西）、
 		// 没有侧栏要收（同一个回调）、WebView 也没有同网关的上一页可回。
-		// D6 ①：平板档不装移动 hook，页面上没有长按鲸鱼入口，这里是兜底——
+		// D6 ①：不装移动 hook 的平板档页面上没有长按鲸鱼入口，这里是兜底；
 		// 改为打开连接设置页；再按一次由 handleAppBack() 的 HOME 分支决定
 		// （有活会话就回会话，没有才退到后台）。showConnectionSettings() 不杀隧道、
 		// 不丢 WebView 页面，设置页自身的返回行为一字未改。
-		// 手机档：isTabletClass() 为 false，直接落到原来的 moveTaskToBack(true)。
-		if (isTabletClass()) {
-			// 记下本次是「返回键路径」进来的：设置页的返回键据此退到后台（D6.1），
-			// 而不是走 HOME 分支回会话——那会变成会话⇄设置死循环。
-			// 置位只在平板档分支内，手机档本标记恒为 false，行为一字未改。
-			// 若此时没有活会话（fromSession 为 false），showConnectionSettings() 内部的
-			// clearResumeSession() 会把标记清掉——那种情况返回键本就走 super.onBackPressed()。
-			settingsViaBackKey = true;
-			showConnectionSettings();
-			return;
-		}
-		moveTaskToBack(true);
+		//
+		// T65：这一段**不再按档位分叉**——手机档也走「打开连接设置」而不是退到桌面。
+		// 右栏打开态不受影响：sidebar 收掉时上面那个 JS 回调返回 true，
+		// finishWebBack() 根本不会被调用（T43/T47 已验证的语义原样保留）。
+		//
+		// 记下本次是「返回键路径」进来的：设置页的返回键据此退到后台（D6.1），
+		// 而不是走 HOME 分支回会话——那会变成会话⇄设置死循环。
+		// 若此时没有活会话（fromSession 为 false），showConnectionSettings() 内部的
+		// clearResumeSession() 会把标记清掉——那种情况返回键本就走 super.onBackPressed()。
+		settingsViaBackKey = true;
+		showConnectionSettings();
 	}
 
 	private final class AppBridge {
@@ -3788,7 +4334,13 @@ public class MainActivity extends Activity {
 			// 这里再加一层按**摘要**去重：即使 hook 侧判重键因故失效（例如旧版 hook
 			// 脚本，或将来新增字段导致判重口径漂移），繁忙页面上报也不会刷屏。
 			if (!summary.equals(uiDiagSummary)) {
-				Log.i("dshr-perf", "hook 诊断上报 " + uiDiagRaw);
+				// T64：消息里带上方法名 setUiDiag。
+				// 原先只打「hook 诊断上报 {…}」，**整条消息不含 setUiDiag 子串** ——
+				// 于是排查时最自然的 `logcat | grep setUiDiag` 永远 0 命中，
+				// 会被误读成「hook 从未上报」（T58 §9-5 即此误判：其自存 logcat 里
+				// 「诊断上报」11 条、「setUiDiag」0 条，上报其实一直正常）。
+				// 保留原中文前缀（既有 grep 习惯不变），只**追加**方法名 token。
+				Log.i("dshr-perf", "setUiDiag hook 诊断上报 " + uiDiagRaw);
 			}
 			uiDiagSummary = summary;
 			runOnUiThread(() -> refreshUiDiagLine());

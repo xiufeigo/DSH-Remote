@@ -117,7 +117,7 @@ export function makeHtmlInjector(options: HtmlInjectOptions = {}): (body: Buffer
  * 后台 revalidate 成功后更新缓存（下次打开即新版）；无缓存才等网络，
  * 失败回退缓存。二次打开不再被隧道全量下载卡住。
  *
- * T49：`/plugins/` 组合包的 URL 是 `plugins/?@…&rev=…`——第一个 `?` 就开始 query，
+ * T49：`/plugins/` 组合包的 URL 是 `plugins/??@…&rev=…`——第一个 `?` 就开始 query，
  * `url.pathname` 退化成 `/plugins/`。由此有三件事**必须同批**改，少一半就坏，
  * 其中两半组合起来直接白屏：
  *
@@ -126,18 +126,50 @@ export function makeHtmlInjector(options: HtmlInjectOptions = {}): (body: Buffer
  *   2. **cacheKey 必须是完整 URL（含 `rev`）且不带 `ignoreSearch`**：旧的
  *      `origin + pathname` + `ignoreSearch:true` 让三个包塌成同一个 key，先落
  *      缓存的 5MB 大包会被当成所有 `/plugins/` 请求的答案，喂给只想要 40KB 的
- *      `__ModuleLoader__.load()` ⇒ **白屏**（T44 已证，本轮有负控制复现）。
+ *      `__ModuleLoader__.load()` ⇒ **白屏**（T44 已证，T49 有负控制复现）。
  *   3. **`/plugins/` 关掉 SWR 后台重验**：`rev` 是内容指纹，重验 100% 拿回同一
- *      份字节 ⇒ 每轮白送一次 5.14MB 流量。`/assets/*` 的 SWR 保持不变。
+ *      份字节 ⇒ 每轮白送一次 5.14MB 流量。
  *
- * `immutable` 保留不动：桌面端已经在吃它，设备端一旦 WebView 缓存落盘也立刻生效。
+ * ── T63：SWR 的适用范围由「响应头」改成「URL 本身是否内容寻址」 ──
+ *
+ * 改前，后台重验要不要发起，判据是**缓存里那条响应的 `cache-control` 有没有
+ * `immutable`**（`pwa.ts` 旧 `cachedCc` 分支）。这有两个问题：
+ *
+ *   1. **判据在别人手里。** `immutable` 是上游 dsh-gui / 网关 `proxy.ts` 加的
+ *      响应头，哪天上游自己改了就静默失效 ⇒ 11.5MB 的 `/plugins/` 包与
+ *      `/assets/*` 全量重验又回来了，而**代码与注释都还写着「已关」**——
+ *      这正是 T53 记为「假账」的那一类。
+ *   2. **判据与事实无关。** 「内容变则 URL 变」这件事**只看 URL 就能判定**，
+ *      根本不需要问响应头。
+ *
+ * 现在改成 `isContentAddressed(url)`：命中即**命中缓存直接返回、不发起后台重验**。
+ * 三条判据任意一条成立（`/plugins/` 路径 / URL 带 `rev=` / 文件名带构建期哈希，
+ * 哈希正则与 `proxy.ts` 的 `HASHED_ASSET` **逐字同形**，保证网关与 SW 判定一致）。
+ * 响应头的 `immutable` 检查**保留**为额外一条（上游显式声明长寿命时不重验，
+ * 代价只是一次 header 读取），但**不再是指望它兜底**。
+ *
+ * **非内容寻址的稳定 URL 资源（`/favicon.svg`、`/favicon-dark.svg` 等）仍保留
+ * SWR，这是有意为之**：它们的 URL 不随内容变，只有后台重验能让升级后的新图标
+ * 到达设备。这类资源实测只有 KB 量级，与 11.5MB 的大包不同量级。
+ *
+ * **「DSH 升级后拿不到新版」为什么不成问题（本轮最关键的一条论证）**：
+ * 正确性**从不依赖**后台重验，因为**主文档永远不走缓存**——
+ * `request.mode === "navigate"` 在下面直接 `return`，每次进入都从网络拿新文档，
+ * 而**只有主文档会说出新版的资源 URL**（Vite 构建产物 `index-<hash>.js` 的
+ * 哈希随内容变；`/plugins/??…&rev=<指纹>` 的 rev 也是内容指纹，T50 §2.3 实测
+ * 三个包 rev 互异且随上游插件集合变化）。于是：
+ *   - 变了的内容 ⇒ **新 URL** ⇒ SW 缓存必然未命中 ⇒ 从网络取到新版；
+ *   - 没变的内容 ⇒ 哈希/rev 不变 ⇒ 继续命中旧缓存（这正是省流量的目的）。
+ * 换句话说，**版本信号在主文档里，而主文档永远新鲜**，所以「内容寻址 ⇒ 不重验」
+ * 不牺牲任何正确性。T63 §C.3 用「改 rev ⇒ 必然回源」做了实测。
+ *
+ * ⚠️ **缓存名仍是 v3，不要动。** 本轮 cacheKey 语义没变（仍是完整 request.url），
+ * 已有的 11.5MB 条目**依然有效可用**；此时改名会在 activate 时清空缓存，逼用户
+ * 在升级网关的**下一次进入**白付一次 5.14MB/轮的全量重下——那正是本任务要治的
+ * 浪费。只有 cacheKey/结构语义真的变了才升 v（v2→v3 就是因为 key 语义变了）。
  *
  * 不在白名单内的请求不调用 respondWith，等价于完全不拦截。
  * 缓存名带版本号：策略/资源结构变更时改名即可在 activate 时清旧缓存。
- *
- * T49：v2 → v3 的原因只有一个 —— cacheKey 语义变了。v2 里按
- * `origin + pathname` 存的条目在新的「完整 URL」key 下永远匹配不上，
- * 留着只是垃圾（且 5MB 量级）。其余策略语义不变。
  */
 export function renderServiceWorker(): string {
 	return `/* DSH-Remote Service Worker —— 静态资源白名单缓存（WEB-01 + PERF-02 SWR + T49） */
@@ -145,11 +177,27 @@ export function renderServiceWorker(): string {
 var CACHE_NAME = "dsh-remote-static-v3";
 var CACHEABLE = /\\.(?:js|mjs|css|png|jpe?g|gif|webp|svg|woff2?|ttf|otf|eot|ico)$/i;
 
-// T49：内容指纹资源（/plugins/ 的组合包）。包体由 query 选、版本由 query 里的
-// rev=<内容指纹> 选 ⇒ pathname 永远只剩 /plugins/，扩展名正则看不见它。
-// "内容变则 URL 变"成立，所以这类资源可以 cache-only，不必后台重验。
+// T49：/plugins/ 组合包。包体由 query 选、版本由 query 里的 rev=<内容指纹> 选
+// ⇒ pathname 永远只剩 /plugins/，扩展名正则看不见它（所以白名单要单开一条）。
+var FINGERPRINTED_PATH = /^\\/plugins\\/?$/;
+
+// ── T63：内容寻址判据（只看 URL，不看响应头）──
+// 三条任意一条成立即「内容变则 URL 变」：命中缓存直接返回，**不**发后台重验。
+// HASHED_NAME 与 proxy.ts 的 HASHED_ASSET **逐字同形**：网关标 immutable 的
+// 那些文件名，SW 一定也认成内容寻址 ⇒ 两边判定不会漂移。
+var REV_QUERY = /[?&]rev=[0-9A-Za-z_.-]+/;
+var HASHED_NAME = /\\/[^/]*[.-][0-9A-Za-z_-]{8,}\\.(?:js|mjs|css|woff2?|ttf|otf|eot|png|jpe?g|gif|webp|svg|ico)$/;
+
+/** 内容寻址 ⇒ 后台重验 100% 拿回同一份字节，纯浪费流量 ⇒ 绝不重验。 */
+function isContentAddressed(url) {
+	if (FINGERPRINTED_PATH.test(url.pathname)) return true;
+	if (REV_QUERY.test(url.search)) return true;
+	return HASHED_NAME.test(url.pathname);
+}
+
+/** T49 遗留别名：白名单用的就是「路径形如 /plugins/」这一条。 */
 function isFingerprinted(pathname) {
-	return pathname === "/plugins/" || pathname === "/plugins";
+	return FINGERPRINTED_PATH.test(pathname);
 }
 
 // ── T51（R6）：缓存上限 + 淘汰 + 写入失败可见 ──
@@ -293,16 +341,23 @@ self.addEventListener("fetch", function (event) {
 	if (request.mode === "navigate") return;
 	// 动态接口：认证/配对/管理/上游 API，永不缓存、永不拦截。
 	if (url.pathname.indexOf("/api/") === 0 || url.pathname.indexOf("/__dsh_remote__/") === 0) return;
-	// T49：内容指纹资源（/plugins/ 的组合包）单独记一路，见 isFingerprinted。
+	// T49：内容指纹路径（/plugins/ 的组合包）单独记一路，白名单要单开一条。
 	var fingerprinted = isFingerprinted(url.pathname);
 	// 白名单：静态资源扩展名，或上面那条显式前缀（T49：/plugins/ 没有扩展名，
 	// pathname 恒为 /plugins/，扩展名正则会把它整条判掉 ⇒ 5.14MB 每轮满额重下）。
+	// ⚠️ T63：**白名单与下面的 cacheKey 仍是 T49 那一对，没有动**。
+	// 本轮只把「要不要后台重验」换成 URL 判据（isContentAddressed），没有碰
+	// 「拦不拦截」「用什么 key 存」这两件事 —— T49 的白屏正是这两半不同批改出来的。
 	if (!CACHEABLE.test(url.pathname) && !fingerprinted) return;
-	// PERF-02 stale-while-revalidate：命中缓存即秒回，后台更新；
-	// 未命中等网络（成功后写缓存），网络失败才回退缓存。
-	// REVIEW-02：revalidate 用 cache:"no-cache" 真回源；
-	// put 并入 waitUntil 链（SW 提前终止不丢更新）；整链兜底回退网络
-	// （CacheStorage 抛错时不让静态请求直接失败，退化为旧网络优先行为）。
+	// T63：白名单里的请求分两路 ——
+	//   · **内容寻址**（rev 指纹 / /plugins/ 组合包 / 哈希文件名）：命中即返回，
+	//     **不发后台重验**。这类资源占 99.9% 的体积（/plugins/ 三包 11.5MB +
+	//     /assets/* 约 2.9MB），重验一次就是一次全量白付。
+	//   · **稳定 URL**（/favicon*.svg 这类）：SWR 保留，后台重验是它唯一的更新途径。
+	// 其余机制与历史一致：命中缓存先秒回；未命中等网络（成功后写缓存）；
+	// 网络失败才回退缓存。revalidate 用 cache:"no-cache" 真回源；put 并入
+	// waitUntil 链（SW 提前终止不丢更新）；整链兜底回退网络（CacheStorage 抛错时
+	// 不让静态请求直接失败，退化为旧网络优先行为）。
 	event.respondWith(
 		caches.open(CACHE_NAME).then(function (cache) {
 			// T49：key 改成**完整 request.url**（含 rev 指纹），并去掉 ignoreSearch。
@@ -310,9 +365,11 @@ self.addEventListener("fetch", function (event) {
 			// 喂给只想要小包的模块加载器 ⇒ 白屏。白名单与本行必须同批改。
 			var cacheKey = request.url;
 			return cache.match(cacheKey).then(function (cached) {
-				// T49：内容指纹资源命中即返回，**不**起后台重验（rev 变了 URL 就变，
-				// 重验 100% 拿回同一份字节，纯浪费一整轮 5.14MB 流量）。
-				if (fingerprinted) {
+				// T63：内容寻址资源（rev 指纹 / /plugins/ 组合包 / 哈希文件名）
+				// 命中即返回，**不**起后台重验——内容变则 URL 变，重验必然拿回
+				// 同一份字节。主文档永远不走缓存（上面 mode==="navigate" 已 return），
+				// 版本信号永远新鲜，所以这里不重验不牺牲任何正确性（详见文件头 T63 段）。
+				if (isContentAddressed(url)) {
 					if (cached) return cached;
 					return fetch(request).then(function (fresh) {
 						if (fresh && fresh.ok) {
@@ -325,10 +382,9 @@ self.addEventListener("fetch", function (event) {
 					});
 				}
 				var networkUpdate = null;
-				// T49：命中了 immutable 资源就别再 revalidate。immutable 的定义就是
-				// 「在有效期内字节不会变」，重验必然拿回同一份内容 —— 实测每次进入
-				// 仍白拉 /assets/* 的 475,608 B（logcat 里 5 次 pinnedFetch），
-				// 纯浪费。/assets/ 是哈希文件名，本就该长命。
+				// 到了这里 = **非**内容寻址（稳定 URL，如 /favicon*.svg）。
+				// 这类资源 URL 不随内容变，后台重验是它唯一的更新途径 ⇒ SWR **有意保留**。
+				// 再叠一条：上游显式声明 immutable 的，长寿命期内字节不会变，也不重验。
 				var cachedCc = "";
 				try { cachedCc = (cached && cached.headers && cached.headers.get("cache-control")) || ""; } catch (hdrErr) {}
 				if (!/immutable/i.test(cachedCc)) {
@@ -336,9 +392,13 @@ self.addEventListener("fetch", function (event) {
 					if (fresh.ok) {
 						var cacheControl = fresh.headers.get("cache-control") || "";
 						// REVIEW-02：no-cache 语义是"每次使用前必须校验"，SWR 的
-						// "先给旧版"严格来说违反它——这类响应不进 SW 缓存（哈希
-						// 文件名资源一般带长 max-age，仍吃得到 SWR 秒开；no-cache
-						// 资源走 WebView 自带 HTTP 缓存做条件请求，正确性优先）。
+						// "先给旧版"严格来说违反它——这类响应不进 SW 缓存（走 WebView
+						// 自带 HTTP 缓存做条件请求，正确性优先）。
+						// T63 更正旧注释：这一支**已经**收窄到「非内容寻址且非
+						// immutable」的稳定 URL 资源。哈希文件名资源从 T63 起走
+						// isContentAddressed() 分支，根本到不了这里——旧注释里
+						// 「哈希文件名资源一般带长 max-age，仍吃得到 SWR 秒开」
+						// 描述的是一条已经不存在的路径，删掉而不是留着误导后来人。
 						if (!/no-store|private|no-cache/i.test(cacheControl)) {
 							var copy = fresh.clone();
 							// T51（R6）：失败不再静默——可见地喊出来（见 reportCacheWriteFailure）。

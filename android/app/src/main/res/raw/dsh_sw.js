@@ -3,11 +3,27 @@
 var CACHE_NAME = "dsh-remote-static-v3";
 var CACHEABLE = /\.(?:js|mjs|css|png|jpe?g|gif|webp|svg|woff2?|ttf|otf|eot|ico)$/i;
 
-// T49：内容指纹资源（/plugins/ 的组合包）。包体由 query 选、版本由 query 里的
-// rev=<内容指纹> 选 ⇒ pathname 永远只剩 /plugins/，扩展名正则看不见它。
-// "内容变则 URL 变"成立，所以这类资源可以 cache-only，不必后台重验。
+// T49：/plugins/ 组合包。包体由 query 选、版本由 query 里的 rev=<内容指纹> 选
+// ⇒ pathname 永远只剩 /plugins/，扩展名正则看不见它（所以白名单要单开一条）。
+var FINGERPRINTED_PATH = /^\/plugins\/?$/;
+
+// ── T63：内容寻址判据（只看 URL，不看响应头）──
+// 三条任意一条成立即「内容变则 URL 变」：命中缓存直接返回，**不**发后台重验。
+// HASHED_NAME 与 proxy.ts 的 HASHED_ASSET **逐字同形**：网关标 immutable 的
+// 那些文件名，SW 一定也认成内容寻址 ⇒ 两边判定不会漂移。
+var REV_QUERY = /[?&]rev=[0-9A-Za-z_.-]+/;
+var HASHED_NAME = /\/[^/]*[.-][0-9A-Za-z_-]{8,}\.(?:js|mjs|css|woff2?|ttf|otf|eot|png|jpe?g|gif|webp|svg|ico)$/;
+
+/** 内容寻址 ⇒ 后台重验 100% 拿回同一份字节，纯浪费流量 ⇒ 绝不重验。 */
+function isContentAddressed(url) {
+	if (FINGERPRINTED_PATH.test(url.pathname)) return true;
+	if (REV_QUERY.test(url.search)) return true;
+	return HASHED_NAME.test(url.pathname);
+}
+
+/** T49 遗留别名：白名单用的就是「路径形如 /plugins/」这一条。 */
 function isFingerprinted(pathname) {
-	return pathname === "/plugins/" || pathname === "/plugins";
+	return FINGERPRINTED_PATH.test(pathname);
 }
 
 // ── T51（R6）：缓存上限 + 淘汰 + 写入失败可见 ──
@@ -151,16 +167,23 @@ self.addEventListener("fetch", function (event) {
 	if (request.mode === "navigate") return;
 	// 动态接口：认证/配对/管理/上游 API，永不缓存、永不拦截。
 	if (url.pathname.indexOf("/api/") === 0 || url.pathname.indexOf("/__dsh_remote__/") === 0) return;
-	// T49：内容指纹资源（/plugins/ 的组合包）单独记一路，见 isFingerprinted。
+	// T49：内容指纹路径（/plugins/ 的组合包）单独记一路，白名单要单开一条。
 	var fingerprinted = isFingerprinted(url.pathname);
 	// 白名单：静态资源扩展名，或上面那条显式前缀（T49：/plugins/ 没有扩展名，
 	// pathname 恒为 /plugins/，扩展名正则会把它整条判掉 ⇒ 5.14MB 每轮满额重下）。
+	// ⚠️ T63：**白名单与下面的 cacheKey 仍是 T49 那一对，没有动**。
+	// 本轮只把「要不要后台重验」换成 URL 判据（isContentAddressed），没有碰
+	// 「拦不拦截」「用什么 key 存」这两件事 —— T49 的白屏正是这两半不同批改出来的。
 	if (!CACHEABLE.test(url.pathname) && !fingerprinted) return;
-	// PERF-02 stale-while-revalidate：命中缓存即秒回，后台更新；
-	// 未命中等网络（成功后写缓存），网络失败才回退缓存。
-	// REVIEW-02：revalidate 用 cache:"no-cache" 真回源；
-	// put 并入 waitUntil 链（SW 提前终止不丢更新）；整链兜底回退网络
-	// （CacheStorage 抛错时不让静态请求直接失败，退化为旧网络优先行为）。
+	// T63：白名单里的请求分两路 ——
+	//   · **内容寻址**（rev 指纹 / /plugins/ 组合包 / 哈希文件名）：命中即返回，
+	//     **不发后台重验**。这类资源占 99.9% 的体积（/plugins/ 三包 11.5MB +
+	//     /assets/* 约 2.9MB），重验一次就是一次全量白付。
+	//   · **稳定 URL**（/favicon*.svg 这类）：SWR 保留，后台重验是它唯一的更新途径。
+	// 其余机制与历史一致：命中缓存先秒回；未命中等网络（成功后写缓存）；
+	// 网络失败才回退缓存。revalidate 用 cache:"no-cache" 真回源；put 并入
+	// waitUntil 链（SW 提前终止不丢更新）；整链兜底回退网络（CacheStorage 抛错时
+	// 不让静态请求直接失败，退化为旧网络优先行为）。
 	event.respondWith(
 		caches.open(CACHE_NAME).then(function (cache) {
 			// T49：key 改成**完整 request.url**（含 rev 指纹），并去掉 ignoreSearch。
@@ -168,9 +191,11 @@ self.addEventListener("fetch", function (event) {
 			// 喂给只想要小包的模块加载器 ⇒ 白屏。白名单与本行必须同批改。
 			var cacheKey = request.url;
 			return cache.match(cacheKey).then(function (cached) {
-				// T49：内容指纹资源命中即返回，**不**起后台重验（rev 变了 URL 就变，
-				// 重验 100% 拿回同一份字节，纯浪费一整轮 5.14MB 流量）。
-				if (fingerprinted) {
+				// T63：内容寻址资源（rev 指纹 / /plugins/ 组合包 / 哈希文件名）
+				// 命中即返回，**不**起后台重验——内容变则 URL 变，重验必然拿回
+				// 同一份字节。主文档永远不走缓存（上面 mode==="navigate" 已 return），
+				// 版本信号永远新鲜，所以这里不重验不牺牲任何正确性（详见文件头 T63 段）。
+				if (isContentAddressed(url)) {
 					if (cached) return cached;
 					return fetch(request).then(function (fresh) {
 						if (fresh && fresh.ok) {
@@ -183,10 +208,9 @@ self.addEventListener("fetch", function (event) {
 					});
 				}
 				var networkUpdate = null;
-				// T49：命中了 immutable 资源就别再 revalidate。immutable 的定义就是
-				// 「在有效期内字节不会变」，重验必然拿回同一份内容 —— 实测每次进入
-				// 仍白拉 /assets/* 的 475,608 B（logcat 里 5 次 pinnedFetch），
-				// 纯浪费。/assets/ 是哈希文件名，本就该长命。
+				// 到了这里 = **非**内容寻址（稳定 URL，如 /favicon*.svg）。
+				// 这类资源 URL 不随内容变，后台重验是它唯一的更新途径 ⇒ SWR **有意保留**。
+				// 再叠一条：上游显式声明 immutable 的，长寿命期内字节不会变，也不重验。
 				var cachedCc = "";
 				try { cachedCc = (cached && cached.headers && cached.headers.get("cache-control")) || ""; } catch (hdrErr) {}
 				if (!/immutable/i.test(cachedCc)) {
@@ -194,9 +218,13 @@ self.addEventListener("fetch", function (event) {
 					if (fresh.ok) {
 						var cacheControl = fresh.headers.get("cache-control") || "";
 						// REVIEW-02：no-cache 语义是"每次使用前必须校验"，SWR 的
-						// "先给旧版"严格来说违反它——这类响应不进 SW 缓存（哈希
-						// 文件名资源一般带长 max-age，仍吃得到 SWR 秒开；no-cache
-						// 资源走 WebView 自带 HTTP 缓存做条件请求，正确性优先）。
+						// "先给旧版"严格来说违反它——这类响应不进 SW 缓存（走 WebView
+						// 自带 HTTP 缓存做条件请求，正确性优先）。
+						// T63 更正旧注释：这一支**已经**收窄到「非内容寻址且非
+						// immutable」的稳定 URL 资源。哈希文件名资源从 T63 起走
+						// isContentAddressed() 分支，根本到不了这里——旧注释里
+						// 「哈希文件名资源一般带长 max-age，仍吃得到 SWR 秒开」
+						// 描述的是一条已经不存在的路径，删掉而不是留着误导后来人。
 						if (!/no-store|private|no-cache/i.test(cacheControl)) {
 							var copy = fresh.clone();
 							// T51（R6）：失败不再静默——可见地喊出来（见 reportCacheWriteFailure）。

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- T78：原生重连横幅的稳定 id。
+     仅新增一个 id 资源（不引用任何 drawable/string/color），供
+     `adb shell uiautomator dump` 用 resource-id 精确定位横幅（断言 2）。
+     View.getId() 返回的就是这里生成的 R.id.dshrReconnectBanner。 -->
+<resources>
+	<item name="dshrReconnectBanner" type="id" />
+</resources>

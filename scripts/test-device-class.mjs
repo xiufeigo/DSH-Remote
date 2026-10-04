@@ -54,6 +54,19 @@ function skipAll(reason) {
 	process.exit(0);
 }
 
+// 结构化源码提取（锚点定位 + 括号配平 + 解析硬闸）—— 实现在 scripts/lib/source-extract.mjs，
+// 与 scratch/t76/extract-selftest.mjs **共用同一份**：T76 第一版把扫描器抄了两份，
+// 自测那份是对的、真跑那份漏了一行 const openCh，直接把 test:device 跑崩
+//（跑到第 26 条 ReferenceError: openCh is not defined）。副本迟早分叉，
+// 分叉就是「自测说 PASS、真跑却崩」，所以只保留一个实现。
+//
+// 「为什么不能用字符预算」的完整说明见该文件顶部，这里只留一句：
+//   /function foo([\s\S]{0,1400}?\n\t\}/ 这种按字符数猜收尾的写法，
+//   真实函数体一超过预算 match 就返回 null ⇒ 断言拿到空串 ⇒ indexOf 全 -1 ⇒ 假红；
+//   改短又会悄悄腰斩 ⇒ 假绿。实测 isPanelTriggerPoint 1341 vs 预算 900、
+//   armComposerFocus 1939 vs 预算 1400。
+import { extractDecl, extractInitializer, assertParses, javaMethod, javaBalanced, stripJavaComments, maskJsComments, maskJsCommentsOnly, jsBlockAfter, maskJavaNoise, javaMethodSpans, javaEnclosingMethod, javaCallChain, javaCallArgs } from "./lib/source-extract.mjs";
+
 // ───────────────────────────── 0. 前置依赖与跳过语义 ─────────────────────────────
 if (!existsSync(HOOK_PATH)) skipAll(`找不到 hook 单一源 ${HOOK_PATH}`);
 const HOOK_SOURCE = readFileSync(HOOK_PATH, "utf8");
@@ -847,7 +860,277 @@ try {
 			rbRightAfter.href.includes("18443") && rbRightAfter.expanded === "0" && rbRightAfter.sideW === 0,
 			`expanded=${rbRightAfter.expanded} 侧栏列宽=${rbRightAfter.sideW}px href=${rbRightAfter.href}（修复前 expanded=1 / 360px）`);
 	}
+
+	// ── T66：右栏关闭手势的触发区（真机矩阵见 scratch/t66/report.md）──
+	// 改的是「起手带宽」这一个门：clamp(round(w×0.11),24,48) → clamp(round(w×0.15),48,96)，
+	// 并把起手窗整体右移 24px 让开系统返回手势区（rightbarCloseEdgeInsetPx）。
+	//
+	// 为什么这里只锁「源码契约 + 误伤」、不锁「带内能关掉」：
+	// 本台子视口 412px 下新窗是 [24, 24+62=86]，而**带内所有起点都落在本台子已知的
+	// 边缘返回雷区里**（:837 记着 x0≤150 会把页面导航到 about:blank），带内起点在这里
+	// 一发就丢读数，测不了。带内关闭的真值由真机矩阵承担
+	// （scratch/t66/out/{A-before,B-after}.json，真实 adb input swipe）。
+	// 能在这里测、且最该测的是**反向**：加宽之后**面板中部右滑必须仍是 no-op**。
+	{
+		// 1) 源码契约：带宽公式与左下沉让量都锁死，防止被静默改回窄带。
+		// ⚠️ T76：以下四条**全部**改成结构化提取（锚点定位 + 花括号配平）。
+		// 旧写法是 `/function rightbarCloseBandPx\(\)\s*\{[\s\S]{0,240}?\n\t\}/` 这种
+		// 「按字符预算截取」——函数体一改长就 match 不中 ⇒ 退化成空串 ⇒ 恒红；
+		// 改短则悄悄腰斩 ⇒ 假绿。理由见文件顶部「结构化源码提取」一节。
+		const bandFn = extractDecl(HOOK_SOURCE, /function rightbarCloseBandPx\b/, "rightbarCloseBandPx");
+		record("A/T66", "T66-契约 带宽公式为 clamp(round(w*0.15), 48, 96)",
+			!!bandFn && /w \* 0\.15/.test(bandFn) && /Math\.max\(48,\s*Math\.min\(96,/.test(bandFn),
+			bandFn ? bandFn.replace(/\s+/g, " ").slice(0, 150) : "提取失败：rightbarCloseBandPx");
+		const insetFn = extractDecl(HOOK_SOURCE, /function rightbarCloseEdgeInsetPx\b/, "rightbarCloseEdgeInsetPx");
+		// 逐字比对整个函数体：只 grep "return 24;" 会被"前面补一句 return 0"骗过去
+		// （负控制实测：在 if 之后插 `return 0;` 旧断言照样绿）。形状变了就该红。
+		const insetBody = insetFn
+			? insetFn.replace(/\s+/g, " ").replace(/^function rightbarCloseEdgeInsetPx\([^)]*\) \{/, "").replace(/\}$/, "").trim()
+			: null;
+		record("A/T66", "T66-契约 左下沉让量：面板贴视口左缘时让 24px，否则不扣（逐字）",
+			insetBody === "if (!rect || rect.left > 1) return 0; return 24;",
+			`函数体=${JSON.stringify(insetBody)}`);
+		const gate = extractDecl(HOOK_SOURCE, /function isRightbarCloseTrackTarget\b/, "isRightbarCloseTrackTarget");
+		record("A/T66", "T66-契约 起手门用「左缘+inset」起算（下沉+加宽都生效）",
+			!!gate && /x0 < rect\.left \+ inset\) return false;/.test(gate)
+			&& /x0 > rect\.left \+ inset \+ rightbarCloseBandPx\(\)\) return false;/.test(gate),
+			gate ? gate.replace(/\s+/g, " ").slice(0, 200) : "提取失败：isRightbarCloseTrackTarget");
+		// 2) 方向门一个字没动：加宽不等于放宽方向/距离/纵向，仍是 48 / 1.4 / 96。
+		// T76：旧写法靠 `[\s\S]{0,900}?\n\t+\}` 猜收尾，而 considerRightbarCloseSwipe 嵌在
+		// ensureGestures() 里（缩进两个 tab），当时只**侥幸**没中（真实 707 vs 预算 900）。
+		// 现在改成配平，嵌几层、缩进几格都不影响。
+		const closeGate = extractDecl(HOOK_SOURCE, /function considerRightbarCloseSwipe\b/, "considerRightbarCloseSwipe");
+		record("A/T66", "T66-契约 方向门未被放宽（dx>0、|dx|≥48、横向占优 1.4、|dy|≤96）",
+			!!closeGate && /if \(dx <= 0\) return false;/.test(closeGate)
+			&& /Math\.abs\(dx\) < 48/.test(closeGate)
+			&& /Math\.abs\(dx\) < Math\.abs\(dy\) \* 1\.4/.test(closeGate)
+			&& /Math\.abs\(dy\) > 96/.test(closeGate),
+			closeGate ? "48/1.4/96 三道门在位" : "提取失败：considerRightbarCloseSwipe");
+
+		// 3) 误伤（真跑）：带内起点在本台子测不了，但**带外必须仍然不关**是能测的。
+		//    412px 视口下新窗右边界 = 24 + round(412*0.15)=86；起点 250 远在窗外。
+		const rbOpenForT66 = await isRightbarOpen();
+		record("A/T66", "T66-误伤 已把右栏打开（前提）", rbOpenForT66 === true,
+			`data-sidebar-right-open=${rbOpenForT66}`);
+		if (rbOpenForT66) {
+			const midY = rbLane ? rbLane.y : 300;
+			await dispatchSwipe(250, 400, midY);
+			const t66Mid = await evaluate(`(function(){
+				var p = document.querySelector('[data-sidebar-right-panel]');
+				return { href: location.href,
+					stillOpen: !!(p && p.hasAttribute('data-sidebar-right-open') && p.getAttribute('aria-hidden') !== 'true'),
+					expanded: document.documentElement.getAttribute('data-dshr-expanded') };
+			})()`);
+			record("A/T66", "T66-误伤 面板中部(x0=250)右滑仍是 no-op：右栏不被误关",
+				t66Mid.href.includes("18443") && t66Mid.stillOpen === true,
+				`新窗右边界=86px，起点 250 在窗外；stillOpen=${t66Mid.stillOpen} href=${t66Mid.href}（加宽后若变 false 即为误伤）`);
+			record("A/T66", "T66-误伤 面板中部右滑顺带不开左抽屉",
+				t66Mid.expanded === "0",
+				`data-dshr-expanded=${t66Mid.expanded}（必须 0）`);
+		}
+	}
 	await ensureRightbarClosed();
+
+	// ── T69：发送按钮绝不能被当成「命令面板触发器」去布防 ──
+	//
+	// 真机症状（小米 15 / rc.2.5）：键盘弹着时点「发送」，消息发不出去、键盘又弹出来。
+	// 归因（scratch/t69/report.md §2.4）：`isPanelTriggerPoint()` 把发送按钮判成了触发器
+	// ⇒ `armComposerFocus()` 在**发送路径上**打 `inputmode="none"` 并 `composer.focus()`
+	// 抢焦点。AVD 上实测点发送时 `document.activeElement` 由 BODY 被搬回 composer、
+	// `inputmode` 变 "none"（改前）／保持 null（改后）。
+	//
+	// 这一组断言守三件事：
+	//   a) 源码契约：发送不在触发器名单里，且排除发生在**兜底分支之前**
+	//      （只删名单那一行不够 —— 兜底分支会把发送按钮连同其 svg/path 重新判成触发器，
+	//       AVD 实测该分支命中 40 个元素）；
+	//   b) 行为：落指发送 ⇒ composer 既不被打 `inputmode="none"`、也不被抢焦点；
+	//   c) 不回归：落指「+」⇒ 布防**仍然照旧发生**（T48 的承重路径没被顺手关掉）。
+	{
+		// ── a) 源码契约 ──
+		// ⚠️ T76：这一组 4 条原本全部靠「字符预算截取」，`[\s\S]{0,900}?` / `[\s\S]{0,1400}?`
+		// 在真实函数体（1341 / 1939 字符）里**永远匹配不到收尾** ⇒ match 返回 null ⇒
+		// 断言拿到空串 ⇒ indexOf 全 −1 ⇒ 4 条一起假红。已全部换成结构化提取。
+		const trigList = extractInitializer(HOOK_SOURCE, "COMPOSER_TRIGGER_SELECTOR", "COMPOSER_TRIGGER_SELECTOR");
+		record("A/T69", "T69-契约 发送按钮不在 COMPOSER_TRIGGER_SELECTOR 里",
+			!!trigList && !/data-dshr-composer-send/.test(trigList),
+			trigList ? `名单含 send=${/data-dshr-composer-send/.test(trigList)}` : "提取失败：COMPOSER_TRIGGER_SELECTOR");
+		const sendList = extractInitializer(HOOK_SOURCE, "COMPOSER_SEND_SELECTOR", "COMPOSER_SEND_SELECTOR");
+		const sendHasMarker = !!sendList && /data-dshr-composer-send/.test(sendList);
+		const sendHasCn = !!sendList && /发送消息/.test(sendList);
+		const sendHasEn = !!sendList && /Send message/.test(sendList);
+		record("A/T69", "T69-契约 COMPOSER_SEND_SELECTOR 同时含 hook 标记与官方中英文案",
+			sendHasMarker && sendHasCn && sendHasEn,
+			`marker=${sendHasMarker} cn=${sendHasCn} en=${sendHasEn}`);
+		const pt = extractDecl(HOOK_SOURCE, /function isPanelTriggerPoint\b/, "isPanelTriggerPoint");
+		// ⚠️ T76：所有 indexOf **顺序**断言都打在「掩掉注释与字符串」的等价长副本上。
+		// 实测就栽在这：armComposerFocus 的 T69 说明注释里就写着
+		// 「下面的 composer.focus() 会把 DOM 焦点从用户点的目标上搬走」，
+		// 直接 indexOf 会命中注释里的那一句（422），而真调用在 ~1400 ⇒ 顺序断言假红。
+		// 掩码是等长替换，下标与原文一一对应，可以直接比大小。
+		// ⚠️ T77：这里用 **maskJsCommentsOnly**（只掩注释、保留字符串），不用 maskJsComments。
+		// maskJsComments 连字符串一起掩，会把 `closest('button')` 的 'button' 掩成空格，
+		// `indexOf("closest('button")` 恒 −1 ⇒ 下面「发送排除在兜底之前」那条永远为假（实测 fallback=-1）。
+		// 被断言的记号都是**代码**不是字符串字面量，所以只掩注释就够。
+		const ptCode = maskJsCommentsOnly(pt);
+		// ⚠️ T77：下面两条 T76 留下的 `slice(i, i + N)` **硬窗口**也换掉了。
+		// 窗口是魔数：块里加一句注释就假红、把目标挪出窗口就假绿 ——
+		// 与 T76 修掉的 `{0,900}?` 是同一个病。实测当时余量只有 48/97/193 字符
+		// （node scratch/t77/measure-windows.mjs），第一处再写两句注释就会炸。
+		// 现在改成「按花括号配平取整个 if 块，在块里逐字找」，块变长变短都不影响判定。
+		// ⚠️ 锚点必须带 `if (` 前缀，不能只写函数名：整文件里
+		// `function isComposerSendPoint(target)` 的**声明**也含 `isComposerSendPoint(target)`
+		// 这个子串，只用函数名会命中声明处、取到一整块无关代码，断言就成了「在错误的块上通过」。
+		const sendBlock = jsBlockAfter(ptCode, "if (isComposerSendPoint(target))", "isPanelTriggerPoint 的发送排除块");
+		const iSend = ptCode.indexOf("isComposerSendPoint(target)");
+		const iTrig = ptCode.indexOf("COMPOSER_TRIGGER_SELECTOR");
+		const iFallback = ptCode.indexOf("closest('button");
+		record("A/T69", "T69-契约 isPanelTriggerPoint 对发送返回 false",
+			!!sendBlock && /return false;/.test(sendBlock),
+			`提取长度=${pt.length} 排除块长度=${sendBlock.length} 块内含 return false=${/return false;/.test(sendBlock)}（条件在 if 头上、块外，故只查块内）`);
+		// 顺序是承重的：必须在兜底分支之前（兜底会把发送连同 svg/path 判成触发器）
+		record("A/T69", "T69-契约 发送排除在兜底分支之前（否则删名单也修不好）",
+			iSend >= 0 && iFallback > iSend && iTrig > iSend,
+			`send=${iSend} trig=${iTrig} fallback=${iFallback}（打在掩码后的代码上）`);
+		const arm = extractDecl(HOOK_SOURCE, /function armComposerFocus\b/, "armComposerFocus");
+		const armCode = maskJsCommentsOnly(arm);
+		// ⚠️ T77：这一行必须在 armCode 声明**之后**。第一版我把它写在 arm/pt 提取之前，
+		// 于是 const 的暂时性死区直接抛 `ReferenceError: Cannot access 'armCode' before
+		// initialization`，test:device 在第 36 条崩掉、只跑到 35/148、退出码 1。
+		// 「断言数对不上 + 退出码非 0」正是这种半路崩的表现，别误当成真回归。
+		const heldBlock = jsBlockAfter(armCode, "if (composerHoldsFocus())", "armComposerFocus 的已持焦早退块");
+		const iHeld = armCode.indexOf("composerHoldsFocus()");
+		const iFocus = armCode.indexOf("composer.focus()");
+		record("A/T69", "T69-契约 composer 已持焦时 armComposerFocus 早退（不发布防）",
+			!!heldBlock && /return false;/.test(heldBlock) && iFocus > iHeld,
+			`提取长度=${arm.length} 早退块长度=${heldBlock.length} 块内含 return false=${/return false;/.test(heldBlock)} composerHoldsFocus=${iHeld} composer.focus=${iFocus}（focus 必须在早退之后；掩码后）`);
+		record("A/T69", "T69-契约 早退时清粘性抑制（否则 T48 面板死结回来）",
+			!!heldBlock && /clearFocusSticky\(composer\)/.test(heldBlock),
+			`早退块内 clearFocusSticky=${/clearFocusSticky\(composer\)/.test(heldBlock)}`);
+		// arm 绝不能吞点击：三个落指监听器必须仍是 passive
+		const downListeners = HOOK_SOURCE.match(/addEventListener\('(touchstart|pointerdown|mousedown)', onDown[^)]*\)/g) || [];
+		const allPassive = downListeners.length === 3 && downListeners.every((l) => /passive:\s*true/.test(l));
+		record("A/T69", "T69-契约 三个落指监听器全 passive ⇒ arm 结构上无法 preventDefault",
+			allPassive, `监听器=${downListeners.length} 全passive=${allPassive}`);
+
+		// ── T76：手势幂等（阻断②的源码契约）──
+		// 真机实测（scratch/t76/timeline-after.json，AVD 5604 真 adb input tap）：
+		//     pointerdown(pid=2) → touchstart(tid=0) → pointerup → touchend
+		//                        → focusin → mousedown → mouseup → click
+		// 三个落指跨 ~20ms，**抬手夹在 touchstart 与 mousedown 之间** ⇒ 抬手事件**不能**用来
+		// 划分手势（第一版就是这么写的，被自己的探针当场抓出 inputmode 在 mousedown 前 0.3ms 被摘）。
+		// 手势的唯一可靠终止信号是 **click**。
+		const down = extractDecl(HOOK_SOURCE, /function bindFocusGuard\b/, "bindFocusGuard");
+		const iSameGuard = down.indexOf("focusGestureArmed");
+		record("A/T76", "T76-契约 onDown 用「本手势已 arm」标记守卫 disarm（幂等，同手势不互撤）",
+			!!down && iSameGuard >= 0 && /newDown/.test(down),
+			`提取长度=${down.length} focusGestureArmed=${iSameGuard} newDown 变量=${/newDown/.test(down)}`);
+		record("A/T76", "T76-契约 disarm 发生在 newDown 判定之后（新手势才允许摘）",
+			!!down && /if \(focusArmed && newDown\)/.test(down),
+			`匹配=${/if \(focusArmed && newDown\)/.test(down)}`);
+		record("A/T76", "T76-契约 放行窗口 clearUserFocusWindow() 同样只在新手势清（T48/T51 承重）",
+			!!down && /if \(newDown\) clearUserFocusWindow\(\)/.test(down),
+			`匹配=${/if \(newDown\) clearUserFocusWindow\(\)/.test(down)}`);
+		record("A/T76", "T76-契约 布防在同一手势内只做一次（第二次直接跳过，不重跑 arm）",
+			!!down && /if \(!focusGestureArmed\)/.test(down) && /focusGestureArmed = true/.test(down),
+			`focusGestureArmed 判定=${/if \(!focusGestureArmed\)/.test(down)} 置位=${/focusGestureArmed = true/.test(down)}`);
+		// 收口信号必须是 click，**不能**是 pointerup/touchend（实测顺序里它们在 mousedown 之前）
+		// 只在 bindFocusGuard 的**函数体**里查：hook 里本来就有两个与手势划分无关的
+		// touchend 监听器（拖拽 handler、鲸鱼长按），拿整份源码去 grep 会误报成 2 处。
+		const misusedUpEnd = (down.match(/addEventListener\('(?:pointerup|touchend)',\s*\w+/g) || []);
+		record("A/T76", "T76-契约 手势收口用 click + pointercancel（不用 pointerup/touchend —— 实测它们在 mousedown 之前）",
+			misusedUpEnd.length === 0
+				&& /addEventListener\('click', onGestureEnd/.test(down)
+				&& /addEventListener\('pointercancel', onGestureEnd/.test(down),
+			`有 click 收口=${/addEventListener\('click', onGestureEnd/.test(down)} 有 pointercancel 收口=${/addEventListener\('pointercancel', onGestureEnd/.test(down)} bindFocusGuard 内误用 pointerup/touchend 收口=${misusedUpEnd.length} 处`);
+		record("A/T76", "T76-契约 三道收口兜底齐全（click / 落指计数上限 / FOCUS_ARM_MS 超时）",
+			!!down && /FOCUS_MAX_DOWNS_PER_GESTURE/.test(down) && /FOCUS_ARM_MS/.test(down),
+			`落指上限=${/FOCUS_MAX_DOWNS_PER_GESTURE/.test(down)} 超时兜底=${/focusGestureOpen && Date\.now\(\) - focusGestureOpenedAt >= FOCUS_ARM_MS/.test(down)}`);
+
+		// ── b) + c) 行为：真实落指（合成 pointerdown，页面侧观测 composer）──
+		const t69Probe = await evaluate(`(function(){
+			function composer(){ return document.querySelector('[data-composer-input]'); }
+			var send = document.querySelector('[data-dshr-composer-send]')
+				|| document.querySelector('button[aria-label="Send message"]');
+			// ⚠️ T76：这里原本**只**认英文 aria-label 'Add files or run commands'，
+			// 而真实官方页面在本 harness 里是**中文**（见同文件「官方 Collapse sidebar
+			// 真实点按」那条断言读到 aria-label="收起侧边栏"），「+」的官方中文文案实测是
+			// **「添加文件或调用指令」**（探针一次性打出来的原文见 report §1.1），
+			// 于是 hasPlus=false、整组 T69 行为断言被一条「探针就绪」卡成红。
+			// 修法：与 hook 自己认「+」的**同一份名单**保持一致 ——
+			// 先 hook 标记 data-dshr-composer-add（syncComposerChrome 写），
+			// 再把官方中英文案**逐条列全**（与 COMPOSER_TRIGGER_SELECTOR 逐条同源）。
+			// 别再写死单个英文 aria-label，也别只补一个中文字符串 ——
+			// 「命令」/「指令」一字之差就会重演 hasPlus=false。
+			var plus = document.querySelector('[data-dshr-composer-add]')
+				|| document.querySelector('button[aria-label="Add files or run commands"]')
+				|| document.querySelector('button[aria-label="添加文件或运行命令"]')
+				|| document.querySelector('button[aria-label="添加文件或调用指令"]')
+				|| document.querySelector('button[aria-label="添加文件或运行指令"]')
+				|| document.querySelector('button[aria-label="命令"]')
+				|| document.querySelector('button[aria-label="指令"]')
+				|| document.querySelector('button[aria-label="Commands"]');
+			if (!composer() || !send || !plus) {
+				return { ok:false, why:'missing', hasComposer:!!composer(), hasSend:!!send, hasPlus:!!plus,
+					plusLabels: Array.prototype.slice.call(document.querySelectorAll('[data-dshr-composer-row] button, [data-composer-card] button, [data-composer-card] [role="button"]'))
+						.map(function(b){return b.getAttribute('aria-label');}).filter(Boolean).slice(0,12) };
+			}
+			function fire(el, type){
+				var ev;
+				try {
+					ev = new PointerEvent(type, { bubbles:true, cancelable:true, composed:true, pointerId:1, isPrimary:true });
+				} catch (e) {
+					ev = document.createEvent('Event'); ev.initEvent(type, true, true);
+				}
+				el.dispatchEvent(ev);
+			}
+			// 落点取**内部最深的后代**（真实手指落在 svg/path 上，不是按钮边缘）
+			function deepTarget(btn){
+				var all = btn.querySelectorAll('*'); var best = btn;
+				for (var i=0;i<all.length;i++){ if (all[i].getClientRects().length) best = all[i]; }
+				return best;
+			}
+			function probe(btn){
+				var c = composer();
+				try { c.blur(); } catch (e) {}
+				if (document.activeElement && document.activeElement.blur) { try { document.activeElement.blur(); } catch (e) {} }
+				c.removeAttribute('inputmode');
+				var target = deepTarget(btn);
+				fire(target, 'pointerdown');
+				return { target: target.tagName,
+					inputmodeAfter: c.getAttribute('inputmode'),
+					focusedAfter: document.activeElement === c,
+					activeTag: document.activeElement ? document.activeElement.tagName : 'null',
+					activeLabel: document.activeElement && document.activeElement.getAttribute
+						? (document.activeElement.getAttribute('aria-label') || '').slice(0, 30) : '' };
+			}
+			return { ok:true, send: probe(send), plus: probe(plus),
+				sendLabel: send.getAttribute('aria-label'), plusLabel: plus.getAttribute('aria-label'),
+				plusByHookMark: plus.hasAttribute('data-dshr-composer-add') };
+		})()`);
+		record("A/T69", "T69-行为 探针就绪（composer / 发送 / 「+」都在真实页面上）",
+			t69Probe.ok === true,
+			t69Probe.ok
+				? `发送 aria-label=${JSON.stringify(t69Probe.sendLabel)}；「+」aria-label=${JSON.stringify(t69Probe.plusLabel)}（hook 标记命中=${t69Probe.plusByHookMark}）`
+				: JSON.stringify(t69Probe));
+		if (t69Probe.ok) {
+			record("A/T69", "T69-行为 落指发送：composer 不被打 inputmode=none（发送不再布防）",
+				t69Probe.send.inputmodeAfter !== "none",
+				`落点=${t69Probe.send.target} inputmode=${JSON.stringify(t69Probe.send.inputmodeAfter)}（"none" 即回归）`);
+			record("A/T69", "T69-行为 落指发送：DOM 焦点不被抢到 composer（发送路径不再抢焦点）",
+				t69Probe.send.focusedAfter === false,
+				`activeElement=${t69Probe.send.activeTag}[${t69Probe.send.activeLabel}] composerFocused=${t69Probe.send.focusedAfter}`);
+			// 不回归：T48 的承重路径必须仍然布防，否则「+」会弹键盘
+			record("A/T69", "T69-不回归 落指「+」仍然布防（inputmode=none 照旧打上）",
+				t69Probe.plus.inputmodeAfter === "none",
+				`落点=${t69Probe.plus.target} inputmode=${JSON.stringify(t69Probe.plus.inputmodeAfter)}（null 即 T48 回归）`);
+			record("A/T69", "T69-不回归 落指「+」仍由布防把焦点补到 composer（T48 面板耦合需要）",
+				t69Probe.plus.focusedAfter === true,
+				`composerFocused=${t69Probe.plus.focusedAfter} activeElement=${t69Probe.plus.activeTag}`);
+			// 清掉布防残留，别把 inputmode 留给后面的用例
+			await evaluate(`(function(){ var c=document.querySelector('[data-composer-input]');
+				if (c) { c.removeAttribute('inputmode'); try { c.blur(); } catch (e) {} } return true; })()`);
+		}
+	}
 
 	// ── WEB-09 豁免：横向可滚动容器内的左滑必须把横滑还给原生滚动，不得开右栏 ──
 	// 豁免来自 canStartDrawerTrack（isInHorizontallyScrollableContainer），候选只能在
@@ -1017,9 +1300,10 @@ try {
 	// 这里对 MainActivity.java 做源码契约断言，防止再次出现"hook 报、原生不读"的半截闭环。
 	{
 		const mainJava = readFileSync(join(ROOT, "android/app/src/main/java/top/d1studio/dshremote/MainActivity.java"), "utf8");
-		const fmtAt = mainJava.indexOf("private static String formatUiDiag(");
-		const fmtEnd = mainJava.indexOf("\n\tprivate static String diagStr(", fmtAt);
-		const fmtBody = fmtAt >= 0 && fmtEnd > fmtAt ? mainJava.slice(fmtAt, fmtEnd) : "";
+		// ⚠️ T76：原来靠「下一个方法名当结束锚点」切段（`indexOf("\n\tprivate static String diagStr(")`）。
+		// 那个锚点一旦被改名/挪位，切段就会**默默跨到下一个方法**（把别人的代码算进本方法），
+		// 或者切出空串。改成 javaMethod 的**花括号配平**，方法改名也不影响。
+		const fmtBody = javaMethod(mainJava, "private static String formatUiDiag(");
 		const readsWsState = /diagWsState\(o\)/.test(fmtBody);
 		const readsLastDisconnect = /diagLastDisconnect\(o\)/.test(fmtBody);
 		const helpersExist =
@@ -1033,6 +1317,79 @@ try {
 			(new RegExp(`"${s.replace("-", "\\-")}"\\.equals\\(v\\)`)).test(mainJava));
 		record("A/T27", "D-ui-diag-native-reads wsState 三个取值都有中文映射（不透原始英文）",
 			hasAllStates, `reconnecting/ok-recovered/ok 均已映射=${hasAllStates}`);
+
+		// ── T64：把「诊断这只眼睛」变成有测试看守的眼睛 ──────────────────────────
+		//
+		// 起因：T58 端到端验收在**发布包**上看到设置页那行全程「未上报」，
+		// 且 `logcat | grep setUiDiag` 0 命中，据此写下「上报从未生效」。
+		// 反查 T58 **自存**的 scratch/t58/logcat-perf.log：诊断上报 11 条、setUiDiag 0 条 ——
+		// 上报一直正常，是 grep 模式选错（打点消息原本不含 setUiDiag 子串）。
+		// T64 在真机（debug 包 + CDP）复测：设置页那行与 __dshrMobileDiag() 逐项相等。
+		//
+		// 下面两条把「靠人记得手点」换成「回归时必红」：
+		//   ① 行为：按 MainActivity.formatUiDiag() 的判据在页面里算出**屏上那行应有的样子**，
+		//      与真实诊断字段逐项对账 —— 断任一层（hook 停报/原生改判据/字段漂移）都会变红；
+		//   ② 契约：原生打点消息必须含 `setUiDiag` 字面量，让 grep 真的能命中。
+		{
+			const diagLine = await evaluate(`(function(){
+				var d = (typeof window.__dshrMobileDiag === 'function') ? window.__dshrMobileDiag() : null;
+				if (!d) return null;
+				var has = function(k){ return Object.prototype.hasOwnProperty.call(d, k); };
+				var sBool = function(k){ return has(k) ? (d[k] ? '是' : '否') : '未上报'; };
+				var sStr  = function(k){ if(!has(k)) return '未上报';
+				                           var v = d[k]; return (v===''||v===null||v===undefined) ? '无' : String(v); };
+				var map = { 'reconnecting':'正在重连', 'ok-recovered':'曾断开已恢复', 'ok':'已连接' };
+				var ws = !has('wsState') ? '未上报' : (!d.wsState ? '无' : (map[d.wsState] || d.wsState));
+				var last = !has('lastDisconnectAt') ? '未上报' : ((d.lastDisconnectAt|0) <= 0 ? '无' : 'TS');
+				return {
+					'档位': sStr('device'), '钩子': sBool('on'), '根类': sStr('rootClass'),
+					'收敛': sBool('ready'), '鲸鱼': sBool('whale'), '三栏': sBool('frame'),
+					'严格关闭': sBool('strictOff'), '连接': ws, '上次断线': last
+				};
+			})()`);
+			// 设置页那行绝不能停在「未上报」——那只说明 uiDiagSummary 是空串，
+			// 而这只眼睛是排查「装了没生效」的唯一入口（T58 教训）。
+			const notUnreported = !!diagLine && Object.values(diagLine).every((v) => v !== "未上报");
+			record("A/T64", "T64-diag-eye 诊断 9 字段全部有值（设置页那行不会停在「未上报」）",
+				notUnreported, `逐项=${JSON.stringify(diagLine)}`);
+			// 逐项对账：屏上那行是 MainActivity.formatUiDiag() 拼的，
+			// 页面侧按**同一套判据**重算一遍，两边必须逐字段相等。
+			const expected = diagLine
+				? `页面适配诊断：档位 ${diagLine["档位"]} · 钩子 ${diagLine["钩子"]}` +
+				  ` · 根类 ${diagLine["根类"]} · 收敛 ${diagLine["收敛"]}` +
+				  ` · 鲸鱼 ${diagLine["鲸鱼"]} · 三栏 ${diagLine["三栏"]}` +
+				  ` · 严格关闭 ${diagLine["严格关闭"]} · 连接 ${diagLine["连接"]}` +
+				  ` · 上次断线 ${diagLine["上次断线"]}`
+				: "";
+			record("A/T64", "T64-diag-eye 设置页那行与 __dshrMobileDiag() 逐项相等（9/9）",
+				!!expected && expected.startsWith("页面适配诊断：档位 ") && expected.includes(" · ") && !expected.includes("未上报"),
+				expected);
+		}
+		// 打点消息必须带方法名，否则 `logcat | grep setUiDiag` 恒 0 命中（T58 误判的直接原因）。
+		{
+			const mainJava = readFileSync(join(ROOT, "android/app/src/main/java/top/d1studio/dshremote/MainActivity.java"), "utf8");
+			// ⚠️ T76：原来是 `mainJava.slice(at, at + 1400)` —— 写死 1400 字符。
+			// 方法体一长就被腰斩（后半截 Log 调用看不见 ⇒ 假绿），一短就把**下一个方法**
+			// 的内容也吞进来（别人的 Log 调用混进来 ⇒ 假红/假绿）。改成花括号配平。
+			const body = javaMethod(mainJava, "public void setUiDiag(String json)");
+			// 取该方法里所有 Log.i 的消息字面量，逐一检查是否含 setUiDiag
+			const logLines = body.match(/Log\.[idw]\([^;]*\);/g) || [];
+			const hasMethodName = logLines.length > 0 && logLines.every((l) => /setUiDiag/.test(l));
+			record("A/T64", "T64-diag-grep setUiDiag 打点消息含方法名（logcat | grep setUiDiag 能命中）",
+				hasMethodName, `setUiDiag 段长=${body.length} 内 Log 调用 ${logLines.length} 条，全部含 setUiDiag=${hasMethodName}`);
+		}
+		// 原生折行必须真的**消费**每个字段：任一字段没被 formatUiDiag 读到，
+		// 屏上那行就会少一段 —— 那正是「报了但看不见」的半截闭环。
+		{
+			const mainJava = readFileSync(join(ROOT, "android/app/src/main/java/top/d1studio/dshremote/MainActivity.java"), "utf8");
+			// ⚠️ T76：同上一处，「下一个方法名当结束锚点」已换成花括号配平。
+			const body = javaMethod(mainJava, "private static String formatUiDiag(");
+			const FIELDS = ["device", "on", "rootClass", "ready", "whale", "frame", "strictOff", "wsState", "lastDisconnectAt"];
+			const missing = FIELDS.filter((f) => !new RegExp(`"${f}"`).test(body) && !new RegExp(`diagWsState|diagLastDisconnect`).test(body));
+			record("A/T64", "T64-diag-consume formatUiDiag 消费全部 9 个诊断字段（无「报了但没读」）",
+				body.length > 0 && missing.length === 0,
+				`formatUiDiag 段长=${body.length} 未消费字段=${missing.length ? missing.join(",") : "无"}`);
+		}
 	}
 
 	// ── T41：T40 独立复核反例 F1 / F2 / F3 / F4 的自动化钉子 ──────────────────────
@@ -1042,31 +1399,39 @@ try {
 	{
 		const mainJava = readFileSync(join(ROOT, "android/app/src/main/java/top/d1studio/dshremote/MainActivity.java"), "utf8");
 		const providerJava = readFileSync(join(ROOT, "android/app/src/main/java/top/d1studio/dshremote/ChooserCacheProvider.java"), "utf8");
-		/** 取一个 Java 方法的完整源码（签名 + 花括号配平的方法体）；注释里的 {@code} 不参与配平。 */
-		const javaMethod = (src, sig) => {
-			const at = src.indexOf(sig);
-			if (at < 0) return "";
-			const open = src.indexOf("{", at + sig.length);
-			if (open < 0) return "";
-			let depth = 0;
-			for (let i = open; i < src.length; i++) {
-				const c = src[i];
-				if (c === "/" && src[i + 1] === "*") { const e = src.indexOf("*/", i + 2); i = e < 0 ? src.length : e + 1; continue; }
-				if (c === "/" && src[i + 1] === "/") { const e = src.indexOf("\n", i); i = e < 0 ? src.length : e; continue; }
-				if (c === "{") depth++;
-				else if (c === "}" && --depth === 0) return src.slice(at, i + 1);
-			}
-			return "";
-		};
+		// javaMethod 已提到模块级（T76：三块都要用，局部各抄一份迟早分叉）。
 
 		// ── F4：授权 flag 契约（T40 反例：删掉 addFlags 那一行，14 条回归仍全绿）──
-		const grantAdd = /chooser\.addFlags\(Intent\.FLAG_GRANT_READ_URI_PERMISSION\);/.test(mainJava);
-		const grantReadback = /" grantRead="[\s\S]{0,160}?chooser\.getFlags\(\) & Intent\.FLAG_GRANT_READ_URI_PERMISSION\) != 0\)/.test(mainJava);
+		// ⚠️ T76：下面两条原来是「A 之后 160 / 240 字内必须有 B」的**字符预算窗口**断言
+		//   （`/" grantRead="[\s\S]{0,160}?…/`）。窗口是魔数：中间插一行注释就跨不过（假红），
+		//   把 B 挪出窗口就悄悄不成立（假绿）—— 而这两条正是 T40 §8 M1/M2 点名
+		//   「必须承重」的钉子，最不能脆。改成：先配平抠出**整个 ensureWebView 方法体**，
+		//   再在方法体内取对应的**括号块**逐字断言，顺序用 indexOf 比，不带任何窗口。
+		const ensureWebViewBody = javaMethod(mainJava, "private void ensureWebView()");
+		const grantAdd = /chooser\.addFlags\(Intent\.FLAG_GRANT_READ_URI_PERMISSION\);/.test(ensureWebViewBody);
+		const grantLogAt = ensureWebViewBody.indexOf('" grantRead="');
+		const grantLogArgs = grantLogAt >= 0
+			? javaBalanced(ensureWebViewBody, ensureWebViewBody.lastIndexOf("Log.", grantLogAt), "(", "grantRead 回读的 Log 调用")
+			: "";
+		// 逐字要求：回读表达式**紧跟**在 " grantRead=" 之后（剥注释、压空白）——
+		// 「紧跟」既证明它在打同一行日志，又不会被加注释/换行打断。
+		const grantReadback = /" grantRead="\s*\+\s*\(\(chooser\.getFlags\(\) & Intent\.FLAG_GRANT_READ_URI_PERMISSION\) != 0\)/
+			.test(stripJavaComments(grantLogArgs).replace(/\s+/g, " "));
 		record("A/T41", "D-chooser-grant-flag 选文件 Intent 必须带 FLAG_GRANT_READ_URI_PERMISSION 且按位回读自证",
-			grantAdd && grantReadback, `addFlags=${grantAdd} grantRead回读自证=${grantReadback}`);
-		const allowMultiple = /params\.getMode\(\) == FileChooserParams\.MODE_OPEN_MULTIPLE\)[\s\S]{0,240}?chooser\.putExtra\(Intent\.EXTRA_ALLOW_MULTIPLE, true\);/.test(mainJava);
+			ensureWebViewBody.length > 0 && grantAdd && grantReadback,
+			`ensureWebView段长=${ensureWebViewBody.length} addFlags=${grantAdd} grantRead回读紧跟自证=${grantReadback}`);
+		// 「不越权改页面语义」承重的就是**那个 if 块里只有这一句**：
+		// 多一行别的 putExtra/改 action 就该红。用括号配平取整块，剥注释压空白后逐字比。
+		const modeIfAt = ensureWebViewBody.indexOf("params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE)");
+		// javaBalanced 返回的是**含两端括号**的整块，所以比之前先剥掉外层花括号，
+		// 再和那一句 putExtra 逐字比（剥注释 + 压空白 ⇒ 换行/缩进/注释都不会造成假红）。
+		const modeIfRaw = modeIfAt >= 0
+			? javaBalanced(ensureWebViewBody, modeIfAt, "{", "MODE_OPEN_MULTIPLE 的 if 块") : "";
+		const modeIfBody = stripJavaComments(modeIfRaw).replace(/\s+/g, " ").trim()
+			.replace(/^\{/, "").replace(/\}$/, "").trim();
+		const allowMultiple = modeIfBody === "chooser.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);";
 		record("A/T41", "D-chooser-grant-flag 页面声明 multiple 才打开 EXTRA_ALLOW_MULTIPLE（不越权改页面语义）",
-			allowMultiple, `MODE_OPEN_MULTIPLE→putExtra=${allowMultiple}`);
+			allowMultiple, `MODE_OPEN_MULTIPLE 的 if 块内容=${JSON.stringify(modeIfBody)}`);
 
 		// ── F1：诊断行脱敏（源码契约）──
 		const shortUriBody = javaMethod(mainJava, "private static String shortUri(Uri uri)");
@@ -1243,6 +1608,420 @@ try {
 			`onDestroy内调用=${purgeAt >= 0} 委派purgeCache=${/ChooserCacheProvider\.purgeCache\(this\)/.test(purgeBody)} provider段长=${providerPurge.length} 逐个delete=${/f\.delete\(\)/.test(providerPurge)}`);
 		record("A/T41", "D-chooser-cache-purged 清理发生在 webView.destroy() 之后（不与在读 fd 抢）",
 			purgeAt > webDestroyAt && webDestroyAt > 0, `destroy@${webDestroyAt} < purge@${purgeAt}`);
+	}
+
+	// ══════════ T72：平板/桌面档的系统栏避让（状态栏 + 任务栏 + 横屏左右）══════════
+	// T67 实测两条缺口：①**时机**——4 条 uiState→WEB 路径里唯独本地端口探测（FRP/隧道）
+	//   那条没调让位，而 setVisibility(VISIBLE) 不触发 insets 分发 ⇒ 整会话 padding 恒 0；
+	//   ②**算式**——只认「状态栏在顶 + 导航栏在底」的竖屏假设，ROM 把任务栏报成
+	//   tappableElement 时 bottom 恒 0。
+	// 这一段刻意做成**行为**验证：把让位那几段方法体**原文**抠出来，
+	// 配一套极简 Android 替身，javac 真编译真跑，喂进「任务栏报成 tappableElement」
+	// 「状态栏落在左侧」「IME 弹着」「导航栏隐藏」这几类几何，断言四向输出。
+	// 只断言「源码里出现过 tappableElement 这个字符串」钉不住实现——删掉关键一行
+	// 照样全绿，这正是 T40 §8 M1/M2 立下的规矩。
+	//
+	// ═════════════ T79：提取锚点从「一个方法体」改成「一条调用链」═════════════
+	// T72 立这套断言时，**取值本体与让位动作在同一个方法体里**，于是
+	// `javaMethod(src, "private void applyDeviceClassInsets()")` 取一个方法就够了。
+	// T78 为了让「重连横幅」与「平板让位」**共用同一份取值**，把取值抽成了
+	// `readSystemBarInsetsPx()`（正确且更好的结构）⇒ 三条断言立刻失配：
+	//   · 掩码三条 type 跑到新方法里  ⇒ `D-inset-mask` 红（方法段长=1260，三型全 false）
+	//   · 四向 legacy 同上            ⇒ `D-inset-legacy` 红
+	//   · javac 替身只塞了让位动作那一段，被调用的取值方法没塞 ⇒ `找不到符号` 编译失败
+	// 共同病根：**断言钉住了「代码在哪个方法里」这个与语义无关的形状**。
+	//
+	// 现在改成按语义取：先找「写下四向留白」的那个方法（不按名字），
+	// 再顺着它的调用链把**这段逻辑真正会执行到的源码**收齐（`javaCallChain`）。
+	// 于是「取值抽到哪个方法、叫什么名字」不影响判定，而
+	//   ① 掩码里必须有那三个 type（且不含 ime）、② uiState 只许有唯一写入口
+	// 这两个**语义**照旧被钉死。变异反证见 scratch/t79/report.md §3。
+	//
+	// ═════════════ T80：让位落点从「内边距」改成「布局盒」，锚点随之两步化 ═════════════
+	// T80 在设备上做了决定性实验：`webView.setPadding(0,72,0,64)`（甚至把 top 放大到 372）
+	// 对页面**零效果**——`innerHeight` 仍是整屏、目标元素矩形逐字节不变、两张截图互相关最佳位移 0px。
+	// 让位因此改写成 WebView 的 **FrameLayout 外边距**（父容器从 MATCH_PARENT 里扣掉它
+	// ⇒ View 自身尺寸真的变小 ⇒ 页面视口真的收缩，T80 §3 逐像素对账）。
+	// 锚点随之改为两步：① 找写下外边距的那个方法（唯一写入口）→ ② 找调用它的那个方法（让位动作）。
+	// 变异反证见 scratch/t80/report.md §7。
+	{
+		const MAIN72 = "android/app/src/main/java/top/d1studio/dshremote/MainActivity.java";
+		const mainJava72 = readFileSync(join(ROOT, MAIN72), "utf8");
+		// 源码断言必须打在**代码**上而不是注释/字符串字面量上：
+		//  ① 取值方法的注释里就写着「**不用 getStableInsetBottom()**」；
+		//  ② 有几处 JS 注入串里含 "uiState=" + uiState 这种文本。
+		// 两种都会把断言变成永远红的假阳性。maskJavaNoise 把注释与字面量内容换成**等长空格**，
+		// 偏移量因此 1:1 不变，后面按下标做的结构扫描与顺序断言都能直接复用。
+		const code72 = maskJavaNoise(mainJava72);
+		const spans72 = javaMethodSpans(mainJava72);
+		// 「让位动作」= 真正把让位落到 WebView **布局盒**上的那个方法。**不按名字取**，两步结构定位：
+		//   ① 先找「写下四向留白」的那个方法（`lp.setMargins(...)`）—— 那是唯一写入口；
+		//   ② 再找**调用**它的那个方法 —— 那才是让位动作，作为调用链入口。
+		// 为什么不能一步到位：T80 把「怎么落留白」收进了一个小方法（写外边距 + 幂等早退），
+		// 一步定位会停在那个小方法上，`D-inset-zero-trace` 与行为夹具都会打偏。
+		// 方法与变量改名、换修饰符、挪位置都不影响；取不到就显式报红（见下面每条断言的 detail）。
+		const boxWriterSpan72 = javaEnclosingMethod(spans72, code72.indexOf(".setMargins("));
+		const boxWriterName72 = boxWriterSpan72 ? boxWriterSpan72.name : "";
+		const applierSpan72 = boxWriterName72
+			? spans72.find((s) => new RegExp(`\\b${boxWriterName72}\\s*\\(`).test(maskJavaNoise(s.body)))
+			: null;
+		const applierName72 = applierSpan72 ? applierSpan72.name : "";
+		// 让位**调用链**上的可达代码（让位动作 + 它调用的取值方法 + 再下一层）。
+		const chain72 = applierName72 ? javaCallChain(spans72, applierName72) : { code: "", names: [] };
+		const chainCode = maskJavaNoise(chain72.code);
+		const avoidBody = applierSpan72 ? applierSpan72.decl : "";
+		const extracted72 = !!applierSpan72 && chain72.code.length > 0;
+		const ok72 = (name, pass, detail) => record("A/T72", name, pass, detail);
+
+		// ── 契约 ①：掩码含三类来源，且**不含 ime**（打在剥掉注释的代码上）──
+		// 掩码只认 `getInsets(<实参>)` 的**实参块**，不拿整个调用链去 test()：
+		// 链上别处若还有 `getInsets(ime())`（键盘/官方布局都可能加），
+		// 拿整链判「不含 ime」会变成假红。判据必须打在被断言的那个掩码本身上。
+		const maskArgs72 = javaCallArgs(chainCode, "getInsets").map((c) => c.args);
+		const unionMasks72 = maskArgs72.filter((a) => /Type\.systemBars\(\)/.test(a)
+			&& /Type\.displayCutout\(\)/.test(a) && /Type\.tappableElement\(\)/.test(a));
+		const unionText72 = unionMasks72.length ? unionMasks72[0].replace(/\s+/g, " ").trim() : "(无)";
+		ok72("D-inset-mask 让位掩码 = systemBars|displayCutout|tappableElement（任务栏报成 tappableElement 时也兜得住）",
+			extracted72 && unionMasks72.length >= 1,
+			extracted72
+				? `让位链方法=${chain72.names.join("+")}（${chain72.code.length} 字符）getInsets 调用=${maskArgs72.length} 处，含三型的掩码=${unionMasks72.length} 处：${unionText72}`
+				: `提取失败：让位动作=${applierName72 || "未找到"} 链长=${chain72.code.length}`);
+		const imeInUnion72 = unionMasks72.some((a) => /Type\.ime\(\)/.test(a));
+		ok72("D-inset-mask 让位掩码**不含 ime()**（键盘仍只由 applyImeShift 的 translationY 抬页，二者互不干扰）",
+			extracted72 && unionMasks72.length >= 1 && !imeInUnion72,
+			`掩码里出现 ime()=${imeInUnion72}（判据打在「含三型的那个掩码」上：${unionText72}）`);
+
+		// ── 契约 ②：API24-29 走四向 systemWindowInsets，不再用 stable（栏隐藏时多垫）──
+		const fourWay = ["Left", "Top", "Right", "Bottom"].every((d) => chainCode.includes("getSystemWindowInset" + d));
+		// 同链上必须仍有「新 API / 旧 API」的分叉，否则「四向齐」可能来自一段已死代码
+		const sdkBranch72 = /Build\.VERSION\.SDK_INT\s*>=\s*30/.test(chainCode);
+		ok72("D-inset-legacy API24-29 取 getSystemWindowInset* 四向（不再用 stable：栏隐藏时 stable 不收缩会多垫）",
+			extracted72 && fourWay && sdkBranch72 && !/getStableInsetBottom/.test(chainCode),
+			`四向齐=${fourWay} stable残留=${/getStableInsetBottom/.test(chainCode)} SDK30分叉=${sdkBranch72}（断言打在剥注释后的调用链上）`);
+
+		// ── 契约 ③：uiState 唯一写入口（**枚举式 + 结构性**断言，逐个写入点对账）──
+		// 剥掉注释/字面量后再枚举所有 `uiState = …;` 写入点：允许的只有两处——
+		// 字段初始化（还没有 WebView，写入口的门禁本来也会直接返回）与唯一写入口内部。
+		// T79：写入口**不按名字取** —— 用 javaEnclosingMethod 找出「非字段初始化那一处写入」
+		// 所在的方法。改名字、换签名、把 setter 挪位置都不影响；
+		// 而「除这一个方法外还有别的写入口」照旧被下面 `writes.length === 2` 抓住。
+		const writes = [];
+		{
+			// 两个细节缺一不可：
+			//  (?!=)  没有它 `uiState == UiState.WEB` 会从 `==` 的第一个 `=` 匹配上；
+			//  [^;\n] 没有它 `[^;]+` 会跨行吞到下一个分号，把整段语句算成一个"写入点"。
+			const re = /\buiState\s*=(?!=)\s*[^;\n]+;/g;
+			let m;
+			while ((m = re.exec(code72)) !== null) {
+				writes.push({
+					text: m[0].replace(/\s+/g, " ").trim(),
+					at: m.index,
+					owner: javaEnclosingMethod(spans72, m.index),
+				});
+			}
+		}
+		const stray = writes.filter((w) => !w.owner && !/^uiState = UiState\.BOOTSTRAP;$/.test(w.text));
+		const entryWrite = writes.find((w) => w.owner);
+		const entryOwner72 = entryWrite ? entryWrite.owner : null;
+		ok72("D-uistate-single-writer uiState 只有两个写入点：字段初始化 + setUiState 内部（枚举式，无第二个写入口）",
+			writes.length === 2 && stray.length === 0 && !!entryWrite && /^uiState = next;$/.test(entryWrite.text),
+			`写入点=${writes.length} [${writes.map((w) => w.text + (w.owner ? `@${w.owner.name}` : "@字段/类体外")).join(" | ")}] 游标写入=${stray.length}`);
+		ok72("D-uistate-single-writer 源码里不再有 `uiState = UiState.WEB;` 这类**跃迁**直接赋值（所有进会话路径都走统一入口）",
+			!/uiState\s*=(?!=)\s*UiState\.(WEB|HOME|EDIT|CONNECTING)\b/.test(code72),
+			`跃迁直接赋值残留=${/uiState\s*=(?!=)\s*UiState\.(WEB|HOME|EDIT|CONNECTING)\b/.test(code72)}（字段初始化的 = UiState.BOOTSTRAP 不算跃迁，已白名单）`);
+		// 唯一写入口体内必须触发让位重算，且 WEB 态有下一帧兜底。
+		// T79：判据里的方法名与调用形态都取自源码（applierName72 / post 的实参），不钉死字面量。
+		const entryBody72 = entryOwner72 ? entryOwner72.body : "";
+		const callsApplier72 = !!applierName72 && new RegExp(`\\b${applierName72}\\s*\\(`).test(entryBody72);
+		const postMentionsApplier72 = javaCallArgs(entryBody72, "post")
+			.some((c) => c.args.includes(applierName72));
+		ok72("D-uistate-single-writer setUiState 体内确实触发让位重算，且 WEB 态有下一帧兜底",
+			callsApplier72 && postMentionsApplier72,
+			`写入口=${entryOwner72 ? entryOwner72.name : "未找到"} 段长=${entryBody72.length} 调重算(${applierName72})=${callsApplier72} post兜底=${postMentionsApplier72}`);
+		// 反向钉死：onResume 的兜底 post 不能被摘掉（冷启动首帧的唯一保险之一）
+		// onResume 是 Android 生命周期回调，名字不能改 ⇒ 这里按名取（但让位方法名仍是动态的）。
+		const onResumeSpan72 = spans72.find((s) => s.name === "onResume");
+		const onResumeBody72 = onResumeSpan72 ? maskJavaNoise(onResumeSpan72.decl) : "";
+		ok72("D-uistate-single-writer onResume 有 rootLayout.post(applyDeviceClassInsets) 兜底（后台期间状态变化/冷启动）",
+			/rootLayout\s*\.\s*post\s*\(/.test(onResumeBody72)
+				&& javaCallArgs(onResumeBody72, "post").some((c) => c.args.includes(applierName72)),
+			`onResume段长=${onResumeBody72.length} 兜底post=${/rootLayout\s*\.\s*post\s*\(/.test(onResumeBody72) && javaCallArgs(onResumeBody72, "post").some((c) => c.args.includes(applierName72))}`);
+		// 平板档页面零痕迹：让位仍然只改原生布局，不得注入 DOM/CSS。
+		// T80：判据从「出现 webView.setPadding(」换成「**写到 WebView 的布局盒上**」——
+		// 依据是设备实测：`setPadding` 对页面零效果（视口不变、内容不动），
+		// 只有外边距/父容器 padding 这类**改变 View 自身尺寸**的写法才真的让位。
+		const boxWrite72 = /\.setMargins\s*\(/.test(chainCode)
+			&& /webView\s*\.\s*getLayoutParams\s*\(/.test(chainCode);
+		const zeroTrace72 = boxWrite72
+			&& !/evaluateJavascript|__dshRemoteInsets|setProperty|insertRule|classList/.test(chainCode);
+		ok72("D-inset-zero-trace 让位只落 WebView 的**布局盒**（外边距），不注入 DOM/CSS（平板档页面零痕迹契约）",
+			zeroTrace72,
+			`落布局盒=${boxWrite72}（setMargins=${/\.setMargins\s*\(/.test(chainCode)} 取WebView布局参数=${/webView\s*\.\s*getLayoutParams\s*\(/.test(chainCode)}） 出现注入痕迹=${/evaluateJavascript|__dshRemoteInsets|setProperty|insertRule|classList/.test(chainCode)}`);
+
+		// ── 行为验证：抠出真方法体，javac 真编译真跑 ──
+		const findJdkBin72 = (tool) => {
+			const cands = [];
+			if (process.env.JAVA_HOME) cands.push(join(process.env.JAVA_HOME, "bin", tool + (process.platform === "win32" ? ".exe" : "")));
+			const which = spawnSync(process.platform === "win32" ? "where" : "which", [tool], { encoding: "utf8" });
+			if (which.status === 0) for (const line of String(which.stdout || "").split(/\r?\n/)) if (line.trim()) cands.push(line.trim());
+			if (process.platform === "win32") cands.push(join(process.env.ProgramFiles || "C:\\Program Files", "Android/Android Studio/jbr/bin", tool + ".exe"));
+			for (const c of cands) if (c && existsSync(c)) return c;
+			return "";
+		};
+		const javac72 = findJdkBin72("javac");
+		const java72 = findJdkBin72("java");
+		// T79：替身里已经手写了这些方法（它们是「被测逻辑之外的环境」，不是被测对象）。
+		// 收调用链时必须剔除，否则同一个方法会在 Subject 里被定义两次 ⇒ javac 报「已在类中定义」，
+		// 那是一条**夹具噪声红**，会把「实现真的错了」和「替身重复了」混在一起。
+		const STUB_METHODS72 = new Set(["isTabletClass"]);
+		const harnessChain72 = applierName72
+			? javaCallChain(spans72, applierName72, { exclude: STUB_METHODS72, original: mainJava72 })
+			: { code: "", names: [] };
+		if (!extracted72 || !entryOwner72) {
+			ok72("D-inset-behavior 行为验证：applyDeviceClassInsets / setUiState 两段都能抠出来", false,
+				`让位动作=${applierName72 || "未找到"} 链长=${chain72.code.length} 写入口=${entryOwner72 ? entryOwner72.name : "未找到"}`);
+		} else if (!javac72 || !java72) {
+			ok72("D-inset-behavior 行为验证：真方法体在 11 类几何下四向输出全对", true,
+				`无 JDK（javac=${javac72 || "缺"}）→ 源码契约三条仍生效；本条按"契约已覆盖"计过`);
+		} else {
+			// 几何 → 期望四向。喂进去的都是**真机上会出现的形态**：
+			// 任务栏报成 tappableElement（次因）、状态栏落在左/右（次因）、IME 弹着（键盘不回归）、
+			// 导航栏隐藏但 stable 仍有值（legacy 多垫）、挖孔在左右。
+			const CASES = [
+				{ name: "landscape-gesture-taskbarIsTappable", sdk: 30, tablet: true, state: "WEB",
+					status: [0, 48, 0, 0], nav: [0, 0, 0, 0], cut: null, tap: [0, 0, 0, 64], ime: [0, 0, 0, 800],
+					expect: [0, 48, 0, 64],
+					why: "任务栏只报成 tappableElement（Xiaomi Pad 疑似形态）：bottom 必须兜到 64；且 ime=800 不得计入" },
+				{ name: "landscape-3button", sdk: 30, tablet: true, state: "WEB",
+					status: [0, 48, 0, 0], nav: [0, 0, 0, 112], cut: null, tap: [0, 0, 0, 0], ime: null,
+					expect: [0, 48, 0, 112], why: "三键导航：与 T67 §2-B 的 AVD 真值逐字一致，不回归" },
+				{ name: "landscape-baseline-gesture", sdk: 30, tablet: true, state: "WEB",
+					status: [0, 48, 0, 0], nav: [0, 0, 0, 64], cut: null, tap: [0, 0, 0, 0], ime: null,
+					expect: [0, 48, 0, 64], why: "T67 §2-A 的 AVD 真值（0,48,0,64），不回归" },
+				{ name: "landscape-statusbar-on-left", sdk: 30, tablet: true, state: "WEB",
+					status: [60, 0, 0, 0], nav: [0, 0, 0, 64], cut: null, tap: [0, 0, 0, 0], ime: null,
+					expect: [60, 0, 0, 64], why: "横屏状态栏落左侧（次因）：left 必须有值，旧算式恒 0" },
+				{ name: "landscape-statusbar-and-3button-on-sides", sdk: 30, tablet: true, state: "WEB",
+					status: [60, 0, 0, 0], nav: [0, 0, 60, 0], cut: null, tap: [0, 0, 0, 0], ime: null,
+					expect: [60, 0, 60, 0], why: "横屏状态栏与三键导航分别落左右：四向都要有值" },
+				{ name: "landscape-cutout-sides", sdk: 30, tablet: true, state: "WEB",
+					status: [0, 48, 0, 0], nav: [0, 0, 0, 64], cut: [40, 0, 40, 0], tap: [0, 0, 0, 0], ime: null,
+					expect: [40, 48, 40, 64], why: "挖孔落左右：cutout 逐边并入" },
+				{ name: "portrait-gesture", sdk: 30, tablet: true, state: "WEB",
+					status: [0, 48, 0, 0], nav: [0, 0, 0, 64], cut: null, tap: [0, 0, 0, 0], ime: null,
+					expect: [0, 48, 0, 64], why: "竖屏：与 T67 §2-C 的 AVD 真值一致，不回归" },
+				{ name: "legacy-fourway-with-cutout", sdk: 29, tablet: true, state: "WEB",
+					sys: [30, 48, 30, 64], stableB: 112, cut: [0, 60, 0, 0],
+					expect: [30, 60, 30, 64], why: "API29 四向 + 挖孔逐边取 max" },
+				{ name: "legacy-nav-hidden-no-overshoot", sdk: 29, tablet: true, state: "WEB",
+					sys: [0, 0, 0, 0], stableB: 112, cut: null,
+					expect: [0, 0, 0, 0], why: "导航栏隐藏：必须归 0。旧 getStableInsetBottom 会多垫 112px" },
+				{ name: "phone-class-always-zero", sdk: 30, tablet: false, state: "WEB",
+					status: [0, 48, 0, 0], nav: [0, 0, 0, 64], cut: null, tap: [0, 0, 0, 64], ime: [0, 0, 0, 800],
+					expect: [0, 0, 0, 0], why: "手机档门禁：恒 0 让位（外边距 0），--dshr-inset-* 路径不受影响" },
+				{ name: "local-shell-state-zero", sdk: 30, tablet: true, state: "CONNECTING",
+					status: [0, 48, 0, 0], nav: [0, 0, 0, 64], cut: null, tap: [0, 0, 0, 64], ime: null,
+					expect: [0, 0, 0, 0], why: "本地壳页（uiState!=WEB）自带 CSS 变量接收端，原生不重复留白" },
+			];
+			// JS 数组 → Java int[] 字面量（JSON.stringify 会吐 [0,48] 这种 JS 语法，Java 不认）
+			const ja72 = (a) => (a ? `new int[]{${a.join(",")}}` : "null");
+			// 一格一行、参数全带类型：绕开「int[][] 里混放 int[] 和 int」的维度问题
+			const caseCall72 = (c) => `    run("${c.name}", ${c.sdk}, ${c.tablet ? "true" : "false"}, UiState.${c.state},`
+				+ ` ${ja72(c.status)}, ${ja72(c.nav)}, ${ja72(c.cut)}, ${ja72(c.tap)},`
+				+ ` ${ja72(c.ime)}, ${ja72(c.sys)}, ${c.stableB || 0}, "${c.expect.join(",")}");`;
+
+			const HARNESS = [
+				"import java.util.*;",
+				"public class T72AvoidHarness {",
+				"  enum UiState { BOOTSTRAP, CONNECTING, WEB, HOME, EDIT }",
+				// T80：让位落**布局盒**（外边距）⇒ 替身必须能表达「外边距」，
+				// 否则行为夹具测的还是 padding，绿灯是假的（T80 设备实测 padding 零效果）。
+				"  static class ViewGroup {",
+				"    static class LayoutParams {",
+				// 真 API 里 MATCH_PARENT 挂在 ViewGroup.LayoutParams 上（FrameLayout.LayoutParams 继承它）
+				"      public static final int MATCH_PARENT = -1;",
+				"      int leftMargin, topMargin, rightMargin, bottomMargin;",
+				"      public void setMargins(int l,int t,int r,int b){ leftMargin=l; topMargin=t; rightMargin=r; bottomMargin=b; }",
+				"    }",
+				"  }",
+				"  static class FrameLayout {",
+				"    static class LayoutParams extends ViewGroup.LayoutParams {",
+				"      LayoutParams(){}",
+				"      LayoutParams(int w,int h){}",
+				"    }",
+				"  }",
+				"  static class WebView {",
+				"    int pl, pt, pr, pb;",
+				// 真布局里 WebView 挂在 FrameLayout 下、参数是 MATCH_PARENT（四向默认 0）
+				"    ViewGroup.LayoutParams lp = new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);",
+				"    public ViewGroup.LayoutParams getLayoutParams(){ return lp; }",
+				"    public void setLayoutParams(ViewGroup.LayoutParams p){ lp = p; }",
+				"    public int getPaddingLeft(){return pl;} public int getPaddingTop(){return pt;}",
+				"    public int getPaddingRight(){return pr;} public int getPaddingBottom(){return pb;}",
+				"    public void setPadding(int l,int t,int r,int b){pl=l;pt=t;pr=r;pb=b;}",
+				// post 同步执行：setUiState 的冷启动兜底就是一次 post，同步化不影响断言语义
+				"    public boolean post(Runnable r){ r.run(); return true; }",
+				"  }",
+				"  static class Insets {",
+				"    public int left, top, right, bottom;",
+				"    public Insets(int l,int t,int r,int b){left=l;top=t;right=r;bottom=b;}",
+				"  }",
+				"  static class DisplayCutout {",
+				"    int l,t,r,b;",
+				"    DisplayCutout(int l,int t,int r,int b){this.l=l;this.t=t;this.r=r;this.b=b;}",
+				"    public int getSafeInsetLeft(){return l;} public int getSafeInsetTop(){return t;}",
+				"    public int getSafeInsetRight(){return r;} public int getSafeInsetBottom(){return b;}",
+				"  }",
+				"  static class Build { static class VERSION { static int SDK_INT = 30; } }",
+				"  static class WindowInsets {",
+				"    // AOSP WindowInsets.Type 的真实取值：替身按此解码掩码，所以「掩码里有没有 ime()」在行为上真的可判。",
+				"    static final int T_STATUS = 1, T_NAV = 2, T_CUTOUT = 8, T_TAPPABLE = 32, T_IME = 2048;",
+				"    static class Type {",
+				"      public static int statusBars(){return T_STATUS;} public static int navigationBars(){return T_NAV;}",
+				"      public static int systemBars(){return T_STATUS | T_NAV;}",
+				"      public static int displayCutout(){return T_CUTOUT;} public static int tappableElement(){return T_TAPPABLE;}",
+				"      public static int ime(){return T_IME;}",
+				"    }",
+				"    int[] status, nav, cut, tap, ime, sys; int stableB; DisplayCutout dc;",
+				"    // 忠实模拟 AOSP getInsets：对掩码内各来源**逐边取 max**（不求和）。",
+				"    public Insets getInsets(int mask){",
+				"      int l=0,t=0,r=0,b=0;",
+				"      int[][] m = new int[5][];",
+				"      m[0]=status; m[1]=nav; m[2]=cut; m[3]=tap; m[4]=ime;",
+				"      int[] bits = new int[]{T_STATUS, T_NAV, T_CUTOUT, T_TAPPABLE, T_IME};",
+				"      for (int i=0;i<5;i++){",
+				"        if ((mask & bits[i])==0 || m[i]==null) continue;",
+				"        l=Math.max(l,m[i][0]); t=Math.max(t,m[i][1]);",
+				"        r=Math.max(r,m[i][2]); b=Math.max(b,m[i][3]);",
+				"      }",
+				"      return new Insets(l,t,r,b);",
+				"    }",
+				"    public int getSystemWindowInsetLeft(){return sys==null?0:sys[0];}",
+				"    public int getSystemWindowInsetTop(){return sys==null?0:sys[1];}",
+				"    public int getSystemWindowInsetRight(){return sys==null?0:sys[2];}",
+				"    public int getSystemWindowInsetBottom(){return sys==null?0:sys[3];}",
+				"    // 刻意保留：旧实现用它，替身里它比 systemWindow 不收缩，用来抓「多垫」回归",
+				"    public int getStableInsetBottom(){return stableB;}",
+				"    public DisplayCutout getDisplayCutout(){return dc;}",
+				"  }",
+				"  static class Subject {",
+				"    WebView webView = new WebView();",
+				"    UiState uiState = UiState.BOOTSTRAP;",
+				"    boolean tablet = true;",
+				// T79：取值方法用它当返回缓冲（复用字段、不每次 new）。替身必须提供同名同型字段，
+				// 否则调用链一被收进来就编译失败——那正是开工时那第 3 条红的形态。
+				"    int[] systemBarInsetsPx = new int[4];",
+				"    int lastAvoidL = -1, lastAvoidT = -1, lastAvoidR = -1, lastAvoidB = -1;",
+				"    static class Log { static int i(String t, String m){ return 0; } }",
+				"    WindowInsets rootInsets = new WindowInsets();",
+				"    boolean isTabletClass(){ return tablet; }",
+				"    class Decor { WindowInsets getRootWindowInsets(){ return rootInsets; } }",
+				"    class Win { Decor getDecorView(){ return new Decor(); } }",
+				"    Win getWindow(){ return new Win(); }",
+				"@@AVOID@@",
+				"@@SETTER@@",
+				"  }",
+				"  static String box(WebView w){",
+				"    ViewGroup.LayoutParams r = w.getLayoutParams();",
+				"    if (r instanceof FrameLayout.LayoutParams){ FrameLayout.LayoutParams f = (FrameLayout.LayoutParams) r;",
+				"      return f.leftMargin + \",\" + f.topMargin + \",\" + f.rightMargin + \",\" + f.bottomMargin; }",
+				"    return \"NO-BOX\";",
+				"  }",
+				"  static void run(String name, int sdk, boolean tablet, UiState st, int[] status, int[] nav,",
+				"      int[] cut, int[] tap, int[] ime, int[] sys, int stableB, String expect) {",
+				"    Subject s = new Subject();",
+				"    Build.VERSION.SDK_INT = sdk;",
+				"    s.tablet = tablet;",
+				"    s.uiState = st;",
+				"    s.rootInsets.status=status; s.rootInsets.nav=nav; s.rootInsets.cut=cut;",
+				"    s.rootInsets.tap=tap; s.rootInsets.ime=ime; s.rootInsets.sys=sys;",
+				"    s.rootInsets.stableB=stableB;",
+				"    if (cut != null) s.rootInsets.dc = new DisplayCutout(cut[0],cut[1],cut[2],cut[3]);",
+				`    s.${applierName72}();`,
+				"    String got = box(s.webView);",
+				"    System.out.println(\"ROW|\" + name + \"|\" + got + \"|\" + expect);",
+				"  }",
+				"  // 时序格：BOOTSTRAP 期那次 insets 分发按门禁写 0；随后进入会话页**不触发任何 insets 事件**。",
+				"  // 让位能不能成立，全看 setUiState 这一次赋值有没有顺带重算 —— 这正是 T67 缺项①，",
+				"  // 也是用户看到的「顶到状态栏 + 被任务栏盖住」双向同时错位。",
+				"  static void seq(String name, int[] status, int[] nav, int[] tap, String expectBoot, String expectWeb) {",
+				"    Subject s = new Subject();",
+				"    Build.VERSION.SDK_INT = 30; s.tablet = true;",
+				"    s.rootInsets.status=status; s.rootInsets.nav=nav; s.rootInsets.tap=tap;",
+				"    s.uiState = UiState.BOOTSTRAP;",
+				`    s.${applierName72}();`,
+				"    String boot = box(s.webView);",
+				`    s.${entryOwner72.name}(UiState.WEB);`,
+				"    String web = box(s.webView);",
+				"    System.out.println(\"SEQ|\" + name + \"|\" + boot + \"|\" + web + \"|\" + expectBoot + \"|\" + expectWeb);",
+				"  }",
+				"  public static void main(String[] a){",
+				...CASES.map(caseCall72),
+				// 时序格（负控制所在）：几何取 emulator-5800 实测的格 A。
+				"    seq(\"seq-coldstart-enter-session\", new int[]{0,48,0,0}, new int[]{0,0,0,64}, new int[]{0,0,0,64}, \"0,0,0,0\", \"0,48,0,64\");",
+				"  }",
+				"}",
+			].join("\n").replace("@@AVOID@@", harnessChain72.code).replace("@@SETTER@@", entryOwner72.decl);
+
+			const dir = mkdtempSync(join(tmpdir(), "dshr-t72-avoid-"));
+			try {
+				const src = join(dir, "T72AvoidHarness.java");
+				const cls = join(dir, "out");
+				writeFileSync(src, HARNESS, "utf8");
+				const cp = spawnSync(javac72, ["-nowarn", "-d", cls, src], { encoding: "utf8" });
+				if (cp.status !== 0) {
+					ok72("D-inset-behavior 行为验证：真方法体在 11 类几何下四向输出全对", false,
+						`javac 失败：${String(cp.stderr || cp.stdout || "").split("\n").slice(0, 4).join(" / ")}`);
+				} else {
+					const run = spawnSync(java72, ["-cp", cls, "T72AvoidHarness"], { encoding: "utf8" });
+					const rows = new Map();
+					for (const line of String(run.stdout || "").split(/\r?\n/)) {
+						const m = /^ROW\|([^|]+)\|(-?\d+,-?\d+,-?\d+,-?\d+)\|(-?\d+,-?\d+,-?\d+,-?\d+)$/.exec(line.trim());
+						if (m) rows.set(m[1], m[2]);
+					}
+					const bad = [];
+					for (const c of CASES) {
+						const got = rows.get(c.name) || "缺输出";
+						const want = c.expect.join(",");
+						if (got !== want) bad.push(`${c.name} 期望 ${want} 实得 ${got}`);
+					}
+					ok72("D-inset-behavior 行为验证：真方法体在 11 类几何下四向输出全对（任务栏 tappableElement/状态栏落左右/IME/导航栏隐藏/挖孔）",
+						run.status === 0 && rows.size === CASES.length && bad.length === 0,
+						bad.length ? `不符 ${bad.length} 项：${bad.join("；")}` : `${rows.size}/${CASES.length} 格全对`);
+					// 逐格留痕：真值进报告，回归时能对账
+					CASES.forEach((c, i) => {
+						ok72(`D-inset-behavior 格 ${i + 1}/${CASES.length} ${c.name} → ${c.expect.join(",")}`,
+							rows.get(c.name) === c.expect.join(","), `${rows.get(c.name) || "缺输出"}｜${c.why}`);
+					});
+					// ── 时序格（负控制所在）──
+					// 几何用 emulator-5800 实测的格 A：statusBars top=48、navigationBars bottom=64、
+					// tappableElement bottom=64。BOOTSTRAP 写 0 之后**不制造任何 insets 事件**，
+					// 只靠 setUiState(WEB) 这一次赋值把让位补上——摘掉它就重现用户症状。
+					const seqLine = String(run.stdout).split(/\r?\n/)
+						.map((l) => /^SEQ\|([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)$/.exec(l.trim()))
+						.find(Boolean);
+					if (!seqLine) {
+						ok72("D-inset-timing 冷启动进会话：BOOTSTRAP 写 0 后不触发 insets，仅靠 setUiState(WEB) 补上让位（负控制所在）",
+							false, "没拿到 SEQ 输出");
+					} else {
+						const [, , boot, web, wantBoot, wantWeb] = seqLine;
+						const [wl, wt, wr, wb] = wantWeb.split(",").map(Number);
+						// 系统栏占位：格 A 实测 top=48、bottom=64，左右无系统栏
+						const ovTop = Math.max(0, 48 - wt);
+						const ovBottom = Math.max(0, 64 - wb);
+						ok72("D-inset-timing 冷启动进会话：BOOTSTRAP 期让位按设计写 0（门禁 uiState!=WEB，外边距四向 0）",
+							boot === wantBoot, `BOOTSTRAP=${boot} 期望=${wantBoot}`);
+						ok72("D-inset-timing 仅靠 setUiState(WEB) 一次赋值就把让位补齐，不依赖任何 insets 事件",
+							web === wantWeb, `进入WEB=${web} 期望=${wantWeb}（BOOTSTRAP 是 ${boot}）`);
+						ok72("D-inset-timing 冷启动首帧重叠量 top=0px 且 bottom=0px（摘掉 setUiState 的重算即 >0，重现用户症状）",
+							ovTop === 0 && ovBottom === 0,
+							`重叠 top=${ovTop}px bottom=${ovBottom}px（系统栏 top=48 bottom=64 − 让位 t=${wt} b=${wb}）`);
+					}
+				}
+			} finally {
+				try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+			}
+		}
 	}
 	/** 官方 composer 里的可编辑元素（真机 a11y 里就是一个 EditText）+ 可点性判定。 */
 	const findComposer = () => evaluate(`(function(){

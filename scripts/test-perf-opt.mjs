@@ -415,11 +415,15 @@ test("renderServiceWorker：v3 缓存、隔离与 SWR 语义齐全", () => {
 	// 注释里可以提到 ignoreSearch（那是要防的坑），但**代码里不得再传它**。
 	assert.ok(!/match\([^)]*ignoreSearch/.test(sw), "cache.match 不得再带 ignoreSearch（T49）");
 	assert.ok(!sw.includes("url.origin + url.pathname"));
-	// T49：/plugins/ 白名单显式放行 + 内容指纹资源不参与 SWR
+	// T49：/plugins/ 白名单显式放行。
+	// ⚠️ T63：下面两条从「源码字面量」换成了「判据仍然存在」——
+	// T49 当时把 `/plugins/` 认成内容指纹的实现写死成 `pathname === "/plugins/"`；
+	// T63 把它并进 isContentAddressed()（三条判据，URL 级），字面量随之消失。
+	// 断言跟着**意图**走，不跟着实现细节走：白名单那一行必须一字未改，
+	// 「内容指纹资源不参与 SWR」这条语义由下面两条行为级用例守。
 	assert.ok(sw.includes("function isFingerprinted(pathname)"));
-	assert.ok(sw.includes('pathname === "/plugins/"'));
+	assert.ok(sw.includes('var FINGERPRINTED_PATH = /^\\/plugins\\/?$/'), "T63：/plugins/ 仍是显式的内容寻址路径判据");
 	assert.ok(sw.includes("if (!CACHEABLE.test(url.pathname) && !fingerprinted) return;"));
-	assert.ok(sw.includes("if (fingerprinted) {"));
 	// 其余语义不变
 	assert.ok(sw.includes('cache: "no-cache"'));
 	assert.ok(sw.includes("no-store|private|no-cache"));
@@ -629,17 +633,62 @@ test("T49 SW 行为：/assets/* 带 immutable ⇒ 不再后台重验（回归本
 	assert.equal(host.netCalls.length, 0, "immutable 资源命中后不得再回源");
 });
 
-test("T49 SW 行为：非 immutable 资源仍走 SWR（不回归原有语义）", async () => {
+test("T63 SW 行为：稳定 URL 的非 immutable 资源仍走 SWR（不回归原有语义）", async () => {
 	// 造一个不带 immutable 的网关（只有 max-age）：SWR 语义必须原样保留。
+	//
+	// ⚠️ T63 换掉了夹具 URL，这是**必须换**的，不是为了让断言变绿：
+	// T49 这条原本拿 `/assets/index-BPHePDI_.js` 当「非 immutable 的资源」，
+	// 而那是个**带构建期哈希的文件名** ⇒ T63 起它被判成内容寻址（内容变则 URL 变），
+	// 重验必然拿回同一份字节，**本来就不该再重验**（这正是本任务要治的 2.9MB 浪费）。
+	// 所以这条用例的**意图**（「SWR 不能被整体砍掉」）仍然成立，只是必须落在
+	// 一条**真的**稳定 URL 上——`/favicon.svg` 正是真机实测里唯一无 cache-control
+	// 的静态资源（见 scratch/t63/report.md §1.0 的响应头实测）。
 	const h2 = makeSwHost(renderServiceWorker(), "public, max-age=600");
-	const asset = "/assets/index-BPHePDI_.js";
+	const asset = "/favicon.svg";
 	await h2.request(asset);
 	h2.netCalls.length = 0;
 	const r = await h2.request(asset);
 	assert.equal(r.body, `BODY<https://127.0.0.1:18443${asset}>`, "命中应立刻给缓存体");
-	assert.equal(r.waited.length, 1, "非 immutable 命中后仍应排一次后台 revalidate");
+	assert.equal(r.waited.length, 1, "稳定 URL 的非 immutable 命中后仍应排一次后台 revalidate");
 	await Promise.all(r.waited);
 	assert.equal(h2.netCalls.length, 1, "SWR 应恰好回源一次");
+});
+
+test("T63 SW 行为：内容寻址资源即使非 immutable 也不后台重验（本次改动的核心）", async () => {
+	// 改前的判据是「缓存里那条响应的 cache-control 有没有 immutable」——
+	// 那是**别人（上游/网关）**加的响应头，上游一改就静默失效。
+	// T63 改成只看 URL：下面三条都**故意不给 immutable**，仍必须 0 次回源。
+	for (const [asset, why] of [
+		["/assets/index-BPHePDI_.js", "哈希文件名（真机 URL）"],
+		["/assets/vendor-CCJJTK99.js", "哈希文件名（真机 URL）"],
+		[PLUGIN_URLS[0], "/plugins/ 组合包，rev 是内容指纹"],
+	]) {
+		const h = makeSwHost(renderServiceWorker(), "public, max-age=600"); // 明确**无** immutable
+		await h.request(asset);
+		h.netCalls.length = 0;
+		const r = await h.request(asset);
+		assert.equal(r.body, `BODY<https://127.0.0.1:18443${asset}>`, `${asset} 命中应立刻给缓存体`);
+		assert.equal(h.netCalls.length, 0, `${asset}（${why}）命中后不得回源：重验 100% 拿回同一份字节`);
+		assert.equal(r.waited.length, 0, `${asset}（${why}）命中后不得排后台 revalidate`);
+	}
+});
+
+test("T63 SW 行为：升级路径 —— rev 变了必须回源，绝不把旧包当新版发出去", async () => {
+	// 「DSH 升级后拿得到新版」不能只写论证。rev 是内容指纹（cacheKey 含 rev），
+	// 所以 rev 一变 URL 就变 ⇒ 必然缓存未命中 ⇒ 必须回源。
+	const h = makeSwHost(renderServiceWorker());
+	const oldUrl = "/plugins/?@dsh-plugin&rev=10ddc612f195";
+	const newUrl = "/plugins/?@dsh-plugin&rev=ffffffffffff"; // 同插件清单，只换指纹
+	assert.equal((await h.request(oldUrl)).body, `BODY<https://127.0.0.1:18443${oldUrl}>`);
+	h.netCalls.length = 0;
+	const r = await h.request(newUrl);
+	assert.equal(r.body, `BODY<https://127.0.0.1:18443${newUrl}>`, "新 rev 必须拿到它自己的字节");
+	assert.equal(h.netCalls.length, 1, "新 rev 必须恰好回源一次（不能拿旧 rev 的缓存冒充）");
+	// 正控制：旧 rev 仍命中，证明上面那条不是「缓存整个失效了」。
+	h.netCalls.length = 0;
+	const back = await h.request(oldUrl);
+	assert.equal(back.body, `BODY<https://127.0.0.1:18443${oldUrl}>`);
+	assert.equal(h.netCalls.length, 0, "旧 rev 仍应命中缓存（没变的内容继续省流量）");
 });
 
 test("T49 SW 行为：动态面与导航请求依然完全不拦截（不回归）", async () => {

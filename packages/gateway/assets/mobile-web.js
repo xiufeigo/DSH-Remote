@@ -87,10 +87,61 @@
  * data-sidebar-collapsed 等），不依赖 CSS Module 哈希类名；官方开关按钮只加
  * 标记属性与样式覆盖，不离开原 React 树，body 仅承载后备鲸鱼和透明遮罩。
  */
-(function () {
+// T56（治本）：document-start 注入时 <html> 可能还不存在。
+//
+// 旧形态把幂等守卫 `window.__dshRemoteMobileInstalled = true` 放在 IIFE **第一行**、
+// 无条件置位，而第一处写 DOM 的语句（样式挂载 ~(document.head || document.documentElement)
+// .appendChild）位于其后约 800 行。一旦注入落在这 800 行的空档里而 documentElement 仍是 null，
+// 那一行就抛「TypeError: Cannot read properties of null (reading 'appendChild')」，
+// 整段初始化在**守卫已置位**的状态下夭折 ⇒ 本文档此后每一次注入都是空操作，hook 永远装不上。
+// 原生症状：重连/会话内导航后界面退回官方桌面布局、悬浮鲸鱼消失，重连不愈，杀 App 重开才恢复。
+//
+// 治本：**守卫不再无条件置位**。<html> 未就绪时不置守卫、不往下走任何一行 DOM 代码，
+// 只挂一个「一次性重启」——就绪后由 relaunch 重新进入同一个**具名函数表达式**
+// （函数名在自己的作用域内可见，因此正文可以原地重入）：
+//   - DOMContentLoaded：真实文档里 documentElement 为 null 时它必然还没触发，信号可靠；
+//   - 有界轮询兜底：万一该文档不触发 DOMContentLoaded，24s 内仍要自愈，不要静默丢失 hook。
+// 下面 4300 行正文**一行未改、执行顺序完全不变**（只挪进了具名函数表达式），
+// 所以 hook 的既有行为——手机档全部能力、平板档零痕迹、T42/T47/T48/T51 的键盘与手势语义——不变。
+//
+// 幂等性由两道闸保证：
+//   ① 已装上（__dshRemoteMobileInstalled）→ 直接 return；
+//   ② 尚未就绪时的重复 document-start 注入 → 由 __dshRemoteMobilePending 去重，
+//      只会续上同一个重启，不会排第二份；重启真正执行时 ① 会把后来的重启挡掉。
+// 另外「就绪后才到的注入」不等任何重启，直接就地装上（late 注入路径照旧）。
+(function dshRemoteMobileBoot() {
 	'use strict';
 	if (window.__dshRemoteMobileInstalled) return;
-	window.__dshRemoteMobileInstalled = true;
+	if (document.documentElement) {
+		window.__dshRemoteMobilePending = false;
+		window.__dshRemoteMobileInstalled = true;
+	} else {
+		if (window.__dshRemoteMobilePending) return;
+		window.__dshRemoteMobilePending = true;
+		var relaunch = function () {
+			if (window.__dshRemoteMobilePending !== true) return;
+			window.__dshRemoteMobilePending = false;
+			dshRemoteMobileBoot();
+		};
+		document.addEventListener('DOMContentLoaded', relaunch, { once: true });
+		// 24s 上限（1500 × 16ms）：到点仍未给出 <html> 的，多半是非 HTML 文档或文档已被丢弃。
+		// 此时放弃等待并清掉 pending，让**下一次**原生注入从头再来，而不是留一个永转的定时器。
+		var pendingTries = 0;
+		var pendingPoll = function () {
+			if (window.__dshRemoteMobilePending !== true) return;
+			// 单条不重排的轮询：最多 1500 × 16ms ≈ 24s。每 tick 只判一次「<html> 到了没」，
+			// 到了（或到上限）就 relaunch；relaunch 内部才可能重新武装，因此最坏情况是
+			// 每 24s 多挂一个一次性监听，不会无界增长。
+			if (pendingTries < 1500 && !document.documentElement) {
+				pendingTries += 1;
+				window.setTimeout(pendingPoll, 16);
+				return;
+			}
+			relaunch();
+		};
+		window.setTimeout(pendingPoll, 16);
+		return;
+	}
 
 	var ROOT_CLASS = 'dshr-mobile';
 
@@ -904,11 +955,27 @@
 	].join('\n');
 
 	// ── 样式注入 ───────────────────────────────────────────────
+	// T56：不再裸调 appendChild。走到这里时 <html> 已由启动闸门保证存在，但 document
+	// 仍可能在解析途中被整体换掉（documentElement 变回 null）——那正是本 bug 的成因类别。
+	// 这里做能力检查：挂不上就把 style 留在 pendingStyle，等 <head> 出现时补挂，绝不抛。
+	var pendingStyle = null;
+	function flushStyle() {
+		if (pendingStyle === null) return true;
+		var mount = document.head || document.documentElement;
+		if (!mount) return false;
+		mount.appendChild(pendingStyle);
+		pendingStyle = null;
+		return true;
+	}
 	if (document.querySelector('style[data-dshr-mobile-css]') === null) {
 		var style = document.createElement('style');
 		style.setAttribute('data-dshr-mobile-css', '');
 		style.textContent = MOBILE_CSS;
-		(document.head || document.documentElement).appendChild(style);
+		pendingStyle = style;
+		if (!flushStyle()) {
+			// 只有真挂不上才多挂一个一次性监听；正常路径零额外监听。
+			document.addEventListener('DOMContentLoaded', flushStyle, { once: true });
+		}
 	}
 
 	// ── 视口：viewport-fit=cover；Android 壳 overlays-content，键盘占位交给原生 padding ──
@@ -1145,7 +1212,34 @@
 	var focusRevokeEl = null;
 	var focusRevokeCount = 0;
 	var focusRevokeSince = 0;
-	var focusGuardStats = { revoked: 0, capped: 0, sticky: 0, armed: 0, disarmed: 0, residualSwept: 0 };
+	var focusGuardStats = { revoked: 0, capped: 0, sticky: 0, armed: 0, disarmed: 0, residualSwept: 0, sendExcluded: 0, armSkippedHeldFocus: 0, armRepeatSameGesture: 0, armNewGesture: 0, disarmSkippedSameGesture: 0 };
+	// ── T76：手势身份与「同手势幂等」（阻断②的真凶就在这四个状态变量上）──────
+	//
+	// 一次真实点按会触发**三个**「落指」事件，而 bindFocusGuard 的 onDown 同时绑在
+	// touchstart / pointerdown / mousedown 上；onDown 开头又**无条件**
+	// `if (focusArmed) disarmComposerFocus()`。于是 touchstart 那一下刚布上的防，
+	// 会被 pointerdown 摘掉；等 mousedown 想补布防时，armComposerFocus() 的 T69 早退
+	// （composerHoldsFocus() 为真 —— 焦点正是上一次 arm 抢的）直接 return false，
+	// 不再打 inputmode。终态：inputmode=null + composer 持焦 ⇒ 浏览器按节点重新向
+	// IME 请求 showSoftInput ⇒ **冷态点「+」又弹键盘**（rc.2.5 → rc.2.6 回退，实测 2/2）。
+	//
+	// 【手势怎么划？—— 这条是本段最要紧的实测结论，AVD 5604 / pixel_8a / SDK 35，
+	//  真 `adb shell input tap` 一次点按的原始事件序列，见 scratch/t76/timeline-after.json】
+	//     pointerdown(pid=2) → touchstart(tid=0) → pointerup(pid=2) → touchend(tid=0)
+	//                        → focusin → mousedown → mouseup → click(pid=2)
+	// 三个落指跨约 20ms，而**抬手事件夹在 touchstart 与 mousedown 之间**。
+	// ⇒ **绝对不能拿 pointerup / touchend 划分手势**：那会把同一次点按的兼容 mousedown
+	//   误判成新手势，它开头的 disarm 就会摘掉 pointerdown 刚布的防（正是原缺陷本身）。
+	//   （第一版就是按抬手划分的，被自己的探针当场抓出来：inputmode 在 mousedown 前 0.3ms 被摘。）
+	// ⇒ 手势的**唯一可靠终止信号是 click**：一次点按恰好一次 click，且必在所有落指之后。
+	//   再加两道兜底：单次手势最多 3 个落指（实测就是 3）、以及 FOCUS_ARM_MS 超时。
+	//   这三道里任何一道触发都会正确收口；click 丢了也不会让 inputmode 长期残留
+	//   （第一道保障仍是 disarmComposerFocus 自己的 500ms 定时器）。
+	var FOCUS_MAX_DOWNS_PER_GESTURE = 3;
+	var focusGestureOpen = false;   // 当前手势是否还没收尾
+	var focusGestureDowns = 0;      // 本手势已落的指数
+	var focusGestureArmed = false;  // 本手势是否已做过布防决策（含早退）
+	var focusGestureOpenedAt = 0;   // 本手势开始时刻（超时兜底用）
 	var focusGuardBound = false;
 	// 粘性抑制的登记处。键用「稳定签名」而不是节点引用：官方 composer 会被重渲染换掉
 	// 节点实例，只按节点认，换节点后的继续抢焦点就漏了（实测 3 连抢是同一节点，但重渲染
@@ -1168,8 +1262,32 @@
 		'[data-dshr-composer-add]',
 		'[data-dshr-composer-model]',
 		'[data-dshr-composer-access]',
-		'[data-dshr-composer-send]',
 		'[data-dshr-composer-trailing]'
+	].join(', ');
+
+	/**
+	 * T69：**发送**按钮的识别。发送**不是**"打开命令面板的触发器"，它走的是"把草稿
+	 * 交给会话"的语义 —— 布防对它没有任何用处，只会造成伤害（见 isPanelTriggerPoint
+	 * 与 armComposerFocus 的注释）。所以这里给它一份**独立的**名单，并让
+	 * isPanelTriggerPoint() 第一件事就是排除它。
+	 *
+	 * 为什么不能只从 COMPOSER_TRIGGER_SELECTOR 里删掉 `[data-dshr-composer-send]`：
+	 * isPanelTriggerPoint() 的**兜底分支**（composer 卡片内任意可交互控件）会把发送按钮
+	 * 重新判成触发器 —— AVD 实测该兜底分支让 40 个元素命中，其中就包括发送按钮本身
+	 * 以及它内部的 svg/path（它们各自 closest('button') 都回到发送按钮）。
+	 * ⇒ 排除必须发生在兜底分支**之前**，且要覆盖"落在发送按钮内部任意后代"的情况。
+	 *
+	 * 名单同时列了 hook 自己的标记与官方 aria-label（中英），冷启动时 hook 标记可能还没
+	 * 写上，不能只靠标记。
+	 */
+	var COMPOSER_SEND_SELECTOR = [
+		'[data-dshr-composer-send]',
+		'button[aria-label="Send message"]',
+		'button[aria-label="发送消息"]',
+		'button[aria-label="Send"]',
+		'button[aria-label="发送"]',
+		'button[aria-label="Submit"]',
+		'button[aria-label="提交"]'
 	].join(', ');
 
 	/**
@@ -1344,15 +1462,50 @@
 	}
 
 	/**
+	 * 落点是不是**发送**按钮（含它内部的 svg/path 等任意后代）。
+	 *
+	 * T69：发送按钮和「+」这类面板触发器是**两种完全不同的语义**。布防（arm）的全部
+	 * 作用是「让官方随后那次抢焦点变成空操作」—— 只对"官方会打开面板、并且面板要求
+	 * composer 持焦"这件事有意义。发送不打开任何面板，抢焦点对它只有坏处。
+	 */
+	function isComposerSendPoint(target) {
+		if (!isElement(target) || !target.closest) return false;
+		if (target.closest(COMPOSER_SEND_SELECTOR)) return true;
+		// 兜底：composer 卡片内的 type="submit" 按钮（官方某些形态用提交按钮发消息）。
+		var submit = target.closest('button[type="submit"]');
+		if (!submit) return false;
+		var composer = focusComposerEl();
+		if (!composer) return false;
+		var card = composer.parentElement;
+		var depth = 0;
+		while (isElement(card) && card !== document.body && depth < FOCUS_ARM_HOST_MAX_DEPTH) {
+			if (card.contains(submit)) return true;
+			card = card.parentElement;
+			depth += 1;
+		}
+		return false;
+	}
+
+	/**
 	 * 落点算不算「会打开命令面板/弹层的那类非可编辑触发器」。
 	 *
 	 * 判据用**官方 aria-label**（中英都列）而不是 hook 自己打的标记：
 	 * hook 标记（data-dshr-composer-add 等）由 syncComposerChrome 写，
 	 * 冷启动第一次点「+」时它可能还没写上，用它会漏掉最关键的那一次。
 	 * 其次再兜一层：落点位于 composer 卡片内、且是可交互控件（按钮/菜单项等）。
+	 *
+	 * T69：**发送按钮必须在这里第一个被排除**（见 isComposerSendPoint）。
+	 * 删除 `[data-dshr-composer-send]` 出 COMPOSER_TRIGGER_SELECTOR 是不够的 ——
+	 * 下面的兜底分支会把它（连同其内部 svg/path）重新判成触发器。
 	 */
 	function isPanelTriggerPoint(target) {
 		if (!isElement(target) || !target.closest) return false;
+		// **最先**排除发送。真机症状：键盘弹着时点发送，消息发不出去、键盘又弹出来。
+		// 根因就是这里原先把发送判成触发器 ⇒ armComposerFocus() 抢焦点 + 搅 inputmode。
+		if (isComposerSendPoint(target)) {
+			focusGuardStats.sendExcluded += 1;
+			return false;
+		}
 		// **先**排除「已经打开的面板/弹层里的条目」，再谈布防。
 		// 官方把命令面板挂在 composer 卡片内部，所以这些条目同样落在 composer 卡片里；
 		// 一旦对它们布防，就会顺手 markUserFocusIntent() 撑开守卫的放行窗口，
@@ -1380,6 +1533,20 @@
 	}
 
 	/**
+	 * composer（含其内部节点）此刻是否已经持有 DOM 焦点。
+	 */
+	function composerHoldsFocus() {
+		var composer = focusComposerEl();
+		if (!isElement(composer)) return false;
+		var active = document.activeElement;
+		if (!active) return false;
+		if (active === composer) return true;
+		try {
+			return !!(composer.contains && composer.contains(active));
+		} catch (ignoredContains) { return false; }
+	}
+
+	/**
 	 * 布防：打 inputmode="none" + 自己把焦点抢过来。
 	 *
 	 * 顺序要点：markUserFocusIntent() 必须在 focus() **之前** ——
@@ -1389,10 +1556,38 @@
 	 * T51（R1）：窗口现在**只对 composer 这一棵树**放行（见 inUserFocusWindow），
 	 * 不再是对整个文档放行。面板里那些自带输入框的子面板（模型搜索框）与 composer
 	 * 无亲缘关系 ⇒ 拿不到这张通行证 ⇒ T50 §6.1 的键盘弹出被根除。
+	 *
+	 * ── 不变量（本函数**绝不做**的事，T69 加断言守住）──
+	 *   1. **绝不 preventDefault / 绝不掉点击**：这里只做「打属性」+「标注意图」+
+	 *      「补焦点」三类无副作用动作；三个落指监听器也全是 `{passive:true}`，
+	 *      结构上就不可能取消事件。AVD 实测整条发送路径 `defaultPrevented` 恒为 false。
+	 *   2. **绝不抢已经持焦的输入区**：见下面的 composerHoldsFocus() 早退。
 	 */
 	function armComposerFocus() {
 		var composer = focusComposerEl();
 		if (!isElement(composer)) return false;
+		// T69：composer 已经持焦时**不布防**。
+		//
+		// 布防存在的唯一理由是「让官方随后那次抢焦点变成空操作」（焦点没变 ⇒ 无新
+		// focusin ⇒ 无新 showSoftInput）。composer 本来就持焦 ⇒ 这个目的**已经达成**，
+		// 此时再布防只剩净损失：
+		//   - 把 inputmode="none" 塞到用户正在用的输入区上，500ms 后又摘掉；
+		//     摘的那一刻 composer 仍持焦 ⇒ 浏览器重新向 IME 请求 showSoftInput
+		//     ⇒ 真机症状「点发送后键盘又弹出来」；
+		//   - 下面的 composer.focus() 会把 DOM 焦点从用户点的目标上搬走。
+		//     在一次触摸序列进行到一半搬焦点，正是 WebView 可能不再为原目标合成 click
+		//     的条件 ⇒ 真机症状「消息发不出去」（AVD 34/x86_64 上仍合成了，1/1 发出，
+		//     但真机小米 15 上没有）。
+		// 早退同时也让 composer.focus() 不再可能成为"吞点击"的那一步。
+		//
+		// 仍要清掉粘性抑制：若此前给这个 composer 登记过粘性状态，官方打开面板时那次
+		// 抢焦点会被 T42 的粘性抑制收回去，面板就打不开 —— 那是 T48 的原始死结。
+		// clearFocusSticky 是登记处清理，无副作用。
+		if (composerHoldsFocus()) {
+			clearFocusSticky(composer);
+			focusGuardStats.armSkippedHeldFocus += 1;
+			return false;
+		}
 		// 兜底：官方换节点实例时旧属性会跟着旧节点走，这里确保布防落在当前节点上。
 		if (focusArmEl && focusArmEl !== composer) disarmComposerFocus();
 		// T51：换节点 ⇒ 观察者跟着换。
@@ -1568,17 +1763,46 @@
 		var onDown = function (event) {
 			if (!focusGuardActive()) return;
 			var target = event.target;
-			// T51（R1）：任何一次落指都先把放行窗口关掉。
-			// 旧实现不清它，于是「＋」那一下撑开的窗口会活到 800ms 自然过期，
-			// 覆盖掉用户接下来在面板里的那一下 —— T50 §6.1 反例的直接来源。
+			// ── T76：先算「这一次落指是不是新手势」──────────────────────────────
+			// 三道收口条件，任何一道成立都表示「上一次手势已经结束」：
+			//   ① 上一次 click 已经把手势收了（正常路径，一次点按一次 click）；
+			//   ② 本手势的落指已达 FOCUS_MAX_DOWNS_PER_GESTURE（实测真值就是 3：
+			//      pointerdown + touchstart + mousedown），再来一个必是新手势；
+			//   ③ 上一次手势开始已超过 FOCUS_ARM_MS（click 丢失时的兜底）。
+			if (focusGestureOpen && Date.now() - focusGestureOpenedAt >= FOCUS_ARM_MS) {
+				focusGestureOpen = false;
+			}
+			if (focusGestureOpen && focusGestureDowns >= FOCUS_MAX_DOWNS_PER_GESTURE) {
+				focusGestureOpen = false;
+			}
+			var newDown = !focusGestureOpen;
+			if (newDown) {
+				focusGestureOpen = true;
+				focusGestureDowns = 0;
+				focusGestureOpenedAt = Date.now();
+				focusGestureArmed = false;
+				focusGuardStats.armNewGesture += 1;
+			}
+			focusGestureDowns += 1;
+			// T51（R1）：**新**的一次落指先把放行窗口关掉。
+			// 旧实现不分新手势同手势，于是「＋」那一下在 pointerdown 撑开的窗口会被
+			// 同一手势的 touchstart / mousedown 清掉 —— T48 的承重步骤之一
+			// （T46 §1 R1：窗口没了，面板开不出来）被自己撤。
 			// 关掉之后，下面 armComposerFocus() / markUserFocusIntent(owner) 会
 			// 按**这次**落指的意图重新开一个（且只对这次的目标元素生效）。
-			clearUserFocusWindow();
-			// T48：任何一次落指都先无条件摘一次防。
+			// 之所以要限定「新手势」：要防的本来就是**用户接下来在面板里的另一下**，
+			// 而同手势的后续落指与第一次是同一次用户意图。
+			if (newDown) clearUserFocusWindow();
+			// T48：任何一次**新**落指都先无条件摘一次防。
 			// 这是「inputmode 不得长期留在 composer 上」的第二道保障（第一道是 500ms 定时）：
 			// 用户落指在输入框上时，属性必须在浏览器默认聚焦动作发生**之前**就没了，
 			// 否则这次真实点击也会被 inputmode=none 压住、键盘不弹（T46 实测）。
-			if (focusArmed) disarmComposerFocus();
+			// ⚠️ T76：必须限定新手势。同一手势里摘自己刚布的防，正是阻断②的根因。
+			if (focusArmed && newDown) {
+				disarmComposerFocus();
+			} else if (focusArmed) {
+				focusGuardStats.disarmSkippedSameGesture += 1;
+			}
 			// T51（R4）：非布防态下若 composer 身上还挂着 inputmode=none（第三方写的、
 			// 或摘除被节流），在浏览器按节点决定 showSoftInput 之前先摘掉。
 			sweepResidualInputMode();
@@ -1589,7 +1813,21 @@
 				// 既不会无新 focusin 触发 showSoftInput，也不会被粘性抑制收回去。
 				// **不能**在这里 clearFocusSticky：粘性抑制是给「非用户手势造成的聚焦」用的，
 				// 而这条落指确实是用户手势，放行窗口（markUserFocusIntent）已经足够。
-				if (isPanelTriggerPoint(target)) armComposerFocus();
+				//
+				// T69：isPanelTriggerPoint() 第一件事就是排除「发送」⇒ 点发送永远走不到
+				// 这里，布防的抢焦点与 inputmode 搅动不会发生在发送路径上。
+				// armComposerFocus() 自身还有第二道：composer 已持焦时不布防。
+				if (isPanelTriggerPoint(target)) {
+					// T76：同手势内布防**只做一次**。第二、三次（touchstart / mousedown）
+					// 直接跳过 —— 此时防要么还挂着（什么都不用做），要么被别的路摘了
+					//（新落指/超时那两条会先把 focusGestureOpen 清掉，自然落到新手势分支）。
+					if (!focusGestureArmed) {
+						focusGestureArmed = true;
+						armComposerFocus();
+					} else {
+						focusGuardStats.armRepeatSameGesture += 1;
+					}
+				}
 				return;
 			}
 			// T51（R1）：窗口记「用户这次点的那个输入区」，而不是对整页放行。
@@ -1616,6 +1854,19 @@
 		document.addEventListener('touchstart', onDown, { capture: true, passive: true });
 		document.addEventListener('pointerdown', onDown, { capture: true, passive: true });
 		document.addEventListener('mousedown', onDown, { capture: true, passive: true });
+		// T76：手势收尾。全 passive：只写自己那几个布尔量，结构上不可能吞任何事件。
+		//
+		// **用 click，不用 pointerup/touchend** —— 这是上面的实测结论：
+		// 兼容 mousedown 是在 pointerup/touchend **之后**才发的（实测 +411ms vs +395ms），
+		// 按抬手划分手势会把同一次点按的 mousedown 误判成新手势，原缺陷原样复发。
+		// pointercancel 也收口：系统手势取消后不会再有兼容 mousedown，收了是对的。
+		var onGestureEnd = function () {
+			focusGestureOpen = false;
+			focusGestureArmed = false;
+		};
+		document.addEventListener('click', onGestureEnd, { capture: true, passive: true });
+		document.addEventListener('pointercancel', onGestureEnd, { capture: true, passive: true });
+		document.addEventListener('touchcancel', onGestureEnd, { capture: true, passive: true });
 		document.addEventListener('focusin', function (event) {
 			if (!focusGuardActive()) return;
 			var el = event.target;
@@ -2458,13 +2709,38 @@
 	}
 
 	/**
-	 * T47：右栏「右滑关闭」的起手带宽。视口的 11%，夹到 [24,48]；
-	 * 393px 手机视口 → round(393×0.11)=43px。
+	 * T66：右栏「右滑关闭」的起手带宽。视口的 15%，夹到 [48,96]。
+	 *
+	 * 为什么从 11% 放宽到 15%、下限从 24 抬到 48（T47 真机矩阵，见 scratch/t66/report.md §2）：
+	 * 旧公式 clamp(round(w×0.11),24,48) 在 540px 视口上正好顶到上限 48px —— 也就是
+	 * **只有最左 8.9% 的屏幕能触发**，探针 8 档起点里有 3 档（+64/+96/+128）是死路。
+	 * 216 格真机矩阵同时证明：门是**起点 x 的纯阶跃**（带内 135/135 关、带外 81/81 不关），
+	 * 距离 150/250/400、时长 200/350/500、纵向 25%/50%/75% 的关闭率**全都是 62.5%**，
+	 * 即"滑远一点/放慢一点/往上滑一点"三条调优路线全部无效——唯一的杠杆就是这个带宽。
+	 * 15% 在 393px 上给 59px、540px 上给 81px，上限 96 兜住超宽视口。
 	 */
 	function rightbarCloseBandPx() {
 		var w = window.innerWidth || 0;
-		if (!w) return 24;
-		return Math.max(24, Math.min(48, Math.round(w * 0.11)));
+		if (!w) return 48;
+		return Math.max(48, Math.min(96, Math.round(w * 0.15)));
+	}
+
+	/**
+	 * T66：起手窗的**左下沉让量**——面板贴到视口左缘时，把最外这一段让给系统返回手势。
+	 *
+	 * 为什么必须让：Android 手势导航的返回手势占屏幕最外约 24dp。页面在
+	 * `<meta viewport width=device-width>` 下 1 CSS px == 1dp，所以 24dp 就是 24 CSS px。
+	 * 这一格**JS 抢不过、preventDefault 也挡不住**——它发生在系统输入管线里、早于 WebView。
+	 * 旧门把整条带子从 x=panelRect.left 起算，于是最左 24px 是"声明了但永远收不到"的位置：
+	 * 带子看起来有 48px，实际只有 [24,48] 这 24px 是活的。把起手窗整体右移 24px，
+	 * 换来的是同样宽度下**两倍**的可用起点，而不是白白浪费掉一半带宽。
+	 *
+	 * 只在面板**贴住视口左缘**（全屏态，rect.left≈0）时让：非全屏的侧栏式右栏
+	 * （push/Split）左缘在屏幕中间，附近没有系统返回手势，此时不该扣这 24px。
+	 */
+	function rightbarCloseEdgeInsetPx(rect) {
+		if (!rect || rect.left > 1) return 0;
+		return 24;
 	}
 
 	/**
@@ -2474,10 +2750,11 @@
 	 * 只是原本被整笔丢弃的手势多了一个兑现点。
 	 *   1) 右栏确实打开（读 data-sidebar-right-open + aria-hidden，与 isRightbarOpen 逐字一致）；
 	 *   2) 起点落在面板**水平范围内**（面板非全屏的 push/Split 态也正确）；
-	 *   3) 起点落在面板**左缘带**内：x0 <= panelRect.left + band（band 见上）；
+	 *   3) 起点落在面板**左缘带**内：rect.left + inset <= x0 <= rect.left + inset + band
+	 *      （inset 见 rightbarCloseEdgeInsetPx、band 见上；T66 起这条窗整体右移出系统返回手势区）；
 	 *   4) 不在横向可滚容器内（WEB-05 同款豁免，保护 pre/code/表格与横向溢出区）；
 	 *   5) 不是 isIgnoredSwipeTarget（输入框/输入卡/鲸鱼/状态栏/统计行）。
-	 * 门 3 是"不劫持面板内横向内容"的关键：面板**中部**右滑（x0 > left+band）
+	 * 门 3 是"不劫持面板内横向内容"的关键：面板**中部**右滑（x0 > left+inset+band）
 	 * 拿不到候选 ⇒ 维持 no-op（scratch/t43/diagnosis.md §7 T3）。
 	 */
 	function isRightbarCloseTrackTarget(target, x0) {
@@ -2488,7 +2765,9 @@
 		var rect = panel.getBoundingClientRect();
 		if (!rect || !rect.width) return false;
 		if (x0 < rect.left || x0 > rect.right) return false;
-		if (x0 > rect.left + rightbarCloseBandPx()) return false;
+		var inset = rightbarCloseEdgeInsetPx(rect);
+		if (x0 < rect.left + inset) return false;
+		if (x0 > rect.left + inset + rightbarCloseBandPx()) return false;
 		if (isIgnoredSwipeTarget(target)) return false;
 		if (isInHorizontallyScrollableContainer(target)) return false;
 		return true;
