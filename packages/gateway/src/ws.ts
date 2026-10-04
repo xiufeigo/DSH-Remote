@@ -7,7 +7,7 @@
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { INTERNAL_PREFIX, checkRequest, visitorKeyAdmits } from "./auth.ts";
-import type { GatewayConfig } from "./config.ts";
+import { wsPingIntervalMs, type GatewayConfig } from "./config.ts";
 import { proxyUpgrade, type Upstream } from "./proxy.ts";
 import type { Store } from "./store.ts";
 
@@ -50,5 +50,7 @@ export async function handleGatewayUpgrade(
 		socket.end("HTTP/1.1 413 Payload Too Large\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
 		return;
 	}
-	proxyUpgrade(req, socket as never, head, deps.resolveUpstream());
+	proxyUpgrade(req, socket as never, head, deps.resolveUpstream(), {
+		wsPingIntervalMs: wsPingIntervalMs(deps.config),
+	});
 }

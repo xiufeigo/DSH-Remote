@@ -16,7 +16,7 @@
  * 宿主/网关不可达时（例如 CI）打印原因并以退出码 0 跳过，不报失败。
  * 只读页面：全程不新建会话、不发送消息、不改任何设置；只新建一个配对设备并在结束时吊销。
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -928,16 +928,257 @@ try {
 	record("A/T27", "D-ui-diag-dedupe 状态真变化时仍照报（没把诊断打瞎）",
 		dedupe.dirty === 2 && dedupe.restored === 3,
 		`改 rootClass 后=${dedupe.dirty} 还原后=${dedupe.restored}（期望 2 / 3）`);
-	record("A/T27", "D-ui-diag-payload 过桥载荷仍是 7 字段 + ts（诊断行不受影响）",
+	// 载荷字段集合是**钉死的契约**：原生 MainActivity.formatUiDiag() 按名字取字段，
+	// 多一个少一个都会让诊断行说谎，所以这里用"全等"而不是"包含"。
+	// T31 为保活诊断新增了 wsState / lastDisconnectAt 两个字段（T31-4），
+	// 这里同步到 9 字段 + ts；日后任何人再加字段，这条断言仍会立刻变红。
+	const EXPECTED_DIAG_KEYS =
+		"device,frame,lastDisconnectAt,on,ready,rootClass,strictOff,ts,whale,wsState";
+	record("A/T27", "D-ui-diag-payload 过桥载荷字段集合仍是钉死的 9 字段 + ts（诊断行不受影响）",
 		(() => {
 			try {
 				const keys = Object.keys(JSON.parse(dedupe.last)).sort().join(",");
-				return keys === "device,frame,on,ready,rootClass,strictOff,ts,whale";
+				return keys === EXPECTED_DIAG_KEYS;
 			} catch (e) {
 				return false;
 			}
 		})(),
-		`载荷字段=${(() => { try { return Object.keys(JSON.parse(dedupe.last)).sort().join(","); } catch (e) { return "unparsable"; } })()}`);
+		`载荷字段=${(() => { try { return Object.keys(JSON.parse(dedupe.last)).sort().join(","); } catch (e) { return "unparsable"; } })()}` +
+		`（期望 ${EXPECTED_DIAG_KEYS}）`);
+
+	// T38-3：光有字段不够 —— 必须**原生真的读它**。
+	// T35 §10-21 的原话：T31 一直在报 wsState/lastDisconnectAt，MainActivity.formatUiDiag()
+	// 只读 7 个字段，这两个字段"完全没被消费"，注释里那个 never-seen 也永不产出。
+	// 这里对 MainActivity.java 做源码契约断言，防止再次出现"hook 报、原生不读"的半截闭环。
+	{
+		const mainJava = readFileSync(join(ROOT, "android/app/src/main/java/top/d1studio/dshremote/MainActivity.java"), "utf8");
+		const fmtAt = mainJava.indexOf("private static String formatUiDiag(");
+		const fmtEnd = mainJava.indexOf("\n\tprivate static String diagStr(", fmtAt);
+		const fmtBody = fmtAt >= 0 && fmtEnd > fmtAt ? mainJava.slice(fmtAt, fmtEnd) : "";
+		const readsWsState = /diagWsState\(o\)/.test(fmtBody);
+		const readsLastDisconnect = /diagLastDisconnect\(o\)/.test(fmtBody);
+		const helpersExist =
+			/private static String diagWsState\(JSONObject o\)/.test(mainJava) &&
+			/private static String diagLastDisconnect\(JSONObject o\)/.test(mainJava);
+		record("A/T27", "D-ui-diag-native-reads 原生 formatUiDiag 真的读了 wsState / lastDisconnectAt（T38-3 闭环）",
+			fmtBody.length > 0 && readsWsState && readsLastDisconnect && helpersExist,
+			`formatUiDiag 段长=${fmtBody.length} 读 wsState=${readsWsState} 读 lastDisconnectAt=${readsLastDisconnect} 辅助方法存在=${helpersExist}`);
+		// 反向：wsState 的三个取值必须在原生侧都有中文映射，不能把原始英文透给用户看
+		const hasAllStates = ["reconnecting", "ok-recovered", "ok"].every((s) =>
+			(new RegExp(`"${s.replace("-", "\\-")}"\\.equals\\(v\\)`)).test(mainJava));
+		record("A/T27", "D-ui-diag-native-reads wsState 三个取值都有中文映射（不透原始英文）",
+			hasAllStates, `reconnecting/ok-recovered/ok 均已映射=${hasAllStates}`);
+	}
+
+	// ── T41：T40 独立复核反例 F1 / F2 / F3 / F4 的自动化钉子 ──────────────────────
+	// T40 §8 M1/M2 已经证明：这类断言必须"承重"。只断言"源码里有某个字符串"钉不住实现
+	// —— 删掉关键那一行，14 条回归照样全绿。所以 F1 除了源码契约，还做一次**行为**验证：
+	// 把 MainActivity.java 里三段方法**原文**抠出来配一个极简 Uri 替身，javac 真编译真跑。
+	{
+		const mainJava = readFileSync(join(ROOT, "android/app/src/main/java/top/d1studio/dshremote/MainActivity.java"), "utf8");
+		const providerJava = readFileSync(join(ROOT, "android/app/src/main/java/top/d1studio/dshremote/ChooserCacheProvider.java"), "utf8");
+		/** 取一个 Java 方法的完整源码（签名 + 花括号配平的方法体）；注释里的 {@code} 不参与配平。 */
+		const javaMethod = (src, sig) => {
+			const at = src.indexOf(sig);
+			if (at < 0) return "";
+			const open = src.indexOf("{", at + sig.length);
+			if (open < 0) return "";
+			let depth = 0;
+			for (let i = open; i < src.length; i++) {
+				const c = src[i];
+				if (c === "/" && src[i + 1] === "*") { const e = src.indexOf("*/", i + 2); i = e < 0 ? src.length : e + 1; continue; }
+				if (c === "/" && src[i + 1] === "/") { const e = src.indexOf("\n", i); i = e < 0 ? src.length : e; continue; }
+				if (c === "{") depth++;
+				else if (c === "}" && --depth === 0) return src.slice(at, i + 1);
+			}
+			return "";
+		};
+
+		// ── F4：授权 flag 契约（T40 反例：删掉 addFlags 那一行，14 条回归仍全绿）──
+		const grantAdd = /chooser\.addFlags\(Intent\.FLAG_GRANT_READ_URI_PERMISSION\);/.test(mainJava);
+		const grantReadback = /" grantRead="[\s\S]{0,160}?chooser\.getFlags\(\) & Intent\.FLAG_GRANT_READ_URI_PERMISSION\) != 0\)/.test(mainJava);
+		record("A/T41", "D-chooser-grant-flag 选文件 Intent 必须带 FLAG_GRANT_READ_URI_PERMISSION 且按位回读自证",
+			grantAdd && grantReadback, `addFlags=${grantAdd} grantRead回读自证=${grantReadback}`);
+		const allowMultiple = /params\.getMode\(\) == FileChooserParams\.MODE_OPEN_MULTIPLE\)[\s\S]{0,240}?chooser\.putExtra\(Intent\.EXTRA_ALLOW_MULTIPLE, true\);/.test(mainJava);
+		record("A/T41", "D-chooser-grant-flag 页面声明 multiple 才打开 EXTRA_ALLOW_MULTIPLE（不越权改页面语义）",
+			allowMultiple, `MODE_OPEN_MULTIPLE→putExtra=${allowMultiple}`);
+
+		// ── F1：诊断行脱敏（源码契约）──
+		const shortUriBody = javaMethod(mainJava, "private static String shortUri(Uri uri)");
+		const tagBody = javaMethod(mainJava, "private static String redactedTagOf(Uri uri)");
+		const hashBody = javaMethod(mainJava, "private static String shortHashOf(String s)");
+		const touchesPath = /getLastPathSegment|getPath\(|getEncodedPath|getQuery|getFragment|getLastPathSegment/.test(shortUriBody);
+		record("A/T41", "D-chooser-diag-redacted shortUri 只拼 scheme://authority+脱敏标识，自身不再取任何路径段",
+			shortUriBody.length > 0 && /redactedTagOf\(/.test(shortUriBody) && !touchesPath && tagBody.length > 0 && hashBody.length > 0,
+			`shortUri段长=${shortUriBody.length} 走脱敏=${/redactedTagOf\(/.test(shortUriBody)} 自身取路径=${touchesPath} redactedTagOf段长=${tagBody.length} shortHashOf段长=${hashBody.length}`);
+		const uriForLogBody = javaMethod(mainJava, "private static String uriForLog(Uri uri)");
+		const fullUriInLog = /Log\.w\(TAG, "not directly readable: " \+ uriForLog\(uri\)/.test(mainJava);
+		record("A/T41", "D-chooser-diag-redacted 完整 URI 只允许进 logcat，不上屏（uriForLog 存在且读不到日志用它）",
+			uriForLogBody.length > 0 && fullUriInLog, `uriForLog段长=${uriForLogBody.length} 读不到日志用它=${fullUriInLog}`);
+
+		// ── F1：诊断行脱敏（**行为**：抠出真方法体，javac 真编译真跑）──
+		// 用的就是 T40 在 AVD 上实测泄露的那几条 URI（downloads 的 raw:<绝对路径>、
+		// media 的 image:<绝对路径>、多选的 msf:<id>、我们自己 provider 的 <原名>、以及穿越串）。
+		const LEAK_CASES = [
+			{ name: "T40-downloads-raw", uri: "content://com.android.providers.downloads.documents/raw%3A%2Fstorage%2Femulated%2F0%2FDownload%2Fnormal.txt", prefix: "content://com.android.providers.downloads.documents", forbidden: ["storage", "emulated", "Download", "normal.txt", "raw:", "/"] },
+			{ name: "media-image-abs", uri: "content://com.android.providers.media.documents/image%3A%2Fstorage%2Femulated%2F0%2FPictures%2F%E7%A7%81%E5%AF%86.jpg", prefix: "content://com.android.providers.media.documents", forbidden: ["Pictures", "私密", "image:", "/"] },
+			{ name: "msf-id", uri: "content://com.android.providers.media.documents/msf%3A1000000026", prefix: "content://com.android.providers.media.documents", forbidden: ["msf:", "1000000026", "/"] },
+			{ name: "own-cache-原名", uri: "content://top.d1studio.dshremote.choosercache/normal.txt", prefix: "content://top.d1studio.dshremote.choosercache", forbidden: ["normal.txt", "/"] },
+			{ name: "traversal", uri: "content://top.d1studio.dshremote.choosercache/..%2F..%2Fdatabases%2Fx", prefix: "content://top.d1studio.dshremote.choosercache", forbidden: ["databases", "..", "/"] },
+		];
+		const shortHashOfBody = hashBody;
+		if (!shortUriBody || !tagBody || !shortHashOfBody) {
+			record("A/T41", "D-chooser-diag-redacted 行为验证：shortUri/redactedTagOf/shortHashOf 三段都能抠出来",
+				false, `抠出长度 ${shortUriBody.length}/${tagBody.length}/${shortHashOfBody.length}`);
+		} else {
+			// 找 javac / java：JAVA_HOME → PATH → Android Studio JBR。都没有就 SKIP（不是失败）。
+			const findJdkBin = (tool) => {
+				const cands = [];
+				if (process.env.JAVA_HOME) cands.push(join(process.env.JAVA_HOME, "bin", tool + (process.platform === "win32" ? ".exe" : "")));
+				const which = spawnSync(process.platform === "win32" ? "where" : "which", [tool], { encoding: "utf8" });
+				if (which.status === 0) for (const line of String(which.stdout || "").split(/\r?\n/)) if (line.trim()) cands.push(line.trim());
+				if (process.platform === "win32") cands.push(join(process.env.ProgramFiles || "C:\\Program Files", "Android/Android Studio/jbr/bin", tool + ".exe"));
+				for (const c of cands) if (c && existsSync(c)) return c;
+				return "";
+			};
+			const javacBin = findJdkBin("javac");
+			const javaBin = findJdkBin("java");
+			if (!javacBin || !javaBin) {
+				record("A/T41", "D-chooser-diag-redacted 行为验证：真方法体输出不含路径/文件名/documentId",
+					null, `无 JDK（javac=${javacBin || "缺"}）→ 跳过；源码契约那条仍生效`);
+			} else {
+				const dir = mkdtempSync(join(tmpdir(), "dshr-t41-redact-"));
+				try {
+					const inFile = join(dir, "in.txt");
+					const outFile = join(dir, "out.txt");
+					writeFileSync(inFile, LEAK_CASES.map((c) => c.uri).join("\n"), "utf8");
+					// Uri 替身按 AOSP 语义实现：路径段先按 '/' 切、再逐段 %XX 解码
+					// —— 正是这一点让 documentId `raw:/…` 整体成为最后一个 path segment。
+					writeFileSync(join(dir, "RedactHarness.java"), [
+						"import java.io.BufferedReader;",
+						"import java.io.FileReader;",
+						"import java.io.FileWriter;",
+						"import java.io.PrintWriter;",
+						"import java.util.Locale;",
+						"class Uri {",
+						"  private final String s;",
+						"  Uri(String s) { this.s = s; }",
+						"  static Uri parse(String s) { return new Uri(s); }",
+						"  public String getScheme() { int i = s.indexOf(':'); return i < 0 ? null : s.substring(0, i); }",
+						"  public String getAuthority() {",
+						"    int i = s.indexOf(\"://\"); if (i < 0) return null;",
+						"    int j = s.indexOf('/', i + 3); return j < 0 ? s.substring(i + 3) : s.substring(i + 3, j);",
+						"  }",
+						"  public String getLastPathSegment() {",
+						"    int i = s.indexOf(\"://\"); if (i < 0) return null;",
+						"    int j = s.indexOf('/', i + 3); if (j < 0) return null;",
+						"    String seg = s.substring(j + 1); int k = seg.lastIndexOf('/');",
+						"    if (k >= 0) seg = seg.substring(k + 1);",
+						"    return pctDecode(seg);",
+						"  }",
+						"  private static String pctDecode(String v) {",
+						"    StringBuilder b = new StringBuilder();",
+						"    for (int i = 0; i < v.length(); i++) {",
+						"      char c = v.charAt(i);",
+						"      if (c == '%' && i + 2 < v.length()) {",
+						"        try { b.append((char) Integer.parseInt(v.substring(i + 1, i + 3), 16)); i += 2; continue; } catch (Throwable t) { }",
+						"      }",
+						"      b.append(c);",
+						"    }",
+						"    return b.toString();",
+						"  }",
+						"  public String toString() { return s; }",
+						"}",
+						"class RedactHarness {",
+						shortUriBody,
+						tagBody,
+						shortHashOfBody,
+						"  static java.util.List<String> readAll(String p) throws Exception {",
+						"    java.util.List<String> l = new java.util.ArrayList<String>();",
+						"    BufferedReader r = new BufferedReader(new FileReader(p)); String line;",
+						"    while ((line = r.readLine()) != null) if (!line.isEmpty()) l.add(line);",
+						"    r.close(); return l;",
+						"  }",
+						"  public static void main(String[] a) throws Exception {",
+						"    java.util.List<String> in = readAll(a[0]);",
+						"    PrintWriter w = new PrintWriter(new FileWriter(a[1]));",
+						"    for (String u : in) w.println(shortUri(Uri.parse(u)));",
+						"    for (String u : in) w.println(\"STABLE=\" + shortUri(Uri.parse(u)).equals(shortUri(Uri.parse(u))));",
+						"    w.close();",
+						"  }",
+						"}",
+					].join("\n"), "utf8");
+					const cRes = spawnSync(javacBin, ["-encoding", "UTF-8", "-nowarn", "-d", dir, join(dir, "RedactHarness.java")], { encoding: "utf8" });
+					if (cRes.status !== 0) {
+						record("A/T41", "D-chooser-diag-redacted 行为验证：真方法体输出不含路径/文件名/documentId",
+							null, `javac 编译不过（工具链/替身不兼容，非泄露）→ 跳过；${String(cRes.stderr || "").split(/\r?\n/)[0]}`);
+					} else {
+						const rRes = spawnSync(javaBin, ["-cp", dir, "RedactHarness", inFile, outFile], { encoding: "utf8" });
+						if (rRes.status !== 0) {
+							record("A/T41", "D-chooser-diag-redacted 行为验证：真方法体输出不含路径/文件名/documentId",
+								null, `java 运行失败 → 跳过；${String(rRes.stderr || "").split(/\r?\n/)[0]}`);
+						} else {
+							const lines = readFileSync(outFile, "utf8").split(/\r?\n/).filter((l) => l.length > 0);
+							const outs = lines.slice(0, LEAK_CASES.length);
+							const stables = lines.slice(LEAK_CASES.length);
+							const bad = [];
+							LEAK_CASES.forEach((c, i) => {
+								const out = outs[i] === undefined ? "" : outs[i];
+								const tail = out.slice(c.prefix.length); // authority 之后的部分
+								const hits = c.forbidden.filter((f) => tail.includes(f));
+								if (!out.startsWith(c.prefix) || hits.length) {
+									bad.push(`${c.name}: out=${JSON.stringify(out)} 违规=${JSON.stringify(hits)} 前缀匹配=${out.startsWith(c.prefix)}`);
+								}
+							});
+							// 短标识必须稳定（同 URI 恒等）且不同（不是恒定串，信息没被抹平成废码）
+							const allStable = stables.length === LEAK_CASES.length && stables.every((l) => l === "STABLE=true");
+							const distinct = new Set(outs).size === outs.length;
+							record("A/T41", "D-chooser-diag-redacted 行为验证：真方法体输出不含路径/文件名/documentId",
+								bad.length === 0 && allStable && distinct,
+								`${LEAK_CASES.length} 条用例全脱敏=${bad.length === 0} 稳定=${allStable} 互不相同=${distinct} ` +
+								`样例=${JSON.stringify(outs[0])}${bad.length ? " 违规→ " + bad.join(" | ") : ""}`);
+							// 扩展名是**刻意保留**的（任务书允许"只留扩展名 + 短哈希"），
+							// 断言写死这条口径：既不被误删，也不许退化成整名。
+							const extKept = (outs[1] || "").endsWith(".jpg]") && (outs[0] || "").endsWith(".txt]");
+							record("A/T41", "D-chooser-diag-redacted 扩展名刻意保留（够判断类型）但文件名不留",
+								extKept, `media→.jpg=${(outs[1] || "").endsWith(".jpg]")} downloads→.txt=${(outs[0] || "").endsWith(".txt]")}`);
+						}
+					}
+				} finally {
+					try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+				}
+			}
+		}
+
+		// ── F3：在途文件选择回调必须归还 null，且必须在 WebView 拆除之前 ──
+		const onDestroyBody = javaMethod(mainJava, "protected void onDestroy()");
+		// 定位必须**忽略注释**：onDestroy 的注释里就写着 "一旦 webView.destroy() 先跑"，
+		// 直接 indexOf 会命中注释（offset 542）而不是真正的调用点，断言就成了假红/假绿。
+		// 做法：把注释挖成等长空格，偏移量保持不变。
+		const maskComments = (s) =>
+			s.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
+				.replace(/\/\/[^\n]*/g, (m) => m.replace(/[^\n]/g, " "));
+		const onDestroyCode = maskComments(onDestroyBody);
+		const releaseBody = javaMethod(mainJava, "private void releaseInFlightFileCallback(String why)");
+		const releaseAt = onDestroyCode.indexOf("releaseInFlightFileCallback(");
+		const webDestroyAt = onDestroyCode.indexOf("webView.destroy()");
+		record("A/T41", "D-chooser-callback-released onDestroy 归还在途 fileCallback（页面 file input 不悬空）",
+			releaseBody.length > 0 && /cb\.onReceiveValue\(null\)/.test(releaseBody) && /fileCallback = null;/.test(releaseBody) && releaseAt >= 0,
+			`方法存在=${releaseBody.length > 0} 归还null=${/cb\.onReceiveValue\(null\)/.test(releaseBody)} 清字段=${/fileCallback = null;/.test(releaseBody)} onDestroy内调用=${releaseAt >= 0}`);
+		record("A/T41", "D-chooser-callback-released 归还发生在 webView.destroy() 之前（否则回调悬在已销毁 WebView 上）",
+			releaseAt >= 0 && webDestroyAt > releaseAt, `release@${releaseAt} < destroy@${webDestroyAt}`);
+
+		// ── F2：chooser 缓存目录必须退出即清（此前全仓零清理，只增不减）──
+		const purgeBody = javaMethod(mainJava, "private void purgeChooserCacheDir(String why)");
+		const providerPurge = javaMethod(providerJava, "static int purgeCache(Context ctx)");
+		const purgeAt = onDestroyCode.indexOf("purgeChooserCacheDir(");
+		record("A/T41", "D-chooser-cache-purged onDestroy 清空 cacheDir/chooser，与“退出即清”口径一致",
+			purgeBody.length > 0 && /ChooserCacheProvider\.purgeCache\(this\)/.test(purgeBody) && purgeAt >= 0 &&
+				/listFiles\(\)/.test(providerPurge) && /f\.delete\(\)/.test(providerPurge),
+			`onDestroy内调用=${purgeAt >= 0} 委派purgeCache=${/ChooserCacheProvider\.purgeCache\(this\)/.test(purgeBody)} provider段长=${providerPurge.length} 逐个delete=${/f\.delete\(\)/.test(providerPurge)}`);
+		record("A/T41", "D-chooser-cache-purged 清理发生在 webView.destroy() 之后（不与在读 fd 抢）",
+			purgeAt > webDestroyAt && webDestroyAt > 0, `destroy@${webDestroyAt} < purge@${purgeAt}`);
+	}
 	/** 官方 composer 里的可编辑元素（真机 a11y 里就是一个 EditText）+ 可点性判定。 */
 	const findComposer = () => evaluate(`(function(){
 		var seat = document.querySelector('[data-composer-seat]') || document.querySelector('[data-composer-card]');

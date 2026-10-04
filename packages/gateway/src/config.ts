@@ -62,6 +62,13 @@ export interface FrpConfig {
 	edgeConsume?: "stcp" | "entry-port";
 	/** frps 的 allowPorts（仅 edge=frps 生成 frps.toml 时写入），如 [{start:18400,end:18500}]。 */
 	allowPorts?: Array<{ start: number; end: number }>;
+	/**
+	 * T31-1：frpc 控制连接心跳周期（秒）。缺省 25；写 0/负数则不写该行（回落 frp 内建默认）。
+	 * 注意这只保活 frpc↔frps 的**控制**连接，不保活数据面。
+	 */
+	heartbeatInterval?: number;
+	/** T31-1：frpc 控制连接心跳超时（秒）。缺省 90；写 0/负数则不写该行。 */
+	heartbeatTimeout?: number;
 }
 
 /** 前置 Token 门禁配置（edge 公网入口）。 */
@@ -98,6 +105,15 @@ export interface TlsConfig {
 	keyPath?: string;
 }
 
+/** WebSocket 直通通道的保活设置（T31-2）。 */
+export interface WsConfig {
+	/**
+	 * 网关→浏览器侧 WS PING 的间隔（毫秒）。缺省 25_000。
+	 * 写 0 / 负数 / `false` 即关闭（退回 T31 之前的纯字节管道）。
+	 */
+	pingIntervalMs?: number | false;
+}
+
 export interface GatewayConfig {
 	/**
 	 * 部署角色：
@@ -126,6 +142,8 @@ export interface GatewayConfig {
 	mobile?: MobileConfig;
 	/** 手工 TLS 证书（可选） */
 	tls?: TlsConfig;
+	/** WS 直通保活（T31-2） */
+	ws?: WsConfig;
 	/** 设备 Token 有效期（天） */
 	deviceTokenDays: number;
 	/** 配对码有效期（分钟） */
@@ -226,12 +244,30 @@ export function mobileInjectionEnabled(config: GatewayConfig): boolean {
 
 /** 移动 hook 断点：非法值一律回落 980。 */
 export const DEFAULT_MOBILE_BREAKPOINT = 980;
-
 export function mobileBreakpointPx(config: GatewayConfig): number {
 	const raw = config.mobile?.breakpointPx;
 	return typeof raw === "number" && Number.isFinite(raw) && raw >= 240 && raw <= 4096
 		? Math.round(raw)
 		: DEFAULT_MOBILE_BREAKPOINT;
+}
+
+/**
+ * T31-2：网关→浏览器侧 WS PING 间隔（毫秒）。
+ *
+ * 缺省 25_000。依据：绝大多数中间设备（运营商 NAT / 企业防火墙 / 负载均衡器）
+ * 的 TCP 空闲回收阈值在 5 分钟量级，25s 的空载荷 PING（每个 2 字节）完全可忽略，
+ * 又足以让整条 frp/移动/Wi-Fi 链路持续有流量，不被判定为空闲。
+ * 写 0 / 负数 / `false` 即关闭（退回纯字节管道），便于做负控制与故障回滚。
+ */
+export const DEFAULT_WS_PING_INTERVAL_MS = 25_000;
+
+export function wsPingIntervalMs(config: GatewayConfig): number {
+	const raw = config.ws?.pingIntervalMs;
+	if (raw === false) return 0;
+	if (typeof raw !== "number" || !Number.isFinite(raw)) return DEFAULT_WS_PING_INTERVAL_MS;
+	if (raw <= 0) return 0;
+	// 下限 1s：再密也只是徒增 CPU，且会挤占 mux 数据面
+	return Math.round(Math.min(Math.max(raw, 1_000), 600_000));
 }
 
 function boolEnv(value: string | undefined): boolean | undefined {
@@ -334,6 +370,23 @@ export function applyEnvOverrides(base: GatewayConfig, env: NodeJS.ProcessEnv = 
 	if (edgeConsume === "stcp" || edgeConsume === "entry-port") set(["frp", "edgeConsume"], edgeConsume);
 	const allowPorts = parseAllowPorts(env["DSHR_FRPS_ALLOW_PORTS"]);
 	if (allowPorts !== undefined) set(["frp", "allowPorts"], allowPorts);
+	// T31-1：0 表示"不写该行"（回落 frp 内建默认），非数字一律忽略
+	const hbInterval = Number.parseInt(env["DSHR_FRP_HEARTBEAT_INTERVAL"] ?? "", 10);
+	if (Number.isInteger(hbInterval) && hbInterval >= -3600 && hbInterval <= 3600) set(["frp", "heartbeatInterval"], hbInterval);
+	const hbTimeout = Number.parseInt(env["DSHR_FRP_HEARTBEAT_TIMEOUT"] ?? "", 10);
+	if (Number.isInteger(hbTimeout) && hbTimeout >= -3600 && hbTimeout <= 3600) set(["frp", "heartbeatTimeout"], hbTimeout);
+
+	// T31-2：WS PING 间隔；0 / off / false 关闭
+	const wsPing = env["DSHR_WS_PING_INTERVAL_MS"];
+	if (typeof wsPing === "string" && wsPing.trim().length > 0) {
+		const trimmed = wsPing.trim();
+		const asBool = boolEnv(trimmed);
+		if (asBool !== undefined) set(["ws", "pingIntervalMs"], asBool ? DEFAULT_WS_PING_INTERVAL_MS : 0);
+		else {
+			const ms = Number.parseInt(trimmed, 10);
+			if (Number.isInteger(ms)) set(["ws", "pingIntervalMs"], ms);
+		}
+	}
 
 	return out;
 }

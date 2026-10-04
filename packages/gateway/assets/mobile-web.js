@@ -1177,8 +1177,103 @@
 	var lastUiDiagKey = null;
 	var uiDiagBridgeMissing = false;
 
+	// T31-3/T31-4 的共享状态。**必须在这里声明**：collectUiDiag（第 ~1180 行）
+	// 会读 lastDisconnectAt，而它在 IIFE 顶部的 reportUiDiag() 调用点之前就被求值。
+	var RESUME_PROBE_DELAY_MS = 1200;
+	var RESUME_MIN_INTERVAL_MS = 15000;
+	// T38-2 新增的两道防风暴闸：二次确认的延后时长，以及单页面生命周期的硬上限。
+	var RESUME_CONFIRM_DELAY_MS = 2000;
+	var RESUME_MAX_NUDGES = 3;
+	// T38-2：断开闩锁。resumeDownSince = 第一次观测到"确实断开"的时刻（0 = 未断开）；
+	// resumeNudgeArmed = 是否允许推。推过一次后必须先观测到恢复才重新武装。
+	var resumeDownSince = 0;
+	var resumeDownConfirmScheduled = false;
+	var resumeNudgeArmed = true;
+	var resumeNudgeCount = 0;
+	var resumeLastNudgeAt = 0;
+	var resumeLastProbeAt = 0;
+	var resumeLastProbeResult = 'never';
+	/** 本次页面生命周期内第一次观测到"确实断开"的时刻；0 = 从未断线。 */
+	var lastDisconnectAt = 0;
+
+	// ── T38-2：结构化"是否真的断开"判据（替换 T31 的裸 reconnect 扫全页 innerText）──
+	//
+	// T31 的写法：/重新连接|正在重连|重连中|reconnect/i.test(document.body.innerText)。
+	// 问题出在最后那个 `reconnect`（还带 /i，且不锚定任何结构）：英文界面里的
+	// "Reconnecting"、一个叫 "Reconnect" 的按钮、文件名、甚至终端输出里出现该词，
+	// 整页都算命中 ⇒ 连接健康也会被判成"正在断线"，回前台就反复推。
+	//
+	// 现在的判据（两条同时成立才算"确实断开"）：
+	//   (1) **元素级 + 整串锚定**：存在一个可见元素，它**整段文字就是**重连状态
+	//       （正则 ^...$ 全匹配，且长度 ≤ RESUME_STATUS_MAX_LEN）。
+	//       散文、代码块、文件名、日志行永远匹配不上 —— 这就是"不靠宽泛子串"。
+	//   (2) **排除可交互控件**：button / a / input / [role=button] / [onclick] 及其后代
+	//       一律不算。「Reconnect 按钮」是让人去点的，不是"正在重连"的状态。
+	// 另有第三道闸在 probeResumeRecovery 里：单次观测不动作，要隔
+	// RESUME_CONFIRM_DELAY_MS 二次确认（见那里的说明）。
+	//
+	// 文案只保留 DSH 真实出现过的整串（0.1.5-rc.1 实测是「重新连接中...」），
+	// 裸 reconnect 已从判据里彻底移除。
+	var RECONNECT_STATUS_RE = /^(?:正在重新连接|重新连接中|正在重连中|正在重连|重连中|reconnecting)[\.…]{0,3}$/i;
+	var RESUME_STATUS_MAX_LEN = 24;
+	var RESUME_STATUS_SCAN_LIMIT = 4000;
+
+	/** 可交互控件不算"状态"：按钮/链接是让人去点的。 */
+	function isInteractiveNode(node) {
+		if (!isElement(node)) return true;
+		var tag = (node.tagName || '').toLowerCase();
+		if (tag === 'button' || tag === 'a' || tag === 'input' || tag === 'select' || tag === 'textarea') return true;
+		try {
+			var role = node.getAttribute('role');
+			if (role === 'button' || role === 'link') return true;
+			if (node.hasAttribute('onclick')) return true;
+			if (node.closest) {
+				if (node.closest('button,a,[role="button"],[onclick]')) return true;
+			}
+		} catch (ignoredInteractive) {}
+		return false;
+	}
+
+	/**
+	 * 找出「整段文字就是重连状态」的可见、非交互元素；找不到返回 null。
+	 *
+	 * 刻意**不查 document.body**：body 是所有文本的并集，一旦匹配就退化成
+	 * T31 那种"整页扫子串"，正是要消灭的误触发来源。
+	 */
+	function findReconnectStatusElement() {
+		if (!document.body || typeof document.body.querySelectorAll !== 'function') return null;
+		var nodes = document.body.querySelectorAll('div,span,p,section,li,strong,em,label,h1,h2,h3,h4,h5,h6');
+		var n = nodes.length;
+		if (n > RESUME_STATUS_SCAN_LIMIT) n = RESUME_STATUS_SCAN_LIMIT;
+		for (var i = 0; i < n; i++) {
+			var el = nodes[i];
+			if (isInteractiveNode(el)) continue;
+			var text = '';
+			try { text = (el.innerText || el.textContent || '').trim(); } catch (ignoredStatusText) { continue; }
+			if (!text || text.length > RESUME_STATUS_MAX_LEN) continue;
+			if (!RECONNECT_STATUS_RE.test(text)) continue;
+			if (!isVisible(el)) continue;
+			return el;
+		}
+		return null;
+	}
+
 	function collectUiDiag() {
 		var root = document.documentElement;
+		// T31-4：把连接状态并进同一份诊断载荷 —— 用户远程（手机不接电脑）时
+		// 只需看 App 设置页这一行就知道"是不是真的在掉线、上次什么时候掉的"。
+		// T38-2：判据换成 findReconnectStatusElement()（元素级 + 整串锚定 + 排除可交互控件），
+		// 与 probeResumeRecovery 走**同一个**函数 —— 诊断行不再可能和实际动作口径不一致。
+		// wsState 取值只有三个，且全部可产出：
+		//   reconnecting   此刻确实处于断开态；
+		//   ok-recovered   曾经断过、现在已恢复（lastDisconnectAt > 0）；
+		//   ok             本次页面生命周期内一次都没断过。
+		// （T31 注释里写过的 never-seen 从来不可能出现，已删除。）
+		// lastDisconnectAt 为 0 表示本次页面生命周期内没有观测到断线。
+		var reconnecting = false;
+		try {
+			reconnecting = findReconnectStatusElement() !== null;
+		} catch (ignoredDiagText) {}
 		return {
 			device: deviceMode,
 			on: !!hookOn,
@@ -1187,6 +1282,8 @@
 			whale: isVisible(document.getElementById('dshr-mobile-whale')),
 			frame: !!findFrame(),
 			strictOff: isStrictOff(),
+			wsState: reconnecting ? 'reconnecting' : (lastDisconnectAt > 0 ? 'ok-recovered' : 'ok'),
+			lastDisconnectAt: lastDisconnectAt || 0,
 			ts: Date.now(),
 		};
 	}
@@ -3526,6 +3623,119 @@
 		else if (themeMq.addListener) themeMq.addListener(onScheme);
 	} catch (ignoredMq) {}
 
+	// ── T31-3 / T38-2：切后台 / 锁屏回来时，若连接**确实**断了就立刻恢复 ──
+	//
+	// 问题：MainActivity.onResume 只恢复定时器、不重连；DSH 客户端的重连退避是
+	// setTimeout 驱动的（client.js 退避 500ms→10s 封顶），一旦 onPause 的
+	// pauseTimers 真的冻住了计时器，回前台就得先干等剩余退避。
+	//
+	// 为什么选「页面侧 visibilitychange + 派发 online 事件」而不是原生 reload：
+	//   1. 不动原生，不碰 resumeLiveSession 契约，不会整页重载丢会话/输入；
+	//   2. DSH 客户端本就监听 window 的 online/offline 来触发 setNetworkAvailable，
+	//      派发 online 等于「清零退避 + 立即重连」，是它自己提供的幂等入口；
+	//   3. 纯 JS，桌面浏览器打开同一页面也能受益（不限于 App）。
+	//
+	// 触发时机（不变）：
+	//   - 只有 document.visibilityState 变成 visible 才看；
+	//   - 延后 RESUME_PROBE_DELAY_MS 再判：回前台瞬间 DOM 可能还没恢复。
+	//
+	// T38-2 收口：把 T31 的「裸 reconnect 扫全页 innerText」换成结构化判据。
+	// 判据本体在 findReconnectStatusElement()（见 IIFE 顶部，此处不重复）：
+	// 元素级 + 整串锚定 + 排除可交互控件。这里再加四道防重连风暴的闸：
+	//   1. **二次确认**：单次观测只上闩不动作，延后 RESUME_CONFIRM_DELAY_MS 再确认一次，
+	//      两次都为真才推 ⇒ 闪一下的状态文案、一次性巧合都活不过这一关；
+	//   2. **武装位**：推过一次后 resumeNudgeArmed=false，必须先观测到恢复才重新武装，
+	//      所以"页面长期卡在重连态"不会变成连续推；
+	//   3. **最小间隔**：RESUME_MIN_INTERVAL_MS 内不重复推；
+	//   4. **硬上限**：单页面生命周期最多 RESUME_MAX_NUDGES 次。
+	//
+	// 会话/草稿安全：唯一动作是 window.dispatchEvent(new Event('online'))。
+	// 不 reload、不碰 document.cookie、不导航 ⇒ 会话与未发送的草稿都不受影响。
+	// （常量与计数器声明在 IIFE 顶部，见 lastUiDiagKey 附近。）
+
+	function resumeRecoveryState() {
+		return {
+			installed: true,
+			nudges: resumeNudgeCount,
+			lastNudgeAt: resumeLastNudgeAt,
+			lastProbeAt: resumeLastProbeAt,
+			lastProbe: resumeLastProbeResult,
+			lastDisconnectAt: lastDisconnectAt,
+			reconnecting: findReconnectStatusElement() !== null,
+			downSince: resumeDownSince,
+			armed: resumeNudgeArmed,
+			maxNudges: RESUME_MAX_NUDGES,
+			vis: document.visibilityState,
+		};
+	}
+
+	/**
+	 * 探测并（必要时）推一把。返回是否真的推了。测试与原生都可直接调。
+	 *
+	 * 健康 ⇒ 立刻返回 false，是本函数的第一件事（"不误触发"的结构性保证）。
+	 */
+	function probeResumeRecovery() {
+		resumeLastProbeAt = Date.now();
+		var reconnecting = findReconnectStatusElement() !== null;
+		// 健康路径必须第一件事就返回 false：这是"不误触发"的结构性保证。
+		// 顺带把断开闩锁与武装复位（先观测到恢复，才允许下一次推）。
+		if (!reconnecting) {
+			resumeDownSince = 0;
+			resumeDownConfirmScheduled = false;
+			resumeNudgeArmed = true;
+			resumeLastProbeResult = 'healthy';
+			return false;
+		}
+		// 第一次观测到"确实断开"：只上闩 + 记录断线起点（供远程自查），并安排二次确认
+		if (resumeDownSince === 0) {
+			resumeDownSince = Date.now();
+			if (lastDisconnectAt === 0) lastDisconnectAt = resumeDownSince;
+			resumeLastProbeResult = 'down-seen';
+			if (!resumeDownConfirmScheduled) {
+				resumeDownConfirmScheduled = true;
+				window.setTimeout(function () {
+					resumeDownConfirmScheduled = false;
+					probeResumeRecovery();
+				}, RESUME_CONFIRM_DELAY_MS);
+			}
+			return false;
+		}
+		// 走到这里 = 二次确认通过，确实处于断开态。逐道闸检查，任何一道不过都不推。
+		if (lastDisconnectAt === 0) lastDisconnectAt = Date.now();
+		if (!resumeNudgeArmed) { resumeLastProbeResult = 'down-confirmed-disarmed'; return false; }
+		if (resumeNudgeCount >= RESUME_MAX_NUDGES) { resumeLastProbeResult = 'cap-reached'; return false; }
+		if (resumeLastNudgeAt > 0 && Date.now() - resumeLastNudgeAt < RESUME_MIN_INTERVAL_MS) {
+			resumeLastProbeResult = 'rate-limited';
+			return false;
+		}
+		try {
+			// DSH 客户端的既有网络态入口：清零退避并立即重连（连接已断，abort 无损失）
+			window.dispatchEvent(new Event('online'));
+			resumeNudgeCount += 1;
+			resumeLastNudgeAt = Date.now();
+			resumeDownSince = Date.now(); // 重新起算：若仍断开，下一次要走完二次确认
+			resumeNudgeArmed = false;     // 必须先观测到恢复，才允许再推
+			resumeLastProbeResult = 'nudged';
+			reportUiDiag();
+			return true;
+		} catch (ignoredDispatch) {
+			resumeLastProbeResult = 'dispatch-failed';
+			return false;
+		}
+	}
+
+	if (document.addEventListener) {
+		document.addEventListener('visibilitychange', function () {
+			if (document.visibilityState !== 'visible') return;
+			window.setTimeout(probeResumeRecovery, RESUME_PROBE_DELAY_MS);
+		}, { passive: true });
+		window.addEventListener('pageshow', function (ev) {
+			// bfcache 恢复：从后台标签页回前台同样走一次
+			if (!ev || !ev.persisted) return;
+			window.setTimeout(probeResumeRecovery, RESUME_PROBE_DELAY_MS);
+		}, { passive: true });
+	}
+
 	// ── 壳 App 返回键桥接（与既有 MainActivity 契约保持一致） ──
 	window.__dshRemoteAndroidMobile = {
 		closeSidebarIfExpanded: function () {
@@ -3584,5 +3794,8 @@
 		applyImeLift: applyImeLift,
 		readSessionNotice: collectSessionNotice,
 		imeLiftRect: imeLiftRect,
+		// T31-3：回前台恢复的自检入口（原生与测试都读它，不做任何动作）
+		resumeRecoveryState: resumeRecoveryState,
+		probeResumeRecovery: probeResumeRecovery,
 	};
 })();

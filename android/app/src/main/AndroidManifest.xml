@@ -38,6 +38,18 @@
 			</intent-filter>
 		</activity>
 
+		<!-- T39：WebView 文件选择器兜底通道。选择器返回的 content:// URI 读不到时，
+		     把内容复制进私有缓存并由本 provider 以一个必然可读、名称/大小都准确的
+		     URI 交给 WebView，截断"选完什么都不显示且全程无报错"这条静默链路。
+		     exported=false：WebView 的 onReceiveValue(Uri[]) 在本进程内经
+		     ContentResolver 打开 URI（渲染进程只收字节），因此无需对外导出；
+		     grantUriPermissions=true：保留框架按 URI 授权的能力。 -->
+		<provider
+			android:name=".ChooserCacheProvider"
+			android:authorities="top.d1studio.dshremote.choosercache"
+			android:exported="false"
+			android:grantUriPermissions="true" />
+
 		<!-- AND-02：specialUse 前台服务类型，必须随附用途声明（商店审核材料）。 -->
 		<service
 			android:name=".TunnelService"

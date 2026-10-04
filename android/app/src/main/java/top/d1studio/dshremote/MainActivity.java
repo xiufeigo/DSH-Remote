@@ -4,12 +4,14 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
 import android.content.ActivityNotFoundException;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Insets;
@@ -20,6 +22,8 @@ import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.ParcelFileDescriptor;
+import android.provider.OpenableColumns;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.util.Log;
@@ -58,13 +62,20 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.security.MessageDigest;
 import java.security.cert.X509Certificate;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -109,6 +120,17 @@ public class MainActivity extends Activity {
 	private static final String MODE_TABLET = "tablet";
 	private static final int REQ_FILE_CHOOSER = 1001;
 	private static final int REQ_NOTIF_PERM = 1002;
+	/**
+	 * T39：logcat tag。与既有 {@code dshr-frpc} / {@code dshr-svc} 同族命名。
+	 * 用途：把每次文件选择器的原始结果（resultCode / data 是否为空 / URI scheme+authority /
+	 * clipData 条数 / 能否读取与字节数 / 异常类名）打一份，便于事后用 adb 复盘。
+	 * 用户远程不方便 adb，所以他主要看连接设置页那行只读诊断；这份是留给我们自己的。
+	 */
+	private static final String TAG = "dshr-chooser";
+	/** T39：可读性自检的字节数硬顶。超过即认为流有问题（选择器返回 0 字节/半截流）。 */
+	private static final int CHOOSER_PROBE_CAP = 1024 * 1024;
+	/** T39：复制进私有缓存的单文件字节上限。附件场景足够，同时兜住"选择器给了个超大流"。 */
+	private static final long CHOOSER_CACHE_MAX = 64L * 1024 * 1024;
 	/**
 	 * 隧道就绪等待硬顶。T23-B 把它搬到 TunnelReady（纯常量、可单测），值仍是 20_000ms。
 	 * @see TunnelReady#TUNNEL_READY_TIMEOUT_MS
@@ -234,6 +256,14 @@ public class MainActivity extends Activity {
 	 */
 	private volatile String uiDiagRaw = "";
 	private volatile String uiDiagSummary = "";
+
+	/**
+	 * T39：最近一次 WebView 文件选择器的诊断行（原生侧，只读）。与 {@code uiDiagSummary}
+	 * 分开存：hook 那份是页面适配诊断且**载荷字段集合被 test:device 全等钉死**（9 字段 + ts），
+	 * 原生这份是文件选择器链路，混进去会破坏那条契约断言，故在 refreshUiDiagLine() 里拼接。
+	 * 空串 = 本次 App 生命周期内还没选过文件（显示「未选择」而不是省略）。
+	 */
+	private volatile String chooserDiag = "";
 
 	/**
 	 * AND-06：统一后台线程池（单线程、命名、守护），替换原裸 new Thread 的
@@ -363,7 +393,20 @@ public class MainActivity extends Activity {
 		//（正常路径由 waitAndOpen 的 finally 注销，这里兜底重建/异常路径）。
 		FrpcManager.setReadyListener(null);
 		dismissPendingHttpAuth();
-		fileCallback = null;
+		// T41-F3（T40 反例 F3 / T37 早就指出）：在途的文件选择回调必须**归还 null**，
+		// 不能只把字段置空。位置选在这里、WebView 拆除**之前**：
+		//   ① ValueCallback 是 Chromium 侧 AwContents 持有的对象，回调会顺着它给渲染进程
+		//      发"选择结束(无结果)"，页面的 <input type=file> 才会真正复位；
+		//   ② 一旦 webView.destroy() 先跑，回调就悬在一个已销毁的 WebView 上 ——
+		//      要么静默 no-op（input 永远挂着，用户看到卡在"选择中"），
+		//      要么在 Chromium 内部抛异常。
+		// 覆盖的重建场景：configChanges 含 orientation/screenSize/screenLayout/
+		// smallestScreenSize/density/keyboardHidden/uiMode，旋转/分屏/深色**不会**重建；
+		// 但 locale / fontScale 不在列表里，改系统语言或字号 ⇒ Activity 重建 ⇒
+		// onActivityResult 送到新实例、fileCallback 为 null ⇒ 结果被丢弃。
+		// 归还在此发生，新实例那次仍会走"回调已丢失"诊断分支（结果确实拿不回来，
+		// 那要靠 onSaveInstanceState 才能救），但**页面 input 一定不会永久悬空**。
+		releaseInFlightFileCallback("onDestroy");
 		if (webView != null) {
 			// AND-03：非静态内部类 AppBridge 经 addJavascriptInterface 被 WebView 持有，
 			// 不销毁则 Chromium 内核与 Activity Context 全部泄漏。顺序：摘 JS 桥
@@ -396,7 +439,47 @@ public class MainActivity extends Activity {
 		// profile 持有，不随 webView.destroy() 释放——Activity 销毁时残留的
 		// 远端页面数据会跨启动存活。本 App 是远程访问壳，退出即清，不留痕迹。
 		WebStorage.getInstance().deleteAllData();
+		// T41-F2（T40 反例 F2）：chooser 缓存目录此前**只增不减**（全仓零清理），
+		// 与上面"退出即清"是同一口径。放在 WebView 已 destroy() 之后清：
+		//   ① 此时渲染进程已死，不会再有新的 openFile 进来；
+		//   ② 即使有**正在读**的 fd，POSIX 语义下 unlink 不影响已打开的 fd，
+		//      正在进行的读照样读完（Android 是 ext4/f2fs，都符合）；
+		//   ③ 唯一的窗口是"清完之后 WebView 又来读那个 URI" ⇒ 拿到 FileNotFoundException，
+		//      但那时 WebView 已 destroy、页面已随 Activity 一起死，不存在用户可见的失败。
+		// 另：进程被系统强杀（无 onDestroy）时目录会残留，属 cacheDir，由系统按存储压力回收。
+		purgeChooserCacheDir("onDestroy");
 		super.onDestroy();
+	}
+
+	/**
+	 * T41-F3：归还在途的文件选择回调（{@code onReceiveValue(null)}）并清空字段。
+	 * 幂等：没有在途回调时什么都不做。
+	 */
+	private void releaseInFlightFileCallback(String why) {
+		ValueCallback<Uri[]> cb = fileCallback;
+		fileCallback = null;
+		if (cb == null) return;
+		try {
+			cb.onReceiveValue(null);
+			Log.i("dshr-chooser", "released in-flight fileCallback at " + why + "（页面 input 已复位）");
+		} catch (Throwable t) {
+			// 回调抛异常也不能带崩 onDestroy；页面那边最坏是这次没复位。
+			Log.w("dshr-chooser", "release in-flight fileCallback failed at " + why
+				+ ": " + t.getClass().getSimpleName());
+		}
+	}
+
+	/** T41-F2：清空 {@code cacheDir/chooser/}（不删目录本身，provider 侧会复用）。 */
+	private void purgeChooserCacheDir(String why) {
+		try {
+			int removed = ChooserCacheProvider.purgeCache(this);
+			if (removed > 0) {
+				Log.i("dshr-chooser", "purged chooser cache at " + why + ": " + removed + " file(s)");
+			}
+		} catch (Throwable t) {
+			Log.w("dshr-chooser", "purge chooser cache failed at " + why
+				+ ": " + t.getClass().getSimpleName());
+		}
 	}
 
 	private void configureSystemBars() {
@@ -913,13 +996,22 @@ public class MainActivity extends Activity {
 	 * 刷新连接设置页那行只读诊断。显示最近一次 hook 上报的关键字段
 	 * （device/on/rootClass/ready/whale/frame/strictOff），从未收到上报时显示「未上报」。
 	 * 必须在 UI 线程调用。
+	 *
+	 * <p>T39：在 hook 那段后面接上**原生侧**的文件选择器诊断（同一行、仍然只读、无新增控件）。
+	 * 分两段而不是揉进 {@link #formatUiDiag}：那份载荷字段集合被 test:device 全等钉死
+	 * （9 字段 + ts），原生这段不属于 hook 契约，揉进去会破坏那条断言。
+	 * 这样用户远程复现一次后，回设置页看一眼就能告诉我们卡在选择器链路的哪一环。
 	 */
 	private void refreshUiDiagLine() {
 		if (tvUiDiag == null) return;
 		String summary = uiDiagSummary;
-		tvUiDiag.setText(TextUtils.isEmpty(summary)
+		String base = TextUtils.isEmpty(summary)
 			? "页面适配诊断：未上报（连上会话后由页面回报）"
-			: summary);
+			: summary;
+		String chooser = TextUtils.isEmpty(chooserDiag)
+			? "文件选择：未选择过"
+			: "文件选择：" + chooserDiag;
+		tvUiDiag.setText(base + "\n" + chooser);
 	}
 
 	/**
@@ -937,10 +1029,43 @@ public class MainActivity extends Activity {
 				+ " · 收敛 " + diagBool(o, "ready")
 				+ " · 鲸鱼 " + diagBool(o, "whale")
 				+ " · 三栏 " + diagBool(o, "frame")
-				+ " · 严格关闭 " + diagBool(o, "strictOff");
+				+ " · 严格关闭 " + diagBool(o, "strictOff")
+				// T38-3：接上 T31-4 加的 wsState / lastDisconnectAt。
+				// 这两个字段此前 hook 一直在报、原生却从不读 ⇒ 诊断行说的"连接好不好"全是空话；
+				// 而 T30 §5 第四步要的正是"用户手机不接电脑时，靠这一行自证是不是真在掉线"。
+				// 纯展示、只读，不新增任何可点击控件。
+				+ " · 连接 " + diagWsState(o)
+				+ " · 上次断线 " + diagLastDisconnect(o);
 		} catch (Exception e) {
 			return "";
 		}
+	}
+
+	/**
+	 * T38-3：把 hook 侧观测到的 WS 连接状态翻成中文，取值与 mobile.js 的
+	 * collectUiDiag() 一一对应：reconnecting / ok-recovered / ok。
+	 * 字段缺失（旧版 hook）时返回「未上报」，与其它字段同一口径，不静默编造。
+	 */
+	private static String diagWsState(JSONObject o) {
+		if (!o.has("wsState")) return "未上报";
+		String v = o.optString("wsState", "");
+		if (TextUtils.isEmpty(v)) return "无";
+		if ("reconnecting".equals(v)) return "正在重连";
+		if ("ok-recovered".equals(v)) return "曾断开已恢复";
+		if ("ok".equals(v)) return "已连接";
+		return v;
+	}
+
+	/**
+	 * T38-3：上次断线的时刻。0 或字段缺失 = 本次页面生命周期内一次都没断过（显示「无」）。
+	 * 每次调用新建 SimpleDateFormat：setUiDiag 跑在 WebView 的桥线程上，
+	 * 复用实例会有并发风险。
+	 */
+	private static String diagLastDisconnect(JSONObject o) {
+		if (!o.has("lastDisconnectAt")) return "未上报";
+		long v = o.optLong("lastDisconnectAt", 0L);
+		if (v <= 0L) return "无";
+		return new SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(new Date(v));
 	}
 
 	private static String diagStr(JSONObject o, String key) {
@@ -1713,10 +1838,46 @@ public class MainActivity extends Activity {
 				if (fileCallback != null) fileCallback.onReceiveValue(null);
 				fileCallback = callback;
 				try {
-					startActivityForResult(params.createIntent(), REQ_FILE_CHOOSER);
+					// T39 加固。createIntent() 只负责把页面 <input type=file> 的
+					// action / acceptTypes / capture 意图翻成 Intent，**不保证带读授权**。
+					// 原实现直接丢给 startActivityForResult ⇒ 拿到的 content:// URI
+					// 我们可能压根没有读权限 ⇒ WebView 打开时 SecurityException ⇒
+					// 页面拿到 0 字节 ⇒ 用户看到"选完什么都没多"，且全程零报错。
+					// 这在 AOSP 上看不出来（AVD 上 txt 走通过），只在小米这类 OEM 选择器上炸。
+					Intent chooser = params.createIntent();
+					// ① 读授权：必须显式加。WebView 的 onReceiveValue(Uri[]) 在**本进程内**
+					//    经 ContentResolver 打开 URI 再把字节交给渲染进程，所以这一条 grant
+					//    就同时覆盖"我们的可读性自检"与"浏览器侧读取"两处。
+					//    瞬时 grant 正好匹配用法（拿到立刻读），故**不**申请
+					//    FLAG_GRANT_PERSISTABLE_URI_PERMISSION。
+					chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+					// ② 多选：WebView 的 createIntent() 在部分 Android 版本上不带
+					//    EXTRA_ALLOW_MULTIPLE，多选会静默降级成单选。按页面自己声明的
+					//    mode 显式打开——页面写了 multiple 才开，不越权改页面语义。
+					if (params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE) {
+						chooser.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+					}
+					// ③ **不**换成 ACTION_OPEN_DOCUMENT + CATEGORY_OPENABLE：换 action
+					//    会丢掉 input 上带 capture 时的 ACTION_IMAGE_CAPTURE 分支
+					//    （WebView 只在 createIntent() 内部处理 capture，params 上没有
+					//    对应的公开 getter，拿不到就没法在替换 action 时复现它），
+					//    那是实打实的回归；而 PERSISTABLE grant 的唯一价值是
+					//    "进程重启后仍可读"，我们的消费是即时的，付不出收益。
+					//    故 action 保持 createIntent() 的原样，不动。
+					// Intent 没有 hasFlags()（那是 API 34 才有的 setFlags 配套的读取扩展，
+					// 框架未提供），这里直接按位与读回我们自己刚加的 flag。
+					Log.i(TAG, "show mode=" + params.getMode()
+						+ " accept=" + java.util.Arrays.toString(params.getAcceptTypes())
+						+ " multiple=" + chooser.getBooleanExtra(Intent.EXTRA_ALLOW_MULTIPLE, false)
+						+ " grantRead="
+						+ ((chooser.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0)
+						+ " action=" + chooser.getAction());
+					startActivityForResult(chooser, REQ_FILE_CHOOSER);
 					return true;
 				} catch (ActivityNotFoundException e) {
+					Log.w(TAG, "no activity for chooser: " + e);
 					fileCallback = null;
+					toast("没有可用的文件选择器：" + e.getClass().getSimpleName());
 					return false;
 				}
 			}
@@ -2852,13 +3013,445 @@ public class MainActivity extends Activity {
 
 	@Override
 	protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-		if (requestCode == REQ_FILE_CHOOSER && fileCallback != null) {
-			fileCallback.onReceiveValue(
-				WebChromeClient.FileChooserParams.parseResult(resultCode, data));
+		if (requestCode == REQ_FILE_CHOOSER) {
+			// 注意：**不**再要求 fileCallback != null 才处理。原来那个条件意味着
+			// 回调已被清掉（重复弹选择器等）时结果被静默丢弃，诊断也无从谈起。
+			ValueCallback<Uri[]> cb = fileCallback;
 			fileCallback = null;
+			if (cb != null) {
+				// 解析 + 可读性自检 + 必要时复制进缓存都要读文件，2~5MB 的图片在
+				// UI 线程上做足以 ANR。整段搬到后台线程，UI 线程只负责回填 callback。
+				final Intent resultData = data;
+				try {
+					bgExecutor.execute(() -> resolveChooserResult(resultCode, resultData, cb));
+				} catch (RejectedExecutionException e) {
+					// 线程池已关（Activity 正在销毁）：只能当取消处理，但必须让页面
+					// 的 file input 复位，否则页面会一直卡在"选择中"。
+					Log.w(TAG, "chooser resolve rejected: " + e);
+					cb.onReceiveValue(null);
+					setChooserDiag("解析未执行：后台线程已关闭（Activity 正在销毁）");
+				}
+			} else {
+				Log.w(TAG, "chooser result with no callback, resultCode=" + resultCode);
+				setChooserDiag("结果回来了但回调已丢失（resultCode=" + resultCode + "）");
+			}
 			return;
 		}
 		super.onActivityResult(requestCode, resultCode, data);
+	}
+
+	// ---------- T39：文件选择器结果解析 / 可读性自检 / 兜底缓存 ----------
+
+	/**
+	 * T39：在后台线程上把选择器结果变成 {@code Uri[]}，并顺手做可读性自检。
+	 * 全包 try/catch 绝不抛（一个异常就会让页面的 file input 永远复位不了），
+	 * 任何一步失败都落到"给页面 null + 记诊断 + 必要时 Toast"这条有用户可见反馈的路上。
+	 *
+	 * <p>三级解析，覆盖两种已知的 OEM 失败模式：
+	 * <ol>
+	 *   <li>{@code FileChooserParams.parseResult(resultCode, data)} —— AOSP 正路。
+	 *       AOSP 的实现内部就是 {@code data.getClipData()} 优先、否则
+	 *       {@code data.getData()}；小米等 OEM 有时 RESULT_OK 但两者皆空，
+	 *       于是这里返回 null/空数组。AVD 上 txt 走通过正是走的这一支。</li>
+	 *   <li>parseResult 空 ⇒ 手工再取一遍 {@code getData()} 与 {@code getClipData()}，
+	 *       把 OEM 只填 clipData、或 resultData 被中途清空的情况捞回来。</li>
+	 *   <li>仍为空 ⇒ **不静默**：区分"用户按了取消"与"系统说成功却没给 URI"，
+	 *       后者正是小米症状的指纹，给用户明确文案。</li>
+	 * </ol>
+	 */
+	private void resolveChooserResult(int resultCode, Intent data, ValueCallback<Uri[]> cb) {
+		Uri[] out = null;
+		String diag;
+		boolean needToast = false;
+		String toastMsg = null;
+		try {
+			StringBuilder sb = new StringBuilder();
+			sb.append("resultCode=").append(resultCode)
+				.append(resultCode == RESULT_OK ? "(OK)" : "(非OK)")
+				.append(" · data=").append(data == null ? "空" : "有");
+
+			if (resultCode != RESULT_OK) {
+				// 取消：这是**正常**路径（用户按了返回/取消），照 AOSP 语义回 null，
+				// 但仍记一行，免得"取消"和"系统没给 URI"在诊断里长得一样。
+				diag = sb.append(" · 判定=用户取消").toString();
+			} else {
+				int clipCount = data != null && data.getClipData() != null
+					? data.getClipData().getItemCount() : 0;
+				Uri single = data != null ? data.getData() : null;
+				sb.append(" · clipData=").append(clipCount)
+					.append(" · getData=").append(single == null ? "空" : shortUri(single));
+
+				// 第 1 级：parseResult 正路。
+				List<Uri> uris = new ArrayList<>();
+				try {
+					Uri[] parsed = WebChromeClient.FileChooserParams.parseResult(resultCode, data);
+					if (parsed != null) {
+						for (Uri u : parsed) {
+							if (u != null && !uris.contains(u)) uris.add(u);
+						}
+					}
+				} catch (Throwable t) {
+					sb.append(" · parseResult异常=").append(t.getClass().getSimpleName());
+				}
+				int fromParse = uris.size();
+
+				// 第 2 级：parseResult 空 → 手工兜底 getData() / getClipData()。
+				if (uris.isEmpty() && data != null) {
+					if (single != null) uris.add(single);
+					android.content.ClipData clip = data.getClipData();
+					if (clip != null) {
+						for (int k = 0; k < clip.getItemCount(); k++) {
+							Uri cu = clip.getItemAt(k).getUri();
+							if (cu != null && !uris.contains(cu)) uris.add(cu);
+						}
+					}
+				}
+
+				if (uris.isEmpty()) {
+					// 第 3 级：全拿不到。RESULT_OK 却没 URI = 系统选择器的 bug，
+					// 这就是"选完什么都不显示"最典型的指纹，必须让用户看见。
+					diag = sb.append(" · 判定=成功但无URI").toString();
+					Log.w(TAG, "RESULT_OK but no URI obtainable: " + diag);
+					toastMsg = "文件已选中，但系统没有返回文件内容，请换一张再试";
+					needToast = true;
+				} else {
+					StringBuilder per = new StringBuilder();
+					int copied = 0, unreadable = 0;
+					List<Uri> finalUris = new ArrayList<>();
+					for (int i = 0; i < uris.size(); i++) {
+						Uri u = uris.get(i);
+						per.append(i == 0 ? "" : "；").append("#").append(i + 1)
+							.append(" ").append(shortUri(u));
+						Uri delivered = makeReadable(u, per);
+						if (delivered == null) {
+							// 彻底读不到：不把这个不可读的 URI 交给 WebView
+							// （否则就是"0 字节静默"的老症状），记下来并计数。
+							unreadable++;
+						} else {
+							if (!delivered.equals(u)) copied++;
+							finalUris.add(delivered);
+						}
+					}
+					int zeroBytes = countZeroBytes;
+					countZeroBytes = 0;
+					// 完整 URI（含文件名）只进 logcat：支持要定位"到底是哪个文件读不到"时用得上，
+					// 而屏幕上那行是脱敏的（T41-F1）。
+					Log.i(TAG, "picked uris(logcat only): " + uris + " · 交付=" + finalUris.size() + "/" + uris.size());
+					if (finalUris.isEmpty()) {
+						diag = sb.append(" · 判定=全部读不到").append(" · ").append(per).toString();
+						toastMsg = "读不到所选文件（权限或文件已失效），请重选";
+						needToast = true;
+					} else {
+						// 读不到几个也要说出来：远程用户只看这一行，
+						// "选 3 张只上来 2 张"这种部分失败必须能被一眼看到。
+						diag = sb.append(" · 判定=可用").append(" · parseResult=").append(fromParse)
+							.append(" · 走缓存=").append(copied)
+							.append(" · 空文件=").append(zeroBytes)
+							.append(" · 读不到=").append(unreadable)
+							.append(" · ").append(per).toString();
+						if (copied > 0) {
+							toastMsg = "已通过本地缓存读取 " + copied + " 个文件";
+							needToast = true;
+						}
+					}
+					out = finalUris.toArray(new Uri[0]);
+				}
+			}
+		} catch (Throwable t) {
+			// 兜底之兜底：绝不让异常逃出去卡住页面的 file input。
+			Log.e(TAG, "resolve crashed", t);
+			diag = "解析异常=" + t.getClass().getSimpleName() + "：" + t.getMessage();
+			out = null;
+			toastMsg = "选择文件时出错：" + t.getClass().getSimpleName();
+			needToast = true;
+		}
+
+		setChooserDiag(diag == null ? "无结果" : diag);
+		Log.i(TAG, "resolve done: " + chooserDiag);
+		final Uri[] finalOut = out;
+		final boolean toastIt = needToast;
+		final String finalToast = toastMsg;
+		runOnUiThread(() -> {
+			try {
+				cb.onReceiveValue(finalOut);
+			} catch (Throwable t) {
+				Log.e(TAG, "onReceiveValue threw", t);
+			}
+			if (toastIt && finalToast != null) toast(finalToast);
+			refreshUiDiagLine();
+		});
+	}
+
+	/**
+	 * T39：供 {@link #makeReadable} 上报"读到 0 字节"用的线程内计数。
+	 * 只有 {@code dshr-bg} 单线程执行器会碰它，故无需同步。
+	 */
+	private int countZeroBytes = 0;
+
+	/**
+	 * T39：把一个选择器 URI 变成"交给 WebView 一定读得到"的 URI，并顺带做可读性自检。
+	 *
+	 * <p>三条路径：
+	 * <ol>
+	 *   <li><b>能读且 &gt;0 字节</b>：原样返回。改动最小，也不占双份存储。</li>
+	 *   <li><b>能读但 0 字节</b>：复制进私有缓存，由 {@link ChooserCacheProvider} 交付。
+	 *       有些 OEM 选择器给的 URI 在我们这边打开就是一个空流，但 provider 侧其实有内容；
+	 *       复制这一步顺带把"空"这件事和"读不到"区分开并记进诊断。</li>
+	 *   <li><b>读不到</b>（SecurityException / FileNotFoundException / 其它）：先换
+	 *       {@code openFileDescriptor} 再试一次（部分 provider 只实现了
+	 *       openAssetFile，openInputStream 失败而 openFileDescriptor 能成）；
+	 *       仍失败则记异常类名并返回 null —— 由调用方给用户可见反馈，
+	 *       <b>绝不</b>把一个自己都读不到的 URI 交给 WebView 复现静默空附件。</li>
+	 * </ol>
+	 *
+	 * @param diag 追加写诊断片段（每个 URI 的可读性与字节数都进这里）
+	 * @return 可交给 WebView 的 URI；读不到时返回 null
+	 */
+	private Uri makeReadable(Uri uri, StringBuilder diag) {
+		ContentResolver cr = getContentResolver();
+		long bytes = -1L;
+		String err = null;
+		try (InputStream in = cr.openInputStream(uri)) {
+			if (in == null) {
+				err = "openInputStream返回空";
+			} else {
+				bytes = 0L;
+				byte[] buf = new byte[16 * 1024];
+				int n;
+				while (bytes <= CHOOSER_PROBE_CAP
+						&& (n = in.read(buf)) > 0) {
+					bytes += n;
+				}
+			}
+		} catch (Throwable t) {
+			err = t.getClass().getSimpleName();
+		}
+
+		if (err == null && bytes > 0L) {
+			diag.append(" 可读=").append(bytes).append("B");
+			return uri;
+		}
+
+		// 走到这里：要么读不到（err != null），要么读到 0 字节。
+		// 先换 openFileDescriptor 再试一次——部分 provider 只实现 openAssetFile。
+		if (err != null) {
+			ParcelFileDescriptor pfd = null;
+			try {
+				pfd = cr.openFileDescriptor(uri, "r");
+				if (pfd != null) {
+					android.os.ParcelFileDescriptor.AutoCloseInputStream ac =
+						new android.os.ParcelFileDescriptor.AutoCloseInputStream(pfd);
+					pfd = null; // 交给 ac 关闭
+					byte[] buf = new byte[16 * 1024];
+					int n;
+					long total = 0L;
+					while (total <= CHOOSER_PROBE_CAP && (n = ac.read(buf)) > 0) {
+						total += n;
+					}
+					err = null;
+					bytes = total;
+				} else {
+					err = "openFileDescriptor返回空";
+				}
+			} catch (Throwable t) {
+				err = t.getClass().getSimpleName();
+			} finally {
+				if (pfd != null) {
+					try { pfd.close(); } catch (Throwable ignored) { }
+				}
+			}
+			if (err == null && bytes > 0L) {
+				diag.append(" 可读(重试)=").append(bytes).append("B");
+				return uri;
+			}
+		}
+
+		if (err == null && bytes == 0L) {
+			countZeroBytes++;
+			diag.append(" 读到0字节");
+		} else {
+			diag.append(" 读不到=").append(err);
+		}
+		// 完整 URI 只进 logcat（T41-F1：屏幕那行只允许 scheme://authority）。
+		Log.w(TAG, "not directly readable: " + uriForLog(uri) + " err=" + err + " bytes=" + bytes);
+
+		// 兜底：复制进 App 私有缓存，再由 ChooserCacheProvider 交付。
+		// 读不到时复制也会失败——这不是可以"绕过"的问题（我们没有别的途径拿到字节），
+		// 所以失败就如实返回 null，让上层给用户可见反馈，而不是硬塞一个同样读不到的 URI。
+		Uri cached = copyToChooserCache(uri, diag);
+		if (cached != null) {
+			diag.append(" →已缓存");
+			return cached;
+		}
+		diag.append(" →缓存也失败");
+		return null;
+	}
+
+	/**
+	 * T39：把 URI 内容复制进 App 私有缓存目录，返回自研 provider 的 URI。
+	 * 复制失败返回 null（不抛），由调用方决定如何反馈。
+	 */
+	private Uri copyToChooserCache(Uri src, StringBuilder diag) {
+		File dir = null;
+		File out = null;
+		try {
+			dir = ChooserCacheProvider.cacheDir(this);
+			String name = displayNameOf(src);
+			out = new File(dir, name);
+			long total = 0L;
+			try (InputStream in = getContentResolver().openInputStream(src);
+				 OutputStream os = new FileOutputStream(out)) {
+				if (in == null) {
+					diag.append(" 缓存读空");
+					return null;
+				}
+				byte[] buf = new byte[32 * 1024];
+				int n;
+				while ((n = in.read(buf)) > 0) {
+					total += n;
+					if (total > CHOOSER_CACHE_MAX) {
+						diag.append(" 缓存超限");
+						return null;
+					}
+					os.write(buf, 0, n);
+				}
+			}
+			diag.append(" 缓存=").append(total).append("B");
+			Log.i(TAG, "copied to chooser cache: " + out.getName() + " " + total + "B");
+			return ChooserCacheProvider.uriFor(out);
+		} catch (Throwable t) {
+			diag.append(" 缓存异常=").append(t.getClass().getSimpleName());
+			Log.w(TAG, "copy to chooser cache failed", t);
+			if (out != null) { try { out.delete(); } catch (Throwable ignored) { } }
+			return null;
+		}
+	}
+
+	/**
+	 * 取原始文件名。查不到（缺权限 / provider 不支持该列）时按"选择器-<时间戳>-<序号>"
+	 * 生成一个**带扩展名**的名字：没有扩展名 ⇒ MIME 认不出 ⇒ WebView 可能当
+	 * application/octet-stream 处理，页面就分不出这是图片。
+	 */
+	private String displayNameOf(Uri uri) {
+		String fallbackExt = "";
+		try {
+			String mime = getContentResolver().getType(uri);
+			if (mime != null) {
+				int slash = mime.indexOf('/');
+				if (slash > 0 && slash < mime.length() - 1) {
+					fallbackExt = "." + mime.substring(slash + 1).toLowerCase(Locale.ROOT);
+				}
+			}
+		} catch (Throwable ignored) { }
+		String name = "";
+		try (Cursor c = getContentResolver().query(uri,
+				new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE},
+				null, null, null)) {
+			if (c != null && c.moveToFirst()) {
+				int i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+				if (i >= 0 && !c.isNull(i)) name = c.getString(i);
+			}
+		} catch (Throwable t) {
+			Log.w(TAG, "display name query failed: " + t.getClass().getSimpleName());
+		}
+		if (TextUtils.isEmpty(name)) {
+			name = "picker-" + System.currentTimeMillis() + fallbackExt;
+		}
+		// 缓存目录按单文件名寻址：去掉分隔符与 ..，保证 provider 侧的白名单校验能过。
+		name = name.replace("/", "_").replace("\\", "_");
+		while (name.contains("..")) name = name.replace("..", "_");
+		if (name.isEmpty() || ".".equals(name) || "..".equals(name)) {
+			name = "picker-" + System.currentTimeMillis() + fallbackExt;
+		}
+		return name;
+	}
+
+	/**
+	 * 诊断用的短 URI：**只允许出现 {@code scheme://authority}**，其余一律脱敏。
+	 *
+	 * <p>T41-F1（T40 反例，F1）：旧实现是 {@code scheme://authority + "/…" + getLastPathSegment()}，
+	 * 而 downloads / media provider 的 documentId 本身就是 {@code raw:<绝对路径>} ——
+	 * T40 在 AVD 上实测，屏幕那行直接打出
+	 * {@code raw:/storage/emulated/0/Download/normal.txt}（出现两次）。这行的设计用途恰恰是
+	 * "远程用户截图发给支持"，等于把用户存储目录结构 + 完整文件名发出去。</p>
+	 *
+	 * <p>现在只补一个**稳定短标识**（同一 URI 恒等 ⇒ 支持仍能判断"是不是同一个文件"）
+	 * 外加可选扩展名（够判断类型）。路径段、用户目录、文件名一律**不上屏**。
+	 * 完整 URI 只留在 logcat（{@link #uriForLog}），那是本机排障口径、用户看不到。</p>
+	 */
+	private static String shortUri(Uri uri) {
+		if (uri == null) return "空";
+		String s = uri.getScheme() + "://" + uri.getAuthority();
+		// 刻意**不**再补一个 "/"：authority 之后一个斜杠都不出现，"绝无路径"这句话
+		// 才能被一条简单的断言钉住（scripts/test-device-class.mjs 的 T41 断言就查这一点）。
+		return s + " [脱敏#" + redactedTagOf(uri) + "]";
+	}
+
+	/** logcat 专用：完整 URI 不上屏。T41-F1 要求脱敏的是"屏幕那行"，本地日志仍要能排障。 */
+	private static String uriForLog(Uri uri) {
+		return uri == null ? "空" : uri.toString();
+	}
+
+	/**
+	 * 脱敏标识：{@code <8 位短哈希> [.<扩展名>]}（{@code 脱敏#} 与方括号由
+	 * {@link #shortUri} 外面包，本方法只产出内容部分）。
+	 *
+	 * <p>扩展名**只**从 documentId 里最后一个 {@code /} 之后的那一段取，于是
+	 * {@code raw:/a/Dir.v2/name} 这种"目录名带点"只会得到"无扩展名"，
+	 * 不会把目录名片段误当扩展名漏出去；纯数字（{@code msf:1000000026} 这类 provider 内部 id）
+	 * 一律不认，免得把 id 片段当扩展名上屏。</p>
+	 */
+	private static String redactedTagOf(Uri uri) {
+		String ext = "";
+		String seg = uri.getLastPathSegment();
+		if (seg != null && !seg.isEmpty()) {
+			int slash = seg.lastIndexOf('/');
+			String tail = slash >= 0 ? seg.substring(slash + 1) : seg;
+			int dot = tail.lastIndexOf('.');
+			// 必须是"非首字符的最后一个点"：".gitignore" 与无扩展名都不产出。
+			if (dot > 0 && dot < tail.length() - 1) {
+				StringBuilder sb = new StringBuilder();
+				for (int i = dot + 1; i < tail.length() && sb.length() < 8; i++) {
+					char c = tail.charAt(i);
+					if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+						sb.append(Character.toLowerCase(c));
+					}
+				}
+				String cand = sb.toString();
+				boolean hasLetter = false;
+				for (int i = 0; i < cand.length(); i++) {
+					char c = cand.charAt(i);
+					if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) { hasLetter = true; break; }
+				}
+				if (hasLetter) ext = "." + cand;
+			}
+		}
+		return shortHashOf(uri.toString()) + (ext.isEmpty() ? "" : " " + ext);
+	}
+
+	/** FNV-1a 32bit → 8 位十六进制。同一输入恒等，且不可逆回原文。 */
+	private static String shortHashOf(String s) {
+		int h = 0x811c9dc5;
+		for (int i = 0; i < s.length(); i++) {
+			h ^= s.charAt(i);
+			h *= 0x01000193;
+		}
+		return String.format(Locale.ROOT, "%08x", h);
+	}
+
+	/**
+	 * T39：T39 专用 Toast 助手。沿用既有风格（中文、`原因：异常类名` 句式、LENGTH_LONG），
+	 * 不新增任何 UI 控件——"读不到文件"这种事必须让用户看见，但不值得为它加一个按钮。
+	 */
+	private void toast(String message) {
+		if (destroyed) return;
+		Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+	}
+
+	/** 写文件选择器诊断行并刷新连接设置页那行只读诊断。 */
+	private void setChooserDiag(String s) {
+		chooserDiag = s == null ? "" : s;
+		runOnUiThread(() -> refreshUiDiagLine());
 	}
 
 	@Override

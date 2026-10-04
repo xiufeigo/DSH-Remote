@@ -26,6 +26,14 @@ public final class VisitorConfig {
 	public int bindPort = 18443;      // 与电脑端网关 listenPort 对齐，App 不让用户改
 	public String fingerprint = "";   // 网关自签证书 SHA-256（hex 小写无冒号；空 = 退化为 TOFU 确认）
 
+	/**
+	 * T31-1：frpc 控制连接心跳（秒）。与网关 renderFrpcToml/renderVisitorToml 的缺省一致；
+	 * 写成 ≤0 即不输出这两行（回落 frp 内建默认 30/90）。
+	 * 刻意不做用户可见开关：只在访客配置里改，且 App 不让用户编辑这段 toml。
+	 */
+	public int heartbeatIntervalSec = 25;
+	public int heartbeatTimeoutSec = 90;
+
 	/** 从 dsh-remote://visitor?... 解析；格式不对返回 null。 */
 	public static VisitorConfig parse(String link) {
 		if (link == null) return null;
@@ -67,7 +75,14 @@ public final class VisitorConfig {
 		b.append("serverAddr = \"").append(serverAddr).append("\"\n");
 		b.append("serverPort = ").append(serverPort).append("\n\n");
 		b.append("auth.token = \"").append(authToken).append("\"\n");
-		b.append("transport.tls.enable = true\n\n");
+		b.append("transport.tls.enable = true\n");
+		if (heartbeatIntervalSec > 0) {
+			b.append("transport.heartbeatInterval = ").append(heartbeatIntervalSec).append("\n");
+			// 与网关 resolveFrpHeartbeat 同策略：超时必须严格大于周期，否则抬成周期的 2 倍
+			int timeout = heartbeatTimeoutSec > heartbeatIntervalSec ? heartbeatTimeoutSec : heartbeatIntervalSec * 2;
+			b.append("transport.heartbeatTimeout = ").append(timeout).append("\n");
+		}
+		b.append("\n");
 		if ("xtcp".equals(mode)) {
 			String stcpVisitor = serverName + "-stcp-visitor";
 			b.append("[[visitors]]\n");

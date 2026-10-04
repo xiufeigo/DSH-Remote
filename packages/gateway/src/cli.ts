@@ -308,6 +308,8 @@ async function cmdVisitor(store: Store, flags: Map<string, string | boolean>): P
 		mode,
 		bindPort,
 		serverName: tunnelName,
+		// T31-1：与 PC 端 frpc.toml 同一套控制连接心跳（App 内嵌 frpc 也需要）
+		heartbeat: { interval: frp.heartbeatInterval, timeout: frp.heartbeatTimeout },
 	});
 	const out = typeof flags.get("out") === "string" ? String(flags.get("out")) : "frp/frpc-visitor.toml";
 	await store.writeAtomic(out, toml);

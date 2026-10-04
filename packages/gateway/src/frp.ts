@@ -69,6 +69,67 @@ function tomlString(value: string): string {
 	return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+// ---------- T31-1：控制连接心跳（transport.heartbeat*） ----------
+
+/**
+ * frpc 控制连接心跳的缺省值（秒）。
+ *
+ * 依据（重要，别把它当"根治项"）：
+ * - frp 0.61.1 的内建缺省就是 `heartbeatInterval=30` / `heartbeatTimeout=90`，
+ *   **显式写死并不改变"frpc 能多快发现控制连接已死"**，只是把行为钉死、不随版本漂移。
+ * - 取 25s（比缺省早 5s）让"控制连接已被运营商 NAT 悄悄回收"的发现窗口从
+ *   最坏 ~120s 缩到 ~115s；`heartbeatTimeout=90` 与缺省一致，留足蜂窝抖动余量
+ *   （缺心跳只会误判为掉线并重建隧道，代价远大于晚 5s 发现）。
+ * - **它不保活数据面**：frp 的心跳 worker 只挂在 `client.(*Control)`，
+ *   proxied 连接（xtcp P2P 打洞后的那条）上没有任何心跳。
+ *   数据面的空闲保活由 T31-2（网关周期性 WS PING）承担，两者互补、不可互相替代。
+ */
+export const DEFAULT_FRP_HEARTBEAT_INTERVAL_SEC = 25;
+export const DEFAULT_FRP_HEARTBEAT_TIMEOUT_SEC = 90;
+
+/** 单个心跳字段的归一化；返回 undefined 表示"这一行不写进 toml"。 */
+function heartbeatSec(raw: unknown, fallback: number): number | undefined {
+	// 显式 false / 0 / 负数 = 关闭该项（回落到 frp 内建默认，而不是写出非法值）
+	if (raw === false) return undefined;
+	if (typeof raw !== "number" || !Number.isFinite(raw)) return fallback;
+	if (raw <= 0) return undefined;
+	return Math.round(Math.min(Math.max(raw, 1), 3600));
+}
+
+export interface FrpHeartbeat {
+	/** transport.heartbeatInterval（秒）；undefined = 不写该行 */
+	intervalSec?: number;
+	/** transport.heartbeatTimeout（秒）；undefined = 不写该行 */
+	timeoutSec?: number;
+}
+
+/** 模板入参：undefined = 用缺省；false = 整个心跳关掉；对象 = 逐字段覆盖。 */
+export type FrpHeartbeatInput = false | { interval?: unknown; timeout?: unknown } | undefined;
+
+/**
+ * 把模板入参归一化成要写进 toml 的两行。
+ * 超时必须严格大于周期（frpc 对 `timeout <= interval` 直接启动失败），这里兜住。
+ */
+export function resolveFrpHeartbeat(input: FrpHeartbeatInput): FrpHeartbeat {
+	if (input === false) return {};
+	const src = input ?? {};
+	const intervalSec = heartbeatSec(src.interval, DEFAULT_FRP_HEARTBEAT_INTERVAL_SEC);
+	if (intervalSec === undefined) return {};
+	const timeoutSec = heartbeatSec(src.timeout, DEFAULT_FRP_HEARTBEAT_TIMEOUT_SEC);
+	if (timeoutSec === undefined) return { intervalSec };
+	// 周期被调大到超过缺省超时时，成比例抬超时，避免写出 frpc 拒绝的组合
+	return { intervalSec, timeoutSec: timeoutSec > intervalSec ? timeoutSec : intervalSec * 2 };
+}
+
+/** 渲染成两行 TOML（无有效值时返回空串）。 */
+function heartbeatBlock(input: FrpHeartbeatInput): string {
+	const { intervalSec, timeoutSec } = resolveFrpHeartbeat(input);
+	const lines: string[] = [];
+	if (intervalSec !== undefined) lines.push(`transport.heartbeatInterval = ${String(intervalSec)}`);
+	if (timeoutSec !== undefined) lines.push(`transport.heartbeatTimeout = ${String(timeoutSec)}`);
+	return lines.length === 0 ? "" : `${lines.join("\n")}\n`;
+}
+
 /**
  * 生成 frps 端配置（edge=frps 角色在容器/服务器本地跑 frps）。
  * 只开控制口；入口端口由 allowPorts 限定，避免 PC 端把任意端口绑到公网。
@@ -108,9 +169,12 @@ export function renderFrpcToml(options: {
 	/** mode=stcp/xtcp 时的访客密钥 */
 	secretKey?: string;
 	name?: string;
+	/** T31-1：控制连接心跳；undefined = 缺省 25/90，false = 不写 */
+	heartbeat?: FrpHeartbeatInput;
 }): string {
 	const mode = normalizeFrpMode(options.mode);
 	const proxyName = normalizeTunnelName(options.name);
+	const beat = heartbeatBlock(options.heartbeat);
 	if (mode === "entry") {
 		return `# 由 dsh-remote 自动生成，手工修改会在下次 start 时被覆盖
 serverAddr = "${options.serverAddr}"
@@ -118,7 +182,7 @@ serverPort = ${options.serverPort}
 
 auth.token = ${tomlString(options.authToken)}
 transport.tls.enable = true
-
+${beat}
 [[proxies]]
 name = "${proxyName}"
 type = "tcp"
@@ -137,7 +201,7 @@ serverPort = ${options.serverPort}
 
 auth.token = ${tomlString(options.authToken)}
 transport.tls.enable = true
-
+${beat}
 [[proxies]]
 name = "${proxyName}"
 type = "stcp"
@@ -157,7 +221,7 @@ serverPort = ${options.serverPort}
 
 auth.token = ${tomlString(options.authToken)}
 transport.tls.enable = true
-
+${beat}
 [[proxies]]
 name = "${proxyName}-stcp"
 type = "stcp"
@@ -193,6 +257,8 @@ export function renderVisitorToml(options: {
 	bindAddr?: string;
 	bindPort: number;
 	name?: string;
+	/** T31-1：visitor 侧控制连接心跳；undefined = 缺省 25/90，false = 不写 */
+	heartbeat?: FrpHeartbeatInput;
 }): string {
 	const mode = normalizeFrpMode(options.mode);
 	const serverName = normalizeTunnelName(options.serverName);
@@ -204,7 +270,7 @@ serverPort = ${options.serverPort}
 
 auth.token = ${tomlString(options.authToken)}
 transport.tls.enable = true
-`;
+${heartbeatBlock(options.heartbeat)}`;
 	if (mode !== "xtcp") {
 		return `${common}
 [[visitors]]

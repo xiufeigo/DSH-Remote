@@ -14,6 +14,7 @@ import { pipeline } from "node:stream";
 import tls from "node:tls";
 import zlib from "node:zlib";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { encodePingFrame, findHttpHeadEnd, WsFrameBoundaryTracker } from "./wsframe.ts";
 
 export interface Upstream {
 	host: string;
@@ -515,11 +516,147 @@ export function proxyHttp(
 
 // ---------- WebSocket / Upgrade 直通 ----------
 
+/** proxyUpgrade 的可选参数。 */
+export interface ProxyUpgradeOptions {
+	/**
+	 * T31-2：网关 → 浏览器侧周期性 WS PING 的间隔（毫秒）。≤0 或缺省视为调用方关闭。
+	 * 由 ws.ts 从 `config.ws.pingIntervalMs` 归一化后传入。
+	 */
+	wsPingIntervalMs?: number;
+}
+
+/** 上游 101 响应头超过这个长度就不可能是 WebSocket 握手（RFC 建议上限）——直接放弃保活。 */
+const MAX_WS_HANDSHAKE_HEAD_BYTES = 16 * 1024;
+
+/** 保活发生器的可观测计数；测试与排查用挂在这个 socket 上，不影响任何对外行为。 */
+export interface WsKeepaliveStats {
+	/** 真正写出的 PING 帧数 */
+	sent: number;
+	/** 因"上游正在一帧中间"而跳过的拍数 */
+	skipped: number;
+	/** 跟踪器判定字节流非法 / 握手非 101 而永久放弃的次数（正常应为 0） */
+	aborted: number;
+	/** 上游已完整确认的帧数 */
+	upstreamFrames: number;
+}
+
+/** 取 socket 上的保活计数；未挂保活返回 undefined。 */
+export const WS_KEEPALIVE_STATS = Symbol.for("dsh-remote.wsKeepaliveStats");
+
+export function wsKeepaliveStatsOf(socket: unknown): WsKeepaliveStats | undefined {
+	if (typeof socket !== "object" || socket === null) return undefined;
+	return (socket as Record<symbol, WsKeepaliveStats | undefined>)[WS_KEEPALIVE_STATS];
+}
+
+/**
+ * T31-2：给已握手的 WebSocket 连接挂一个"只在帧边界插 PING"的保活发生器。
+ *
+ * 关键设计（为什么这不会破坏 mux 数据流）：
+ * - **只往浏览器侧写**，绝不改写任何透传字节；mux 载荷一个字节都不碰；
+ * - 写入时机由 `WsFrameBoundaryTracker` 把关：只有确认"上游此刻不在一帧中间"才写，
+ *   永远不会把 PING 插进某个 mux 帧的中间造成帧损坏；
+ * - 握手不是 `HTTP/1.1 101`，或字节流无法按 RFC6455 解释（如上游不是 WS），
+ *   就永久退回纯字节管道（`stop()` 后不再写任何东西）；
+ * - 定时器 `unref` + 两侧 close 时清理：不会给进程留挂钟句柄。
+ *
+ * 对应用层完全不可见：PING/PONG 是控制帧，浏览器的 WebSocket API 在
+ * `message` 事件里永远不会看到它们，浏览器自动回 PONG。
+ */
+function attachWsKeepalive(
+	browser: net.Socket,
+	upstreamSocket: net.Socket,
+	intervalMs: number,
+): void {
+	if (intervalMs <= 0) return;
+	const tracker = new WsFrameBoundaryTracker();
+	let pendingHead: Buffer | null = null; // 101 响应头缓冲（握手前）
+	let handshaked = false;
+	let timer: NodeJS.Timeout | undefined;
+	const stats: WsKeepaliveStats = { sent: 0, skipped: 0, aborted: 0, upstreamFrames: 0 };
+	Object.defineProperty(browser, WS_KEEPALIVE_STATS, { value: stats, enumerable: false, configurable: true });
+
+	const stop = () => {
+		if (timer !== undefined) {
+			clearInterval(timer);
+			timer = undefined;
+		}
+	};
+	browser.on("close", stop);
+	upstreamSocket.on("close", stop);
+	browser.on("error", stop);
+	upstreamSocket.on("error", stop);
+
+	upstreamSocket.on("data", (chunk: Buffer) => {
+		if (handshaked) {
+			tracker.push(chunk);
+			stats.upstreamFrames = tracker.frames;
+			if (tracker.invalid) stats.aborted += 1;
+			return;
+		}
+		pendingHead = pendingHead === null ? Buffer.from(chunk) : Buffer.concat([pendingHead, chunk]);
+		if (pendingHead.length > MAX_WS_HANDSHAKE_HEAD_BYTES) {
+			stats.aborted += 1;
+			stop(); // 不像 WS 握手：永久纯管道
+			return;
+		}
+		const headEnd = findHttpHeadEnd(pendingHead);
+		if (headEnd < 0) return;
+		const headText = pendingHead.subarray(0, headEnd).toString("latin1");
+		const rest = pendingHead.subarray(headEnd + 4);
+		pendingHead = null;
+		// 非 101（如上游回了 4xx、或根本不是 WebSocket）：绝不注入控制帧
+		if (!/^HTTP\/1\.1 101/i.test(headText)) {
+			stats.aborted += 1;
+			stop();
+			return;
+		}
+		handshaked = true;
+		if (rest.length > 0) tracker.push(rest);
+		stats.upstreamFrames = tracker.frames;
+		timer = setInterval(() => {
+			if (browser.destroyed || upstreamSocket.destroyed) {
+				stop();
+				return;
+			}
+			// 上游正处在一帧中间 → 放弃这一拍，下一拍再试（mux 帧都是小 JSON，实践中几乎不会命中）
+			if (!tracker.atBoundary) {
+				stats.skipped += 1;
+				return;
+			}
+			try {
+				browser.write(encodePingFrame());
+				stats.sent += 1;
+			} catch {
+				stats.aborted += 1;
+				stop();
+			}
+		}, intervalMs);
+		// socket 本身就持有事件循环；定时器不需要额外挂着进程
+		timer.unref?.();
+	});
+}
+
+/** 请求是否真的是 WebSocket 升级（非 WS 的 upgrade 一律不碰）。 */
+function isWebSocketUpgrade(req: IncomingMessage): boolean {
+	if (typeof req.headers["sec-websocket-key"] !== "string") return false;
+	return String(req.headers["upgrade"] ?? "").toLowerCase() === "websocket";
+}
+
 /**
  * 把升级请求按原始字节转发到上游：重写 host/origin 后写回请求行+头部，
  * 之后双向管道透传（不解析、不改写 WebSocket 帧）。
+ *
+ * T31-2 起：WebSocket 升级且 `options.wsPingIntervalMs > 0` 时，会额外在
+ * **帧边界**向浏览器侧发空载荷 PING 控制帧（见 attachWsKeepalive）；
+ * 非 WebSocket 的 upgrade 路径与全部载荷字节的行为与此前完全一致。
  */
-export function proxyUpgrade(req: IncomingMessage, socket: net.Socket, head: Buffer, upstream: Upstream): void {
+export function proxyUpgrade(
+	req: IncomingMessage,
+	socket: net.Socket,
+	head: Buffer,
+	upstream: Upstream,
+	options: ProxyUpgradeOptions = {},
+): void {
 	const lines = [`${req.method} ${req.url} HTTP/1.1`];
 	for (const [key, value] of Object.entries(req.headers)) {
 		const lower = key.toLowerCase();
@@ -561,4 +698,10 @@ export function proxyUpgrade(req: IncomingMessage, socket: net.Socket, head: Buf
 	socket.on("error", teardown);
 	upstreamSocket.on("close", () => socket.destroy());
 	socket.on("close", () => upstreamSocket.destroy());
+
+	// 保活必须在 pipe 之前挂上 data 监听：跟踪器要先于透传看到同一批字节，
+	// `atBoundary` 的判断才与"哪些字节已经写给浏览器"严格同序。
+	if (isWebSocketUpgrade(req)) {
+		attachWsKeepalive(socket, upstreamSocket, options.wsPingIntervalMs ?? 0);
+	}
 }

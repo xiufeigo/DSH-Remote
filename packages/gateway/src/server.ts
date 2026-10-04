@@ -56,6 +56,7 @@ import {
 	renderFrpsToml,
 	renderVisitorToml,
 	visitorBindPortOf,
+	type FrpHeartbeatInput,
 } from "./frp.ts";
 import { loadMobileScript } from "./mobile.ts";
 import { BRAND_SVG, iconPng, injectIntoHtml, makeHtmlInjector, renderServiceWorker } from "./pwa.ts";
@@ -72,6 +73,14 @@ import {
 	safeNext,
 } from "./views.ts";
 import { handleGatewayUpgrade } from "./ws.ts";
+
+/**
+ * T31-1：把 `frp.heartbeatInterval/Timeout` 翻译成模板入参。
+ * 两项都写 ≤0（或缺省但被显式置 0）时输出 `false`，模板就一行心跳都不写。
+ */
+function frpHeartbeatOf(frp: GatewayConfig["frp"]): FrpHeartbeatInput {
+	return { interval: frp.heartbeatInterval, timeout: frp.heartbeatTimeout };
+}
 
 export interface GatewayServerOptions {
 	store: Store;
@@ -266,6 +275,7 @@ export class GatewayServer {
 			mode,
 			secretKey: secrets.frpVisitorKey,
 			name: frp.name,
+			heartbeat: frpHeartbeatOf(frp),
 		});
 		const configPath = this.store.path("frp", "frpc.toml");
 		await this.store.writeAtomic("frp/frpc.toml", toml);
@@ -349,6 +359,7 @@ export class GatewayServer {
 			mode: "stcp",
 			bindAddr: "127.0.0.1",
 			bindPort,
+			heartbeat: frpHeartbeatOf(frp),
 		});
 		const configPath = this.store.path("frp", role === "frps" ? "frpc-edge-visitor.toml" : "frpc-visitor.toml");
 		await this.store.writeAtomic(role === "frps" ? "frp/frpc-edge-visitor.toml" : "frp/frpc-visitor.toml", visitorToml);
