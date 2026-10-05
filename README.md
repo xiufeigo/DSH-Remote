@@ -878,18 +878,23 @@ test:session / test:fixes，见 `.github/workflows/ci.yml`）；
 （tag `v0.2.0-rc.2.8`）。
 
 > **填表纪律**：下表**只写实测值**，Release 创建前不填任何预期值（文件名/字节数/时间/digest
-> 全部由 `gh release view` + 下载后本机重算得出）。rc.2.8 那张表在 Release 建好后由一次
-> `docs:` 提交回填，原始记录见 `scratch/t100/report.md` §6。
+> 全部由 `gh release view` + 下载后本机重算得出）。rc.2.8 起本表由一次 `docs:` 提交回填，
+> 原始记录见 `scratch/t100/report.md` §3.5。
 
 **本版 `0.2.0-rc.2.8`**：
 
 | Release 资产 / 核验项 | 实测值 |
 |---|---|
-| 资产文件名 / 字节数 / 发布时间 | ⏳ Release 创建后回填 |
-| APK SHA-256 | ⏳ 同上 |
-| 包内 `res/raw/mobile.js` | ⏳ 同上（判据：**逐字节等于**源 `D4466D0D…23B26A`，317998 B） |
-| 签名证书 | ⏳ 同上（沿用 `CN=DSH Remote` / `1e217fa6…e4000d` 同一条签名链） |
-| APK `versionName` / `versionCode` | `0.2.0-rc.2.8` / ⏳ `versionCode` 回填 |
+| 资产文件名 | `dsh-remote-0.2.0-rc.2.8.apk` |
+| 字节数 | **5,756,119 B**（与本地构建产物同尺寸） |
+| 发布时间 | **2026-10-05T10:59:48Z**（UTC；北京时间 18:59:48） |
+| APK SHA-256 | `ad5399ab4d9d84ea664f2c265e92c136cf99fe4003ead42a35ff40d1b5d72fb6`（下载后**本机重算**，与 `gh release view` 的资产 digest 逐字一致） |
+| 包内 `res/raw/mobile.js` | `d4466d0d58b272877e7edc7287f1c0e5d047642b214f5548afee0cac8923b26a`（**317,998 B**、纯 LF），与源 `packages/gateway/assets/mobile-web.js` **逐字节相同** |
+| 签名证书 | DN `CN=DSH Remote`，SHA-256 `1e217fa66c3c68f6e031ed28b8b1c12b675db01f01b87bf7426a4f94d8e4000d`（与 rc.2.5 / rc.2.6 / rc.2.7 及更早发布**同一条签名链**，可直接覆盖升级） |
+| APK `versionName` / `versionCode` | `0.2.0-rc.2.8` / `2000208`（`aapt2 dump badging`） |
+| 本轮工作流结论 | `ci`(main) ✅ · `android-apk`(main) ✅ · `android-apk`(tag) ✅ · `release`(tag) ✅ |
+
+> Release 页：https://github.com/xiufeigo/DSH-Remote/releases/tag/v0.2.0-rc.2.8
 
 **上一版 `0.2.0-rc.2.7`（已发布，下表全部为实测值，非预期值）**：
 

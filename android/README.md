@@ -144,7 +144,7 @@ C 平板 852×883 / D 平板 1280×800（平板档对照实验）、E 运行中 
 
 | 项 | 实测结果 |
 |---|---|
-| 断言总数 | **158/158 通过，失败 0，跳过 0**（rc.2.6 批次终局，退出码 0；`断言合计 158：通过 158，失败 0，跳过 0`，台账 `scratch/lead-rc26-regression.log:19`。**rc.2.7 复跑同值：158/158、失败 0、跳过 0**，台账 `scratch/lead-rc27-regression.log:17`；**rc.2.8 复跑同值**，台账 `scratch/t100/regression.log` 与 `scratch/lead-rc28-regression.log:19`）。其中 **34 条**是 rc.2.6 新增的平板档系统栏避让（6 条源码契约 + 四方向重叠 + 键盘 not-in-mask）；**140 条是本批次中期快照**（T72 收口时），55 条基线曾**连跑 4 次全绿**、91 条为 rc.2.3 批次、106 条为 rc.2.5 批次 |
+| 断言总数 | **158/158 通过，失败 0，跳过 0**（rc.2.6 批次终局，退出码 0；`断言合计 158：通过 158，失败 0，跳过 0`，台账 `scratch/lead-rc26-regression.log:19`。**rc.2.7 复跑同值：158/158、失败 0、跳过 0**，台账 `scratch/lead-rc27-regression.log:17`；**rc.2.8 复跑同值：158/158、失败 0、跳过 0**，断言行原文见 `scratch/t100/regression.log:19`，Lead 台账 `scratch/lead-rc28-regression.log:19` 记该项 `exit=0`）。其中 **34 条**是 rc.2.6 新增的平板档系统栏避让（6 条源码契约 + 四方向重叠 + 键盘 not-in-mask）；**140 条是本批次中期快照**（T72 收口时），55 条基线曾**连跑 4 次全绿**、91 条为 rc.2.3 批次、106 条为 rc.2.5 批次 |
 | 零痕迹 | 平板档 C/D 与切换后的 OFF 态：`<html>` 无 `data-dshr-*`、无 hook 根类（含 `dshr-official-inset`）、无 hook 创建的可见节点、官方节点上无 `data-dshr-*` 标记——全部通过 |
 | 平板档对照 | C（852×883）与 D（1280×800）两视口**逐项像素差全 0**：frame / 三列 / header / composerCard / composerSeat / rightbar / bodyScrollHeight / documentScrollWidth / documentClientWidth |
 | 运行中切换 | `__dshrSetDevice('tablet'\|'phone')` 立即生效；**同值重复调用幂等**（第二次返回 `false`）；切回后根类、标记与几何可逆 |
