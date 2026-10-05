@@ -111,6 +111,32 @@
 // 另外「就绪后才到的注入」不等任何重启，直接就地装上（late 注入路径照旧）。
 (function dshRemoteMobileBoot() {
 	'use strict';
+	// ── T90 自检状态（**必须在第一行之前**赋值）────────────────────────────────
+	// `installWsStateWatch()` 是本函数体的第一件事（见下面那次调用），它要用到这三个值：
+	//   · WS_WATCH_KEY      自检全局键（只读快照，不参与任何业务判断）；
+	//   · WS_CONNECT_GRACE_MS 首连/重连的 CONNECTING 允许时长：超过它仍没 open 才按"断"算；
+	//   · wsWatchState      观测状态（closure 里的活引用；`window.__dshrWsWatch` 指向它）。
+	// （`var` 提升只提升声明不提升赋值，所以不能把赋值留在下面那段里。）
+	var WS_WATCH_KEY = '__dshrWsWatch';
+	var WS_CONNECT_GRACE_MS = 2000;
+	var wsWatchState = null;
+	// 包装标记：挂在**包装器自己**上，供 pending 重启后的第二次进来"认领"同一个状态对象。
+	// 用 `Symbol.for` 而不是字符串属性：`Object.getOwnPropertyNames(WebSocket)` 是**可枚举的
+	// 面**（第三方脚本/自检会拿它比对），多两个自有属性就是透传上的可见偏差；符号属性
+	// 不进 getOwnPropertyNames ⇒ 自有属性集合与原生**逐条相同**（T90 真值台有断言）。
+	// 老引擎没有 Symbol 时回落到字符串属性（仍能工作，只是多两个自有键）。
+	var WS_WATCH_MARK = null;
+	try {
+		WS_WATCH_MARK = (typeof Symbol === 'function' && typeof Symbol.for === 'function')
+			? Symbol.for('dshr.wsWatch.state') : null;
+	} catch (ignoredWsSymbol) { WS_WATCH_MARK = null; }
+
+	// T90：**连接态信号源**（UI 无关）必须在最早一步装上，且必须在下面这条
+	// pending 早退**之前** —— 文档还没给出 <html> 时本函数会先返回、等
+	// DOMContentLoaded 再进来，而 app 的 WebSocket 有可能在那之后、本次
+	// 重启之前就被建出来（T27-B 的"半装"窗口同理）。函数声明提升保证可用；
+	// 它只读 window、不依赖本文后面才赋值的任何变量。平板档在里面直接跳过。
+	installWsStateWatch();
 	if (window.__dshRemoteMobileInstalled) return;
 	if (document.documentElement) {
 		window.__dshRemoteMobilePending = false;
@@ -167,9 +193,32 @@
 		'  --dshr-drawer-peek: 52px;',
 		'  --dshr-drawer-width: calc(100% - 52px);',
 		'  --dshr-ime: 0px;',
+		// ── T91：卡片圆角半径（唯一源） ──
+		// 20px 的依据是**官方自己同一族表面的实测值**（真机 getComputedStyle 扫全页非零圆角，
+		// 真值见 report §1）：整宽会话卡 `geFEbW_entry`（364×67）= **20px**、
+		// 输入卡 `uV2eYG_card`（373×110）= 28px、小图标按钮 8~12px。
+		// 取 20px ⇒ 主卡与抽屉右缘跟官方「整宽卡片」同值：不比官方更方，也不大过
+		// 官方大卡（28px）。16px 偏保守、两张卡的交界缺口几乎看不出来；
+		// 24~28px 时 2R=48~56px 的缺口会在顶端把抽屉右缘咬掉一大块。
+		// 与改动前的 18px 只差 2px ⇒ 打开终态的观感连续，不是换了一套皮肤。
+		'  --dshr-card-r: 20px;',
+		// 两张圆角卡「交界缝」的底色：抽屉与主卡的圆角是**同色表面上的对拼**，
+		// 若背后还是同一个灰（frame 背景 = 侧栏底色），两个圆弧都会隐形成一片
+		// ——真机真值见 report §3（把缝前后两张截图逐像素相减，缺口区 0 变化）。
+		// 所以给 frame 铺一层**只露在缺口里**的暗底（::after，见下），
+		// 让「抽屉右缘圆弧 / 主卡左缘圆弧」两头都读得出来。
+		// 0.10 的取值：缺口=抽屉灰(249)×0.9=224，与抽屉(249)、主卡(255)分别差 25/31 级，
+		// 肉眼是「一条缝」而不是「一道黑边」；更深（≥0.2）会变成描边。
+		'  --dshr-seam: rgba(0, 0, 0, 0.1);',
 		'  color-scheme: light dark;',
 		'  -webkit-text-size-adjust: 100%;',
 		'  text-size-adjust: 100%;',
+		'}',
+		// 深色档：抽屉/主卡都是近黑（#1b1b1f / #111318 一档），10% 的黑在近黑上差不到 3 级、
+		// 等于没铺。深色下把缝加深到 0.42：抽屉底 ≈ (27,27,31) → 缝 ≈ (16,16,18)，
+		// 与抽屉、主卡都拉得开（真值见 report §1 深色档截图）。
+		'html.' + ROOT_CLASS + '[data-dshr-dark="1"] {',
+		'  --dshr-seam: rgba(0, 0, 0, 0.42);',
 		'}',
 		// 表面色必须走官方会随深浅切换的 token。`--dsw-specific-background` 在
 		// DSH 里经常不存在，写成它的 fallback 会把设置页钉死成白底，深色字就看不见。
@@ -385,6 +434,17 @@
 		'  z-index: 10 !important;',
 		'  border-right: 0 !important;',
 		'  box-shadow: none !important;',
+		// T91：抽屉右缘圆角在**打开终态**（与跟手态同一个 token）。
+		// 终态不需要按位移裁剪 —— 抽屉盒右缘 == 主卡左缘（同一个 --dshr-drawer-width），
+		// 两者天然对齐，两张圆角卡在交界处「对拼」。
+		// 但顶边要按 --dshr-inset-top 裁掉：抽屉盒顶在 y=0（它自己带 padding-top 垫进状态栏），
+		// 而主卡盒顶在 y=inset-top（frame 的 padding）—— 不裁的话抽屉的圆弧跑在状态栏里、
+		// 与主卡圆弧差 28px 高度，两张卡的圆角对不上（真机真值见 report §3）。
+		// 这条裁剪**不改变任何可见像素**：被裁掉的那 28px 条带背后就是 frame 背景，
+		// 而 frame 背景本来就等于侧栏底色（同一 token）⇒ 沉浸观感不变。
+		'  border-top-right-radius: var(--dshr-card-r, 20px) !important;',
+		'  border-bottom-right-radius: var(--dshr-card-r, 20px) !important;',
+		'  clip-path: inset(var(--dshr-inset-top, env(safe-area-inset-top, 0px)) 0 0 0 round 0 var(--dshr-card-r, 20px) var(--dshr-card-r, 20px) 0) !important;',
 		'}',
 		'html.' + ROOT_CLASS + ' [data-dshr-frame]:not([data-sidebar-collapsed]) [data-dshr-sidebar-col] > * {',
 		'  width: 100% !important;',
@@ -422,12 +482,16 @@
 		'}',
 		'html.' + ROOT_CLASS + ' [data-dshr-frame]:not([data-sidebar-collapsed]) [data-dshr-main-col] {',
 		'  transform: translateX(var(--dshr-drawer-width)) !important;',
-		'  border-radius: 18px !important;',
+		'  border-radius: var(--dshr-card-r, 20px) !important;',
 		'  box-shadow: -14px 0 36px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(0, 0, 0, 0.04) !important;',
 		'  overflow: hidden !important;',
-		'  margin-top: 8px !important;',
-		'  margin-bottom: 8px !important;',
-		'  max-height: calc(100% - 16px) !important;',
+		// T82：这里原来有 margin-top/bottom: 8px。它把**展开态**的会话浮层整体下推 8px，
+		// 而 header 也在这张卡片里 ⇒ 打开抽屉时 header.y 从 54 跳到 62，松开后**不回落**。
+		// 真值见 scratch/t82/report.md §B。删掉即可，不要用 translateY(8px) 反向补偿——
+		// 那只是把 header 一起推下去，位移还在，只是换了来源。
+		// max-height 同步从 calc(100% - 16px) 提到 100%：原来那 16px 就是给上下 margin 让位的，
+		// margin 没了还留着会让卡片底部空出 16px。
+		'  max-height: 100% !important;',
 		'}',
 		'@media (prefers-reduced-motion: reduce) {',
 		'  html.' + ROOT_CLASS + ' [data-dshr-main-col] { transition: none !important; }',
@@ -470,15 +534,87 @@
 		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] [data-dshr-frame] [data-dshr-main-col] {',
 		'  transition: none !important;',
 		'  transform: translateX(var(--dshr-drawer-x, 0px)) !important;',
-		// 拖动期间固定卡片几何与阴影，只更新 transform，避免每次 touchmove 重排聊天。
-		'  border-radius: 18px !important;',
-		'  box-shadow: -14px 0 36px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(0, 0, 0, 0.04) !important;',
-		'  margin-top: 8px !important;',
-		'  margin-bottom: 8px !important;',
-		'  max-height: calc(100% - 16px) !important;',
+		// T91：圆角与阴影**跟手**——两者都由 --dshr-card-p（0..1，hook 每帧按位移写、
+		// 见 setDrawerVisual）驱动。改动前的缺陷（真机真值见 report §2）：这里写死 18px +
+		// 写死阴影 ⇒ 指针刚落下（x=0、手指还没动）主卡就已经是「整张圆角卡」，
+		// 与关闭态的 0 圆角之间是一次**跳变**，观感上「一按下去就变成卡片」，
+		// 而不是用户要的「跟着手指圆角平移过来」。
+		// p=0 ⇒ 圆角 0、阴影 0（与关闭态逐像素一致，交接无台阶）；
+		// p=1 ⇒ 圆角 var(--dshr-card-r)、阴影与打开终态逐字一致（交接无跳变）。
+		'  border-radius: calc(var(--dshr-card-p, 0) * var(--dshr-card-r, 20px)) !important;',
+		'  box-shadow: calc(var(--dshr-card-p, 0) * -14px) 0 calc(var(--dshr-card-p, 0) * 36px) rgba(0, 0, 0, calc(var(--dshr-card-p, 0) * 0.18)),',
+		'    0 0 0 1px rgba(0, 0, 0, calc(var(--dshr-card-p, 0) * 0.04)) !important;',
+		// 拖动期钉住几何（半径/阴影都不参与布局，只重绘；offsetHeight 不变 ⇒
+		// 既有 fixture 断言 drag-keeps-layout-and-shadow 的「不重排」语义保持不变）。
+		// T82：跟手态也不许带 8px 上/下 margin（否则手指一按下去 header 就跳 8px，
+		// 与展开态那处的下移同帧发生，观感上就是"拖动一开始整块往下掉"）。
+		'  max-height: 100% !important;',
 		'  overflow: hidden !important;',
 		'}',
-		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] #dshr-mobile-whale { display: none !important; }',
+		// ── T91：抽屉（左栏）**右缘圆角**，与主卡同一个 --dshr-card-p 跟手 ──
+		//
+		// 为什么单独起一条规则、且选择器**必须带 [data-dshr-frame]**：
+		// 拖动期 setDrawerVisual() 会先 setSidebarOpen(true)（T82 结论，不许挪），
+		// 于是 frame 上的 data-sidebar-collapsed 被摘掉 ⇒ 上面那条**打开态**抽屉规则
+		// （`[data-dshr-frame]:not([data-sidebar-collapsed]) [data-dshr-sidebar-col]`，
+		// 特异度 0-4-1）在本帧同时命中。而拖动块的抽屉选择器是 0-3-1，
+		// **压不住** 打开态那条 —— 真值：加上本规则前，拖动到 x=0 时抽屉右缘半径
+		// 仍是终态的 20px（probe-geom.json: drag0 side.r=0px/20px），
+		// 即「跟手」被终态静态值顶掉。所以这里补齐到 0-4-1 且排在打开态之后。
+		//
+		// clip-path：抽屉的可绘制右缘必须**钉在主卡左缘**（= --dshr-drawer-x）。
+		// 否则拖动期抽屉仍是它自己的整宽 360px，右缘整段被不透明主卡盖住，
+		// 圆角一个像素都看不到（真机真值见 report §3）。clip-path 只裁剪绘制、
+		// **不参与布局**，抽屉内容 width:100% 不重排，不会像改宽度那样每帧挤变形。
+		// 打开终态不需要它：那时抽屉盒右缘本来就等于主卡左缘（同一个
+		// --dshr-drawer-width），两张圆角卡天然在交界点对拼。
+		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] [data-dshr-frame]:not([data-sidebar-collapsed]) [data-dshr-sidebar-col],',
+		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] [data-dshr-frame][data-sidebar-collapsed] [data-dshr-sidebar-col] {',
+		'  border-top-right-radius: calc(var(--dshr-card-p, 0) * var(--dshr-card-r, 20px)) !important;',
+		'  border-bottom-right-radius: calc(var(--dshr-card-p, 0) * var(--dshr-card-r, 20px)) !important;',
+		'  clip-path: inset(var(--dshr-inset-top, env(safe-area-inset-top, 0px)) calc(max(0px, 100% - var(--dshr-drawer-x, 0px))) 0 0 round 0 calc(var(--dshr-card-p, 0) * var(--dshr-card-r, 20px)) calc(var(--dshr-card-p, 0) * var(--dshr-card-r, 20px)) 0) !important;',
+		'}',
+		// ── T91：交界缝的暗底（frame::after，只露在缺口里）──
+		//
+		// 为什么是 frame 的伪元素而不是新节点：零痕迹契约里平板档要求「hook 自有节点 0 个」，
+		// 而 scripts/test-device-class.mjs:36 的 HOOK_NODE_IDS 是一份**硬编码名单**，
+		// 我不允许改那个文件 ⇒ 新节点会掉出那份名单的检查面。伪元素不占 DOM，
+		// 且实测官方 frame 的 ::before/::after 都是 content:none（真机真值见 report §1），
+		// 无覆盖风险。
+		//
+		// 为什么是 position:fixed：frame 是 grid 容器，静态流的伪元素会变成 grid item
+		// 去抢轨道；fixed 脱流。官方 frame 上没有任何 transform/filter/will-change
+		// （实测 none/none/auto）⇒ fixed 的包含块就是视口，不会被 frame 的
+		// overflow:hidden 裁掉（它只在缺口处可见，正是要的地方）。
+		//
+		// z-index:1 —— 低于抽屉(z-index:10)与主卡(20)，高于 frame 自己的背景：
+		// 抽屉/主卡覆盖处完全看不到它，只在两者都没画到的圆弧缺口里露出来。
+		// 顶边同样从 --dshr-inset-top 起：状态栏那 28px 条带保持与抽屉同色（沉浸不变），
+		// 缺口从主卡盒顶同一高度开始，两张卡的圆弧在同一水平线上对拼。
+		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] [data-dshr-frame]::after,',
+		'html.' + ROOT_CLASS + '[data-dshr-expanded="1"]:not([data-dshr-dialog="1"]) [data-dshr-frame]::after {',
+		'  content: "";',
+		'  position: fixed;',
+		'  left: 0;',
+		'  right: 0;',
+		'  top: var(--dshr-inset-top, env(safe-area-inset-top, 0px));',
+		'  bottom: 0;',
+		'  z-index: 1;',
+		'  background: var(--dshr-seam);',
+		'  pointer-events: none;',
+		'}',
+		// T82：鲸鱼不再被拖动闸藏掉。它自己读 --dshr-drawer-x 跟手（见下方 #dshr-mobile-whale），
+		// 与主列共用同一对 transition ⇒ 同帧同缓动交接。
+		// 但必须让它 pointer-events:none：实测遮罩占 x 359.4–411.4，鲸鱼 z-index 900
+		// 会压在遮罩上吞掉 42px 宽的「点遮罩关抽屉」点击（鲸鱼跟着滑到右边后正好落在这条带里）。
+		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] #dshr-mobile-whale,',
+		'html.' + ROOT_CLASS + '[data-dshr-expanded="1"] #dshr-mobile-whale {',
+		'  pointer-events: none !important;',
+		'}',
+		// 跟手期间关掉过渡：位移必须与手指 1:1（主列与鲸鱼同一条规则，避免两者不同步）。
+		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] #dshr-mobile-whale {',
+		'  transition: none !important;',
+		'}',
 		// 侧栏展开时主会话浮层整卡可跟手拖；禁止浏览器把左滑吃成滚动。
 		'html.' + ROOT_CLASS + '[data-dshr-expanded="1"] [data-dshr-main-col],',
 		'html.' + ROOT_CLASS + '[data-dshr-expanded="1"] #dshr-mobile-drawer-mask {',
@@ -519,9 +655,23 @@
 		'  z-index: 900;',
 		'  cursor: pointer;',
 		'  -webkit-tap-highlight-color: transparent;',
+		// T82：鲸鱼改用**与主列同一个变量**驱动位移，并共用同一对 transition。
+		//
+		// 改前的结构性根因：鲸鱼是 position:fixed; left:10px，既不读 --dshr-drawer-x、
+		// 也没有 transform ⇒ 它和抽屉位移完全解耦，位移只能靠"显示/隐藏"来表达，
+		// 于是 hook 里两条互不知情的规则（拖动闸 + 展开闸，都是 display:none !important）
+		// 在拖动第 1 帧、手指还没动时就把鲸鱼抹掉了（三次重复一致，见 report §B）。
+		// 现在它与主列读同一个变量 ⇒ 同一帧同一缓动交接，不存在"一个先动一个后动"。
+		'  transform: translateX(var(--dshr-drawer-x, 0px));',
+		'  transition: transform 0.34s cubic-bezier(0.32, 0.72, 0, 1);',
+		'  will-change: transform;',
 		'}',
 		'#dshr-mobile-whale svg { display: block; width: 27px; height: 20px; }',
-		'html.' + ROOT_CLASS + '[data-dshr-ready="1"][data-dshr-expanded="0"] #dshr-mobile-whale { display: block; }',
+		// T82 产品最终形态（用户拍板）：鲸鱼**跟着抽屉一路滑到右边并停住**，不淡出、不隐藏。
+		// 因此这里从"仅 expanded=0 显示"放宽为"ready 即显示"。
+		// 安全性：三条隐藏规则（rightbar-fullscreen / explorer-details / dialog）都带
+		// !important，而本条不带 ⇒ 它们仍然压得住本条，不因放宽而误显示。
+		'html.' + ROOT_CLASS + '[data-dshr-ready="1"] #dshr-mobile-whale { display: block; }',
 		'#dshr-mobile-drawer-mask {',
 		'  display: none;',
 		'  position: fixed;',
@@ -559,6 +709,77 @@
 		'html.' + ROOT_CLASS + '[data-dshr-dialog="1"] #dshr-drawer-handle,',
 		'html.' + ROOT_CLASS + '[data-dshr-explorer-details="1"] #dshr-drawer-handle {',
 		'  display: none !important;',
+		'}',
+		// ── T82：右栏跟手层（关闭方向的跟手 + 打开方向的补间） ──
+		//
+		// 为什么要给「承载面板的容器」单独抬 z-index，而不是只给面板加 transform：
+		// 实测（report §A）单独给面板**或**单独给主列加 transform 都是**零视觉反馈**——
+		// 位移确实写了，但面板被官方层叠上下文压住，合成出来的画面一帧都不动。
+		// 唯一有效的做法是把面板所在的那一层容器整体抬到官方之上。
+		//
+		// 为什么是「官方现有最大 z-index + 1」而不是硬编码 40：
+		// 硬编码在官方改版（新增更高层的浮层/弹窗）时会静默失效，表现是"跟手又不动了"，
+		// 而这正是本轮要修的症状，不能让它以另一种形式回来。运行时由
+		// applyRightbarLayer() 扫描 frame 子树算出实际最大值再 +1，写进 --dshr-rightbar-z。
+		'html.' + ROOT_CLASS + '[data-dshr-rightbar-drag="1"] [data-dshr-rightbar-col] {',
+		'  z-index: var(--dshr-rightbar-z, 40) !important;',
+		'  transform: translateX(var(--dshr-rightbar-x, 0px)) !important;',
+		'  transition: none !important;',
+		'  will-change: transform;',
+		// 拖动期容器盖在页面上，但它只是承载面板的壳，不能吃掉内容点击。
+		'  pointer-events: none !important;',
+		'}',
+		// 提交/回弹阶段：改走 CSS transition（合成线程），与官方主列同款曲线。
+		// 回弹**不用**这条——回弹走 rAF，避免"摘掉属性那一帧"出现空窗（见 settleRightbarVisual）。
+		'html.' + ROOT_CLASS + '[data-dshr-rightbar-settle="1"] [data-dshr-rightbar-col] {',
+		'  z-index: var(--dshr-rightbar-z, 40) !important;',
+		'  transform: translateX(var(--dshr-rightbar-x, 0px)) !important;',
+		'  transition: transform 0.34s cubic-bezier(0.32, 0.72, 0, 1) !important;',
+		'  will-change: transform;',
+		'  pointer-events: none !important;',
+		'}',
+		// ── T85：右栏**打开方向**——把承载容器当裁剪窗，用 `width` 过渡让面板"从左边长出来" ──
+		//
+		// 为什么不能用 transform 补间（T82 的降级结论在这里被实测推翻了一半）：
+		// 真机上开/关两态**除面板上两个属性外零差异**（recon/diff2：面板 + 全祖先链 +
+		// 三个兄弟节点的 computed style 与 rect 逐位相同，frame 的 grid-template-columns
+		// 也相同），承载容器 BynINW_rightbarCol 两态恒为 width:0。也就是说官方**没有**把
+		// 容器拉宽——所以"只加一条 transition: width"不会有任何像素可动，必须由本层
+		// 自己把容器的 width 当成裁剪窗的窗宽来驱动。
+		//
+		// 几何依据（真机实测，scratch/t85/exp-clip.mjs）：
+		//   面板是 absolute，官方锚在承载容器的**右缘**（panel.x = col.right - 100vw）。
+		//   col 一旦被搬走，面板跟着搬；补偿量又依赖正在动的 width ⇒ 单靠 CSS 过渡没法两全。
+		//   把面板改锚到容器**左缘**（left:-100vw）后，col 搬到 x=0、窗宽=width，
+		//   面板恒在 x=0 ⇒ 窗 [0,width] 从左往右变宽 = 面板从左长出来。
+		//   实测 W=150/300/412 三档 panelRect.left 全部 = 0，colRect = [0,46,W,869]。
+		//
+		// 为什么 overflow 用 clip 而不是 hidden：hidden 会把容器变成**滚动容器**，
+		// 面板在容器左侧造成的负溢出会被按"负向滚动区"补偿，面板位置随 width 漂移。
+		// clip 不建滚动容器，纯裁剪。
+		'html.' + ROOT_CLASS + '[data-dshr-rightbar-open="1"] [data-dshr-rightbar-col] {',
+		'  z-index: var(--dshr-rightbar-z, 40) !important;',
+		'  overflow: clip !important;',
+		'  width: 0px !important;',
+		'  transform: translateX(-100vw) !important;',
+		'  transition: none !important;',
+		'  pointer-events: none !important;',
+		'}',
+		// "2" 才带上 width 过渡：属性从 1 翻到 2 时，after-change style 里的 transition
+		// 与新的 width 同时生效 ⇒ 过渡从 0 起来（CSS Transitions 用 after-change style 判定）。
+		'html.' + ROOT_CLASS + '[data-dshr-rightbar-open="2"] [data-dshr-rightbar-col] {',
+		'  z-index: var(--dshr-rightbar-z, 40) !important;',
+		'  overflow: clip !important;',
+		'  width: var(--dshr-rightbar-open-w, 100vw) !important;',
+		'  transform: translateX(-100vw) !important;',
+		'  transition: width 0.3s cubic-bezier(0.32, 0.72, 0, 1) !important;',
+		'  will-change: width;',
+		'  pointer-events: none !important;',
+		'}',
+		'html.' + ROOT_CLASS + '[data-dshr-rightbar-open] [data-dshr-rightbar-col] [data-sidebar-right-panel] {',
+		'  left: -100vw !important;',
+		'  right: auto !important;',
+		'  transform: translateX(100vw) !important;',
 		'}',
 		// ── 设置弹窗 → 全屏页（盖住侧栏与会话，带进入动画） ──
 		'@keyframes dshr-settings-fade {',
@@ -1914,10 +2135,18 @@
 	// T31-3/T31-4 的共享状态。**必须在这里声明**：collectUiDiag（第 ~1180 行）
 	// 会读 lastDisconnectAt，而它在 IIFE 顶部的 reportUiDiag() 调用点之前就被求值。
 	var RESUME_PROBE_DELAY_MS = 1200;
-	var RESUME_MIN_INTERVAL_MS = 15000;
+	// T82：二次确认延后 2000→400ms。改前实测：断开后要等满 2s 才走到"确实断开"，
+	// 而这一轮的诉求是"不再等 30 秒"——把确认窗口压到 400ms 是这条时间线最短的一段。
+	var RESUME_MIN_INTERVAL_MS = 8000;
 	// T38-2 新增的两道防风暴闸：二次确认的延后时长，以及单页面生命周期的硬上限。
-	var RESUME_CONFIRM_DELAY_MS = 2000;
-	var RESUME_MAX_NUDGES = 3;
+	// T82：15s→8s、3→6。风暴边界核算见 report §C：
+	//   6 次 × (0.4s 确认 + 8s 间隔) ≈ 50.4s 窗口，与上游自身退避梯子
+	//   12.75–25.5s（H=2000ms 时 31.3s）**同量级、非同密度**；
+	//   且只在"断开持续态"才走这条路径，健康时零开销。
+	var RESUME_CONFIRM_DELAY_MS = 400;
+	var RESUME_MAX_NUDGES = 6;
+	// T82：断开持续态的巡检步长。健康时这个 tick 只做一次判据读取就返回（零开销）。
+	var RESUME_DOWN_TICK_MS = 1000;
 	// T38-2：断开闩锁。resumeDownSince = 第一次观测到"确实断开"的时刻（0 = 未断开）；
 	// resumeNudgeArmed = 是否允许推。推过一次后必须先观测到恢复才重新武装。
 	var resumeDownSince = 0;
@@ -1927,6 +2156,10 @@
 	var resumeLastNudgeAt = 0;
 	var resumeLastProbeAt = 0;
 	var resumeLastProbeResult = 'never';
+	// T82：断开持续态巡检定时器句柄（0 = 未装）。只在观测到断开时装上，恢复即卸，健康时零开销。
+	var resumeDownTick = 0;
+	// T82：最近一次实际用了哪一层入口（'connection-reconnect' / 'network-transition'）。
+	var resumeLastNudgeResult = 'never';
 	/** 本次页面生命周期内第一次观测到"确实断开"的时刻；0 = 从未断线。 */
 	var lastDisconnectAt = 0;
 
@@ -1952,29 +2185,221 @@
 	var RESUME_STATUS_MAX_LEN = 24;
 	var RESUME_STATUS_SCAN_LIMIT = 4000;
 
-	/** 可交互控件不算"状态"：按钮/链接是让人去点的。 */
+	// ── T88：层 1 —— 官方 `<button data-phase="connecting">`（与原生 ReconnectBanner.PROBE_JS 同源）──
+	//
+	// 官方 0.2.0-rc.2 的「重新连接中」渲染成这个（`dsh-web-frontend/dist` 里 `q_()` 的 connecting
+	// 分支，逐字对着产物读出来的）：
+	//   <button type="button" data-phase="connecting" aria-label="连接中断，正在重试，点击立即重连">
+	//     <span class="_icon_1gwo3_69" aria-hidden="true">…</span>
+	//     <span class="_label_1gwo3_80">重新连接中<span class="_dots_1gwo3_84" aria-hidden="true">…</span></span>
+	//   </button>
+	//
+	// 而层 2（下面的老路径）整条建在「排除可交互控件**及其后代**」上 ⇒ 这条永远被跳过：
+	// 内层 `span.label` 本身不是 button，但 `closest('button,a,[role="button"],[onclick]')`
+	// 命中的是它那个 `<button>` 祖先 ⇒ 直接 continue。⇒ 真实页面上
+	// findReconnectStatusElement() **恒为 null**（T87 实测：29s 真实断线、60 帧 500ms 采样 0 命中）。
+	// 后果是三条路径一起失灵：
+	//   ① probeResumeRecovery() 第一行 `reconnecting` 恒 false ⇒ 直接走健康分支（闩锁复位 + 卸巡检）
+	//      ⇒ T82 的 400ms/8s/6 次与 1s 巡检**一次都不会跑**（整套自愈成了死代码）；
+	//   ② resumeRecoveryState().reconnecting 恒 false；
+	//   ③ collectUiDiag().wsState 恒 'ok' —— App 设置页那行诊断对"正在重连"说谎。
+	//
+	// 层 1 是**定向例外**：只认官方这一条结构，**刻意不**放宽 isInteractiveNode()
+	// （放宽会把发送键 /「+」/ composer 一起放进来 —— 误报比漏报糟得多）。
+	// 四条判据与原生 PROBE_JS 层 1 **逐条同源**：
+	//   ① 扫 `[data-phase]`（上限 64），值 trim + toLowerCase 后**恰等于** connecting
+	//      （disconnected 不认：那条的文案是「连接异常，刷新重试」，认它就说错话）；
+	//   ② aria-label 命中 composer 排除清单（发送键 /「+」键，中英两式逐条列全）⇒ 直接否决；
+	//   ③ getClientRects().length > 0（有布局盒）；只挡 display:none / 未挂载 ——
+	//      侧栏用 left:-320px 收起时仍有盒，与原生 isOnScreen 的分工保持一致；
+	//   ④ 文案锚定：取该元素**去掉 aria-hidden="true" 子树后**的文字（官方那条的 icon 与三点 dots
+	//      都带 aria-hidden ⇒ 等价于只读 label 文案，且**不依赖 CSS module 哈希类名**：
+	//      label 的类名是 `_label_1gwo3_80` 这种），整串命中 / 去尾句点后整串命中 / aria 命中
+	//      「重连|reconnect」—— 三取一。
+	//   ⑤ composer 祖先否决：官方那条的祖先链上没有 contenteditable / role=textbox
+	//      ⇒ 真实页面上这条永不生效；它挡的是"composer 里手打文案 + 带 data-phase 的标记面"
+	//      这种组合（见 isInsideComposer）。
+	//
+	// **两端不漂移的机制**（不是靠人记）：下面三个字面量与 ReconnectBanner 的三个 Java 常量
+	// **逐字符相同**（含顺序、`$` 与 `/i`），并且 `scripts/test-mobile-chrome.mjs` 里有一条断言
+	// **同时读这两个文件**、抽出双方字面量做相等比较 ⇒ 任何一端被单独改动，`pnpm test:mobile`
+	// 立刻变红（原生侧另有 `ReconnectBannerTest` 把同一份字面量抽出来真跑正/负例）。
+	var OFFICIAL_PHASE = 'connecting';
+	var RESUME_PHASE_SCAN_LIMIT = 64;
+	var RESUME_PHASE_TEXT_PAD = 8;
+	// 与原生 `ReconnectBanner.COMPOSER_DENY_JS` 逐字符相同。
+	var COMPOSER_DENY_RE = /^(?:send message|发送消息|send|发送|submit|提交|add files or run commands|添加文件或运行命令|添加文件或调用指令|添加文件或运行指令|命令|指令|commands)$/i;
+	// 与原生 `ReconnectBanner.ARIA_RE_JS` 逐字符相同。
+	var RECONNECT_ARIA_RE = /重连|reconnect/i;
+	// 与原生 `ReconnectBanner.COMPOSER_ROLE_JS` 逐字符相同（T90：把 T88 遗留的那处
+	// 两端差异收口 —— 层 1 的 ⑤ composer 祖先否决现在两端**同一条名单、同一段走法**）。
+	var COMPOSER_ROLE_RE = /^(?:textbox|searchbox|combobox)$/;
+
+	/** 层 1 专用：aria-label（trim 后）。与原生 PROBE_JS 的 `aria(n)` 同义。 */
+	function ariaLabelOf(node) {
+		try {
+			return String((node.getAttribute && node.getAttribute('aria-label')) || '').trim();
+		} catch (ignoredAriaLabel) {
+			return '';
+		}
+	}
+
+	/**
+	 * 层 1 专用：该元素**去掉 aria-hidden="true" 子树后**的文字。
+	 * 只累加文本节点、整棵 aria-hidden 子树跳过 —— 与原生 PROBE_JS 的 `anchor(n)` 同算法。
+	 * 用递归而不是 innerText 的理由：官方 label 与三点 dots 是兄弟，innerText 会把 dots 一起读进来，
+	 * 而 dots 的 `aria-hidden="true"` 正是"这不是文案、别锚定它"的官方声明。
+	 */
+	function anchoredText(node) {
+		var out = '';
+		try {
+			if (!node || !node.childNodes) return '';
+			for (var i = 0; i < node.childNodes.length; i++) {
+				var child = node.childNodes[i];
+				if (child.nodeType === 3) { out += String(child.nodeValue || ''); continue; }
+				if (child.nodeType !== 1) continue;
+				if (String((child.getAttribute && child.getAttribute('aria-hidden')) || '').toLowerCase() === 'true') continue;
+				out += anchoredText(child);
+			}
+		} catch (ignoredAnchoredText) { return out; }
+		return out;
+	}
+
+	/** 层 1 专用：去掉尾部空白/省略号与 1–3 个句点再 trim。与原生 PROBE_JS 的 `core(s)` 同义。 */
+	function coreStatusText(text) {
+		return String(text)
+			.replace(/[\s\u2026]+$/, '')
+			.replace(/\.{1,3}$/, '')
+			.trim();
+	}
+
+	/**
+	 * 层 1 的**例外边界**（T88 实测出来的补丁）：
+	 * 豁免只给官方那条**自己**（它就是一个 `<button>`），不给"被 composer 包住"的情形。
+	 *
+	 * 官方那条住在 settings 触发行（`SettingsRoot` 的 `triggerRow`）里，祖先链上没有
+	 * contenteditable / role=textbox ⇒ 这条否决在**真实页面上永不生效**。
+	 * 它挡的是"用户在 composer 里手打一句「重新连接中」，而某个标记面又恰好带了
+	 * data-phase"这类组合：改前那条（层 2）会因为 composer 自身/后代不是 button 而误报，
+	 * 改后层 1 也会认 —— 所以这里必须显式否决。
+	 *
+	 * ⚠️ T88 曾与原生 `PROBE_JS` 层 1 有**一处**差别（原生没有这条否决、更松）。
+	 * T90 把同一条补进原生侧（`ReconnectBanner.PROBE_JS` 的 `insideComposer`，用同一份
+	 * role 字面量 {@link COMPOSER_ROLE_RE}）⇒ **两端同算法、同名单、同位置**，
+	 * `scripts/test-mobile-chrome.mjs` 抽两端字面量做逐字符比较，`scratch/t90/dom-truth.mjs`
+	 * 用**同一批 42 条夹具**在同一页里跑两端判据逐条比对结论。
+	 */
+	function isInsideComposer(node) {
+		try {
+			var cur = node;
+			while (cur && cur.nodeType === 1) {
+				var role = String(cur.getAttribute('role') || '').toLowerCase();
+				if (role && COMPOSER_ROLE_RE.test(role)) return true;
+				if (isEditableNode(cur)) return true;
+				cur = cur.parentElement;
+			}
+		} catch (ignoredComposerAncestor) { return false; }
+		return false;
+	}
+
+	/**
+	 * T88 层 1：官方 `[data-phase="connecting"]` 那条；找不到返回 null。
+	 * 逐条判据见上方注释（① 恰等于 connecting ② 排除清单 ③ 有布局盒 ④ 文案锚定三取一
+	 * ⑤ composer 祖先否决）。
+	 */
+	function findOfficialReconnectButton() {
+		if (!document.body || typeof document.body.querySelectorAll !== 'function') return null;
+		var nodes;
+		try { nodes = document.body.querySelectorAll('[data-phase]'); } catch (ignoredPhaseQuery) { return null; }
+		var n = nodes && nodes.length ? nodes.length : 0;
+		if (n > RESUME_PHASE_SCAN_LIMIT) n = RESUME_PHASE_SCAN_LIMIT;
+		for (var i = 0; i < n; i++) {
+			var el = nodes[i];
+			var phase = '';
+			try { phase = String(el.getAttribute('data-phase') || '').trim().toLowerCase(); } catch (ignoredPhaseAttr) { continue; }
+			if (phase !== OFFICIAL_PHASE) continue;
+			var aria = ariaLabelOf(el);
+			if (COMPOSER_DENY_RE.test(aria)) continue;
+			if (isInsideComposer(el)) continue;
+			if (!isVisible(el)) continue;
+			var text = anchoredText(el).trim();
+			if (!text || text.length > RESUME_STATUS_MAX_LEN + RESUME_PHASE_TEXT_PAD) continue;
+			if (!RECONNECT_STATUS_RE.test(text)
+				&& !RECONNECT_STATUS_RE.test(coreStatusText(text))
+				&& !RECONNECT_ARIA_RE.test(aria)) continue;
+			return el;
+		}
+		return null;
+	}
+
+	/** 与原生 PROBE_JS 的 `editable(n)` 同义：contenteditable 存在且不是 "false"。 */
+	function isEditableNode(node) {
+		try {
+			var value = node.getAttribute('contenteditable');
+			if (value === null || value === undefined) return false;
+			return String(value).toLowerCase() !== 'false';
+		} catch (ignoredEditableAttr) { return false; }
+	}
+
+	/**
+	 * 可交互控件不算"状态"：按钮/链接是让人去点的；输入控件里的文字是**用户自己打的**。
+	 *
+	 * T88：这份排除名单与原生 PROBE_JS 的 `inter(n)` **逐条对齐**（补齐 T86 给原生加的
+	 * `role=textbox|searchbox|combobox|menuitem|checkbox|radio|switch|tab|slider`、
+	 * `[contenteditable]` 本体与 `closest` 里的 `[role="textbox"],[contenteditable]`）。
+	 * 这是**收紧**（能匹配上的元素只会变少）、不是放宽：官方 composer 就是一个
+	 * `div[contenteditable][role=textbox]`，用户在里打一句「重新连接中」不该让整页被判成
+	 * "正在重连"——层 2 的整串锚定挡不住它，只有这份名单能挡（T86 在原生侧就是这么钉的，
+	 * 两边名单不一致会立刻在 `scratch/t88/dom-truth.mjs` 的 composer 负例上显形）。
+	 */
 	function isInteractiveNode(node) {
 		if (!isElement(node)) return true;
 		var tag = (node.tagName || '').toLowerCase();
 		if (tag === 'button' || tag === 'a' || tag === 'input' || tag === 'select' || tag === 'textarea') return true;
 		try {
-			var role = node.getAttribute('role');
-			if (role === 'button' || role === 'link') return true;
+			var role = String(node.getAttribute('role') || '').toLowerCase();
+			if (role === 'button' || role === 'link' || role === 'textbox' || role === 'searchbox'
+				|| role === 'combobox' || role === 'menuitem' || role === 'checkbox' || role === 'radio'
+				|| role === 'switch' || role === 'tab' || role === 'slider') return true;
 			if (node.hasAttribute('onclick')) return true;
+			if (isEditableNode(node)) return true;
 			if (node.closest) {
-				if (node.closest('button,a,[role="button"],[onclick]')) return true;
+				if (node.closest('button,a,[role="button"],[role="textbox"],[onclick],[contenteditable]')) return true;
 			}
 		} catch (ignoredInteractive) {}
 		return false;
 	}
 
 	/**
-	 * 找出「整段文字就是重连状态」的可见、非交互元素；找不到返回 null。
+	 * 找出「正在重连」的那个元素，并报出**是哪一层**认出来的；找不到返回 src=0。
+	 * 分层与原生 PROBE_JS 一致：层 1（官方按钮）优先，层 2 兜底。
+	 * src 只给测试/排查用（不并进 collectUiDiag：那个载荷的字段集被 test:device 逐字钉住）。
+	 */
+	function findReconnectStatusDetail() {
+		var official = findOfficialReconnectButton();
+		if (official) return { src: 1, el: official };
+		var legacy = findTextReconnectStatusElement();
+		if (legacy) return { src: 2, el: legacy };
+		return { src: 0, el: null };
+	}
+
+	/**
+	 * 找出「正在重连」的那个元素；找不到返回 null。**只有两层**：
+	 *   层 1（T88）：官方 `<button data-phase="connecting">` —— 定向例外，见上方注释；
+	 *   层 2（T38-2）：非交互元素里"整段文字就是重连状态"的那条（判据原样未动）。
+	 * 层 1 命中即返回：官方那条比"页面上随便一段文案"更可信，优先级同原生 PROBE_JS。
+	 */
+	function findReconnectStatusElement() {
+		return findReconnectStatusDetail().el;
+	}
+
+	/**
+	 * 层 2（T38-2 老路径，判据不变，向后兼容）：找出「整段文字就是重连状态」的可见、非交互元素。
 	 *
 	 * 刻意**不查 document.body**：body 是所有文本的并集，一旦匹配就退化成
 	 * T31 那种"整页扫子串"，正是要消灭的误触发来源。
 	 */
-	function findReconnectStatusElement() {
+	function findTextReconnectStatusElement() {
 		if (!document.body || typeof document.body.querySelectorAll !== 'function') return null;
 		var nodes = document.body.querySelectorAll('div,span,p,section,li,strong,em,label,h1,h2,h3,h4,h5,h6');
 		var n = nodes.length;
@@ -1998,6 +2423,8 @@
 		// 只需看 App 设置页这一行就知道"是不是真的在掉线、上次什么时候掉的"。
 		// T38-2：判据换成 findReconnectStatusElement()（元素级 + 整串锚定 + 排除可交互控件），
 		// 与 probeResumeRecovery 走**同一个**函数 —— 诊断行不再可能和实际动作口径不一致。
+		// T88：该函数现在有两层（层 1 = 官方 `[data-phase="connecting"]`），诊断行因此能在
+		// **真实页面**上如实报出 reconnecting（改前层 1 缺失 ⇒ 这里恒 'ok'）。
 		// wsState 取值只有三个，且全部可产出：
 		//   reconnecting   此刻确实处于断开态；
 		//   ok-recovered   曾经断过、现在已恢复（lastDisconnectAt > 0）；
@@ -2006,7 +2433,10 @@
 		// lastDisconnectAt 为 0 表示本次页面生命周期内没有观测到断线。
 		var reconnecting = false;
 		try {
-			reconnecting = findReconnectStatusElement() !== null;
+			// T90：判据 = 层 1/层 2 的 DOM 文案（T88）**或** WS 观测（T90）。
+			// rail（左栏收起）时官方那条指示器根本不渲染 ⇒ 只有 WS 这一条能如实报出
+			// "正在重连"；wide 布局下 DOM 那条更精确，两者任一为真即为真。
+			reconnecting = isConnectionDown();
 		} catch (ignoredDiagText) {}
 		return {
 			device: deviceMode,
@@ -2246,6 +2676,10 @@
 		var portrait = isPortraitViewport();
 		var on = resolveHookEnabled(portrait);
 		hookOn = on;
+		// T90：连接态观测跟着 hook 启用态走 —— 严格 OFF（平板）与关闭态一律还原
+		// `window.WebSocket`（零痕迹不只 DOM），启用态安装（幂等）。必须放在下面那条
+		// strictOff 早退**之前**，否则切到平板档时构造器还原不掉。
+		syncWsStateWatch(on && !isStrictOff());
 		var root = document.documentElement;
 		if (!on && isStrictOff()) {
 			// 平板档：官方布局零改动，直接走拆除路径（不写 dshr-official-inset）。
@@ -2773,6 +3207,329 @@
 		return true;
 	}
 
+	// ── T82：右栏跟手层 ──────────────────────────────────────────────
+	//
+	// 背景（实测真值，见 scratch/t82/report.md §A）：改前右栏开/关都只是
+	// dispatchNativeClick() 点官方那颗折叠按钮 ⇒ 官方面板自身**完全没有过渡**
+	// （面板及 8 层祖先 transition-duration 全 0s、animation-name 全 none）。
+	// 手指在屏 1147ms（开）/ 981ms（关）期间面板位移变化 0 帧，松手后 1 帧内到位。
+	//
+	// 本层与既有左抽屉 setDrawerVisual 同构：拖动期只写一个自定义属性驱动
+	// transform（只走合成器、不触发布局），用 rAF 节流；兑现仍然走
+	// dispatchNativeClick()（复用官方状态机，**绝不自己改写官方 open 状态**）。
+	var rightbarVisual = null;
+	var rightbarRaf = 0;
+	var rightbarNextX = 0;
+	var rightbarSettleTimer = 0;
+	var rightbarTrack = null;
+
+	/**
+	 * 承载右栏面板的那一层容器（= panel 在 frame 下的那一层祖先）。
+	 * 官方只有一个 [data-sidebar-right-panel] 标记，没有给"列"标记，所以这里自己找。
+	 */
+	function findRightbarColumn() {
+		var panel = findRightbarPanel();
+		if (!panel) return null;
+		var frame = findFrame();
+		var el = panel;
+		while (el && el.parentElement && el.parentElement !== frame && el.parentElement !== document.body) {
+			el = el.parentElement;
+		}
+		if (el && el.parentElement === frame) return el;
+		// 没有 frame（结构探测未收敛）时退一级：面板的直接父级就是容器。
+		return panel.parentElement && panel.parentElement !== document.body ? panel.parentElement : null;
+	}
+
+	/**
+	 * 把承载面板的容器抬到官方层叠之上，z-index = **官方现有最大 z-index + 1**。
+	 *
+	 * 为什么不硬编码 40：硬编码在官方改版（新增更高层浮层）时会静默失效，
+	 * 表现恰好就是本轮要修的"跟手又不动了"。运行时算出来的值不会随官方改版漂移。
+	 *
+	 * 采样集合刻意做小（frame/body/documentElement 的直接子元素 + 面板祖先链），
+	 * 因为：层级对抗只发生在**同一层叠上下文里的兄弟**之间；主列自己带
+	 * z-index:20 + transform ⇒ 它自成层叠上下文，其后代 z-index 逃不出来，不必逐个扫。
+	 * 全子树扫描会在这个每笔手势都要走的入口上强制几千次样式解析。
+	 */
+	function applyRightbarLayer() {
+		var col = findRightbarColumn();
+		if (!col) return null;
+		col.setAttribute('data-dshr-rightbar-col', '');
+		var max = 0;
+		var consider = function (node) {
+			if (!isElement(node) || node === col) return;
+			var z = 0;
+			try { z = parseInt(window.getComputedStyle(node).zIndex, 10); } catch (ignoredZ) { z = 0; }
+			if (isFinite(z) && z > max) max = z;
+		};
+		var roots = [findFrame(), document.body, document.documentElement];
+		for (var r = 0; r < roots.length; r++) {
+			var host = roots[r];
+			if (!host) continue;
+			var kids = host.children || [];
+			for (var i = 0; i < kids.length; i++) consider(kids[i]);
+		}
+		var p = findRightbarPanel();
+		while (p) { consider(p); p = p.parentElement; }
+		col.style.setProperty('--dshr-rightbar-z', String(max + 1));
+		return col;
+	}
+
+	/** 面板位移上限 = 面板自身宽度（全屏态就是视口宽度）。 */
+	function rightbarShiftMax() {
+		var panel = findRightbarPanel();
+		var w = 0;
+		if (panel) {
+			try { w = panel.getBoundingClientRect().width; } catch (ignoredW) { w = 0; }
+		}
+		if (!(w > 0)) w = window.innerWidth || 390;
+		return w;
+	}
+
+	function setRightbarVisual(x) {
+		if (!rightbarVisual) return 0;
+		x = Math.max(0, Math.min(rightbarVisual.max, x));
+		rightbarVisual.x = x;
+		document.documentElement.style.setProperty('--dshr-rightbar-x', Math.round(x) + 'px');
+		return x;
+	}
+
+	/** rAF 节流：一帧最多写一次属性（touchmove 可以每帧来好几次）。 */
+	function queueRightbarVisual(x) {
+		rightbarNextX = x;
+		if (rightbarRaf) return;
+		rightbarRaf = window.requestAnimationFrame(function () {
+			rightbarRaf = 0;
+			if (rightbarVisual) setRightbarVisual(rightbarNextX);
+		});
+	}
+
+	function clearRightbarVisualAttrs() {
+		var root = document.documentElement;
+		// T85：打开方向的裁剪窗与关闭方向的拖动态互斥，收尾时一并清掉，别留残窗。
+		cancelRightbarOpenVisual();
+		root.removeAttribute('data-dshr-rightbar-drag');
+		root.removeAttribute('data-dshr-rightbar-settle');
+		root.style.removeProperty('--dshr-rightbar-x');
+		if (rightbarRaf) { window.cancelAnimationFrame(rightbarRaf); rightbarRaf = 0; }
+		if (rightbarSettleTimer) { window.clearTimeout(rightbarSettleTimer); rightbarSettleTimer = 0; }
+		if (rightbarSettleAnim) { window.cancelAnimationFrame(rightbarSettleAnim); rightbarSettleAnim = 0; }
+	}
+
+	/** 起手：关闭方向。面板已在屏上，直接跟手。 */
+	function startRightbarCloseVisual() {
+		// T85：打开方向的 width 过渡若还在跑，先把它收干净——两条规则都会写容器的
+		// transform/transition，同帧共存会互相压制（关闭方向是跟手，优先级更高）。
+		cancelRightbarOpenVisual();
+		var col = applyRightbarLayer();
+		if (!col) return false;
+		rightbarVisual = { col: col, max: rightbarShiftMax(), x: 0, opening: false };
+		document.documentElement.setAttribute('data-dshr-rightbar-drag', '1');
+		setRightbarVisual(0);
+		return true;
+	}
+
+	// ── T85：打开方向「面板从左边长出来」──────────────────────────────
+	//
+	// 只管**视觉**，一行都不碰官方状态机：
+	//   - 兑现仍然是原来那一刻、原来那一句 `openOfficialRightbar()`（dispatchNativeClick 通道逐字未改）；
+	//   - 遮罩/鲸鱼/composer 的可点性、`data-sidebar-right-*` 属性翻转全由官方照旧发生；
+	//   - 本层只在容器上临时挂 `data-dshr-rightbar-open` 抢走 `width`，过渡一结束就摘干净，
+	//     终态回到"官方 open"的几何（两者 panel.x 都是 0，摘的那一帧没有跳变）。
+	// 只有**手势路径**走它：官方那颗折叠按钮的点击路径保持瞬时展开（避免把一条没验过的
+	// 交互面也拖进本轮的回归范围）。
+	var RIGHTBAR_OPEN_MS = 300;
+	var rightbarOpenTimer = 0;
+
+	/**
+	 * 把容器架成"窗宽 0"的裁剪窗并抬到官方之上。返回容器供过渡用（拿不到就返回 null，
+	 * 此时调用方照旧只做官方打开，退化成改动前的瞬时行为）。
+	 */
+	function primeRightbarOpenVisual() {
+		var col = applyRightbarLayer();
+		if (!col) return null;
+		// 窗宽目标 = 面板自身宽度（全屏态就是视口宽度）；用变量喂给 CSS，避免在 JS 里猜单位。
+		col.style.setProperty('--dshr-rightbar-open-w', Math.round(rightbarShiftMax()) + 'px');
+		document.documentElement.setAttribute('data-dshr-rightbar-open', '1');
+		// 强制落定一次样式：保证"1"这一帧的 width:0 真的被算过，过渡才有起点。
+		// （同一个任务里连续改两个值，浏览器只做一次 style recalc，不加这句过渡不会启动。）
+		void col.offsetWidth;
+		return col;
+	}
+
+	/** 起过渡（0 → 窗宽）。必须在官方打开那句**之后**调用，理由见 considerRightbarSwipe。 */
+	function playRightbarOpenVisual(col) {
+		if (!col) return;
+		var root = document.documentElement;
+		if (root.getAttribute('data-dshr-rightbar-open') !== '1') return;
+		root.setAttribute('data-dshr-rightbar-open', '2');
+		var onEnd = function (ev) {
+			if (ev && ev.propertyName !== 'width') return;
+			clearRightbarOpenVisual(col, onEnd);
+		};
+		col.addEventListener('transitionend', onEnd);
+		// 兜底：宿主切后台会冻结合成/动画，transitionend 可能永远不来，别把裁剪窗留在页面上。
+		if (rightbarOpenTimer) window.clearTimeout(rightbarOpenTimer);
+		rightbarOpenTimer = window.setTimeout(function () {
+			rightbarOpenTimer = 0;
+			clearRightbarOpenVisual(col, onEnd);
+		}, RIGHTBAR_OPEN_MS + 120);
+	}
+
+	/** 摘掉裁剪窗（= 让官方 open 的几何接管）。可重入，重复调用无副作用。 */
+	function clearRightbarOpenVisual(col, onEnd) {
+		var root = document.documentElement;
+		root.removeAttribute('data-dshr-rightbar-open');
+		if (col) {
+			if (onEnd) col.removeEventListener('transitionend', onEnd);
+			col.style.removeProperty('--dshr-rightbar-open-w');
+		}
+		if (rightbarOpenTimer) { window.clearTimeout(rightbarOpenTimer); rightbarOpenTimer = 0; }
+	}
+
+	/** 取消：把裁剪窗当场收掉。官方此刻已经是 open，收掉 = 面板立刻完整显示（不是跳回关闭）。 */
+	function cancelRightbarOpenVisual() {
+		clearRightbarOpenVisual(null, null);
+	}
+
+	/**
+	 * T82：打开方向 —— **不做视觉层**（官方瞬时展开，与改动前逐字一致）。
+	 *
+	 * 父任务原本建议"起手时先兑现官方打开，再施加反向 transform 把它拉回手指位置并跟手"，
+	 * 并允许在产生跳变/失同步时降级为"只做 340ms 补间"。实测**两级都走不通**：
+	 *
+	 * ① 提前兑现（方向门命中处 10px 就开官方右栏）与官方状态机失同步：
+	 *    兑现有阈值（T47 的 |dx|≥48），而跟手起手点是 10px。10–47px 的左滑于是变成
+	 *    "开官方右栏 → 松手未过阈值 → 回弹 → 再关"，而 React 提交是异步的，
+	 *    closeOfficialRightbar() 会在提交落地前撞上 toggleBusy/按钮 disabled 而返回 false，
+	 *    右栏**留在打开态**。后果不止"右栏开着"：右栏全屏会给 <html> 打上
+	 *    data-dshr-rightbar-fullscreen="1"，该规则带 !important 一次性藏掉
+	 *    **鲸鱼 + 遮罩 + 拖动手柄**。device-class 回归据此从 158/158/0跳过 掉到
+	 *    152总/3失败/8跳过（失败点：遮罩 display:none、__dshrMobileDiag().whale=false、
+	 *    以及级联的 composer 不可点）。降级掉这条路之后 158/158/0跳过 复现。
+	 *
+	 * ② 只在兑现点做 340ms 补间同样没有视觉：关闭态下承载容器实测
+	 *      pI_x6G_rightbarCol { width: 0, overflow: visible }，其上级 overflow: hidden
+	 *    ⇒ 面板（412px 宽）被整块裁掉，加任何 translateX 都没有像素可动。
+	 *    实测"位移变化帧数=1"（与改前的 0 帧在观感上无从区分）。
+	 *    要真做出滑入必须逐帧动画容器 width 0→412（布局动画），
+	 *    与本轮"只走合成器、不触发布局"的硬约束冲突 ⇒ 不做。
+	 *
+	 * 因此：打开方向 = 官方瞬时展开；关闭方向才是本轮补齐的跟手层
+	 * （实测跟手 33 帧同向位移、提交/回弹 35 帧补间，见 report §A）。
+	 * 两条不变量（面板中部右滑 no-op、打开态左滑 no-op）在两种方向下都逐字保留。
+	 */
+	function rightbarOpenMove() {
+		// 起手期不碰任何官方状态、不写任何位移属性：兑现点仍是原来的 touchend + T47 阈值。
+		// 保留这个空实现是刻意的——调用方统一按 rightbarVisualMove 派发，方向门语义一个字不改。
+	}
+
+	/**
+	 * 提交：走 CSS transition（0.34s cubic-bezier(0.32,0.72,0,1)，与官方主列同款、
+	 * 在合成线程上跑），到位后再兑现官方状态。
+	 */
+	function commitRightbarVisual(targetX, done) {
+		var state = rightbarVisual;
+		if (!state) { done(); return; }
+		var root = document.documentElement;
+		if (rightbarRaf) { window.cancelAnimationFrame(rightbarRaf); rightbarRaf = 0; }
+		root.removeAttribute('data-dshr-rightbar-drag');
+		root.setAttribute('data-dshr-rightbar-settle', '1');
+		// 先强制一次样式落定，保证 transition 的起点是"当前手指位置"而不是属性默认值。
+		void state.col.offsetWidth;
+		setRightbarVisual(targetX);
+		var finish = function () {
+			if (rightbarVisual !== state) return;
+			rightbarVisual = null;
+			root.removeAttribute('data-dshr-rightbar-settle');
+			root.style.removeProperty('--dshr-rightbar-x');
+			if (rightbarSettleTimer) { window.clearTimeout(rightbarSettleTimer); rightbarSettleTimer = 0; }
+			done();
+		};
+		var onEnd = function (ev) {
+			if (ev && ev.propertyName !== 'transform') return;
+			state.col.removeEventListener('transitionend', onEnd);
+			finish();
+		};
+		state.col.addEventListener('transitionend', onEnd);
+		// transitionend 兜底：宿主在后台标签页会冻结合成线程，回调可能永远不来。
+		rightbarSettleTimer = window.setTimeout(function () {
+			state.col.removeEventListener('transitionend', onEnd);
+			finish();
+		}, 340 + 80);
+	}
+
+	/**
+	 * 回弹：走 rAF 补间，**不用** CSS transition。
+	 * 理由：回弹的目标态就是"没有位移"，用 transition 就得先摘 [data-dshr-rightbar-settle]、
+	 * 再摘 --dshr-rightbar-x，而属性一摘位移立刻归零 —— 官方 transform 那帧直接跳回去，
+	 * 会看到一帧空窗。rAF 逐帧写到位再摘属性，摘的时候本来就已经在 0，没有回跳。
+	 */
+	function reboundRightbarVisual(done) {
+		var state = rightbarVisual;
+		if (!state) { done(); return; }
+		if (rightbarRaf) { window.cancelAnimationFrame(rightbarRaf); rightbarRaf = 0; }
+		var from = state.x;
+		if (Math.abs(from) < 2 || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+			setRightbarVisual(0);
+			finish();
+			return;
+		}
+		var start = 0;
+		var duration = 220;
+		rightbarSettleAnim = window.requestAnimationFrame(function step(ts) {
+			if (rightbarVisual !== state) { rightbarSettleAnim = 0; return; }
+			if (!start) start = ts;
+			var t = Math.min(1, (ts - start) / duration);
+			var eased = 1 - Math.pow(1 - t, 3);
+			setRightbarVisual(from * (1 - eased));
+			if (t < 1) {
+				rightbarSettleAnim = window.requestAnimationFrame(step);
+			} else {
+				rightbarSettleAnim = 0;
+				finish();
+			}
+		});
+		function finish() {
+			if (rightbarVisual !== state) return;
+			rightbarVisual = null;
+			clearRightbarVisualAttrs();
+			done();
+		}
+	}
+
+	/**
+	 * T47 阈值**逐字复用**：|dx|≥48 && |dx|≥1.4|dy| && |dy|≤96。
+	 * 与 considerRightbarSwipe / considerRightbarCloseSwipe 三处完全一致。
+	 */
+	function rightbarSwipeCommits(dx, dy) {
+		if (Math.abs(dx) < 48) return false;
+		if (Math.abs(dx) < Math.abs(dy) * 1.4) return false;
+		if (Math.abs(dy) > 96) return false;
+		return true;
+	}
+
+	/** 右栏打开态：右滑关闭的跟手 + 松手判定。 */
+	function rightbarCloseMove(clientX, clientY) {
+		if (!rightbarTrack || rightbarTrack.mode !== 'close') return;
+		var dx = clientX - rightbarTrack.x0;
+		var dy = clientY - rightbarTrack.y0;
+		if (dx <= 0) return;   // 打开态左滑：保持 no-op，一帧都不动
+		if (!rightbarVisual) {
+			// 方向确认后才起手（与左抽屉"越过 10px 才接管"同款节奏）。
+			if (Math.abs(dx) < 10) return;
+			if (Math.abs(dx) < Math.abs(dy) * 1.15) { rightbarTrack = null; return; }
+			if (!startRightbarCloseVisual()) { rightbarTrack = null; return; }
+		}
+		queueRightbarVisual(dx);
+	}
+
+	function rightbarOpenMove() {
+		// T82：打开方向已降级为"只做 340ms 补间"（见 stageRightbarOpenTween 的注释），
+		// 起手期间**不碰任何官方状态、不写任何位移属性**。这里保留空实现是刻意的：
+		// 调用方（rightbarVisualMove）仍然按统一路径派发，方向门的既有语义一个字不改。
+	}
+
 	function isDialogOpen() {
 		return document.documentElement.getAttribute('data-dshr-dialog') === '1';
 	}
@@ -2869,20 +3626,52 @@
 	var drawerRaf = 0;
 	var drawerNextX = 0;
 
+	// T91：圆角「成形位移」= 一个半径的量。依据：圆角是**卡片的属性**，不是位移的比例——
+	// 卡片一旦从屏幕边缘分离出来就该是完整圆角（参考图里卡片本身就是刚性的，只是平移过去；
+	// 用户明确否掉了缩放）。但 x=0 时若直接给满半径就是跳变（改前缺陷：真机真值
+	// x=7px 就已经是 18px 圆角，见 report §2），所以取「半径不能超过卡片自身的分离量」
+	// 这条几何约束做斜坡：r(x) = min(x, R)。x>=20px 起就是完整圆角，之后半径恒定、
+	// 只跟随平移 ⇒ 观感上正是用户要的「圆角平移过去」。
+	var CARD_RADIUS_PX = 20;
+
 	function setDrawerVisual(x) {
 		if (!drawerVisual) {
 			var frame = findFrame();
 			drawerVisual = { max: drawerMaxShift(), main: frame ? findMainCol(frame) : null, wasOpen: isSidebarOpen() };
 			// 先锁住跟手样式，再请求官方渲染 wide 内容；不能只把 rail 拉宽。
 			document.documentElement.setAttribute('data-dshr-dragging', '1');
+			// T82：**实测推翻了"把这次官方打开挪到落位阶段"的方案**，所以它留在这里。
+			//
+			// 改前设想：拖动期只用 hook 自己的 CSS 点亮侧栏，把 setSidebarOpen(true)
+			// 挪到 settleDrawer 的 wantOpen 分支，好让热路径只剩 transform/opacity。
+			// 实测（scratch/t82/b-content-signature.json，真实 DSH 0.2.0-rc.2 页面）：
+			//   仅靠 hook CSS 点亮：侧栏列确实被拉宽到 360px，但**可见文本 0 个**、
+			//                      只有 5 个 svg/按钮 ⇒ 用户拖出来的是一条"被拉宽的图标 rail"；
+			//   官方打开态：        同一列可见文本 28 个字符、8 按钮 / 10 svg ⇒ 完整会话列表。
+			// 也就是说"拖动期只靠 CSS 点亮"会让**整个拖动过程**都看不到会话列表，
+			// 直到落位才"啪"地补上内容 —— 比原来的跟手更不可接受。
+			// 既有 fixture 断言 drag-shows-wide-sidebar（scripts/fixtures/mobile-selftest.html:732）
+			// 钉的正是这条语义，它也确实是**有判别力**的守卫，因此不改断言、改回本实现。
+			//
+			// 那"最长帧永远落在 expanded 0→1"怎么修？见下面 [data-dshr-main-col] 的
+			// margin 说明：那一帧的重排来自 margin/max-height 的 0.34s 过渡（margin 参与布局），
+			// 本轮把两处 8px margin 删掉后该帧不再做整列布局，真机帧率真值见 report §B。
 			setSidebarOpen(true);
 		}
 		var max = drawerVisual.max;
 		x = Math.max(0, Math.min(max, x));
 		var p = max > 0 ? x / max : 0;
-		// 变量只写在主列，不让每次移动使整个文档继承的样式失效。
-		if (drawerVisual.main) drawerVisual.main.style.setProperty('--dshr-drawer-x', Math.round(x) + 'px');
-		else document.documentElement.style.setProperty('--dshr-drawer-x', Math.round(x) + 'px');
+		// T82：变量改写到 <html>。原本只写主列，是为了少让一棵子树继承失效；
+		// 但鲸鱼必须读**同一个变量**才能与主列同帧同缓动交接（见 report §B），
+		// 所以写到共同祖先上。消费方只有 [data-dshr-main-col] 与 #dshr-mobile-whale。
+		document.documentElement.style.setProperty('--dshr-drawer-x', Math.round(x) + 'px');
+		// T91：圆角/阴影跟手量（0..1，无单位，供 CSS calc 相乘）。
+		// 与 --dshr-drawer-x 同帧同源写入 ⇒ 半径、阴影、位移三者永远在同一帧上一致，
+		// 不会出现「位移到了、圆角还停在上一帧」的跳动。
+		// 取整到 1/1000：避免把 0.30000000000000004 这类浮点串写进行内样式
+		// （行内属性逐字变化会让 CSS 变量消费者每帧重算，真机上无益）。
+		var cardP = Math.min(1, x / CARD_RADIUS_PX);
+		document.documentElement.style.setProperty('--dshr-card-p', String(Math.round(cardP * 1000) / 1000));
 		return { x: x, p: p, max: max };
 	}
 
@@ -2904,11 +3693,11 @@
 		drawerVisual = null;
 		var root = document.documentElement;
 		root.removeAttribute('data-dshr-dragging');
-		if (previous && previous.main) {
-			previous.main.style.removeProperty('--dshr-drawer-x');
-		} else {
-			root.style.removeProperty('--dshr-drawer-x');
-		}
+		// T82：变量统一写在 <html> 上（见 setDrawerVisual），清理也只清这一处。
+		root.style.removeProperty('--dshr-drawer-x');
+		// T91：跟手圆角量同一处写入、同一处清理（残留会让下一次进入跟手态时
+		// 第一帧先按旧半径画一下，观感就是「拖动开始时圆角闪一下」）。
+		root.style.removeProperty('--dshr-card-p');
 		if (previous && !keepState) setSidebarOpen(previous.wasOpen);
 	}
 
@@ -2926,8 +3715,8 @@
 			done();
 			return;
 		}
-		var el = state.main;
-		var from = parseFloat(el.style.getPropertyValue('--dshr-drawer-x')) || 0;
+		// T82：起点读 <html>（变量已统一写到那里）。
+		var from = parseFloat(document.documentElement.style.getPropertyValue('--dshr-drawer-x')) || 0;
 		if (Math.abs(x - from) < 2 || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
 			setDrawerVisual(x);
 			done();
@@ -2972,8 +3761,8 @@
 			if (settleAnim) { window.cancelAnimationFrame(settleAnim); settleAnim = 0; }
 			if (drawerRaf) { window.cancelAnimationFrame(drawerRaf); drawerRaf = 0; }
 			document.documentElement.removeAttribute('data-dshr-dragging');
-			if (closing && closing.main) closing.main.style.removeProperty('--dshr-drawer-x');
-			else document.documentElement.style.removeProperty('--dshr-drawer-x');
+			document.documentElement.style.removeProperty('--dshr-drawer-x');
+			document.documentElement.style.removeProperty('--dshr-card-p');
 			setSidebarOpen(false);
 		});
 		return true;
@@ -3149,8 +3938,13 @@
 			if (isRightbarOpen()) {
 				if (!toggleBusy && isRightbarCloseTrackTarget(target, clientX)) {
 					rightbarCloseCandidate = { x0: clientX, y0: clientY, target: target };
+					// T82：同一笔手势武装跟手层。这里**只记**，不动任何样式——
+					// 起手窗（band/inset）与"面板中部右滑 no-op"由上面那道门保证；
+					// 视觉位移要等 onDragMove 确认方向（dx>0）才起手。
+					rightbarTrack = { x0: clientX, y0: clientY, mode: 'close' };
 				} else {
 					rightbarCloseCandidate = null;
+					rightbarTrack = null;
 				}
 				resetTrack();
 				return false;
@@ -3172,9 +3966,61 @@
 			startTarget = target;
 			activePointer = pointerId == null ? 'touch' : pointerId;
 			baseX = drawerVisual && drawerVisual.main
-				? parseFloat(drawerVisual.main.style.getPropertyValue('--dshr-drawer-x')) || 0
+				? parseFloat(document.documentElement.style.getPropertyValue('--dshr-drawer-x')) || 0
 				: isSidebarOpen() ? drawerMaxShift() : 0;
+			// T82：抽屉路径也可能是"左滑开右栏"的起手。这里**只记起点**，
+			// 真正起手要等 onDragMove 里右栏跟手层确认方向（见 rightbarVisualMove）。
+			rightbarTrack = { x0: clientX, y0: clientY, mode: 'open' };
 			return true;
+		}
+
+		// ── T82：右栏跟手层的移动/兑现桥 ──
+		//
+		// 为什么不把这些逻辑直接塞进 onDragMove：右栏**打开态**那笔手势在 onDragStart
+		// 就 resetTrack() 了（tracking=false），onDragMove 首行即 return；而
+		// rightbarCandidate / rightbarCloseCandidate 这两个候选槽位是**本层作用域**的，
+		// 视觉层一旦接管就必须在这里把它们清掉，否则 touchend 的候选路径会再兑现一次，
+		// 把官方状态二次翻转（开完又被关回去）。
+		function rightbarVisualMove(clientX, clientY) {
+			if (!rightbarTrack) return;
+			if (rightbarTrack.mode === 'close') rightbarCloseMove(clientX, clientY);
+			else rightbarOpenMove();
+			if (rightbarVisual) {
+				rightbarCandidate = null;
+				rightbarCloseCandidate = null;
+			}
+		}
+
+		/** 松手兑现。返回 true 表示这笔手势已由跟手层处理（调用方不要再走候选路径）。 */
+		function settleRightbarGesture(endX, endY) {
+			var track = rightbarTrack;
+			rightbarTrack = null;
+			var visual = rightbarVisual;
+			if (!track || !visual) return false;
+			var dx = endX - track.x0;
+			var dy = endY - track.y0;
+			var commits = rightbarSwipeCommits(dx, dy);
+			if (track.mode === 'close') {
+				if (commits) {
+					// 提交：合成线程上补间到 +max（滑出右缘），到位后再兑现官方关闭。
+					commitRightbarVisual(visual.max, function () { closeOfficialRightbar(); });
+				} else {
+					// 回弹：面板本来就开着，只把视觉打回 0，不碰官方状态。
+					reboundRightbarVisual(function () {});
+				}
+				return true;
+			}
+			// T82：打开方向已降级——起手期不产生任何 visual，走到这里必然是 close 方向。
+			return true;
+		}
+
+		/** touchcancel：触摸被系统/滚动接管，一律回到"官方当前状态"的原样，不做兑现。 */
+		function cancelRightbarGesture() {
+			rightbarTrack = null;
+			var visual = rightbarVisual;
+			if (!visual) return;
+			if (visual.opening) return;               // 打开方向没有视觉层，无需还原
+			reboundRightbarVisual(function () {});    // 关闭方向：官方还开着，视觉必须回到 0
 		}
 
 		function onDragMove(clientX, clientY, event) {
@@ -3246,7 +4092,32 @@
 			if (Math.abs(dx) < 48) return false;
 			if (Math.abs(dx) < Math.abs(dy) * 1.4) return false;
 			if (Math.abs(dy) > 96) return false;
-			return openOfficialRightbar();
+			// T82：打开方向**保持官方原样（瞬时）**，不做视觉层。这是有证据的降级，不是遗漏：
+			//
+			// 父任务原本建议「起手时先兑现官方打开 → 施加反向 transform 拉回手指位置 → 跟手」，
+			// 并允许在产生跳变/失同步时降级为「只做 340ms 补间」。实测两级都走不通：
+			//   ① 提前兑现（方向门处 10px 就开）会与官方状态机失同步 —— device-class 从
+			//      158/158/0跳过 掉到 152总/3失败/8跳过（详见 report §A3）；
+			//   ② 只在兑现点做 340ms 补间也没有视觉：关闭态下承载容器实测
+			//        pI_x6G_rightbarCol { width: 0, overflow: visible } 且其上级 overflow: hidden
+			//      ⇒ 面板（412px 宽）被**整块裁掉**，此时给它加任何 translateX 都没有像素可动
+			//      （实测位移变化帧数=1，与改前的 0 帧在观感上无从区分，report §A2）。
+			//      要真正做出"滑入"就必须逐帧动画容器 width 0→412 —— 那是布局动画，
+			//      与本轮"只走合成器、不触发布局"的硬约束直接冲突，因此不做。
+			// 结论：打开方向 = 官方瞬时展开（与改动前逐字一致）；关闭方向才是本轮补齐的跟手。
+			//
+			// ── T85 修订 ──
+			// 父任务 T85 明确接受"布局动画 / 可能掉帧"，于是上面 ② 的禁令被解除：
+			// 现在**由本层自己**驱动承载容器的 width（当裁剪窗），做出"面板从左边长出来"。
+			// 兑现时机与调用方式一个字没改——下面仍然只有一次 openOfficialRightbar()，
+			// 仍然走它内部那条 dispatchNativeClick/click() 通道；本层只在其前后贴
+			// 裁剪窗的架/起/摘三步（见 prime/play/clearRightbarOpenVisual 的注释）。
+			// 起手期（方向门那 10px 到松手）依然**不碰**官方状态、不写任何位移属性。
+			var openCol = primeRightbarOpenVisual();
+			var opened = openOfficialRightbar();
+			if (opened) playRightbarOpenVisual(openCol);
+			else cancelRightbarOpenVisual();
+			return opened;
 		}
 
 		/**
@@ -3323,6 +4194,8 @@
 			// WEB-09：新一次触摸先清掉上一次没走完流程的候选（防残留误触发）。
 			rightbarCandidate = null;
 			rightbarCloseCandidate = null;
+			// T82：跟手层的起手记录同样每笔清零（上一次可能被 touchcancel 打断）。
+			rightbarTrack = null;
 			if (event.touches && event.touches.length !== 1) {
 				onDragCancel();
 				return;
@@ -3334,24 +4207,30 @@
 		document.addEventListener('touchmove', function (event) {
 			var touch = event.touches && event.touches[0];
 			if (!touch) return;
+			// T82：右栏跟手层先跑。它只在自己接管后清候选；没接管时不碰任何状态，
+			// 于是"面板中部右滑 no-op""打开态左滑 no-op"两条不变量原样保留。
+			rightbarVisualMove(touch.clientX, touch.clientY);
 			onDragMove(touch.clientX, touch.clientY, event);
 		}, { capture: true, passive: false });
 		document.addEventListener('touchend', function (event) {
 			var touch = event.changedTouches && event.changedTouches[0];
 			var endX = touch ? touch.clientX : lastX;
 			var endY = touch ? touch.clientY : startY;
+			// T82：跟手层接管过的这一笔在这里兑现（提交/回弹），并且**不再**走下面的
+			// 候选路径——否则官方状态会被翻转两次。
+			var handledByVisual = settleRightbarGesture(endX, endY);
 			// WEB-09：方向门记下的左滑候选在这里兑现（为什么是 touchend 而不是方向门，
 			// 见 considerRightbarSwipe 的注释）。候选存在时方向门已经 resetTrack()，
 			// tracking 为 false，所以下面的 onDragEnd 会首行 return——两条路径不会互相干扰。
 			var candidate = rightbarCandidate;
 			rightbarCandidate = null;
-			if (candidate) considerRightbarSwipe(candidate, endX, endY);
+			if (!handledByVisual && candidate) considerRightbarSwipe(candidate, endX, endY);
 			// T47：右栏打开态的「右滑关闭」候选在同一处兑现。两条路径互斥——
 			// 开右栏的候选要求右栏**关**、关右栏的候选要求右栏**开**，
 			// 而且本函数入口已判断 isRightbarOpen()，所以同一笔手势最多命中一条。
 			var closeCandidate = rightbarCloseCandidate;
 			rightbarCloseCandidate = null;
-			if (closeCandidate) considerRightbarCloseSwipe(closeCandidate, endX, endY);
+			if (!handledByVisual && closeCandidate) considerRightbarCloseSwipe(closeCandidate, endX, endY);
 			onDragEnd(endX, endY);
 		}, { capture: true, passive: true });
 		document.addEventListener('touchcancel', function () {
@@ -3360,6 +4239,8 @@
 			rightbarCandidate = null;
 			// T47：关右栏的候选同样不兑现（理由相同）。
 			rightbarCloseCandidate = null;
+			// T82：跟手层也一样——不提交，只回弹并把官方状态还原到"这笔手势开始前"。
+			cancelRightbarGesture();
 			if (!tracking) return;
 			var dx = lastX - startX;
 			if (dragging || Math.abs(dx) >= 48) onDragEnd(lastX, startY);
@@ -4496,6 +5377,263 @@
 		else if (themeMq.addListener) themeMq.addListener(onScheme);
 	} catch (ignoredMq) {}
 
+	// ══════════════════════════════════════════════════════════════════════════
+	// T90：连接态信号源 —— **UI 无关**的「app 自己那条 WebSocket 现在活着吗」
+	// ══════════════════════════════════════════════════════════════════════════
+	//
+	// 为什么需要它（T88 §E.4 / T87 §5.3 实测）：官方那条「重新连接中」指示器的渲染
+	// 条件是 `state: wide && …`（`wide = !collapsed`，dsh-client-ui-settings-general），
+	// **左栏收起（56px rail）时它根本不渲染** —— rail 是用户平时的主界面状态，
+	// 45s 真断线窗口里 `[data-phase="connecting"]` 0 帧、hook 判据 0 命中、
+	// `nudges=0`、`lastDisconnectAt=0`（同轮展开侧栏后 +134ms 立刻出现 268 帧）。
+	// ⇒ 只靠"页面里那段文案"的判据在 rail 下**没有可判对象**，原生横幅同源同限。
+	//
+	// 选型：先找现成的页面侧信号，**没有**才包装 `window.WebSocket`。
+	//   · `__DSH_CONNECTION_RECOVERY__` 是**服务端注入的重连参数**（dsh-client-connection
+	//     的 `resolveConnectionConfig`：backoffBaseMs/backoffFactor/backoffMaxMs/
+	//     generationReadyWarnMs/generationReadyTimeoutMs），**不随断线变化**；
+	//   · `__DSH_BOOT__` / `__DSH_BOOT_READY__` 是 boot 载荷与就绪 promise，
+	//     `__ModuleLoader__` 只有 mode/pendingQueue/load/create（T82 §C 逐键扫过），
+	//     其余 `__DSH_*` 全是数据类配置 ⇒ 没有一个带连接态/重连计数。
+	//   （这一条不是"读源码猜的"：`scratch/t90/signal-scan.mjs` 在真机上把 window 上
+	//     **全部** DSH 相关全局在"断线前/断线中/恢复后"三拍逐一快照做差分，
+	//     证明没有任何一个键随断线变化；原始 JSON 见 `scratch/t90/signals.json`。）
+	//
+	// 包装器纪律（**绝不能影响 app 自己的连接与重连**）：
+	//   1. 只加 `open`/`close` 监听，**不调用 socket 上的任何方法**、不改它的属性；
+	//   2. 构造用 `Reflect.construct(native, arguments, new.target)` —— 参数数组、
+	//      原型（`WebSocket.prototype` **原对象**）、静态量（CONNECTING/OPEN/CLOSING/CLOSED）、
+	//      `instanceof` 语义全部原样透传；不带 `new` 调用时抛与浏览器**逐字相同**的 TypeError；
+	//   3. 支持多 socket（app 每次重连都新建一条）：只要有一条 OPEN 就判健康；
+	//   4. 装上后再被注入时**不会二次包装**（`__dshrWsWatchWrapped` 标记 + 幂等闸）；
+	//   5. 平板档（`device==='tablet'`，hook 严格 OFF）**一个字节都不碰**：
+	//      不安装、不写全局；切换到平板档时 `uninstallWsStateWatch()` 把
+	//      `window.WebSocket` 还原成原生构造器并删掉自检全局。
+	//
+	// 判据（`wsWatchDown()`）逐条：
+	//   ① 有 socket 处于 OPEN            ⇒ 健康（有活口即健康）；
+	//   ② 观测到过 close 且现在没有活口  ⇒ **断**（重连期间新 socket 还在 CONNECTING，仍是断）；
+	//   ③ 只有一个 socket 且它 CONNECTING 超过 WS_CONNECT_GRACE_MS ⇒ **断**
+	//      （覆盖"页面加载时就连不上、一直在重连"：TCP 直接失败会走 ②，
+	//        半死链路上长期 CONNECTING 由 ③ 兜住）；
+	//   ④ 还没见过任何 socket（app 还没建）⇒ 未知 ⇒ **不算断**（宁可漏报不误报）。
+	//   ⇒ 冷启首连那 0–2s 恒为假，不会把"正在建立首连"误报成断线。
+
+	// 注意：`WS_WATCH_KEY` / `WS_CONNECT_GRACE_MS` / `wsWatchState` 三个 var 与下面这一组
+	// 函数**分开**：它们必须在本函数体**第一行**（`installWsStateWatch()` 那次最早的调用）
+	// 之前就完成赋值，故声明在文件顶部那段 "T90 自检状态" 里（见 dshRemoteMobileBoot 开头）。
+	/** 注入档位是不是平板（严格 OFF）。注入早于本脚本，故最早那一步就能判。 */
+	function wsWatchInjectedTablet() {
+		try {
+			var cfg = window.__DSHR_MOBILE__;
+			var dev = cfg && typeof cfg.device === 'string' ? cfg.device.trim().toLowerCase() : '';
+			return dev === 'tablet';
+		} catch (ignoredWsWatchDevice) { return false; }
+	}
+
+	/** T90：连接态是否"断"。**只读、无副作用**，不依赖任何 UI 文案。 */
+	function wsWatchDown() {
+		var s = wsWatchState;
+		if (!s || !s.installed) return false;
+		if (s.openNow > 0) return false;
+		if (s.closeSeen) return true;
+		if (s.connectSince > 0 && Date.now() - s.connectSince >= WS_CONNECT_GRACE_MS) return true;
+		return false;
+	}
+
+	/**
+	 * T90：**两端唯一**的连接态判据。
+	 * 层 1/层 2 的 DOM 文案（T88）**或** WS 观测（T90）任一为真 ⇒ 处于断开态。
+	 * 顺序与语义：DOM 先（它在 wide 布局下更精确、也兼容官方将来换实现），
+	 * WS 兜底（rail 下 DOM 恒 null 时的唯一信号）。
+	 */
+	function isConnectionDown() {
+		var el = null;
+		try { el = findReconnectStatusElement(); } catch (ignoredConnDownText) { el = null; }
+		if (el) return true;
+		return wsWatchDown();
+	}
+
+	/** 观测到一次 socket 生命周期事件：更新计数 → 重算 → 报给原生与自愈。 */
+	function wsWatchEvent(kind, opened) {
+		var s = wsWatchState;
+		if (!s) return;
+		if (opened) {
+			s.openNow += 1;
+			s.closeSeen = false;
+			s.connectSince = 0;
+		} else {
+			s.openNow = s.openNow > 0 ? s.openNow - 1 : 0;
+			s.closeSeen = true;
+			s.connectSince = 0;
+		}
+		s.eventCount += 1;
+		s.lastEvent = kind;
+		s.lastEventAt = Date.now();
+		var down = wsWatchDown();
+		var flipped = down !== s.lastDown;
+		s.lastDown = down;
+		// 只有**翻转**才通知：稳态下（例如重连期间反复 close/open）不产生额外动作。
+		if (!flipped) return;
+		try {
+			if (typeof s.notify === 'function') s.notify(down);
+		} catch (ignoredWsWatchNotify) { /* 通知失败绝不影响 socket 自身 */ }
+	}
+
+	/** 包一条 socket：只挂监听。 */
+	function wsWatchSocket(socket) {
+		var s = wsWatchState;
+		if (!s || !socket) return;
+		s.sockets += 1;
+		try { s.lastUrl = String(socket.url || '').slice(0, 200); } catch (ignoredWsWatchUrl) {}
+		if (s.openNow === 0 && s.connectSince === 0) s.connectSince = Date.now();
+		try {
+			socket.addEventListener('open', function () { wsWatchEvent('open', true); });
+			socket.addEventListener('close', function () { wsWatchEvent('close', false); });
+			// error 不单独判"断"：Chromium 里失败路径必然紧跟 close，重复计数会让
+			// openNow/closeSeen 失衡（T90 实测：只认 open/close，真机 45s 断线窗口内
+			// 事件序列恒为 close→(重连)→open）。
+			socket.addEventListener('error', function () { s.errors += 1; });
+		} catch (ignoredWsWatchListen) {
+			try { socket.onclose = function () { wsWatchEvent('close', false); }; } catch (ignoredWsWatchOnClose) {}
+		}
+	}
+
+	/**
+	 * T90：安装观测（幂等）。**极其保守**：任何一步不如预期都原样退出、不安装。
+	 * @returns true 表示 `window.WebSocket` 现在确实是本脚本的透传包装器
+	 */
+	function installWsStateWatch() {
+		if (wsWatchState && wsWatchState.installed) return true;
+		// 平板档（hook 严格 OFF）：连构造器都不换 —— 零痕迹是硬契约，不只是"不写 DOM"。
+		if (wsWatchInjectedTablet()) return false;
+		var nativeCtor = null;
+		try { nativeCtor = window.WebSocket; } catch (ignoredWsWatchCtor) { nativeCtor = null; }
+		if (typeof nativeCtor !== 'function') return false;
+		// 已经被本脚本包装过（pending 重启后的第二次进来 / 同一文档里的重复注入）：
+		// **认领同一个状态对象**而不是叠第二层包装。这一步不能省：重启是一次新的
+		// 函数调用、closure 变量全新，不认领的话后面所有判据都会读到自己那个 null。
+		try {
+			var adopted = WS_WATCH_MARK ? nativeCtor[WS_WATCH_MARK] : nativeCtor.__dshrWsWatchState;
+			if (adopted) { wsWatchState = adopted; return true; }
+		} catch (ignoredWsWatchMark) {}
+
+		var state = {
+			installed: false,
+			reason: '',
+			native: nativeCtor,
+			wrapped: null,
+			openNow: 0,
+			closeSeen: false,
+			connectSince: 0,
+			sockets: 0,
+			errors: 0,
+			eventCount: 0,
+			lastEvent: '',
+			lastEventAt: 0,
+			lastUrl: '',
+			lastDown: false,
+			notify: null,
+		};
+
+		var Wrapped = function (url, protocols) {
+			// 不带 new 调用：与浏览器**逐字相同**的 TypeError（语义透传的一部分）。
+			if (typeof new.target !== 'function') {
+				throw new TypeError("Failed to construct 'WebSocket': Please use the 'new' operator, "
+					+ "this DOM object constructor cannot be called as a function.");
+			}
+			var args = Array.prototype.slice.call(arguments);
+			var socket = Reflect.construct(nativeCtor, args, new.target);
+			try { wsWatchSocket(socket); } catch (ignoredWsWatchWrap) { /* 观测失败绝不牵连 socket */ }
+			return socket;
+		};
+		// 原型：**同一个对象**（不是复制）⇒ `sock instanceof WebSocket`、
+		// `WebSocket.prototype.send.call(sock)` 等语义与原生逐字一致。
+		Wrapped.prototype = nativeCtor.prototype;
+		// 静态量/自有属性整份透传（CONNECTING/OPEN/CLOSING/CLOSED、name、length…）。
+		var names = [];
+		try { names = Object.getOwnPropertyNames(nativeCtor); } catch (ignoredWsWatchNames) { names = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']; }
+		for (var i = 0; i < names.length; i++) {
+			var key = names[i];
+			if (key === 'prototype') continue;
+			try {
+				Object.defineProperty(Wrapped, key, Object.getOwnPropertyDescriptor(nativeCtor, key));
+			} catch (ignoredWsWatchProp) { /* 个别属性不可复制不影响构造透传 */ }
+		}
+		// 认领标记（符号优先，见 WS_WATCH_MARK 的说明）：重启后第二次进来靠它
+		// 取回同一个状态对象，而不是叠第二层包装。
+		try {
+			if (WS_WATCH_MARK) Object.defineProperty(Wrapped, WS_WATCH_MARK, { value: state });
+			else Object.defineProperty(Wrapped, '__dshrWsWatchState', { value: state });
+		} catch (ignoredWsWatchStateMark) {}
+
+		state.wrapped = Wrapped;
+		wsWatchState = state;
+		try {
+			window.WebSocket = Wrapped;
+		} catch (ignoredWsWatchAssign) { /* 下面统一判定 */ }
+		if (window.WebSocket !== Wrapped) {
+			// 赋不上（属性被冻结/被别的脚本锁住）⇒ **不假装成功**：如实记账，判据恒 false。
+			state.installed = false;
+			state.reason = 'assign-failed';
+			wsWatchState = null;
+			return false;
+		}
+		state.installed = true;
+		state.reason = 'installed';
+		// 只读自检入口（测试/排查/真机证据用）。它**只读**：没有任何写页面、写 DOM、
+		// 发请求的方法；业务判据不经过它（判据是 isConnectionDown/wsWatchDown）。
+		state.down = wsWatchDown;
+		state.stats = function () {
+			return {
+				installed: state.installed, reason: state.reason,
+				sockets: state.sockets, errors: state.errors, openNow: state.openNow,
+				closeSeen: state.closeSeen, connectSince: state.connectSince,
+				events: state.eventCount, lastEvent: state.lastEvent, lastEventAt: state.lastEventAt,
+				url: state.lastUrl, down: state.down(),
+			};
+		};
+		try { window[WS_WATCH_KEY] = state; } catch (ignoredWsWatchGlobal) { /* 自检入口写不上不影响观测 */ }
+		return true;
+	}
+
+	/**
+	 * T90：还原（平板档 / hook 关闭态）。把 `window.WebSocket` 换回原生构造器，
+	 * 并删掉自检全局 —— 这两件是"严格 OFF 零痕迹"在 window 层面的全部内容。
+	 */
+	function uninstallWsStateWatch() {
+		var s = wsWatchState;
+		if (!s) return false;
+		try { if (window.WebSocket === s.wrapped) window.WebSocket = s.native; } catch (ignoredWsRestore) {}
+		try { delete window[WS_WATCH_KEY]; } catch (ignoredWsDelete) { try { window[WS_WATCH_KEY] = undefined; } catch (ignoredWsDelete2) {} }
+		s.installed = false;
+		s.reason = 'uninstalled';
+		s.notify = null;
+		return true;
+	}
+
+	/**
+	 * T90：按 hook 启用态同步观测（`applyWidthScope` 唯一的调用点）。
+	 * 关闭态（含平板严格 OFF）⇒ 还原；启用态 ⇒ 安装（幂等）。
+	 */
+	function syncWsStateWatch(enabled) {
+		if (enabled) {
+			try { installWsStateWatch(); } catch (ignoredWsSyncInstall) { /* 失败即不安装，判据恒 false */ }
+			return;
+		}
+		uninstallWsStateWatch();
+	}
+
+	/**
+	 * T90：登记"连接态翻转"的唯一回调（接进既有上报/自愈入口，见文件末尾的注册点）。
+	 * 只登记一次就够了：状态对象的生存期跨越 pending 重启（第二次进来是**认领**同一个对象）。
+	 */
+	function wsWatchSetNotify(fn) {
+		if (!wsWatchState) return false;
+		wsWatchState.notify = fn;
+		return true;
+	}
+
 	// ── T31-3 / T38-2：切后台 / 锁屏回来时，若连接**确实**断了就立刻恢复 ──
 	//
 	// 问题：MainActivity.onResume 只恢复定时器、不重连；DSH 客户端的重连退避是
@@ -4514,19 +5652,141 @@
 	//
 	// T38-2 收口：把 T31 的「裸 reconnect 扫全页 innerText」换成结构化判据。
 	// 判据本体在 findReconnectStatusElement()（见 IIFE 顶部，此处不重复）：
-	// 元素级 + 整串锚定 + 排除可交互控件。这里再加四道防重连风暴的闸：
+	// **层 1**（T88）= 官方 `<button data-phase="connecting">`（定向例外，不受"排除可交互控件"限制），
+	// **层 2**（T38-2）= 非交互元素的整串文案锚定。这里再加四道防重连风暴的闸：
 	//   1. **二次确认**：单次观测只上闩不动作，延后 RESUME_CONFIRM_DELAY_MS 再确认一次，
 	//      两次都为真才推 ⇒ 闪一下的状态文案、一次性巧合都活不过这一关；
-	//   2. **武装位**：推过一次后 resumeNudgeArmed=false，必须先观测到恢复才重新武装，
-	//      所以"页面长期卡在重连态"不会变成连续推；
+	//   2. **武装位**：T82 起语义修正为「距上次推送已过最小间隔、且仍处于断开态」才重武装
+	//      （改前是"必须先观测到恢复"，复位点却只在健康分支 ⇒ 一次断开只推 1 次，
+	//      间隔/上限两道闸全是死代码，见 probeResumeRecovery 里的说明）；
 	//   3. **最小间隔**：RESUME_MIN_INTERVAL_MS 内不重复推；
 	//   4. **硬上限**：单页面生命周期最多 RESUME_MAX_NUDGES 次。
 	//
-	// 会话/草稿安全：唯一动作是 window.dispatchEvent(new Event('online'))。
-	// 不 reload、不碰 document.cookie、不导航 ⇒ 会话与未发送的草稿都不受影响。
+	// T82 触发时机扩展：除既有的回前台（visibilitychange/pageshow）外，新增
+	// **断开持续态 1s 巡检**（ensureResumeDownTick）——这是修「断着不自愈」的关键。
+	//
+	// ⚠️ 2026-10-05 实测更正（原始真值 scratch/t87/report.md §1、scratch/t90/report.md
+	//    §12.3）：早先这里写的「上游退避梯子跑完（attempt≥6）会**永久停泊**」**已被证否**。
+	//    本机可达的两个 DSH 运行时（npm `@deepseek-ai/dsh@0.2.0-rc.2` 真正下发给浏览器的
+	//    bundle、桌面 `app.asar` 的全量字节扫描）里 `isFinalBackoffTier` 出现 **0 次**：
+	//    `attempt` 无上限、`backoffCap(attempt)=min(backoffMaxMs, base*factor^(attempt-1))`，
+	//    单跳等待上限 **10s**（半开区间 [cap/2, cap)，即 5–10s 随机），**不存在"梯子跑完"这一档**，
+	//    因此也没有"跑完就永久停泊"可以被解除。任务书里的"等 30 秒"是**多次退避叠加 + 服务端
+	//    一直没恢复**累积出来的观感，不是某一档的固定等待。
+	// 没有停泊机制，这条巡检为什么还留：真实断线里页面可能正睡在某一跳退避上、而服务端早就
+	// 回来了，巡检的价值就是把这段空窗压到 <1s（实测 5496ms → 681ms，scratch/t90/report.md §4.4）。
+	// 定时器只在观测到断开时装上、恢复/到顶即卸 ⇒ 健康时零开销。
+	//
+	// 会话/草稿安全：动作只有 requestUpstreamReconnect()（上游 reconnect()，或
+	// offline→online 瞬态对）。不 reload、不碰 document.cookie、不导航 ⇒
+	// 会话与未发送的草稿都不受影响。**禁止 Page.reload**。
 	// （常量与计数器声明在 IIFE 顶部，见 lastUiDiagKey 附近。）
 
+	/**
+	 * T82：找到上游 connection 服务句柄（如果页面侧够得到的话）。
+	 *
+	 * 上游 `dsh-client-connection` 的 `installConnection()` 产出一个 handle，
+	 * 上面的 `reconnect()` 走 `owner.controller.reconnect()`（lib/client.js:1424），
+	 * 效果是把 `attempt` 归零并要求**立即**重连 —— 这是最理想的一级。
+	 *
+	 * 但 handle 只经 `ctx.provide("connection", handle)` 暴露给 **Cordis 插件树**，
+	 * 而本 hook 是壳 App 注入的普通脚本。2026-10-05 在真实 DSH 0.2.0-rc.2 页面上实测
+	 * （scratch/t82/report.md §C、scratch/t82/live-reconnect-probe.json）：
+	 *   · window 上只有 `__ModuleLoader__`（mode:"live"，自有键仅 mode/pendingQueue/load/create，
+	 *     **没有** loader/ctx/env）与数据类 `__DSH_*` 全局；
+	 *   · 全部 DSH 相关全局里没有任何对象带 `reconnect`；
+	 *   · React fiber 树遍历 533 个 fiber，没有任何 Cordis Context。
+	 *   ⇒ 纯注入脚本拿不到它。这一级因此**今天恒为 null**，保留它是为了宿主将来
+	 *     把服务暴露出来时能自动升到最优实现（探到就用，行为只变好不变坏）。
+	 */
+	function findUpstreamConnectionHandle() {
+		var candidate = null;
+		try { candidate = typeof window !== 'undefined' ? window.__DSH_CONNECTION__ : null; } catch (ignoredConn) { candidate = null; }
+		if (!candidate || typeof candidate.reconnect !== 'function') return null;
+		// 结构判据（与 lib/client.js:1403-1476 的 handle 形状逐条对应）：
+		// 只认真正那个 handle，避免误调同名方法。
+		if (!candidate.state || typeof candidate.state.getSnapshot !== 'function') return null;
+		if (!candidate.generation || typeof candidate.generation.getSnapshot !== 'function') return null;
+		if (!candidate.rpc) return null;
+		return candidate;
+	}
+
+	/**
+	 * T82：请求上游重连。分层入口，返回实际用了哪一层（写进诊断）。
+	 *
+	 * 第 1 层：上游 `connection.reconnect()` —— 0ms 立即生效（对照组实测）。
+	 * 第 2 层：`offline` → `online` 瞬态对 —— **当前真正生效的那一层**。
+	 *
+	 * 为什么第 2 层不是"派发 online"那种空操作（这是本轮修的核心）：
+	 * 上游 `watchBrowserNetwork()`（lib/client.js:1342-1359）只把浏览器的
+	 * online/offline 转成 `controller.setNetworkAvailable(bool)`，而它是：
+	 *     setNetworkAvailable(available) {
+	 *       if (this.networkAvailable === available) return;   // ← 幂等短路
+	 *       this.networkAvailable = available;
+	 *       this.attempt = 0;                                  // ← 退避进度清零，回最陡的一跳
+	 *       this.immediateRetry = false;
+	 *       ...
+	 *       this.current?.abort(NETWORK_STATE_CHANGED);
+	 *       this.retryDelay?.abort(NETWORK_STATE_CHANGED);     // ← 把正在睡的退避当场掐断
+	 *     }
+	 * 页面健康时 `networkAvailable` 本来就是 true，所以单独派发 `online` 命中的是
+	 * **第一行的短路**（父任务实测重试数 6→6，确认是空操作）。
+	 * 而 `offline` → `online` 是一次真实的 `true→false→true` 翻转，两行短路都不成立：
+	 *   · `attempt = 0` ⇒ 退避进度清零，回到最陡的一跳 ⇒ 下一次尝试立刻就走；
+	 *     **不是**"解除永久停泊"——本机运行时没有 `isFinalBackoffTier`、`attempt` 无上限、
+	 *     单跳上限 10s（5–10s 随机），该机制已被证否，见上方 T82 段的实测更正；
+	 *   · `current/retryDelay.abort()` ⇒ 正在睡的那个退避**立刻**被掐断，不再干等。
+	 * 两者合起来对用户可见的结论与 `reconnect()` 同级：不再干等当前这一跳退避
+	 * （"等 30 秒"是多次退避 + 服务端一直没恢复的累积，不是某一档的固定等待）。
+	 * 差别只在"起步晚一个 backoffDelay(1)"（宿主默认 backoffBaseMs=500 ⇒ 250–500ms）。
+	 *
+	 * 会话/草稿安全：不 reload、不碰 cookie、不导航 ⇒ 会话与未发送的草稿不受影响。
+	 * 禁止 Page.reload。
+	 */
+	function requestUpstreamReconnect() {
+		var handle = findUpstreamConnectionHandle();
+		if (handle) {
+			try {
+				handle.reconnect();
+				return 'connection-reconnect';
+			} catch (ignoredReconnect) { /* 落到下一层 */ }
+		}
+		// 瞬态对必须**同任务**内完成：中间不插入 await/setTimeout，
+		// 免得用户看到（或被其它逻辑观测到）一个假的"离线"中间态。
+		window.dispatchEvent(new Event('offline'));
+		window.dispatchEvent(new Event('online'));
+		return 'network-transition';
+	}
+
+	function stopResumeDownTick() {
+		if (!resumeDownTick) return;
+		window.clearInterval(resumeDownTick);
+		resumeDownTick = 0;
+	}
+
+	/**
+	 * T82：断开持续态巡检。装上之后每 RESUME_DOWN_TICK_MS 探一次；
+	 * 一旦恢复（或到达上限）立刻卸掉 —— 健康时**零开销**（没有定时器）。
+	 */
+	function ensureResumeDownTick() {
+		if (resumeDownTick) return;
+		resumeDownTick = window.setInterval(function () {
+			if (document.visibilityState !== 'visible') return;
+			probeResumeRecovery();
+		}, RESUME_DOWN_TICK_MS);
+	}
+
 	function resumeRecoveryState() {
+		// T88：判据一次算完，顺便报出是哪一层认出来的（1 = 官方按钮 / 2 = 老文案路径 / 0 = 健康）。
+		// 真机自证要用它："页面里到底跑的是新判据还是旧 APK 里的旧 hook" 靠这个字段分辨。
+		// T90：`reconnecting` 升级为**两端合并**判据（DOM 文案 OR WS 观测），
+		// `reconnectSrc` 语义不变（DOM 层），新增 `wsSrc` 报出合并后的来源：
+		//   1 = 官方按钮 / 2 = 文案 / **3 = 只有 WS 观测命中（rail 下的唯一信号）** / 0 = 健康。
+		// `ws*` 四个字段是 WS 观测的只读快照（真机证据用，业务判据不读它们）。
+		var detail = findReconnectStatusDetail();
+		var wsDown = false;
+		var ws = wsWatchState;
+		try { wsDown = wsWatchDown(); } catch (ignoredWsStateDown) { wsDown = false; }
 		return {
 			installed: true,
 			nudges: resumeNudgeCount,
@@ -4534,10 +5794,20 @@
 			lastProbeAt: resumeLastProbeAt,
 			lastProbe: resumeLastProbeResult,
 			lastDisconnectAt: lastDisconnectAt,
-			reconnecting: findReconnectStatusElement() !== null,
+			reconnecting: detail.el !== null || wsDown,
+			reconnectSrc: detail.src,
+			wsSrc: detail.src > 0 ? detail.src : (wsDown ? 3 : 0),
+			wsSeen: !!(ws && ws.installed),
+			wsDown: wsDown,
+			wsEvents: ws ? ws.eventCount : 0,
+			wsLastEvent: ws ? ws.lastEvent : '',
 			downSince: resumeDownSince,
 			armed: resumeNudgeArmed,
 			maxNudges: RESUME_MAX_NUDGES,
+			minIntervalMs: RESUME_MIN_INTERVAL_MS,
+			confirmDelayMs: RESUME_CONFIRM_DELAY_MS,
+			ticking: resumeDownTick !== 0,
+			nudgeEntry: resumeLastNudgeResult,
 			vis: document.visibilityState,
 		};
 	}
@@ -4549,16 +5819,24 @@
 	 */
 	function probeResumeRecovery() {
 		resumeLastProbeAt = Date.now();
-		var reconnecting = findReconnectStatusElement() !== null;
+		// T90：判据升级为 isConnectionDown() = 层 1/层 2 的 DOM 文案 **或** WS 观测。
+		// 为什么必须升级：rail（左栏收起，用户平时的状态）下官方那条指示器不渲染
+		// （T88 §E.4 实测 45s 断线窗口 0 帧）⇒ 只认文案时这里恒 false、直接走健康分支，
+		// nudge 永不推。变量名与下面那道健康闸的写法**必须保留**（`scripts/test-resume-recovery.mjs`
+		// 的源码契约逐字匹配 `if (!reconnecting)`）。
+		var reconnecting = isConnectionDown();
 		// 健康路径必须第一件事就返回 false：这是"不误触发"的结构性保证。
-		// 顺带把断开闩锁与武装复位（先观测到恢复，才允许下一次推）。
+		// 顺带把断开闩锁复位、武装复位、并卸掉巡检定时器（健康时零开销）。
 		if (!reconnecting) {
 			resumeDownSince = 0;
 			resumeDownConfirmScheduled = false;
 			resumeNudgeArmed = true;
 			resumeLastProbeResult = 'healthy';
+			stopResumeDownTick();
 			return false;
 		}
+		// 观察器挂上：断开期间才有定时器，恢复即卸。
+		ensureResumeDownTick();
 		// 第一次观测到"确实断开"：只上闩 + 记录断线起点（供远程自查），并安排二次确认
 		if (resumeDownSince === 0) {
 			resumeDownSince = Date.now();
@@ -4575,19 +5853,40 @@
 		}
 		// 走到这里 = 二次确认通过，确实处于断开态。逐道闸检查，任何一道不过都不推。
 		if (lastDisconnectAt === 0) lastDisconnectAt = Date.now();
-		if (!resumeNudgeArmed) { resumeLastProbeResult = 'down-confirmed-disarmed'; return false; }
-		if (resumeNudgeCount >= RESUME_MAX_NUDGES) { resumeLastProbeResult = 'cap-reached'; return false; }
+		if (resumeNudgeCount >= RESUME_MAX_NUDGES) {
+			resumeLastProbeResult = 'cap-reached';
+			stopResumeDownTick();
+			return false;
+		}
+		// T82：武装位语义修正。
+		//
+		// 改前是"推过一次就 disarmed，必须先观测到恢复才重新武装"，而复位点在
+		// `if (!reconnecting)` 分支里 —— 断开期间**永不复位** ⇒ 一次断开只推 1 次，
+		// RESUME_MIN_INTERVAL_MS / RESUME_MAX_NUDGES 实际上都是**死代码**
+		// （这正是"断着不自愈"在 hook 这一侧的成因；上游并不存在 isFinalBackoffTier /
+		//   永久停泊这一层，见上方 T82 段的实测更正）。
+		// 现在改成：**距上次推送已过最小间隔、且仍处于断开态**就重新武装。
+		// 防风暴边界不变（上限 6 次 + 间隔 8s 的硬闸仍在下面逐条检查）；
+		// 健康时仍然由上面的 `!reconnecting` 分支复位。
+		if (!resumeNudgeArmed) {
+			if (resumeLastNudgeAt > 0 && Date.now() - resumeLastNudgeAt >= RESUME_MIN_INTERVAL_MS) {
+				resumeNudgeArmed = true;   // 断开持续 + 间隔已到 ⇒ 重武装，下一拍可再推
+			} else {
+				resumeLastProbeResult = 'down-confirmed-disarmed';
+				return false;
+			}
+		}
 		if (resumeLastNudgeAt > 0 && Date.now() - resumeLastNudgeAt < RESUME_MIN_INTERVAL_MS) {
 			resumeLastProbeResult = 'rate-limited';
 			return false;
 		}
 		try {
-			// DSH 客户端的既有网络态入口：清零退避并立即重连（连接已断，abort 无损失）
-			window.dispatchEvent(new Event('online'));
+			resumeLastNudgeResult = requestUpstreamReconnect();
 			resumeNudgeCount += 1;
 			resumeLastNudgeAt = Date.now();
-			resumeDownSince = Date.now(); // 重新起算：若仍断开，下一次要走完二次确认
-			resumeNudgeArmed = false;     // 必须先观测到恢复，才允许再推
+			// 重新起算：若仍断开，下一次要走完二次确认（保留二次确认这道闸）。
+			resumeDownSince = Date.now();
+			resumeNudgeArmed = false;
 			resumeLastProbeResult = 'nudged';
 			reportUiDiag();
 			return true;
@@ -4610,6 +5909,21 @@
 	}
 
 	// ── 壳 App 返回键桥接（与既有 MainActivity 契约保持一致） ──
+	// T90：连接态**变化**的两件事（只在 WS 观测真的翻转时进这里，稳态零动作）：
+	//   ① `reportUiDiag()` —— 把新状态经**既有 JS 桥**（`DshRemoteApp.setUiDiag`）推给原生。
+	//      wsState 本来就在那份载荷里；原生侧拿它当横幅的第二个数据源（rail 下 DOM 探针
+	//      什么都探不到，这是原生唯一能知道"正在重连"的通道）。去抖键含 wsState，
+	//      所以状态一变就必推一次、不变不推。
+	//   ② 安排一次 `probeResumeRecovery()` —— 与"回前台那一次"**同一个**入口，
+	//      四道闸（二次确认 / 武装位 / 8s 最小间隔 / 上限 6）一个字都没放宽。
+	//      断线延后 RESUME_PROBE_DELAY_MS（避开重连抖动），恢复不延后（尽快卸巡检）。
+	wsWatchSetNotify(function (down) {
+		try { reportUiDiag(); } catch (ignoredWsNotifyDiag) { /* 上报失败不影响自愈 */ }
+		try {
+			window.setTimeout(probeResumeRecovery, down ? RESUME_PROBE_DELAY_MS : 0);
+		} catch (ignoredWsNotifyProbe) { /* 定时器失败不影响判据 */ }
+	});
+
 	window.__dshRemoteAndroidMobile = {
 		closeSidebarIfExpanded: function () {
 			var sheet = document.querySelector('[data-dshr-sheet-panel]');
@@ -4668,5 +5982,26 @@
 		// T31-3：回前台恢复的自检入口（原生与测试都读它，不做任何动作）
 		resumeRecoveryState: resumeRecoveryState,
 		probeResumeRecovery: probeResumeRecovery,
+		// T90：**只读**连接态快照（字符串，取值与 collectUiDiag().wsState 逐字相同）。
+		// 原生在 onResume 补一次（后台期间 pauseTimers 可能冻住页面侧的事件派发，
+		// 推来的状态可能陈旧）；正常路径全靠上面的**推送**，这条不是 500ms 轮询。
+		wsStateNow: function () {
+			if (isConnectionDown()) return 'reconnecting';
+			return lastDisconnectAt > 0 ? 'ok-recovered' : 'ok';
+		},
+		// T82：重连入口分层自检（测试用；返回值就是实际用的那一层）
+		requestUpstreamReconnect: requestUpstreamReconnect,
+		// T82：右栏跟手层的只读快照（测试采样用，不做任何动作）
+		rightbarVisualState: function () {
+			return {
+				tracking: rightbarTrack !== null,
+				mode: rightbarTrack ? rightbarTrack.mode : null,
+				active: rightbarVisual !== null,
+				opening: rightbarVisual ? rightbarVisual.opening : null,
+				x: rightbarVisual ? rightbarVisual.x : null,
+				max: rightbarVisual ? rightbarVisual.max : null,
+				col: rightbarVisual && rightbarVisual.col ? rightbarVisual.col.getAttribute('data-dshr-rightbar-col') !== null : false,
+			};
+		},
 	};
 })();

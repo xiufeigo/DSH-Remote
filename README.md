@@ -306,6 +306,40 @@ xtcp 打洞成功时数据手机 ⇄ PC 直连不过 VPS；失败自动回退 st
   > **如实标注：用户在 AVD 上报的「消息发不出去」本轮未能复现**（键盘弹着 / 收起各 1/1 都发得出去）。
   > 因此本条只声称「**移除了发送路径上的抢焦点这个病因**（机理与症状吻合、且可测）」，
   > **不声称症状已消失**。证据：`scratch/t69/report.md` §1.4、§2.2–§2.3、§3.1–§3.2、§4.3。
+- **左抽屉既有修复（T82/T84，rc.2.7 复核）**：鲸鱼改读与主列**同一个** `--dshr-drawer-x`、挂**同一对**
+  `transition` ⇒ **全程可见**（真机 138 帧隐藏帧 **0**）；`|鲸鱼.x − (10+主卡.x)|` **0px**；
+  **header 位移 0px**（改前 `54 → 62` 的 8px 下移已消除）。
+  ⚠️ 一处**未达成**：把 `setSidebarOpen(true)` 挪到落位阶段的做法实测会让拖动期侧栏变成
+  「宽 360px、可见文本 0」的图标 rail，**已回退**，那一帧（React 提交）的代价仍在。
+  证据：`scratch/t82/report.md` §B.2–§B.4、`scratch/t84/report.md` §2。
+- **左抽屉观感：圆角卡片平移（rc.2.7，不做缩放）**：新增 token `--dshr-card-r: 20px`（圆角**唯一源**，
+  依据是官方同族表面实测——整宽会话卡 `364×67` 用 **20px**、输入卡 `373×110` 用 **28px**）与
+  `--dshr-seam`（两张同色圆角卡之间的**缝底**，深色档 `.42`）。跟手期 `border-radius` 与阴影**同源跟手**
+  （`calc(var(--dshr-card-p) * var(--dshr-card-r))`），而 `--dshr-card-p = min(drawerX,20)/20` 与
+  `--dshr-drawer-x` **同帧写入**；抽屉右缘用同一 token 加圆角，并用 `clip-path: inset(… round 0 R R 0)`
+  把**可绘制右缘钉在主卡左缘**。像素判据真值：主卡圆弧误差 **≤0.36 CSS px**、抽屉右缘 **≤1.05 CSS px**，
+  真机 `x → 半径` 逐帧吻合 **0 / 12 / 18 / 20**。**「不做缩放」是产品决定**——鲸鱼的 transform 与尺寸
+  **一字未改**。证据：`scratch/t91/report.md` §1–§3。
+- **右栏两条动画（rc.2.7，术语别混）**：**打开 = `width` 过渡（不是跟手）**——官方承载容器两态恒宽 0，
+  故 hook 自建**裁剪窗**（`width` = 窗宽、`overflow: clip`、`translateX(-100vw)`、面板重锚到容器左缘），
+  实测 **16 个中间态 / 283.3ms / 帧 p95 16.8ms / 长任务 0**（改前 **1 帧**到位），官方状态机逐字未动，
+  **官方折叠按钮那条路径保持瞬时**（本轮只做手势路径）；**关闭 = `transform` 跟手**——手指 120px →
+  写入 120px → 面板位移偏差 **0px**，松手补间 **21 个不同位移位置 / 333ms**；两条不变量
+  （面板中部右滑 no-op、打开态左滑 no-op）真值成立。证据：`scratch/t85/report.md` §1–§5、
+  `scratch/t82/report.md` §A.3、`scratch/t91/report.md` §4–§5。
+- **重连判据与自愈（rc.2.7，本批次最重要）**：页面侧**没有任何现成只读连接态**
+  （17 个 DSH 全局三拍差分只有自装观测器在变；`__DSH_CONNECTION_RECOVERY__` 只是参数，**单跳上限 10s**）
+  ⇒ hook 包装 `window.WebSocket` 观测（真机抓到 `wss://…/api/remote.mux`，**9 条透传**断言全绿；
+  平板档完整还原、零痕迹）。判据两层且**与原生逐字同源**（源码契约同时读 `mobile-web.js` 与
+  `ReconnectBanner.java` 比较字面量）；**官方那条只在左栏展开时渲染**（官方源码 `state: wide && …`，
+  `wide = !collapsed`）——这正是「**只有拉开左侧栏才看得到重连提示**」的根因。原生横幅以 hook 连接态
+  **OR** DOM 探针为数据源、按「**将要占据的带区**」抑制（rail 态实测 `t_kill+1495ms` 出现、不可点不可聚焦、
+  **不吞触摸**）；自愈 nudge **6 次**（间隔 8.0–9.0s），「**服务端已回来 → 页面发起第一次重连**」
+  **5496ms → 681ms（8.1×）**，健康态零开销。
+  ⚠️ **口径纠正**：本机运行时（npm `0.2.0-rc.2` 下发的 bundle + 桌面 `app.asar` **全量字节扫描**）
+  **不存在 `isFinalBackoffTier`**、`attempt` 无上限 ⇒ **没有「退避跑完 6 次就永久停泊、不再自动重连」
+  这回事**；「30 秒」是**多次退避 + 服务端尚未恢复**的累积。证据：`scratch/t86/report.md` §4–§5、
+  `scratch/t88/report.md` §A–§C、`scratch/t90/report.md` §1–§6·§12、`scratch/t87/report.md` §1·§6.4。
 - **平板档系统栏避让（`sw ≥ 600` 会话页）**：让位算式改为**逐方向并集**
   `systemBars() | displayCutout() | tappableElement()`（`getInsets` 对掩码内各来源逐边取 max，
   **不求和**；掩码**不含 `ime()`**，键盘仍只走平移那条路）；API 24–29 走四向
@@ -685,7 +719,7 @@ powershell -File android\build.ps1 -Debug        # 测试期可观测包 dsh-rem
 >   **会被构建抹掉**，而且在抹掉之前**先触发单一源断言**。要改就改源。
 >   证据：`scratch/t52/report.md` §10.1、`scratch/t53/report.md` §1.2。
 
-> **验收纪律两条（rc.2.6 新增，都能把「环境问题」误读成「代码回归」）**：
+> **验收纪律（rc.2.6 两条 + rc.2.7 两条，都能把「环境问题」误读成「代码回归」）**：
 > - **网关有 240 次/分、按 IP 共享的限流。** 本机同一 IP 上并行跑多个验收任务时会**互相打点**、
 >   被限流的那几项返回 429 ⇒ **该轮结果一律判无效**（不是失败），退避后单跑重取。
 >   证据：`scratch/t63/report.md` §1.0(1)。
@@ -693,6 +727,16 @@ powershell -File android\build.ps1 -Debug        # 测试期可观测包 dsh-rem
 >   没被 fetch 唤醒过的域根本不枚举 ⇒ 同一进程内 `caches.keys()` 报 0 条而 `du -sk` 报 12,960,301 B
 >   **同时为真**。验收缓存一律配 **`du -sk` + 网卡字节**三者互证。
 >   证据：`scratch/t62/report.md` §2.3。
+> - **真机验证前必须先重建 APK，并解包比对内嵌 hook 的 SHA**（rc.2.7）。旧包里的 `res/raw/mobile.js`
+>   会**静默吃掉**新 CSS / 新逻辑——hook 的样式注入带「同名 style 已存在就跳过」的守卫，新 CSS 根本
+>   进不了页面，量到的是旧行为。判据：源 = `res/raw` = **APK 内嵌** 三处 SHA 相同、纯 LF。
+>   T84（开工时 APK 内嵌 hook 仍是提交 `5a8d3e5` 的版本）与 T85（陷阱 A）都踩过。
+>   证据：`scratch/t84/report.md` §1、`scratch/t85/report.md` §3.1、`scratch/t90/report.md` §9–§10.2。
+> - **页面不能自己 `Page.reload`**（rc.2.7）。DSH 的「当前会话」指针在 localStorage 的
+>   `dsh.sessions.current`（值是 `{}`），`Page.reload` 之后会落到 **workspace chooser**，而右栏面板只有
+>   「会话 + 工作区」齐了才挂载 ⇒ 面板整个不存在、一条都量不到，且 chooser 里的工作区列表卡在
+>   `Loading workspaces…`（经网关的查询不返回），**无法从 UI 恢复**。唯一稳定的复位手段是
+>   **冷启 App 并重走它自己的「连接」**。证据：`scratch/t85/report.md` §3.1（第三个坑）。
 
 push/PR 到 main 时 CI 自动跑类型检查 + 插件 bundle 同步检查（`src/client` 改动后
 忘记重建提交会被拦下）+ 快测五件套（smoke / smoke:edge / test:routes /
@@ -709,8 +753,9 @@ test:session / test:fixes，见 `.github/workflows/ci.yml`）；
 > `2` = **没拿到对照证据**（本轮一条断言都没真跑，属**瞬态**、不算失败）。
 > 「拿不到证据」与「断言失败」被刻意分开：瞬态不该被读成回归。
 >
-> 本机实测：矩阵 A–E（手机竖屏 / 手机横屏 / 平板 ×2 / 运行中切换）当前共 **140 条断言**
-> （rc.2.6 批次；平板档系统栏避让新增 34 条），**140/140 通过、0 跳过**；平板档两臂（注入 vs
+> 本机实测：矩阵 A–E（手机竖屏 / 手机横屏 / 平板 ×2 / 运行中切换）**共 158 条断言**
+> （rc.2.6 批次终局；140 条是该批次中期快照，平板档系统栏避让新增 34 条），**158/158 通过、失败 0、跳过 0**；
+> **rc.2.7 复跑同值（158/158、0 跳过，台账 `scratch/lead-rc27-regression.log:17`）**。平板档两臂（注入 vs
 > 完全不注入）关键元素**逐项像素差全 0**。更早的 55 / 91 / 106 条基线曾**连跑 3 次全绿**。
 > 模拟器端到端（B1–B9）、通知动作运行时验证与已知限制见
 > [android/README.md 验证小节](android/README.md#验证)。
@@ -718,10 +763,12 @@ test:session / test:fixes，见 `.github/workflows/ci.yml`）；
 ### 版本与发布
 
 版本号 = `<deepseek-harness 基线版本>.<发版号>`，发版号每次发布 +1，详见
-[docs/versioning.md](docs/versioning.md)。当前基线 `0.2.0-rc.2`、版本 **`0.2.0-rc.2.6`**
-（已发布：tag `v0.2.0-rc.2.6` 已推、Release 已创建。下表**全部为实测值**，非预期值）：
+[docs/versioning.md](docs/versioning.md)。当前基线 `0.2.0-rc.2`、版本 **`0.2.0-rc.2.7`**
+（**本次发版进行中**：tag `v0.2.0-rc.2.7` 随本批次一起推送，Release 由 `release.yml` 在 tag 推上去后自动创建。
+下表留档的是**上一版 `0.2.0-rc.2.6` 的实测值**；rc.2.7 的真实资产值——文件名 / 字节数 / 发布时间 /
+APK SHA-256 / 包内 `mobile.js` SHA / 签名指纹——在 Release 产出后**如实回填**，发布前不写预期值）：
 
-| Release 资产 / 核验项 | 实测值 |
+| Release 资产 / 核验项 | `0.2.0-rc.2.6` 实测值（上一版留档） |
 |---|---|
 | 资产文件名 | `dsh-remote-0.2.0-rc.2.6.apk` |
 | 字节数 | **5,706,966 B** |
@@ -732,12 +779,17 @@ test:session / test:fixes，见 `.github/workflows/ci.yml`）；
 | APK `versionName` / `versionCode` | `0.2.0-rc.2.6` / `2000206`（`aapt2 dump badging`） |
 | 本轮工作流结论 | `ci`(main) ✅ · `android-apk`(main) ✅ · `android-apk`(tag) ✅ · `release`(tag) ✅ |
 
-> Release 页：https://github.com/xiufeigo/DSH-Remote/releases/tag/v0.2.0-rc.2.6
+> Release 页（上一版）：https://github.com/xiufeigo/DSH-Remote/releases/tag/v0.2.0-rc.2.6
+> 本版 Release 页在 `v0.2.0-rc.2.7` 推送后自动生成：`/releases/tag/v0.2.0-rc.2.7`
 
 ```powershell
 pnpm ver:bump     # 发版号 +1 并同步 package.json；harness 升级用 --base <新版本>
-git tag v0.2.0-rc.2.6 && git push origin v0.2.0-rc.2.6   # 推 tag 即自动打包发布
+git tag v0.2.0-rc.2.7 && git push origin v0.2.0-rc.2.7   # 推 tag 即自动打包发布
 ```
+
+> ⚠️ **只有推 tag 会重新发布**：`release.yml` 的触发条件是 `on.push.tags: ["v*"]`，
+> 推 `main`（包括发布后的文档回填提交）**不会再触发任何构建或 Release**，只会跑
+> `ci.yml` / `android.yml` 的常规检查。
 
 ### 部署 VPS 前的本地全链路自测（无需 VPS）
 

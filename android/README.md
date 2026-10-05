@@ -88,7 +88,7 @@ powershell -File android\build.ps1 -Debug      # 等价 $env:DSH_DEBUG=1
 |---|---|---|
 | 产物名 | `dsh-remote.apk` | `dsh-remote-debug.apk` |
 | `aapt2 link` 参数 | 不传 `--debug-mode` | 传 `--debug-mode` |
-| versionName | `0.2.0-rc.2.6` | `0.2.0-rc.2.6+debug` |
+| versionName | `0.2.0-rc.2.7` | `0.2.0-rc.2.7+debug` |
 | manifest `android:debuggable` | **属性不存在** | `true` |
 | WebView DevTools | 关 | 按 `FLAG_DEBUGGABLE` 开 `setWebContentsDebuggingEnabled(true)` |
 
@@ -144,7 +144,7 @@ C 平板 852×883 / D 平板 1280×800（平板档对照实验）、E 运行中 
 
 | 项 | 实测结果 |
 |---|---|
-| 断言总数 | **158/158 通过，失败 0，跳过 0**（rc.2.6 批次终局，退出码 0；`断言合计 158：通过 158，失败 0，跳过 0`，台账 `scratch/lead-rc26-regression.log:19`）。其中 **34 条**是 rc.2.6 新增的平板档系统栏避让（6 条源码契约 + 四方向重叠 + 键盘 not-in-mask）；**140 条是本批次中期快照**（T72 收口时），55 条基线曾**连跑 4 次全绿**、91 条为 rc.2.3 批次、106 条为 rc.2.5 批次 |
+| 断言总数 | **158/158 通过，失败 0，跳过 0**（rc.2.6 批次终局，退出码 0；`断言合计 158：通过 158，失败 0，跳过 0`，台账 `scratch/lead-rc26-regression.log:19`。**rc.2.7 复跑同值：158/158、失败 0、跳过 0**，台账 `scratch/lead-rc27-regression.log:17`）。其中 **34 条**是 rc.2.6 新增的平板档系统栏避让（6 条源码契约 + 四方向重叠 + 键盘 not-in-mask）；**140 条是本批次中期快照**（T72 收口时），55 条基线曾**连跑 4 次全绿**、91 条为 rc.2.3 批次、106 条为 rc.2.5 批次 |
 | 零痕迹 | 平板档 C/D 与切换后的 OFF 态：`<html>` 无 `data-dshr-*`、无 hook 根类（含 `dshr-official-inset`）、无 hook 创建的可见节点、官方节点上无 `data-dshr-*` 标记——全部通过 |
 | 平板档对照 | C（852×883）与 D（1280×800）两视口**逐项像素差全 0**：frame / 三列 / header / composerCard / composerSeat / rightbar / bodyScrollHeight / documentScrollWidth / documentClientWidth |
 | 运行中切换 | `__dshrSetDevice('tablet'\|'phone')` 立即生效；**同值重复调用幂等**（第二次返回 `false`）；切回后根类、标记与几何可逆 |
@@ -225,7 +225,7 @@ frpc 真实就绪关键字，并显式断言 `establishing nat hole…` 与 5 �
 
 | 台 | 定位 | 怎么用 |
 |---|---|---|
-| `pnpm test:device`（`scripts/test-device-class.mjs`） | **真页面**设备档位回归，唯一跑真实 DSH 0.2.0-rc.2 页面 + **140** 条断言的那条 | 需本机 DSH 与网关 `127.0.0.1:18443` 都在跑 |
+| `pnpm test:device`（`scripts/test-device-class.mjs`） | **真页面**设备档位回归，唯一跑真实 DSH 0.2.0-rc.2 页面 + **158** 条断言的那条（rc.2.6 起的终局口径） | 需本机 DSH 与网关 `127.0.0.1:18443` 都在跑 |
 | `android\test-direct-nodes.ps1` | **JVM 纯函数**单测（`CertPin` / `TunnelReady`），无需模拟器、无需设备、无需 DSH | 改证书锁定 / 就绪轮询逻辑后**先跑这个**，秒级 |
 | `scratch/t47/harness.mjs` | **手势 / 键盘**专项验收台（44/44），右栏关闭手势与 `+` 布防的证据都出自这里 | 改 hook 手势后跑；它是取证台不是回归门 |
 | `scratch/t51/` · `scratch/t52/` | 键盘布防、假牙与修复的逐轮报告与日志 | 结论以报告为准，不以单次日志为准 |
@@ -246,14 +246,31 @@ frpc 真实就绪关键字，并显式断言 `establishing nat hole…` 与 5 �
 > resume-recovery 12/12 / T47 验收台 44/44）。上表是**各任务收口当时**留档的退出码（写「没有总台账」那句时
 > 总表尚未跑），两者**互补不冲突**，数字一律以总台账为准。证据：`scratch/t60/report.md` §7、
 > `scratch/t65/report.md` §8、`scratch/t72/report.md` §6、`scratch/lead-rc26-regression.log`。
+>
+> **rc.2.7 总台账（Lead 侧统一跑，收口时已产出）**：`scratch/lead-rc27-regression.log` —— **14 项全部 exit 0**
+> （typecheck / test:mobile / **test:device 158/158、失败 0、跳过 0** / test:fixes / test:perf / test:routes /
+> test:session / test:client / test:desktop 10/10 / smoke 22 / smoke:edge 19 / ws-keepalive /
+> **test-resume-recovery 12/12** / **T47 验收台 44/44**）。受测 hook 为
+> `DD2FDD02…A15420`（292936B、CR=0），源与 `res/raw` 副本逐字节相同。
 
-> **验收纪律两条（rc.2.6 新增）**：
+> **验收纪律（rc.2.6 两条 + rc.2.7 两条，都能把「环境问题」误读成「代码回归」）**：
 > - **网关有 240 次/分、按 IP 共享的限流。** 本机同一 IP 上**并行**跑多个验收任务时会互相打点，
 >   被限流的那几项返回 429 ⇒ **该轮结果一律判无效（不是失败）**，退避后**单跑**重取。
 >   证据：`scratch/t63/report.md` §1.0(1)。
 > - **`caches.keys()` 会低报**，别用它判「缓存是不是空了」（索引惰性加载）。验收缓存一律配
-> **`du -sk` + 网卡字节**三者互证，详见「安全说明 → 磁盘缓存「0 条」是预期行为」。
+>   **`du -sk` + 网卡字节**三者互证，详见「安全说明 → 磁盘缓存「0 条」是预期行为」。
 >   证据：`scratch/t62/report.md` §2.3。
+> - **真机验证前必须先重建 APK，并解包比对内嵌 hook 的 SHA**（rc.2.7）。旧包里的 `res/raw/mobile.js`
+>   会**静默吃掉**新 CSS / 新逻辑——hook 的样式注入带「同名 style 已存在就跳过」的守卫，新 CSS 根本
+>   进不了页面，量到的是旧行为。判据：源 = `res/raw` = **APK 内嵌** 三处 SHA 相同、纯 LF。
+>   T84（开工时 APK 内嵌 hook 仍是提交 `5a8d3e5` 的版本）与 T85（陷阱 A）都踩过；
+>   T90 两臂一律从隔离树重建后再解包比对。证据：`scratch/t84/report.md` §1、`scratch/t85/report.md` §3.1、
+>   `scratch/t90/report.md` §9–§10.2。
+> - **页面不能自己 `Page.reload`**（rc.2.7）。DSH 的「当前会话」指针在 localStorage 的
+>   `dsh.sessions.current`（值是 `{}`），`Page.reload` 之后会落到 **workspace chooser**，
+>   而右栏面板只有「会话 + 工作区」齐了才挂载 ⇒ 面板整个不存在、右栏一条都量不到；chooser 里
+>   工作区列表又卡在 `Loading workspaces…`（经网关的查询不返回），**无法从 UI 恢复**。
+>   唯一稳定的复位手段是**冷启 App 并重走它自己的「连接」**。证据：`scratch/t85/report.md` §3.1（第三个坑）。
 
 ### 模拟器端到端
 
@@ -367,6 +384,26 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
 - 官方设置在手机上是**全屏页**（从设置入口盖住整屏，置于会话浮层之上），导航仍横向排在上方；选中分区内容全宽展开。侧栏展开时，按住右侧主会话浮层左滑可**跟手**收回会话全屏。导航列表允许横向触摸滚动，并在 `aria-current` 改变后自动把选中分区完整滚入可视区。只统计**当前可见**的模态框，隐藏弹窗残留不会误触发“弹窗打开”状态。
 - 会话头部适配：官方 header（含会话面包屑标题）在收起态整体右移 72px，不再被固定在左上角的鲸鱼按钮遮挡；官方「Session log」下载按钮在手机宽度下收成 48dp MD3 图标按钮（24dp 图标，文字用 sr-only 剪裁，读屏仍可读，`aria-label` 同步补齐）。两者都按结构特征定位（`header` 内含 `nav`；按钮内 `span` 文本恰为 `Session log` 且带图标），不依赖 CSS Module 哈希类名。
 - 窄屏触控目标按 MD3 规范补齐：消息操作钮（复制/点赞/分支）视觉保持 22px 图标、命中区经透明外扩至 48dp；设置页导航 tab 48dp 触控高度；悬浮鲸鱼 48dp。侧栏抽屉展开时交界处显示 MD3 4×32dp drag handle 指示条（纯视觉，不拦截跟手拖动手势）。
+- **左抽屉既有修复（T82/T84，本轮复核确认）**：鲸鱼改读与主列**同一个** `--dshr-drawer-x`（写在与两者的
+  共同祖先上）并挂**同一对** `transition: transform 0.34s cubic-bezier(0.32,0.72,0,1)` ⇒
+  **全程可见**（真机 138 个采样帧里隐藏帧 **0**）；`|鲸鱼.x − (10 + 主卡.x)|` **最大偏差 0px**；
+  **header 全程位移 0px**——改前 `54 → 62` 那 **8px** 下移已消除（删掉两处 margin）。
+  - ⚠️ **一处未达成，如实写明（别当回归）**：曾按「把 `setSidebarOpen(true)` 挪到落位阶段、拖动期只靠
+    hook 自己的 CSS 点亮侧栏」做过，**实测会让拖动期的侧栏变成「宽 360px、可见文本 0」的图标 rail**
+    （官方打开态是 360px / 28 字符），故**已回退**；那一帧（`expanded 0→1` 的 React 提交）的代价**仍在**。
+  - 证据：`scratch/t82/report.md` §B.2–§B.4、`scratch/t84/report.md` §2。
+- **左抽屉观感：圆角卡片平移（rc.2.7，不做缩放）**。抽屉不再是「硬边卡片直接平移」，而是**圆角卡片平移**：
+  新增 token `--dshr-card-r: 20px`（圆角**唯一源**）与 `--dshr-seam`（两张同色圆角卡之间的**缝底**，
+  浅色 `rgba(0,0,0,.1)` / 深色档 `.42`）。跟手期 `border-radius` 与**阴影同源跟手**——
+  `border-radius: calc(var(--dshr-card-p,0) * var(--dshr-card-r,20px))`，阴影的 offset / blur / α 全部乘同一个量；
+  `--dshr-card-p = min(drawerX,20)/20` 与 `--dshr-drawer-x` **同帧写入**（半径、阴影、位移永远同一帧）。
+  **20px 的依据是官方同族表面实测**：整宽会话卡（`364×67`）用 **20px**、输入卡（`373×110`）用 **28px**、
+  小图标钮 8~12px。抽屉**右缘**用同一 token 加圆角，并用 `clip-path: inset(… round 0 R R 0)` 把
+  **可绘制右缘钉在主卡左缘**（抽屉盒顶在 y=0、主卡盒顶在 y=28，不裁的话两张卡的圆弧差 28px 对不上）。
+  - **像素判据真值**（真机截图 + 圆弧反解）：主卡圆弧误差 **≤0.36 CSS px**、抽屉右缘 **≤1.05 CSS px**；
+    真机 `x → 半径` 逐帧吻合 **0 / 12 / 18 / 20**，即 `r(x) = min(x, 20px)`（x≥20px 后半径饱和、只跟随平移）。
+  - **「不做缩放」是产品决定**：全流程没有 `transform: scale`；鲸鱼的 transform 与尺寸**一字未改**
+    （仍是 `translateX(var(--dshr-drawer-x))`）。证据：`scratch/t91/report.md` §1–§3。
 - 系统栏沉浸（手机档）：App 保持透明状态栏 edge-to-edge，并把真实的状态栏/导航栏 inset（CSS px）写入页面变量 `--dshr-inset-top` / `--dshr-inset-bottom`；页面内容下移让出状态栏，状态栏颜色与页面背景一致（`viewport-fit=cover` 与 `env(safe-area-inset-*)` 仅作兜底）。即使官方 frame 结构探测失败，body 兜底 padding 也保证内容不顶进时钟/挖孔区域。**虚拟键盘**弹出时，原生按焦点输入框位置平移，只抬到输入框露在键盘上方（空会话/设置页元素少时不会把输入框顶出屏幕）；页面侧再用 `interactive-widget=overlays-content` 与 `visualViewport` 把焦点矩形告诉原生。Android 返回键会优先关闭设置弹窗或收起已展开的 DSH 侧栏。
 - **平板档系统栏避让（`sw ≥ 600` 会话页，rc.2.6 重做）**：让位算式改为**逐方向并集**
   `systemBars() | displayCutout() | tappableElement()`——`getInsets` 对掩码内各来源**逐边取 max**，
@@ -447,6 +484,23 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
     ⇒ 实测右边界落在 **24~32** 之间），**不是**直接测出来的。
   证据：`scratch/t47/report.md` §3·§4（原始判据）、`scratch/t66/report.md` §2.2、§3.1、§4.1–§4.2、
   §5.2–§5.3、§10.1–§10.2。
+- **右栏两条方向不同的动画（rc.2.7，术语先分清）**：**打开 = `width` 过渡（不是跟手）**，
+  **关闭 = `transform` 跟手**（= 上一条那条手势）。
+  - **打开方向**：官方承载容器（`…rightbarCol`）在**关闭态与打开态都是 `width: 0`**，给它加任何
+    `translateX` 都没有像素可动（实测「位移变化帧数 = 1」，与改前的 0 帧在观感上无从区分）
+    ⇒ hook 自建**裁剪窗**：容器 `width` = 窗宽、`overflow: clip`（**不能用 `hidden`**，那会把容器变成
+    滚动容器）、面板**重锚到容器左缘** + `translateX(-100vw)`，窗宽 `0 → 100vw` 走 `transition: width`
+    （这确实是**布局动画**，但官方这边本来就没有可复用的合成器路径）。实测**16 个中间态窗宽 / 283.3ms**
+    （改前 **1 帧**到位；CSS 声明 300ms）、帧间隔 p95 **16.8ms**、`>50ms` 长任务 **0 个**。
+    **官方状态机逐字未动**（兑现时机、`dispatchNativeClick` 通道、遮罩/鲸鱼/composer 的可点性与
+    `data-sidebar-right-open`/`aria-hidden` 翻转全部照旧）；**官方那颗折叠按钮的点击路径保持瞬时展开**
+    ——本轮只做手势路径，不把没验过的交互面拖进动画。
+  - **关闭方向**：**跟手 0px 对齐**（手指 120px → hook 写出 `--dshr-rightbar-x` = 120px → 面板实际位移
+    偏差 **0px**，59 次比对；T91 复跑 42 次比对同为 0px），松手后走**合成线程 CSS transition 补间**
+    （T91 真机：**21 个不同位移位置 / 333ms**；T84 真机另一跑：19 帧 / 18 个不同位移 / 300ms）。
+    两条不变量真值成立：**面板中部右滑 no-op**、**打开态左滑 no-op**（判据一字未放宽）。
+  - 证据：`scratch/t85/report.md` §1–§3（打开：裁剪窗、中间态/时长/帧间隔）、§4–§5（关闭与两条不变量）；
+    `scratch/t82/report.md` §A.2–§A.4、`scratch/t84/report.md` §1.4、`scratch/t91/report.md` §4–§5。
 - **发送键不再被布防**（rc.2.6）：发送键已从布防触发器名单**移除**，并新增独立的「发送」识别在
   判定**第一件事优先排除**——覆盖 `aria-label` 中英文 6 种写法，外加「在 composer 卡片内」的
   `button[type=submit]` 兜底。另加一条早退：**composer 已持焦时布防直接返回**（焦点没变 ⇒ 官方再抢
@@ -472,6 +526,41 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
   - **有界，绝不永动机**：3s 最小间隔（折叠一次导航的 `onPageCommitVisible` / `doUpdateVisitedHistory` / `onPageFinished` 三个回调）+ 60s 窗口内最多 4 次（重定向风暴下最多 4 次/分钟）；一轮新的连接尝试（`openGateway`，含「重新连接」）会把预算归零。平板档在排自检之前就返回（连定时器都不排，零痕迹）。
   证据：`scratch/t22/report.md` §1（含 12 项 AVD 验证矩阵 V1–V12）。
 - 连接失败、隧道超时或 PC 端 DSH Web 不可达时，远端页面会换成本地失败页，可点「重新连接」；改连接配置请长按鲸鱼（平板档见下节）。已在跑的隧道不会因返回键或误报断线被拆掉，再点「连接」会复用本机隧道端口（首选 18443，被占用时自动在 16225~16235 协商），不必清后台。
+- **重连判据与自愈（rc.2.7，本批次最重要的一条）**：页面侧**没有任何现成只读连接态**——把 window 上
+  与 DSH 相关的 **17 个全局**在「健康 / 真断线 / 恢复」**三拍**逐一快照差分，唯一变化的是**我们自装的观测器**
+  （`__DSH_CONNECTION_RECOVERY__` 实测只是**参数**：`{backoffBaseMs:500, backoffFactor:2, backoffMaxMs:10000, …}`，
+  不是状态）⇒ hook 包装 `window.WebSocket` 自己观测连接态。
+  - **包装是完整透传的**：真机上确实抓到了 App 那条 socket（URL 逐字 `wss://…/api/remote.mux`）；
+    **9 条透传断言**全绿（prototype / 静态量 / 自有属性 / `name`·`length` / 不带 `new` 抛**逐字相同**的
+    TypeError / `class extends` 子类化 / `instanceof` / 多 socket）。**平板档完整还原**（认领符号 0、
+    观测器消失），切回手机档全部装回 ⇒ 与「平板档零痕迹」契约并存。
+  - **判据两层，且与原生逐字同源**：**层 1** = `[data-phase]` **恰等于** `connecting`
+    + `aria-label` 排除清单否决 + 有布局盒（`getClientRects().length > 0`）
+    + **去掉 `aria-hidden` 子树后的文案**锚定 + **composer 祖先否决**；**层 2** = 原有「非按钮文案」路径
+    （保留，并把 `isInteractiveNode()` **收紧**到与原生 `inter()` 逐条对齐）。
+    官方那条本身是 `<button>`，走「排除可交互控件」就永远认不出来，所以**层 1 是定向例外、不是整体放宽**。
+    另外 `scripts/test-mobile-chrome.mjs` 的源码契约**同时读 `mobile-web.js` 与 `ReconnectBanner.java`、
+    把双方字面量抽出来做相等比较** ⇒ 任一侧被单独改动就红（不是靠人记）。
+  - 🔴 **官方那条只在左栏展开时渲染**（官方源码逐字：`state: wide && …`，而 `wide = !collapsed`）
+    ⇒ **左栏收起（用户平时）时页面上没有任何可读的重连文案**。这既是「只有拉开左侧栏才看得到重连提示」
+    的根因，也是本任务必须自建 WebSocket 信号的原因（rail 态官方文案实测 **0 帧**）。
+  - **原生横幅**：数据源 = hook 上报的连接态 **OR** DOM 探针（平板档 hook OFF ⇒ 只剩纯 DOM 探针）；
+    抑制判据用「**横幅将要占据的带区**」而**不是横幅当前 rect**（`GONE` 时 rect 恒 `0×0` ⇒ 恒判重叠
+    ⇒ 恒抑制 ⇒ 首次显示不出来，即自锁）。实测 rail 态横幅在 **`t_kill+1495ms`** 出现
+    （`[0,121][1080,213]`、`clickable/focusable` 均 false、不抢焦点），恢复后消失；
+    **不吞触摸**——在横幅与官方按钮的交叠区中心点按，页面仍回传 `official-click`。
+  - **自愈真值（rail，真断线）**：hook 侧 nudge **6 次**（间隔 **8.0–9.0s**，到顶 `cap-reached` 并自卸巡检，
+    改前臂是**死代码**、`nudges=0`）；「**服务端已回来 → 页面发起第一次重连**」由 **5496ms 压到 681ms（8.1×）**；
+    健康态**零开销**（断线前 8 拍 `nudges=0 / tick=false`）。
+  - ⚠️ **口径纠正：别再引用「永久停泊」这条**。此前记的机制是「上游退避梯子跑完 6 次后
+    `isFinalBackoffTier` ⇒ 永久停泊、不再自动重连」，但**本机实际运行时**——npm `@deepseek-ai/dsh@0.2.0-rc.2`
+    下发给浏览器的 bundle（389620B）与桌面 `app.asar`（121348951B）**全量字节扫描**——`isFinalBackoffTier`
+    **命中 0 次**，`attempt` **无上限**、退避 `backoffCap(attempt)=min(backoffMaxMs, 500×2^(attempt-1))`，
+    **单跳上限 10s**（`[cap/2, cap)` 即 5–10s 随机）。⇒ **不存在「退避跑完就永久停泊、不再自动重连」**；
+    用户观感里的「30 秒」是**多次退避 + 服务端尚未恢复**的累积，不是某一档停泊。hook 的价值是把
+    「**服务端已经回来、页面还在睡退避**」这段等待压到 **<1s**。判据边界另见「已知取舍」。
+  - 证据：`scratch/t86/report.md` §4–§5、`scratch/t88/report.md` §A–§C、`scratch/t90/report.md` §1–§6·§12、
+    `scratch/t87/report.md` §1·§6.4（停泊证否的字节扫描原文）。
 - **手机档**下连接设置（配置组卡片页）可由**长按小鲸鱼**进入，也可在**会话根按系统返回键**进入
   （**rc.2.6 起两档一致**，此前手机档会话根是直接退到后台）。会话内先关官方弹层/侧栏再回上一页；
   **右栏打开态按返回键只关面板**，不多走一步到设置页。到会话根则回 App 连接设置页，
@@ -753,3 +842,17 @@ sub_filter '<link rel="manifest" href="/manifest.webmanifest" />' '<link rel="ma
     另：新形态的 `__dshRemoteMobilePending` 挂起态对守卫**恒返回 0、绝不触碰**（实测逐字未变）。
   - 证据：`scratch/t56/report.md` §2.2（改法 + `flushStyle` 现挂 `:958-978`）、§3.1（前后对照）、
     §4.1–§4.3（自愈判定）、§5.2 与 §6（变异①与还原）、§9.1（11/12 定位）。
+- **rc.2.7 重连判据的边界（如实写）**：
+  - 判据依赖官方那条 UI 在**左栏展开**时渲染；**左栏收起（rail）下没有任何 UI 判据**，只能靠
+    WebSocket 信号兜底。观测对象是 app 那条 socket 的 `open`/`close`——**若上游改用非 WebSocket 载体
+    （或把 socket 建进 worker），这条观测会静默失效**（届时 `wsSeen` 仍为 true 而 `wsEvents` 长期不变，
+    排查时可一眼看出）。
+  - `role=searchbox` / `role=combobox` 容器内整段文案**恰为**「重新连接中」时，**层 2 仍会命中**
+    （两端同结论，已知边界；要收掉得同时改两端层 2 的 `closest` 名单，会再动两处既有断言）。
+  - **i18n 只覆盖官方中英两套词典**；出现第三语言时**宁漏报不误报**（文案锚定与 `aria-label` 锚定
+    都可能命中不了）。
+  - **取证环境**：本批次的量化真值全部来自 **AVD 模拟器**（T82 `-port 5570`、T84 `-port 5670`、
+    T86 `emulator-5690/5692`、T90 `emulator-5710`）+ 真实页面 CDP；用户报障的小米 15 / Xiaomi Pad
+    只命中**部分场景**，本批次**未在其实机上复验**。平板档只在 phone 档设备上做「运行时切 tablet」，
+    **没有**起第二台平板跑完整的平板端到端（平板档横幅走 DOM 探针这条已在真机上用官方同构节点验过）。
+  - 证据：`scratch/t90/report.md` §12、`scratch/t86/report.md` §2.1·§5.2·§6、`scratch/t88/report.md` §F。

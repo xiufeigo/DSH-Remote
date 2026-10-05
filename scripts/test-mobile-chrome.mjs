@@ -514,6 +514,187 @@ function assertSourceContracts() {
 			throw new Error("源码契约：JS 桥缺失时不得记判重键（桥后到要能补发一次）");
 		}
 	}
+	// ── T88：hook 侧「层 1」（官方 `<button data-phase="connecting">`）的源码契约 + 两端同源 ──
+	//
+	// 为什么必须有这一块：layer 1 是把原生 `ReconnectBanner.PROBE_JS` 的层 1 判据**移植**过来的，
+	// 两边必须只有一份口径。T86 的教训就是两端名单本来就不一致（原生层 2 多排除 contenteditable，
+	// hook 层 2 没排除 ⇒ 同一个 composer 两端结论相反）。这里**同时读两个文件**、把双方字面量
+	// 抽出来做相等比较 ⇒ 任何一端被单独改动，`pnpm test:mobile` 立刻变红。
+	// （原生侧另有 `ReconnectBannerTest` 把同一份字面量抽出来真跑正/负例。）
+	{
+		const at = src.indexOf("function findOfficialReconnectButton() {");
+		if (at < 0) {
+			throw new Error(
+				"源码契约：缺少层 1 的 findOfficialReconnectButton —— 官方那条 `<button data-phase=\"connecting\">` 会被「排除可交互控件」整条挡掉，findReconnectStatusElement() 在真实页面上恒 null（T87 实测 0/528 命中）",
+			);
+		}
+		const body = src.slice(at, src.indexOf("\n\t/** ", at));
+		for (const [needle, why] of [
+			["if (phase !== OFFICIAL_PHASE) continue;", "必须「恰等于」connecting（前缀扩展 connecting-extra 不得命中）"],
+			["if (COMPOSER_DENY_RE.test(aria)) continue;", "必须有 composer 排除清单否决（发送键/「+」键即使带 data-phase 也不得命中）"],
+			["if (isInsideComposer(el)) continue;", "必须有 composer 祖先否决（contenteditable / role=textbox）"],
+			["if (!isVisible(el)) continue;", "必须有可见性闸（无布局盒不算）"],
+			["anchoredText(el)", "文案必须取「去掉 aria-hidden 子树后」的文字（不依赖 CSS module 哈希类名）"],
+		]) {
+			if (!body.includes(needle)) throw new Error(`源码契约：层 1 ${why}（缺 ${needle}）`);
+		}
+		if (!/RECONNECT_STATUS_RE\.test\(coreStatusText\(text\)\)/.test(body) || !/RECONNECT_ARIA_RE\.test\(aria\)/.test(body)) {
+			throw new Error("源码契约：层 1 的文案锚定必须「整串 / 去尾句点 / aria-label」三取一");
+		}
+		if (!/var official = findOfficialReconnectButton\(\);\s*\n\s*if \(official\) return \{ src: 1, el: official \};/.test(src)) {
+			throw new Error("源码契约：findReconnectStatusElement 必须先走层 1（官方那条优先于层 2 的任意文案）");
+		}
+		if (!src.includes("function findTextReconnectStatusElement()") || !src.includes("if (isInteractiveNode(el)) continue;")) {
+			throw new Error("源码契约：层 2（非按钮文案路径，T38-2 老判据）必须保留，且仍排除可交互控件");
+		}
+		if (!src.includes("[role=\"textbox\"],[onclick],[contenteditable]")) {
+			throw new Error(
+				"源码契约：层 2 的排除名单必须与原生 PROBE_JS 的 inter() 对齐（含 role=textbox / contenteditable）——否则 composer 里手打的「重新连接中」会被判成重连",
+			);
+		}
+		// 两端同源：从 ReconnectBanner.java 抽同一份字面量逐字符比对
+		const banner = join(ROOT, "android/app/src/main/java/top/d1studio/dshremote/ReconnectBanner.java");
+		if (!existsSync(banner)) throw new Error("源码契约：找不到 ReconnectBanner.java（层 1 判据的原生端）");
+		const java = readFileSync(banner, "utf8");
+		const javaLiteral = (decl) => {
+			const i = java.indexOf(decl);
+			if (i < 0) throw new Error(`两端同源：ReconnectBanner.java 里找不到 ${decl}`);
+			const seg = java.slice(i, java.indexOf(";", i));
+			const parts = [...seg.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]);
+			if (parts.length === 0) throw new Error(`两端同源：${decl} 里没抽到字符串字面量`);
+			return parts.join("");
+		};
+		const hookLiteral = (name) => {
+			const m = new RegExp(`var ${name} = (/[^\\n]*?/[a-z]*);`).exec(src);
+			if (!m) throw new Error(`两端同源：hook 里找不到 ${name} 的正则字面量`);
+			return m[1];
+		};
+		const hookString = (name) => {
+			const m = new RegExp(`var ${name} = '([^']*)';`).exec(src);
+			if (!m) throw new Error(`两端同源：hook 里找不到 ${name} 的字符串字面量`);
+			return m[1];
+		};
+		for (const [name, jv, hv] of [
+			["OFFICIAL_PHASE", javaLiteral("String OFFICIAL_PHASE ="), hookString("OFFICIAL_PHASE")],
+			["COMPOSER_DENY_JS", javaLiteral("String COMPOSER_DENY_JS ="), hookLiteral("COMPOSER_DENY_RE")],
+			["ARIA_RE_JS", javaLiteral("String ARIA_RE_JS ="), hookLiteral("RECONNECT_ARIA_RE")],
+			// T90：收口 T88 遗留的两端口径差异 —— 层 1 的 ⑤ composer 祖先否决，
+			// 两端现在用**同一份 role 字面量**（hook 的 COMPOSER_ROLE_RE / 原生的 COMPOSER_ROLE_JS）。
+			["COMPOSER_ROLE_JS", javaLiteral("String COMPOSER_ROLE_JS ="), hookLiteral("COMPOSER_ROLE_RE")],
+		]) {
+			if (jv !== hv) {
+				throw new Error(`两端同源：${name} 漂移了 —— ReconnectBanner.java=${jv} 而 hook=${hv}（改一端必须同时改另一端）`);
+			}
+		}
+		// 原生侧必须**真的用**这条否决（不只是声明一个常量）：层 1 循环里要有 insideComposer 闸，
+		// 且它必须排在 DENY 之后、可见性闸之前（与 hook 的 ⑤ 同位置）。
+		{
+			const tier1 = java.slice(java.indexOf("querySelectorAll('[data-phase]')"), java.indexOf("return hit(el,1);}"));
+			const atDeny = tier1.indexOf("if(DENY.test(aria(el)))continue;");
+			const atComposer = tier1.indexOf("if(insideComposer(el))continue;");
+			const atVis = tier1.indexOf("if(!vis(el))continue;");
+			if (atComposer < 0) {
+				throw new Error("两端同源：原生 PROBE_JS 层 1 缺 composer 祖先否决（T88 遗留差异没被收口）");
+			}
+			if (!(atDeny >= 0 && atDeny < atComposer && atComposer < atVis)) {
+				throw new Error(`两端同源：原生层 1 的否决顺序必须与 hook 一致（DENY → composer → vis），实测 ${String(atDeny)}/${String(atComposer)}/${String(atVis)}`);
+			}
+		}
+	}
+	// ── T90：UI 无关的连接态信号源（包装 window.WebSocket）+ 两处接线 ──
+	//
+	// 为什么必须有这一块：T88 把官方那条「重新连接中」认出来了，但官方**只在左栏展开
+	// （wide）时才渲染它**（dsh-client-ui-settings-general：`state: wide && …`）⇒
+	// 左栏收起（56px rail，用户平时的状态）时页面上没有任何可判对象，hook 恒判健康、
+	// nudge 永不推、原生横幅也无从显示。T90 换掉判据源（WebSocket 观测），这块把
+	// **"信号源必须存在" + "判据必须真的接上它" + "包装器必须是完整透传"** 钉死。
+	{
+		for (const [needle, why] of [
+			["function installWsStateWatch() {", "必须有 WebSocket 观测的安装函数"],
+			["function wsWatchDown() {", "必须有 UI 无关的断开判据"],
+			["function isConnectionDown() {", "必须有合并判据（DOM 文案 OR WS 观测）"],
+			["Reflect.construct(nativeCtor, args, new.target)", "构造必须完整透传（参数/原型/new.target）"],
+			["Wrapped.prototype = nativeCtor.prototype;", "prototype 必须是原生**同一个对象**（instanceof 语义）"],
+			["if (typeof new.target !== 'function') {", "不带 new 调用必须走与浏览器相同的 TypeError 路径"],
+			["if (wsWatchInjectedTablet()) return false;", "平板档（严格 OFF）不得安装观测"],
+			["function uninstallWsStateWatch() {", "关闭态/平板档必须能还原 window.WebSocket"],
+			["wsStateNow: function () {", "必须有给原生 onResume 补读的**只读**入口"],
+		]) {
+			if (!src.includes(needle)) throw new Error(`源码契约：T90 ${why}（缺 ${needle}）`);
+		}
+		// 安装点必须在 pending 早退**之前**：否则文档还没给出 <html> 时先返回、
+		// 等 DOMContentLoaded 才装，而 app 的 socket 可能在微任务里就建好了（漏观测）。
+		const atInstall = src.indexOf("\tinstallWsStateWatch();");
+		const atGuard = src.indexOf("if (window.__dshRemoteMobileInstalled) return;");
+		if (!(atInstall > 0 && atInstall < atGuard)) {
+			throw new Error("源码契约：T90 观测安装必须早于 __dshRemoteMobileInstalled 幂等闸（pending 路径会漏掉 app 的首条 socket）");
+		}
+		// 常量必须在最早那次调用之前赋值（否则 wsWatchDown 读到的宽限期是 undefined）。
+		const atConst = src.indexOf("var WS_CONNECT_GRACE_MS = 2000;");
+		if (!(atConst > 0 && atConst < atInstall)) {
+			throw new Error("源码契约：T90 WS_CONNECT_GRACE_MS 必须在 installWsStateWatch() 那次最早调用之前赋值（var 提升不提升赋值）");
+		}
+		// 判据接线：probeResumeRecovery 与 collectUiDiag 都必须换成 isConnectionDown()，
+		// **不得**再只认 DOM 文案 —— 这正是 rail 盲区（T88 §E.4）的成因。
+		const probeAt = src.indexOf("function probeResumeRecovery() {");
+		const probeBody = src.slice(probeAt, src.indexOf("\n\tfunction ", probeAt));
+		if (!probeBody.includes("var reconnecting = isConnectionDown();")) {
+			throw new Error("源码契约：T90 probeResumeRecovery 的判据必须是 isConnectionDown()（rail 下 DOM 恒 null ⇒ 只认文案就永不推 nudge）");
+		}
+		if (!probeBody.includes("if (!reconnecting)")) {
+			throw new Error("源码契约：T90 健康闸写法必须保留（test-resume-recovery.mjs 逐字匹配 if (!reconnecting)）");
+		}
+		if (probeBody.includes("findReconnectStatusElement() !== null")) {
+			throw new Error("源码契约：T90 probeResumeRecovery 不得回退成只认 DOM 文案（rail 盲区回归）");
+		}
+		const diagAt = src.indexOf("function collectUiDiag() {");
+		const diagBody = src.slice(diagAt, src.indexOf("\n\tfunction ", diagAt));
+		if (!diagBody.includes("reconnecting = isConnectionDown();")) {
+			throw new Error("源码契约：T90 collectUiDiag().wsState 必须走同一条合并判据（否则诊断行在 rail 下继续说谎）");
+		}
+		// 翻转回调：必须接进**既有**上报通道与既有自愈入口（不新增定时器）。
+		if (!src.includes("wsWatchSetNotify(function (down) {")) {
+			throw new Error("源码契约：T90 连接态翻转必须有登记回调");
+		}
+		const notifyAt = src.indexOf("wsWatchSetNotify(function (down) {");
+		const notifyBody = src.slice(notifyAt, src.indexOf("\n\t}", notifyAt));
+		if (!notifyBody.includes("reportUiDiag()") || !notifyBody.includes("probeResumeRecovery")) {
+			throw new Error("源码契约：T90 翻转回调必须同时接 reportUiDiag（桥上报）与 probeResumeRecovery（既有自愈入口）");
+		}
+		// 观测本身**不得**引入定时器/轮询/网络请求：健康态零开销的结构性保证。
+		const watchStart = src.indexOf("function installWsStateWatch() {");
+		const watchEnd = src.indexOf("function syncWsStateWatch(enabled) {");
+		const watchBlock = src.slice(watchStart, watchEnd);
+		for (const forbidden of ["setInterval", "fetch(", "XMLHttpRequest", "MutationObserver"]) {
+			if (watchBlock.includes(forbidden)) {
+				throw new Error(`源码契约：T90 观测块不得出现 ${forbidden}（观测必须是被动监听，不是轮询）`);
+			}
+		}
+		// 两处"必须保留"的风暴边界（T82/T88 成果不得回退）。
+		for (const keep of ["RESUME_MAX_NUDGES = 6", "RESUME_MIN_INTERVAL_MS = 8000", "RESUME_CONFIRM_DELAY_MS"]) {
+			if (!src.includes(keep)) throw new Error(`源码契约：T90 不得回退既有风暴边界（缺 ${keep}）`);
+		}
+		// 原生侧：横幅的数据源必须是"hook 上报 OR DOM 探针"两路，且 hook 那路不覆盖 UNKNOWN。
+		const main = readFileSync(join(ROOT, "android/app/src/main/java/top/d1studio/dshremote/MainActivity.java"), "utf8");
+		for (const [needle, why] of [
+			["private volatile String hookConnState = null;", "必须有一个 hook 上报连接态的字段（横幅的第二个数据源）"],
+			["hookConnState = parseUiDiagWsState(json);", "必须从**既有** setUiDiag 载荷里取 wsState（不新增桥方法）"],
+			["private static String parseUiDiagWsState(String json) {", "必须有只认三个已知取值的解析器"],
+			["refreshHookConnState();", "onResume 必须补读一次（后台期间 pauseTimers 会冻住页面事件）"],
+			["\"hook=reconnecting\"", "探针日志必须能区分「这条是 hook 那一路判的」"],
+		]) {
+			if (!main.includes(needle)) throw new Error(`源码契约：T90 原生侧 ${why}（缺 ${needle}）`);
+		}
+		const hprAt = main.indexOf("private void handleReconnectProbe(String value) {");
+		const hprBody = main.slice(hprAt, main.indexOf("\n\t}", hprAt));
+		if (!hprBody.includes("\"reconnecting\".equals(hookConnState)")) {
+			throw new Error("源码契约：T90 handleReconnectProbe 必须 OR hook 上报的连接态（否则 rail 下横幅永不出现）");
+		}
+		const pageStart = main.slice(main.indexOf("public void onPageStarted(WebView view, String url, Bitmap favicon) {"));
+		if (!pageStart.slice(0, 800).includes("hookConnState = null;")) {
+			throw new Error("源码契约：T90 新文档必须重置 hook 上报的连接态（页面级数据源，不许跨页带）");
+		}
+	}
 	// ── WEB-05：抽屉接管接入横向滚动容器豁免 ──
 	if (!src.includes("if (isInHorizontallyScrollableContainer(target)) return false;")) {
 		throw new Error("源码契约：WEB-05 canStartDrawerTrack 必须接入横向可滚容器豁免");

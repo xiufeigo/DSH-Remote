@@ -179,6 +179,22 @@ public class MainActivity extends Activity {
 	/** T78：轮询是否在推进（onResume 起、onPause 停）。 */
 	private boolean reconnectPolling = false;
 	/**
+	 * T90：横幅的**第二个数据源** —— hook 经既有 JS 桥（{@code DshRemoteApp.setUiDiag}）
+	 * 推上来的 {@code wsState}（{@code reconnecting} / {@code ok-recovered} / {@code ok}）。
+	 *
+	 * <p>为什么必须加它：官方那条「重新连接中」指示器的渲染条件是 {@code state: wide && …}
+	 * （{@code wide = !collapsed}）⇒ **左栏收起（56px rail，用户平时的状态）时它根本不渲染**，
+	 * DOM 探针什么都探不到（T88 §E.4 实测：45s 真断线窗口 0 帧 / T90 复现一致）。
+	 * hook 侧 T90 起用**UI 无关**的 WebSocket 观测拿到真实连接态，翻转时推一次；
+	 * 这里把它与 DOM 探针做 **OR**：任一为真即「正在重连」。
+	 *
+	 * <p>生命周期：**页面级**（新文档开始时置 null，见 {@code onPageStarted}）。
+	 * hook 每次装上都经 {@code reportUiDiag()} 推一次当前状态，所以新文档必然有一次刷新；
+	 * 不需要 TTL —— 它本来就是"当前状态"而不是"心跳"。{@code volatile}：写在 WebView 的
+	 * JS 桥线程、读在主线程（{@code reconnectPollTick}）。
+	 */
+	private volatile String hookConnState = null;
+	/**
 	 * T78：系统栏/挖孔/任务栏的逐方向并集（px）。T72 的平板让位与 T78 的横幅外边距
 	 * **共用这一份取值**，不各自算一套——否则两处会各自漂移。
 	 */
@@ -398,6 +414,10 @@ public class MainActivity extends Activity {
 		if (rootLayout != null) rootLayout.post(this::applyReconnectBannerInsets);
 		// T78：回前台重启重连状态轮询（onPause 停掉的那条）。
 		startReconnectPolling();
+		// T90：顺便**补读一次** hook 的连接态（只读、一次性）：后台期间 pauseTimers 冻住了
+		// 页面侧 JS，翻转事件未必推得过来（见 refreshHookConnState 注释）。放在
+		// startReconnectPolling 之后：先让轮询恢复，再补这一读，横幅下一拍就能用上新值。
+		refreshHookConnState();
 		// PERF-03：与 onPause 成对恢复；在 WEB 态补一次 inset/注入（暂停期间
 		// 键盘/旋转事件可能漏掉），已有 resumeLiveSession 保证不断整页重载。
 		if (webView != null) {
@@ -1158,6 +1178,36 @@ public class MainActivity extends Activity {
 	private static String diagBool(JSONObject o, String key) {
 		if (!o.has(key)) return "未上报";
 		return o.optBoolean(key) ? "是" : "否";
+	}
+
+	/**
+	 * T90：只认 hook 诊断载荷里 {@code wsState} 的三个**已知取值**（横幅的第二个数据源）。
+	 * 未知取值 / 缺字段 / 载荷坏掉一律返回 {@code null} = 「这个数据源不投票」
+	 * （横幅照旧只看 DOM 探针，行为与 T90 之前逐字相同）。
+	 */
+	private static String normaliseWsState(String v) {
+		if (v == null) return null;
+		if ("reconnecting".equals(v) || "ok-recovered".equals(v) || "ok".equals(v)) return v;
+		return null;
+	}
+
+	private static String parseUiDiagWsState(String json) {
+		if (json == null || json.isEmpty()) return null;
+		try {
+			return normaliseWsState(new JSONObject(json).optString("wsState", ""));
+		} catch (Throwable ignored) {
+			return null;
+		}
+	}
+
+	private static String normaliseJsonString(String value) {
+		if (value == null) return null;
+		String v = value.trim();
+		if (v.isEmpty() || "null".equals(v)) return null;
+		if (v.length() >= 2 && v.charAt(0) == '"' && v.charAt(v.length() - 1) == '"') {
+			v = v.substring(1, v.length() - 1);
+		}
+		return v.isEmpty() ? null : v;
 	}
 
 	private void clearResumeSession() {
@@ -2219,6 +2269,9 @@ public class MainActivity extends Activity {
 			public void onPageStarted(WebView view, String url, Bitmap favicon) {
 				// DIAG-30s：主帧导航提交点。首包慢（TLS/网关/上游）会体现在
 				// openGateway→onPageStarted 的差值里。
+				// T90：**页面级**数据源随文档一起重置 —— 上一页 hook 推来的连接态一律不许
+				// 带到新文档（新文档的 hook 装好后会经 reportUiDiag 推一次当前状态）。
+				hookConnState = null;
 				// 这里【不】清 failedMainFrameUrl：主框架错误可能与 onPageStarted 同一
 				// 毫秒到达（如 ERR_UNSAFE_PORT 实测两者同为 t+348ms），在这里清会把
 				// 紧随其后的 onPageFinished 放行，错误页又会被当成会话页。
@@ -2469,7 +2522,12 @@ public class MainActivity extends Activity {
 		}
 	};
 
-	/** T78：跑一次只读探针。回调里的空值/异常**一律记 UNKNOWN**，既不显示也不累计。 */
+	/**
+	 * T78：跑一次只读探针。回调里的空值/异常**一律记 UNKNOWN**，既不显示也不累计。
+	 *
+	 * <p>T90：探针之外**再 OR 一路 hook 上报的状态**（见 {@link #hookConnState}）——
+	 * 左栏收起时 DOM 探针恒探不到，rail 下的唯一信号是 hook 那条 WebSocket 观测。
+	 */
 	private void pollReconnectOnce() {
 		if (destroyed) return;
 		if (uiState != UiState.WEB || webView == null || webView.getVisibility() != View.VISIBLE) {
@@ -2481,6 +2539,26 @@ public class MainActivity extends Activity {
 		} catch (Exception e) {
 			handleReconnectProbe(null);
 		}
+	}
+
+	/**
+	 * T90：回前台**补读一次** hook 的连接态（只读、一次性，不是轮询）。
+	 *
+	 * <p>为什么需要：退后台时轮询停了，而且页面侧 {@code pauseTimers()} 会冻住 JS 定时器，
+	 * 后台期间发生的连接态翻转未必推得过来 —— 回前台这一读保证横幅拿到的是当前值。
+	 * 前台正常路径完全靠 hook 在状态翻转时**推**（{@code setUiDiag}）。
+	 */
+	private void refreshHookConnState() {
+		if (webView == null || destroyed) return;
+		try {
+			webView.evaluateJavascript(
+				"(function(){try{var b=window.__dshRemoteAndroidMobile;"
+					+ "return b&&typeof b.wsStateNow==='function'?String(b.wsStateNow()):'';}catch(e){return '';}})()",
+				value -> {
+					if (destroyed) return;
+					hookConnState = normaliseWsState(normaliseJsonString(value));
+				});
+		} catch (Exception ignored) { /* 读不到就不投票 */ }
 	}
 
 	/** T78：立即收起横幅并把防抖清零（onPageCommitVisible / 退后台 / 离开会话页）。 */
@@ -2495,6 +2573,10 @@ public class MainActivity extends Activity {
 	 * <p>{@code ok=0} / 空串 / {@code null} / 解析失败 ⇒ {@code UNKNOWN}（导航期静默，不累计）。
 	 * 探针为真时再看**官方状态元素是否已经真的可见且不与横幅重叠**——是则抑制横幅，
 	 * 同一条信息不显示两遍。
+	 *
+	 * <p>T90：观测值 = 探针结果 **OR** hook 上报的连接态（见下面那条判定）。
+	 * 平板档 hook 严格 OFF ⇒ {@code hookConnState} 恒 null ⇒ 这一路完全不投票，
+	 * 行为与 T90 之前逐字相同（平板仍是纯 DOM 探针）。
 	 */
 	private void handleReconnectProbe(String value) {
 		if (destroyed || reconnectBanner == null) return;
@@ -2517,9 +2599,25 @@ public class MainActivity extends Activity {
 				observed = ReconnectBanner.Observed.UNKNOWN;
 			}
 		}
-		// 只在观测值**变化**时打一行，避免每 500ms 刷屏；这一行是设备侧"原生看到了什么"的唯一原始证据。
-		if (observed != lastProbeObserved) {
-			lastProbeObserved = observed;
+		// T90：**两路 OR** —— 数据源 = hook 上报的连接态 ∪ 现有 DOM 探针。
+		//   ① hook 说 reconnecting（且探针没这么说）⇒ 判重连。左栏收起（rail）时官方那条
+		//      指示器不渲染、探针恒 re=0，这是唯一能让横幅出现的通道；
+		//   ② 探针说 reconnecting ⇒ 照旧走它自己的抑制判定（几何 / tier 语义**未动**）；
+		//   ③ hook 说 ok / ok-recovered ⇒ **不覆盖**探针的结论（wide 下探针能用元素级几何
+		//      做抑制，比 hook 粗粒度状态更精确），也**不把 UNKNOWN 抬成 OK**
+		//      （导航期静默不累计是既有语义，抬了就会把"连续为真/连续为假"跨页面累加）。
+		if (hookConnState != null && "reconnecting".equals(hookConnState)
+			&& observed != ReconnectBanner.Observed.RECONNECTING) {
+			observed = ReconnectBanner.Observed.RECONNECTING;
+			detail = (detail.isEmpty() ? "" : detail + " ") + "hook=reconnecting";
+		}
+		// 只在**日志去重键**变化时打一行，避免每 500ms 刷屏；这一行是设备侧"原生看到了什么"的唯一原始证据。
+		// T86：键里除了观测值，还含**抑制判定**与**匹配层** —— 否则「官方那条可见且不重叠 ⇒ 抑制」
+		// 这一步（observed 从 UNKNOWN/OK 到 OK 不变）在 logcat 里完全看不见，
+		// 事后无法区分"没匹配上"与"按设计抑制了"。
+		String key = probeLogKey(observed, detail);
+		if (!key.equals(lastProbeKey)) {
+			lastProbeKey = key;
 			Log.i("dshr-reconnect", "probe=" + observed + " " + detail);
 		}
 		if (!reconnectDebounce.feed(observed)) return;
@@ -2532,16 +2630,44 @@ public class MainActivity extends Activity {
 		}
 	}
 
-	/** T78：上一次探针观测值，只为"变化时才打日志"。 */
-	private ReconnectBanner.Observed lastProbeObserved = ReconnectBanner.Observed.UNKNOWN;
+	/** T78/T86：上一次探针日志去重键，只为"变化时才打日志"。 */
+	private String lastProbeKey = "";
 
 	/**
-	 * T78：官方那条重连文案是不是已经"用户看得见"（在视口内）且不被横幅压住。
+	 * T86：探针日志的去重键 = 观测值 + **抑制判定** + **匹配层**。
+	 *
+	 * <p>为什么不能只用观测值：抑制（{@code SUPPRESS|…}）会被映射成 {@code Observed.OK}，
+	 * 于是"官方那条本来就在视口里、横幅按设计让位"这一步的观测值跟前一次相同 ⇒ 不打日志 ⇒
+	 * 现场只剩"没有横幅"，分不清是**没匹配上**还是**按设计抑制**。
+	 *
+	 * @param detail {@code officialStatusDetail} 的返回值，形如 {@code "SHOW|src=1 css=[…]"}；无匹配时为 {@code ""}
+	 */
+	private static String probeLogKey(ReconnectBanner.Observed observed, String detail) {
+		if (detail == null || detail.isEmpty()) return observed.name();
+		int bar = detail.indexOf('|');
+		String verdict = bar < 0 ? detail : detail.substring(0, bar);
+		String src = "";
+		int at = detail.indexOf("src=");
+		if (at >= 0) {
+			int end = detail.indexOf(' ', at);
+			src = end < 0 ? detail.substring(at) : detail.substring(at, end);
+		}
+		return observed.name() + "|" + verdict + "|" + src;
+	}
+
+	/**
+	 * T78：官方那条重连文案是不是已经"用户看得见"（在视口内）且不与横幅**带区**重叠。
 	 *
 	 * <p>⚠️ 只有 {@code getClientRects().length > 0} 是不够的：侧栏用 {@code left:-320px}
 	 * 收起时元素仍有布局盒、仍算"可见"（T68 §2.6 实测），但用户根本看不见。
 	 * 探针回的是 CSS 像素矩形，这里按 WebView **实际内容宽度 / CSS 视口宽度**换算成设备像素
 	 * （不用 density，缩放下才准），再与横幅在 rootLayout 里的矩形比对。
+	 *
+	 * <p><b>T86 缺口②</b>：比对对象从「横幅当前 rect」换成「横幅**将要占据的带区**」——
+	 * 横幅 {@code GONE} 时 {@code getWidth()/getHeight()} 恒 0，拿它判重叠恒为「不重叠」，
+	 * 于是只要探针能看见官方那条且在视口内就永远抑制，横幅**第一次显示不出来**（T83 §5 实测）。
+	 * 带区 = 系统栏 top inset 起的整幅宽度 × 横幅高度
+	 * （{@code ReconnectBanner.bandHeightPx}：已布局实高 &gt; 按内容测量 &gt; 40dp 兜底）。
 	 *
 	 * @return {@code "SUPPRESS|…"} 表示抑制横幅；{@code "SHOW|…"} 表示照常显示；
 	 *         后缀是原始判据（进 logcat，便于事后对账）
@@ -2555,10 +2681,18 @@ public class MainActivity extends Activity {
 		double cy = o.optDouble("y", 0);
 		double cw = o.optDouble("w", 0);
 		double ch = o.optDouble("h", 0);
-		String raw = "css=[" + Math.round(cx) + "," + Math.round(cy) + ","
+		int[] ins = readSystemBarInsetsPx();
+		int bandLeft = ins[0];
+		int bandTop = ins[1];
+		int rootW = rootLayout != null ? rootLayout.getWidth() : 0;
+		int bandWidth = Math.max(0, (rootW > 0 ? rootW : webW) - ins[0] - ins[2]);
+		int bandHeight = ReconnectBanner.bandHeightPx(reconnectBanner.getHeight(),
+			reconnectBanner.measureContentHeight(),
+			Math.round(ReconnectBanner.BAND_FALLBACK_DP * getResources().getDisplayMetrics().density));
+		String raw = "src=" + o.optInt("src", 0)
+			+ " css=[" + Math.round(cx) + "," + Math.round(cy) + ","
 			+ Math.round(cw) + "," + Math.round(ch) + "] vp=" + vw + "x" + vh
-			+ " banner=[" + reconnectBanner.getLeft() + "," + reconnectBanner.getTop() + ","
-			+ reconnectBanner.getWidth() + "," + reconnectBanner.getHeight() + "]";
+			+ " band=[" + bandLeft + "," + bandTop + "," + bandWidth + "," + bandHeight + "]";
 		if (vw <= 0 || vh <= 0 || webW <= 0) return "SHOW|" + raw + " reason=no-scale";
 		double scale = (double) webW / (double) vw;
 		int x = (int) Math.round(cx * scale);
@@ -2572,8 +2706,7 @@ public class MainActivity extends Activity {
 		int ox = webView.getLeft() + webView.getPaddingLeft() + x;
 		int oy = webView.getTop() + webView.getPaddingTop() + y;
 		boolean suppress = ReconnectBanner.shouldSuppress(onScreen, ox, oy, w, h,
-			reconnectBanner.getLeft(), reconnectBanner.getTop(),
-			reconnectBanner.getWidth(), reconnectBanner.getHeight());
+			bandLeft, bandTop, bandLeft + bandWidth, bandHeight);
 		return (suppress ? "SUPPRESS|" : "SHOW|") + raw + " device=[" + ox + "," + oy + "," + w + "," + h
 			+ "] onScreen=" + onScreen;
 	}
@@ -4329,6 +4462,9 @@ public class MainActivity extends Activity {
 				return;
 			}
 			uiDiagRaw = json == null ? "" : json;
+			// T90：同一份载荷里的 wsState 还是**重连横幅的第二个数据源**（rail 下 DOM 探针
+			// 探不到任何东西时唯一能用的那条）。这里只做一次纯字符串解析，绝不抛。
+			hookConnState = parseUiDiagWsState(json);
 			// hook 侧已按**判重键**（JSON.stringify 去掉 ts）去抖：载荷带 Date.now()，
 			// 若拿整份 payload 判重则同状态永远不相等；去掉 ts 后状态未变就不重复过桥。
 			// 这里再加一层按**摘要**去重：即使 hook 侧判重键因故失效（例如旧版 hook
