@@ -1180,17 +1180,28 @@ test:session / test:fixes，见 `.github/workflows/ci.yml`）；
 （tag `v0.2.0-rc.2.9`）。
 
 > **填表纪律**：下表**只写实测值**，Release 创建前不填任何预期值（文件名/字节数/时间/digest
-> 全部由 `gh release view` + 下载后本机重算得出）。rc.2.8 起本表由一次 `docs:` 提交回填，
-> 原始记录见 `scratch/t100/report.md` §3.5。
+> 全部由 `gh release view` + 下载后本机重算得出）。rc.2.8 起本表由一次 `docs:` 提交回填
+> （rc.2.8 原始记录见 `scratch/t100/report.md` §3.5；rc.2.9 见 `scratch/t116/report.md` §6）。
 
-**本版 `0.2.0-rc.2.9`**（**发布前**：只写已在最终字节上实测、且**与本轮 CI 资产无关**的值）：
+**本版 `0.2.0-rc.2.9`**：
 
-| 核验项 | 发布前实测值（本机、最终字节） |
+| Release 资产 / 核验项 | 实测值 |
 |---|---|
-| APK `versionName` / `versionCode` | `0.2.0-rc.2.9` / **`2000209`**（`aapt2 dump badging`；`-Debug` 为 `0.2.0-rc.2.9+debug`） |
-| 包内 `res/raw/mobile.js` | `fd0f443417e66d02fb10bc78b1de05432f06f6bfc1b1eb91979fa5251fcd20c0`（**363,829 B**、纯 LF）——**源 = `res/raw` 副本 = APK 内嵌**（release 与 `-Debug` **两个包都核过**）**逐字节相同** |
-| 构建自检 | `android/build.ps1`（默认）与 `-Debug` 均 **exit 0** |
-| 资产文件名 / 字节数 / 发布时间 / APK SHA-256 / 签名证书 / 工作流结论 | **待 Release 创建后由一次 `docs:` 提交回填**（`gh release view` + 下载后本机重算；**本表不填预期值**） |
+| 资产文件名 | `dsh-remote-0.2.0-rc.2.9.apk` |
+| 字节数 | **5,776,599 B**（与本地构建产物同尺寸） |
+| 发布时间 | **2026-10-05T22:13:29Z**（UTC；北京时间 2026-10-06 06:13:29） |
+| APK SHA-256 | `9c2b0512e78e30474a1da9127d382eb8bf0b2cb6634f8fcd69f6883302133254`（下载后**本机重算**，与 `gh release view` 的资产 digest 逐字一致） |
+| 包内 `res/raw/mobile.js` | `fd0f443417e66d02fb10bc78b1de05432f06f6bfc1b1eb91979fa5251fcd20c0`（**363,829 B**、纯 LF），与源 `packages/gateway/assets/mobile-web.js` **逐字节相同** |
+| 签名证书 | DN `CN=DSH Remote`，SHA-256 `1e217fa66c3c68f6e031ed28b8b1c12b675db01f01b87bf7426a4f94d8e4000d`（与 rc.2.5 / rc.2.6 / rc.2.7 / rc.2.8 及更早发布**同一条签名链**，可直接覆盖升级） |
+| APK `versionName` / `versionCode` | `0.2.0-rc.2.9` / `2000209`（`aapt2 dump badging`） |
+| 本轮工作流结论 | `ci`(main) ✅ · `android-apk`(main) ✅ · `android-apk`(tag) ✅ · `release`(tag) ✅（四条全部 success；逐 job：`ci`/`test` success、`android-apk`/`build` success ×2、`release`/`android` success） |
+
+> Release 页：https://github.com/xiufeigo/DSH-Remote/releases/tag/v0.2.0-rc.2.9
+>
+> **发布前**已实测（与 CI 资产无关的那部分）：`aapt2 dump badging` = `0.2.0-rc.2.9` / `2000209`
+> （`-Debug` 为 `0.2.0-rc.2.9+debug`）；`build.ps1` 默认与 `-Debug` 均 exit 0；
+> 源 = `res/raw` 副本 = **两个 APK 的内嵌** 三处同为 `FD0F4434…20C0`（**363829 B、CR=0**）。
+> 台账 `scratch/t116/regression.log`（17 项全部 exit 0）与 `scratch/t116/report.md`。
 
 **上一版 `0.2.0-rc.2.8`（已发布，下表全部为实测值，非预期值）**：
 
