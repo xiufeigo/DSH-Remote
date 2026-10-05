@@ -764,23 +764,20 @@ test:session / test:fixes，见 `.github/workflows/ci.yml`）；
 
 版本号 = `<deepseek-harness 基线版本>.<发版号>`，发版号每次发布 +1，详见
 [docs/versioning.md](docs/versioning.md)。当前基线 `0.2.0-rc.2`、版本 **`0.2.0-rc.2.7`**
-（**本次发版进行中**：tag `v0.2.0-rc.2.7` 随本批次一起推送，Release 由 `release.yml` 在 tag 推上去后自动创建。
-下表留档的是**上一版 `0.2.0-rc.2.6` 的实测值**；rc.2.7 的真实资产值——文件名 / 字节数 / 发布时间 /
-APK SHA-256 / 包内 `mobile.js` SHA / 签名指纹——在 Release 产出后**如实回填**，发布前不写预期值）：
+（**已发布**：tag `v0.2.0-rc.2.7` 已推、Release 已创建。下表**全部为实测值**，非预期值）：
 
-| Release 资产 / 核验项 | `0.2.0-rc.2.6` 实测值（上一版留档） |
+| Release 资产 / 核验项 | 实测值 |
 |---|---|
-| 资产文件名 | `dsh-remote-0.2.0-rc.2.6.apk` |
-| 字节数 | **5,706,966 B** |
-| 发布时间 | **2026-10-05T00:00:31Z**（UTC；北京时间 08:00:31） |
-| APK SHA-256 | `541e6538185375c068f7d7a7e85e75395a1c0290afea590b3995661e7e3c7df5` |
-| 包内 `res/raw/mobile.js` | `E1E2EEDE10A13C6E9CC46C2CCAA441FFA6D8126CD27C2AAE3A1B6F77E693158D`，与源 `packages/gateway/assets/mobile-web.js` **逐字节相同** |
-| 签名证书 | DN `CN=DSH Remote`，SHA-256 `1e217fa66c3c68f6e031ed28b8b1c12b675db01f01b87bf7426a4f94d8e4000d`（与 rc.2.5 及更早发布**同一条签名链**，可直接覆盖升级） |
-| APK `versionName` / `versionCode` | `0.2.0-rc.2.6` / `2000206`（`aapt2 dump badging`） |
+| 资产文件名 | `dsh-remote-0.2.0-rc.2.7.apk` |
+| 字节数 | **5,739,737 B** |
+| 发布时间 | **2026-10-05T07:33:48Z**（UTC；北京时间 15:33:48） |
+| APK SHA-256 | `1e48b334153ece8953a1d286b651c61d1bad85cc211ea00ec4756d4b7be59ff2`（与 `gh release view` 的资产 digest 逐字一致） |
+| 包内 `res/raw/mobile.js` | `656CEE2E66D77404C0923F333AACAA77ECEF49CBF00E4E6187DD2F1B65BCE32E`（294305 B），与源 `packages/gateway/assets/mobile-web.js` **逐字节相同** |
+| 签名证书 | DN `CN=DSH Remote`，SHA-256 `1e217fa66c3c68f6e031ed28b8b1c12b675db01f01b87bf7426a4f94d8e4000d`（与 rc.2.5 / rc.2.6 及更早发布**同一条签名链**，可直接覆盖升级） |
+| APK `versionName` / `versionCode` | `0.2.0-rc.2.7` / `2000207`（`aapt2 dump badging`） |
 | 本轮工作流结论 | `ci`(main) ✅ · `android-apk`(main) ✅ · `android-apk`(tag) ✅ · `release`(tag) ✅ |
 
-> Release 页（上一版）：https://github.com/xiufeigo/DSH-Remote/releases/tag/v0.2.0-rc.2.6
-> 本版 Release 页在 `v0.2.0-rc.2.7` 推送后自动生成：`/releases/tag/v0.2.0-rc.2.7`
+> Release 页：https://github.com/xiufeigo/DSH-Remote/releases/tag/v0.2.0-rc.2.7
 
 ```powershell
 pnpm ver:bump     # 发版号 +1 并同步 package.json；harness 升级用 --base <新版本>
