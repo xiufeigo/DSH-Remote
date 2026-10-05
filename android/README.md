@@ -144,7 +144,7 @@ C 平板 852×883 / D 平板 1280×800（平板档对照实验）、E 运行中 
 
 | 项 | 实测结果 |
 |---|---|
-| 断言总数 | **140/140 通过，失败 0，跳过 0**（rc.2.6 批次，退出码 0；`断言合计 140：通过 140`）。其中 **34 条**是 rc.2.6 新增的平板档系统栏避让（6 条源码契约 + 四方向重叠 + 键盘 not-in-mask）。更早的 55 条基线曾**连跑 4 次全绿**、91 条为 rc.2.3 批次、106 条为 rc.2.5 批次 |
+| 断言总数 | **158/158 通过，失败 0，跳过 0**（rc.2.6 批次终局，退出码 0；`断言合计 158：通过 158，失败 0，跳过 0`，台账 `scratch/lead-rc26-regression.log:19`）。其中 **34 条**是 rc.2.6 新增的平板档系统栏避让（6 条源码契约 + 四方向重叠 + 键盘 not-in-mask）；**140 条是本批次中期快照**（T72 收口时），55 条基线曾**连跑 4 次全绿**、91 条为 rc.2.3 批次、106 条为 rc.2.5 批次 |
 | 零痕迹 | 平板档 C/D 与切换后的 OFF 态：`<html>` 无 `data-dshr-*`、无 hook 根类（含 `dshr-official-inset`）、无 hook 创建的可见节点、官方节点上无 `data-dshr-*` 标记——全部通过 |
 | 平板档对照 | C（852×883）与 D（1280×800）两视口**逐项像素差全 0**：frame / 三列 / header / composerCard / composerSeat / rightbar / bodyScrollHeight / documentScrollWidth / documentClientWidth |
 | 运行中切换 | `__dshrSetDevice('tablet'\|'phone')` 立即生效；**同值重复调用幂等**（第二次返回 `false`）；切回后根类、标记与几何可逆 |
@@ -240,9 +240,12 @@ frpc 真实就绪关键字，并显式断言 `establishing nat hole…` 与 5 �
 > | T65（首屏原生落盘） | 同步改 6 个文件后重跑 `typecheck` / `test:mobile` / `test:device` / `test:fixes` 全绿 | 4/4 exit 0 |
 > | T72（平板 insets） | `test:device` 断言 **106 → 140**，**140/140** 通过 | exit 0 |
 >
-> ⚠️ **本轮没有 `lead-rc26-regression.log` 一类的 rc.2.6 总台账**（rc.2.5 那种 13 项总表是 Lead 侧统一跑的），
-> 故**不编造 rc.2.6 总表**；上表只列各任务自己留档的退出码，证据为 `scratch/t60/report.md` §7、
-> `scratch/t65/report.md` §8、`scratch/t72/report.md` §6。
+> ℹ️ **rc.2.6 总台账（Lead 侧统一跑，收口时已产出）**：`scratch/lead-rc26-regression.log` —— **14 项全部 exit 0**
+> （typecheck / test:mobile / **test:device 158/158、失败 0、跳过 0** / test:fixes / test:perf / test:routes /
+> test:session / test:client / test:desktop 10/10 / smoke / smoke:edge / ws-keepalive 19/19 /
+> resume-recovery 12/12 / T47 验收台 44/44）。上表是**各任务收口当时**留档的退出码（写「没有总台账」那句时
+> 总表尚未跑），两者**互补不冲突**，数字一律以总台账为准。证据：`scratch/t60/report.md` §7、
+> `scratch/t65/report.md` §8、`scratch/t72/report.md` §6、`scratch/lead-rc26-regression.log`。
 
 > **验收纪律两条（rc.2.6 新增）**：
 > - **网关有 240 次/分、按 IP 共享的限流。** 本机同一 IP 上**并行**跑多个验收任务时会互相打点，

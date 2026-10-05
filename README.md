@@ -663,7 +663,7 @@ pnpm test:fixes     # 历轮修复回归钉桩
 pnpm test:panel     # 面板端到端（需 DSH 宿主运行）
 pnpm test:client    # 客户端 bundle 加载检查
 pnpm test:mobile    # 移动布局自测（需 Chrome）
-pnpm test:device    # 设备档位自测（真实 0.2.0-rc.2 页面 140 条断言，实测 140/140；宿主/网关不可达自动跳过）
+pnpm test:device    # 设备档位自测（真实 0.2.0-rc.2 页面 158 条断言，实测 158/158、失败 0、跳过 0；宿主/网关不可达自动跳过）
 pnpm smoke:edge:frp # edge 全链路（需本机 frp 二进制，无则自动跳过）
 pnpm -C packages/plugin build   # 构建设置卡片客户端 bundle
 node scripts/probe-ws.mjs [端口]   # 对运行中的网关+DSH 做 WS 直通探针
@@ -719,8 +719,20 @@ test:session / test:fixes，见 `.github/workflows/ci.yml`）；
 
 版本号 = `<deepseek-harness 基线版本>.<发版号>`，发版号每次发布 +1，详见
 [docs/versioning.md](docs/versioning.md)。当前基线 `0.2.0-rc.2`、版本 **`0.2.0-rc.2.6`**
-（**发布中**：本文随该批次一起提交，随后推 tag `v0.2.0-rc.2.6`；Release 资产名/字节数/发布时间
-在发布完成后据实测回填，未发布前不在此处写资产信息）：
+（已发布：tag `v0.2.0-rc.2.6` 已推、Release 已创建。下表**全部为实测值**，非预期值）：
+
+| Release 资产 / 核验项 | 实测值 |
+|---|---|
+| 资产文件名 | `dsh-remote-0.2.0-rc.2.6.apk` |
+| 字节数 | **5,706,966 B** |
+| 发布时间 | **2026-10-05T00:00:31Z**（UTC；北京时间 08:00:31） |
+| APK SHA-256 | `541e6538185375c068f7d7a7e85e75395a1c0290afea590b3995661e7e3c7df5` |
+| 包内 `res/raw/mobile.js` | `E1E2EEDE10A13C6E9CC46C2CCAA441FFA6D8126CD27C2AAE3A1B6F77E693158D`，与源 `packages/gateway/assets/mobile-web.js` **逐字节相同** |
+| 签名证书 | DN `CN=DSH Remote`，SHA-256 `1e217fa66c3c68f6e031ed28b8b1c12b675db01f01b87bf7426a4f94d8e4000d`（与 rc.2.5 及更早发布**同一条签名链**，可直接覆盖升级） |
+| APK `versionName` / `versionCode` | `0.2.0-rc.2.6` / `2000206`（`aapt2 dump badging`） |
+| 本轮工作流结论 | `ci`(main) ✅ · `android-apk`(main) ✅ · `android-apk`(tag) ✅ · `release`(tag) ✅ |
+
+> Release 页：https://github.com/xiufeigo/DSH-Remote/releases/tag/v0.2.0-rc.2.6
 
 ```powershell
 pnpm ver:bump     # 发版号 +1 并同步 package.json；harness 升级用 --base <新版本>
