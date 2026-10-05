@@ -1,17 +1,18 @@
 /**
- * T99 行为臂：把 MainActivity.TABLET_BACK_OVERLAY_PROBE_JS 的**真实字面量**抠出来，
- * 在一个极简 DOM 桩上真跑，验证「除左抽屉外还有没有要收的东西」这个判据的**行为**。
+ * 行为臂（文件与臂号沿用 T99 的名字）：把 MainActivity.TABLET_BACK_OVERLAY_PROBE_JS
+ * 的**真实字面量**抠出来，在一个极简 DOM 桩上真跑，验证「除左抽屉外还有没有要收的东西」
+ * 这个判据的**行为**（T102 起：'none' ⇒ 原生不调桥、会话根退到后台；'overlay' ⇒ 只关它）。
  *
  * 为什么要这一臂：JVM 臂只能验"探针里的字符串长什么样"（T40 §8 M1/M2 的教训：
  * 只断言源码里有某个字符串的钉子不承重）。这里真跑一遍 IIFE，覆盖：
  *   · 右栏 / 模态弹框 / sheet / Explorer 详情 四个分支各自命中与不命中；
- *   · **左抽屉展开但无弹层 ⇒ 'none'**（T99 的核心：平板档返回键不看左抽屉）；
+ *   · **左抽屉展开但无弹层 ⇒ 'none'**（T99/T102 的核心：平板档返回键不看左抽屉）；
  *   · 异常路径 ⇒ 'error'（原生按非 none 处理 ⇒ 退回既有桥）；
  *   · 只读性：跑完全程，DOM 桩上的写 API 计数必须为 0（不是"字面量里没有 setAttribute"，
  *     而是"真跑一遍一次都没调"）。
  *
  * ⚠️ DOM 桩是**模型**不是浏览器：它证明的是探针的判据逻辑与只读性，
- * 不证明"真页面上这四个标记长这样"——后者由设备侧真机证据（scratch/t99/report.md §3）终审。
+ * 不证明"真页面上这四个标记长这样"——后者由设备侧真机证据（scratch/t102/report.md §3）终审。
  *
  * 用法：node android/tests/t99-probe-dom-stub.mjs <MainActivity.java>
  */
@@ -165,7 +166,7 @@ const rightPanelHidden = () => node({ rects: 1, attrs: { "data-sidebar-right-ope
 {
 	// 桩里刻意**不提供**任何左抽屉节点/属性：探针连查都不查（JVM 臂已逐字钉住这一点）。
 	const r = run({});
-	check(r.value === "none", "★ 无任何弹层（哪怕左抽屉是展开的）⇒ 'none' ⇒ 平板档一次返回进设置页", String(r.value));
+	check(r.value === "none", "★ 无任何弹层（哪怕左抽屉是展开的）⇒ 'none' ⇒ 平板档返回键不调桥，会话根退到后台", String(r.value));
 	check(!r.wrote, "★ 这一路探针零写操作（左抽屉不可能被这行代码动到）");
 }
 {

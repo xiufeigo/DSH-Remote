@@ -30,6 +30,36 @@
  *     **长按 600ms = 打开 App 连接设置页**，**单击仍是官方原本的「新建会话」**；
  *     该特性不写任何 DOM（节点 / 属性 / 类名 / 样式规则零新增），其余平板档能力
  *     仍全部关闭（含 window.WebSocket 包装）。详见 syncBrandLongPress 一段。
+ *   - 平板档第二处例外（T101，用户明确授权「允许最小 hook」）：平板档**多 2 条 CSS 规则**
+ *     ——把官方会话主区画成圆角面板、把官方 frame 铺成左侧栏底色（圆角露出的就是这个底色，
+ *     与 T94 的系统栏带取色同源 ⇒ 无新异色缝）。规则写进**既有的**
+ *     <style data-dshr-mobile-css>，**不新增 DOM 节点 / 类名 / data-dshr-* 属性**。
+ *     注意：这使 teardownHookTraces 文档里「平板档 style 里无一条规则命中官方 DOM」
+ *     这句话**不再成立**（那 2 条规则正是要在平板档命中官方 frame 与 main 列）。
+ *   - 平板档第三处例外（T115，用户口径「系统栏走安卓原生透明 + 页面自己让位」）：
+ *     平板档的系统栏让位从「原生给 WebView 留外边距」改为「**页面自己让位**」。
+ *     轨迹增量仍然只有两样，且都在既有载体里：
+ *       ① <html> 上四个 CSS 自定义属性 `--dshr-inset-top/-bottom/-left/-right`
+ *          （由原生 __dshRemoteInsets.set 写入；手机档本来就是这么用的，语义逐字同源）；
+ *       ② <style data-dshr-mobile-css> 里多一组以同一个平板作用域
+ *          `html:not(.dshr-mobile):not(.dshr-official-inset)` 开头的规则，让官方三列
+ *          自己把内容让开系统栏（背景画进 padding）。**不新增 DOM 节点 / 类名 /
+ *          data-dshr-* 属性**，元素锚点仍走官方结构属性（单层 :has()）。
+ *     为什么必须改：原生留外边距时，系统栏后面那一圈只剩父容器**一种**底色，而平板官方
+ *     布局贴边那一行本来就是**两色**（左栏 --dsw-specific-sidebar-fill / 面板
+ *     --dsw-alias-bg-base）⇒ 单色带必然在面板那一侧留一道硬缝（T115 实测 2560 宽里
+ *     1919 px = 75.0% 与页面差 ΔRGB=(6,5,4)）。让页面自己画这两条带，ΔRGB=0 是构造性的。
+ *     T97 的事件监听器、T101 的 2 条规则、T115 的四个变量与一组规则就是平板档的**全部** hook 痕迹。
+ *   - 手机档「长按 = 进 App 连接设置页」的两处入口（T103，用户口径「进连接设置只保留
+ *     长按这一条路」，取消返回键入口由 T102 完成）：
+ *     ① **悬浮鲸鱼长按**（既有 650ms 行为，T103 补两处防误触：长按触发后那次
+ *        合成 click 被吞，不再顺带给抽屉做 toggle（改前实测会顺带把侧栏打开）；
+ *        多指（第二根手指落在任何地方）即刻取消长按 —— 后者用**手势进行中的临时**
+ *        document 守卫实现，常态监听器数量不变）；
+ *     ② **左上角品牌区长按 600ms**：T97 那段代码的档位闸由「只平板档」放宽为
+ *        「平板档 + 手机档（hook 启用态）」，复用**同一个** document touchstart
+ *        监听器，不新增监听器、不写 DOM、阈值/取消条件/click 抑制逐字未改；
+ *        手机横屏与 auto 档照旧一个监听器都不挂。
  *
  * 设计目标：不依赖服务器端是否安装 dsh-remote-plugin。手机连接任何官方 DSH Web
  * （装或不装插件）都由本脚本完成移动适配：
@@ -119,11 +149,20 @@
 	// ── T90 自检状态（**必须在第一行之前**赋值）────────────────────────────────
 	// `installWsStateWatch()` 是本函数体的第一件事（见下面那次调用），它要用到这三个值：
 	//   · WS_WATCH_KEY      自检全局键（只读快照，不参与任何业务判断）；
-	//   · WS_CONNECT_GRACE_MS 首连/重连的 CONNECTING 允许时长：超过它仍没 open 才按"断"算；
+	//   · WS_CONNECT_GRACE_MS CONNECTING 允许时长：socket 已构造、迟迟没 open，超过它才按"断"算；
+	//   · WS_CLOSE_GRACE_MS  T112：**已 OPEN** 的 socket 关掉之后的宽限期（会话切换 / 页面内
+	//     导航 / SW 更新都会让页面自己重建 socket，新 socket 在宽限内 open 就不该算断）；
 	//   · wsWatchState      观测状态（closure 里的活引用；`window.__dshrWsWatch` 指向它）。
 	// （`var` 提升只提升声明不提升赋值，所以不能把赋值留在下面那段里。）
+	//
+	// T112 取值依据（本轮"频繁重连"修复，原始真值见 scratch/t112/report.md）：
+	//   · 2000 → 8000：真机 + 中转链路上一次 TCP+WSS 握手超过 2s 并不稀奇，而 2s 判"断"
+	//     会把它报成断线；8s 与"卡住自救升级"的节奏（T96：nudge → 12s 重载）相容。
+	//     放宽**不会**漏掉真断线：连不上时 TCP 失败必然紧跟 close/error（close 宽限那条管着），
+	//     这里兜的是"对端收下 SYN 却不回 handshake"的半死链路，8s 足够早。
 	var WS_WATCH_KEY = '__dshrWsWatch';
-	var WS_CONNECT_GRACE_MS = 2000;
+	var WS_CONNECT_GRACE_MS = 8000;
+	var WS_CLOSE_GRACE_MS = 1500;
 	var wsWatchState = null;
 	// 包装标记：挂在**包装器自己**上，供 pending 重启后的第二次进来"认领"同一个状态对象。
 	// 用 `Symbol.for` 而不是字符串属性：`Object.getOwnPropertyNames(WebSocket)` 是**可枚举的
@@ -207,23 +246,15 @@
 		// 24~28px 时 2R=48~56px 的缺口会在顶端把抽屉右缘咬掉一大块。
 		// 与改动前的 18px 只差 2px ⇒ 打开终态的观感连续，不是换了一套皮肤。
 		'  --dshr-card-r: 20px;',
-		// 两张圆角卡「交界缝」的底色：抽屉与主卡的圆角是**同色表面上的对拼**，
-		// 若背后还是同一个灰（frame 背景 = 侧栏底色），两个圆弧都会隐形成一片
-		// ——真机真值见 report §3（把缝前后两张截图逐像素相减，缺口区 0 变化）。
-		// 所以给 frame 铺一层**只露在缺口里**的暗底（::after，见下），
-		// 让「抽屉右缘圆弧 / 主卡左缘圆弧」两头都读得出来。
-		// 0.10 的取值：缺口=抽屉灰(249)×0.9=224，与抽屉(249)、主卡(255)分别差 25/31 级，
-		// 肉眼是「一条缝」而不是「一道黑边」；更深（≥0.2）会变成描边。
-		'  --dshr-seam: rgba(0, 0, 0, 0.1);',
+		// ── T105：`--dshr-seam` 与它的 frame::after 暗底**整块删除** ──
+		// T91 铺那层暗底，是因为它把抽屉右缘也做成了圆角：两张同色圆角卡在交界处对拼，
+		// 两条圆弧之间的缺口若还是同一个灰就看不出来，于是用一层暗色去"描出缝"。
+		// 但用户明确否掉了这个形态（"各自是各自的圆角矩形"）：现在接缝处**只有卡片自己的圆角**
+		// （抽屉是被压在下面的整块背景），缺口里露出的就该是抽屉底色本身，
+		// 留着暗底反而会在卡片左上角外侧画出一块多余的深色。故 token 与伪元素一起删。
 		'  color-scheme: light dark;',
 		'  -webkit-text-size-adjust: 100%;',
 		'  text-size-adjust: 100%;',
-		'}',
-		// 深色档：抽屉/主卡都是近黑（#1b1b1f / #111318 一档），10% 的黑在近黑上差不到 3 级、
-		// 等于没铺。深色下把缝加深到 0.42：抽屉底 ≈ (27,27,31) → 缝 ≈ (16,16,18)，
-		// 与抽屉、主卡都拉得开（真值见 report §1 深色档截图）。
-		'html.' + ROOT_CLASS + '[data-dshr-dark="1"] {',
-		'  --dshr-seam: rgba(0, 0, 0, 0.42);',
 		'}',
 		// 表面色必须走官方会随深浅切换的 token。`--dsw-specific-background` 在
 		// DSH 里经常不存在，写成它的 fallback 会把设置页钉死成白底，深色字就看不见。
@@ -276,6 +307,97 @@
 		'  box-sizing: border-box !important;',
 		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
 		'}',
+		// ── T101：平板档（官方三栏 / 桌面布局）圆角 ──────────────────────────────
+		// 契约变更（用户授权）：平板档由「hook 严格 OFF / 零痕迹」放宽为「**允许最小 hook**」。
+		// 本段的**全部**痕迹就是下面 2 条规则，它们住在**既有的**
+		// <style data-dshr-mobile-css> 里 ⇒ 不新增 DOM 节点、不加类名、不加任何
+		// data-dshr-* 属性（`scripts/test-device-class.mjs` 的零痕迹判定逐条仍绿）。
+		//
+		// 作用域 = `html:not(.dshr-mobile):not(.dshr-official-inset)`，它**恰好**等于
+		// `deviceMode === 'tablet'`：严格 OFF 时 teardownHookTraces() 把这两个类都摘掉；
+		// 手机竖屏有 .dshr-mobile、手机横屏与 auto-OFF 有 .dshr-official-inset ⇒ 一条都不命中。
+		//
+		// 元素锚点全部走官方**结构属性**，不碰 CSS module 哈希类名（同 T97 的约定）：
+		//   官方 frame            = `:has(> [data-shell-overlay])`
+		//                           （overlayLayer `[data-shell-overlay]` 是 frame 的直接子节点）
+		//   官方会话主区列 centerCol = `:has(> [data-slot="main"])`
+		//                           （`[data-slot="main"]` 是 centerCol 的直接子节点）
+		// 两条都是**单层 :has()**：不支持 :has 的旧 WebView 只会整条丢弃 ⇒ 退回改动前观感，
+		// 不会坏版面（`:has()` Chrome 105+，Android 15 WebView / headless Chrome 均满足）。
+		//
+		// 为什么是「frame 铺左侧栏底色 + 主区列画成圆角」而不是反过来：
+		// 状态栏带 / 手势条带的取色是原生 T94 探针按 `elementFromPoint(2, y)` 采页面底色
+		// （MainActivity.PAGE_BG_PROBE_JS，x=2 落在**左侧栏**上）。所以「圆角露出来的颜色」
+		// 必须恒等于 x=2 处的颜色，否则圆角外会多出一条**异色缝**。
+		// 让 frame 与左侧栏取**同一个官方 token** 之后：
+		//   · x=2 无论命中左侧栏还是 frame，探针读到的都是同一个颜色 ⇒ 系统栏带**不变色**；
+		//     侧栏收起（列宽变 0）时探针落到 frame 上，读到的仍是同一个值 ⇒ 两种状态都成立；
+		//   · 圆角缺口露出的就是这个颜色 ⇒ 与上/下带**同色**，交界由直角变成圆弧。
+		// 深色档不另写规则：这两个 token 都由官方主题定义在 body 上并随深浅切换
+		// （真机实测 --dsw-specific-sidebar-fill=#f9fafb、--dsw-alias-bg-base=#fff）。
+		//
+		// 半径取官方**面板级**圆角 token `--dsw-radius-panel`（官方前端实测 28px）：
+		// 官方用它画 dialog 面板、浮层面板、可调整面板的右下抓手，也用它画本页的输入卡
+		// （uV2eYG_card 712×114 = 28px）⇒ 与「官方桌面端最大块表面的圆角」同值。
+		// 兜底写同一个 28px，避免旧构建上退化成 0。
+		//
+		// 只改绘制：不写 margin / padding / width / grid-template-columns / transform，
+		// 因此不重排、不破坏滚动与输入区可点性、不动 WebView 四向让位（仍 0/0/0/0）。
+		// centerCol 上的 `overflow: hidden` 是**官方本来就有的值**（真机实测 computed
+		// overflow=hidden），这里只是加 !important 钉住它，让「圆角裁剪子节点」这件事
+		// 不随官方构建变化而失效（子节点里的真实白底不重排、只被裁到圆角内）。
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-shell-overlay]) {',
+		'  background: var(--dsw-specific-sidebar-fill, #f9fafb) !important;',
+		'}',
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="main"]) {',
+		'  border-radius: var(--dsw-radius-panel, 28px) !important;',
+		// corner-shape 是官方自己也在用的声明（官方前端样式表里 `corner-shape:round`
+		// 出现 8 次），这里显式写 `round` 是**对齐官方既有取值**、并把「圆角 = 正圆弧」
+		// 钉住：新版 Chromium 对 border-radius 默认渲染成**超椭圆（squircle）**，
+		// 与旧版/Android WebView 的正圆弧不是同一条曲线（实测：1280×800 headless Chrome
+		// 上 R=28 的角在 devY=1 处边界 x=297.0，正圆弧理论值 302.73，偏差 5.73px；
+		// Android 15 WebView 不支持 corner-shape ⇒ 恒为正圆弧）。
+		// 写 round 后两个引擎都是正圆弧，像素判据（圆弧拟合 ≤1–2 CSS px）才有意义；
+		// 不支持的引擎直接忽略这条声明，行为不变。
+		'  corner-shape: round;',
+		'  overflow: hidden !important;',
+		'}',
+		// ── T115：平板档系统栏让位（用户口径「系统栏走安卓原生透明 + 页面自己让位」）──────
+		// 契约变更（与 T101 同源授权）：平板档由「原生给 WebView 让位」改为「**页面自己让位**」。
+		// 原生侧 T115 起把 WebView 四向外边距恒写 0（覆盖全窗）、把系统栏四向 inset（CSS px）
+		// 写进 <html> 的 --dshr-inset-*；这里让**三列自己**把内容让开系统栏。
+		//
+		// 为什么让的是「列」而不是「frame」：系统栏后面那一圈现在由**页面自己画**，
+		// 而带该是什么颜色取决于它压在哪一列上——左侧栏是 --dsw-specific-sidebar-fill，
+		// 会话面板是 --dsw-alias-bg-base，两色不同。所以四向 padding 必须落在**列**上
+		// （列自带背景 ⇒ 背景画进 padding、一直铺到 y=0 / y=100%），而不是落在 frame 上
+		// （frame 只有一种底色，垫在它身上必然让某一边露出异色）。
+		// box-sizing: border-box 是硬要求：三列的官方高度是 100%，不加它 padding 会把列撑高。
+		//
+		// 作用域仍是 `html:not(.dshr-mobile):not(.dshr-official-inset)`（恰好等于 deviceMode==='tablet'），
+		// 规则住在**既有的** <style data-dshr-mobile-css> 里 ⇒ 不新增 DOM 节点 / 类名 /
+		// data-dshr-* 属性；元素锚点全部走官方结构属性（单层 :has()），不碰 CSS module 哈希类名。
+		// 值语义与手机档逐字同源：var(--dshr-inset-*, env(safe-area-inset-*, 0px))。
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="sidebar"]),',
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="main"]),',
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="rightbar"]) {',
+		'  box-sizing: border-box !important;',
+		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
+		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
+		'  padding-left: var(--dshr-inset-left, env(safe-area-inset-left, 0px)) !important;',
+		'  padding-right: var(--dshr-inset-right, env(safe-area-inset-right, 0px)) !important;',
+		'}',
+		// 会话面板列官方自己的 background 是 transparent（白底在更深的子节点上）⇒ 只垫 padding
+		// 会把 frame 的侧栏底色透出来，形成一条新的异色带。这里显式给列铺上和「面板同源」的
+		// 官方 token（与手机档 [data-dshr-main-col] 用的是同一个），padding 区因此也是面板色。
+		// 右侧栏列同源（手机档 [data-sidebar-right-panel] 用的也是这个 token）。
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="main"]),',
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="rightbar"]) {',
+		'  background: var(--dsw-alias-bg-base, var(--dsw-specific-background, #ffffff)) !important;',
+		'}',
+		// 深色档不另写规则（与 T101 同口径）：--dsw-alias-bg-base / --dsw-specific-sidebar-fill
+		// 都由官方主题定义在 body 上并随深浅切换，上面那条 !important 取的就是同一个 token。
+		// 也不能用 html[data-dshr-dark] —— 平板档走 teardownHookTraces，那个属性会被摘掉。
 		'#dshr-status-guard {',
 		'  display: none;',
 		'  position: fixed;',
@@ -439,17 +561,14 @@
 		'  z-index: 10 !important;',
 		'  border-right: 0 !important;',
 		'  box-shadow: none !important;',
-		// T91：抽屉右缘圆角在**打开终态**（与跟手态同一个 token）。
-		// 终态不需要按位移裁剪 —— 抽屉盒右缘 == 主卡左缘（同一个 --dshr-drawer-width），
-		// 两者天然对齐，两张圆角卡在交界处「对拼」。
-		// 但顶边要按 --dshr-inset-top 裁掉：抽屉盒顶在 y=0（它自己带 padding-top 垫进状态栏），
-		// 而主卡盒顶在 y=inset-top（frame 的 padding）—— 不裁的话抽屉的圆弧跑在状态栏里、
-		// 与主卡圆弧差 28px 高度，两张卡的圆角对不上（真机真值见 report §3）。
-		// 这条裁剪**不改变任何可见像素**：被裁掉的那 28px 条带背后就是 frame 背景，
-		// 而 frame 背景本来就等于侧栏底色（同一 token）⇒ 沉浸观感不变。
-		'  border-top-right-radius: var(--dshr-card-r, 20px) !important;',
-		'  border-bottom-right-radius: var(--dshr-card-r, 20px) !important;',
-		'  clip-path: inset(var(--dshr-inset-top, env(safe-area-inset-top, 0px)) 0 0 0 round 0 var(--dshr-card-r, 20px) var(--dshr-card-r, 20px) 0) !important;',
+		// ── T105：抽屉**不再有右缘圆角**，也没有任何裁剪 ──
+		// T91 在这里给了抽屉右缘 20px 圆角 + `clip-path: inset(inset-top 0 0 0 round 0 R R 0)`。
+		// 真机像素证据（scratch/t105/shots/t105-hold-base-hold.png）：接缝处于是变成
+		// **两张圆角卡对拼**——抽屉右缘一条弧、卡片左缘一条弧，中间还夹着一条暗缝，
+		// 正是用户说的"各自是各自的圆角矩形"。
+		// 用户要的是「主会话 = 一张圆角卡片浮在官方左侧栏**之上**」⇒ 抽屉还原成
+		// 「被压在下面的整块背景」：背景铺满自己的盒子（顶到 y=0，与官方原生侧栏同形），
+		// 右缘是**直线**，圆角只属于卡片那一张。故 border-radius 与 clip-path 一起删。
 		'}',
 		'html.' + ROOT_CLASS + ' [data-dshr-frame]:not([data-sidebar-collapsed]) [data-dshr-sidebar-col] > * {',
 		'  width: 100% !important;',
@@ -496,7 +615,13 @@
 		// 那只是把 header 一起推下去，位移还在，只是换了来源。
 		// max-height 同步从 calc(100% - 16px) 提到 100%：原来那 16px 就是给上下 margin 让位的，
 		// margin 没了还留着会让卡片底部空出 16px。
-		'  max-height: 100% !important;',
+		//
+		// ── T105：终态卡片背景同样铺到 y=0（与拖动期 p=1 的算式**逐字一致**，交接零台阶） ──
+		// margin-top = −inset、padding-top = +inset、max-height = 100% + inset
+		// —— 把 `--dshr-card-p` 取 1 代进拖动块那三条，就是这三个值（真机交接台阶真值见 §4.1）。
+		'  margin-top: calc(-1 * var(--dshr-inset-top, env(safe-area-inset-top, 0px))) !important;',
+		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
+		'  max-height: calc(100% + var(--dshr-inset-top, env(safe-area-inset-top, 0px))) !important;',
 		'}',
 		'@media (prefers-reduced-motion: reduce) {',
 		'  html.' + ROOT_CLASS + ' [data-dshr-main-col] { transition: none !important; }',
@@ -549,65 +674,42 @@
 		'  border-radius: calc(var(--dshr-card-p, 0) * var(--dshr-card-r, 20px)) !important;',
 		'  box-shadow: calc(var(--dshr-card-p, 0) * -14px) 0 calc(var(--dshr-card-p, 0) * 36px) rgba(0, 0, 0, calc(var(--dshr-card-p, 0) * 0.18)),',
 		'    0 0 0 1px rgba(0, 0, 0, calc(var(--dshr-card-p, 0) * 0.04)) !important;',
+		// ── T105：卡片背景（含圆角）铺到屏幕最顶 y=0，**内容仍让开状态栏** ──
+		// 做法：margin-top 负向抵消、padding-top 等量补齐，两者都由同一个 p 缩放 ⇒
+		//   边框盒顶 = inset − p·inset（p=1 时 = 0）；内容盒顶 = inset − p·inset + p·inset = inset。
+		//   ⇒ 背景/圆角顶到 y=0，而**页面内容一个像素都不动**（仍从 --dshr-inset-top 起）。
+		// 为什么不用"另铺一层底色"：圆角属于**卡片自己的边框盒**，只有让边框盒真的顶到 0，
+		//   圆弧才画在屏幕顶边上；外部色块只能补一块方角，反而在卡片圆角处露馅。
+		// 为什么不动 frame 的 padding-top：那是抽屉盒顶(y=0)、状态栏让位与
+		//   `dshr-official-inset`（官方横屏）三方共同依赖的既有结构。
+		// 键盘抬页是 applyImeLift() 的 `--dshr-ime` + translateY，另一个属性、另一条通道，
+		//   与这里的 margin/padding 互不相干（§3.3）；右栏/平板档不吃这条规则（档位闸）。
+		'  margin-top: calc(-1 * var(--dshr-card-p, 0) * var(--dshr-inset-top, env(safe-area-inset-top, 0px))) !important;',
+		'  padding-top: calc(var(--dshr-card-p, 0) * var(--dshr-inset-top, env(safe-area-inset-top, 0px))) !important;',
 		// 拖动期钉住几何（半径/阴影都不参与布局，只重绘；offsetHeight 不变 ⇒
 		// 既有 fixture 断言 drag-keeps-layout-and-shadow 的「不重排」语义保持不变）。
 		// T82：跟手态也不许带 8px 上/下 margin（否则手指一按下去 header 就跳 8px，
 		// 与展开态那处的下移同帧发生，观感上就是"拖动一开始整块往下掉"）。
-		'  max-height: 100% !important;',
+		// T105：max-height 必须跟着 +p·inset，否则它会把这个"长高了 p·inset"的边框盒
+		// 又按 grid 区高度(100%)夹回去 ⇒ 卡片底边离屏底差 46px。
+		// （拉伸项高度 = grid 区高 − margin 和 = (H−inset) + p·inset。）
+		'  max-height: calc(100% + var(--dshr-card-p, 0) * var(--dshr-inset-top, env(safe-area-inset-top, 0px))) !important;',
 		'  overflow: hidden !important;',
 		'}',
-		// ── T91：抽屉（左栏）**右缘圆角**，与主卡同一个 --dshr-card-p 跟手 ──
+		// ── T105：拖动期抽屉**不再有右缘圆角 / 不再裁剪**（删 T91 那两条规则） ──
 		//
-		// 为什么单独起一条规则、且选择器**必须带 [data-dshr-frame]**：
-		// 拖动期 setDrawerVisual() 会先 setSidebarOpen(true)（T82 结论，不许挪），
-		// 于是 frame 上的 data-sidebar-collapsed 被摘掉 ⇒ 上面那条**打开态**抽屉规则
-		// （`[data-dshr-frame]:not([data-sidebar-collapsed]) [data-dshr-sidebar-col]`，
-		// 特异度 0-4-1）在本帧同时命中。而拖动块的抽屉选择器是 0-3-1，
-		// **压不住** 打开态那条 —— 真值：加上本规则前，拖动到 x=0 时抽屉右缘半径
-		// 仍是终态的 20px（probe-geom.json: drag0 side.r=0px/20px），
-		// 即「跟手」被终态静态值顶掉。所以这里补齐到 0-4-1 且排在打开态之后。
-		//
-		// clip-path：抽屉的可绘制右缘必须**钉在主卡左缘**（= --dshr-drawer-x）。
-		// 否则拖动期抽屉仍是它自己的整宽 360px，右缘整段被不透明主卡盖住，
-		// 圆角一个像素都看不到（真机真值见 report §3）。clip-path 只裁剪绘制、
-		// **不参与布局**，抽屉内容 width:100% 不重排，不会像改宽度那样每帧挤变形。
-		// 打开终态不需要它：那时抽屉盒右缘本来就等于主卡左缘（同一个
-		// --dshr-drawer-width），两张圆角卡天然在交界点对拼。
-		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] [data-dshr-frame]:not([data-sidebar-collapsed]) [data-dshr-sidebar-col],',
-		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] [data-dshr-frame][data-sidebar-collapsed] [data-dshr-sidebar-col] {',
-		'  border-top-right-radius: calc(var(--dshr-card-p, 0) * var(--dshr-card-r, 20px)) !important;',
-		'  border-bottom-right-radius: calc(var(--dshr-card-p, 0) * var(--dshr-card-r, 20px)) !important;',
-		'  clip-path: inset(var(--dshr-inset-top, env(safe-area-inset-top, 0px)) calc(max(0px, 100% - var(--dshr-drawer-x, 0px))) 0 0 round 0 calc(var(--dshr-card-p, 0) * var(--dshr-card-r, 20px)) calc(var(--dshr-card-p, 0) * var(--dshr-card-r, 20px)) 0) !important;',
-		'}',
-		// ── T91：交界缝的暗底（frame::after，只露在缺口里）──
-		//
-		// 为什么是 frame 的伪元素而不是新节点：零痕迹契约里平板档要求「hook 自有节点 0 个」，
-		// 而 scripts/test-device-class.mjs:36 的 HOOK_NODE_IDS 是一份**硬编码名单**，
-		// 我不允许改那个文件 ⇒ 新节点会掉出那份名单的检查面。伪元素不占 DOM，
-		// 且实测官方 frame 的 ::before/::after 都是 content:none（真机真值见 report §1），
-		// 无覆盖风险。
-		//
-		// 为什么是 position:fixed：frame 是 grid 容器，静态流的伪元素会变成 grid item
-		// 去抢轨道；fixed 脱流。官方 frame 上没有任何 transform/filter/will-change
-		// （实测 none/none/auto）⇒ fixed 的包含块就是视口，不会被 frame 的
-		// overflow:hidden 裁掉（它只在缺口处可见，正是要的地方）。
-		//
-		// z-index:1 —— 低于抽屉(z-index:10)与主卡(20)，高于 frame 自己的背景：
-		// 抽屉/主卡覆盖处完全看不到它，只在两者都没画到的圆弧缺口里露出来。
-		// 顶边同样从 --dshr-inset-top 起：状态栏那 28px 条带保持与抽屉同色（沉浸不变），
-		// 缺口从主卡盒顶同一高度开始，两张卡的圆弧在同一水平线上对拼。
-		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] [data-dshr-frame]::after,',
-		'html.' + ROOT_CLASS + '[data-dshr-expanded="1"]:not([data-dshr-dialog="1"]) [data-dshr-frame]::after {',
-		'  content: "";',
-		'  position: fixed;',
-		'  left: 0;',
-		'  right: 0;',
-		'  top: var(--dshr-inset-top, env(safe-area-inset-top, 0px));',
-		'  bottom: 0;',
-		'  z-index: 1;',
-		'  background: var(--dshr-seam);',
-		'  pointer-events: none;',
-		'}',
+		// T91 当年为了"让抽屉右缘的圆角在跟手期看得见"，先给抽屉右缘加跟手圆角
+		// （`border-*-right-radius: calc(--dshr-card-p × --dshr-card-r)`），再用
+		// `clip-path: inset(… calc(max(0px, 100% - var(--dshr-drawer-x))) …)` 把抽屉的
+		// 可绘制右缘钉到主卡左缘。两条一起删，因为：
+		//   1) 目标观感变了（用户原话"各自是各自的圆角矩形"被否掉）——
+		//      接缝处只能有**卡片自己**的圆角，抽屉右缘必须是直线；
+		//   2) 抽屉宽度本来就等于 360.19（= --dshr-drawer-width），跟手期主卡只是
+		//      浮在它上面，右缘被不透明卡片盖住的部分**本来就看不见**，
+		//      不需要把自己的右缘"拉"到卡片左缘去；
+		//   3) 于是抽屉回到"整块背景"语义：不裁剪、不圆角、不参与任何跟手动画
+		//      （只由 z-index:10 待在卡片 z-index:20 下面）。
+		// 真机像素真值（抽屉侧右缘在多条 y 上恒为同一条 x）见 report §4.2。
 		// T82：鲸鱼不再被拖动闸藏掉。它自己读 --dshr-drawer-x 跟手（见下方 #dshr-mobile-whale），
 		// 与主列共用同一对 transition ⇒ 同帧同缓动交接。
 		// 但必须让它 pointer-events:none：实测遮罩占 x 359.4–411.4，鲸鱼 z-index 900
@@ -616,10 +718,9 @@
 		'html.' + ROOT_CLASS + '[data-dshr-expanded="1"] #dshr-mobile-whale {',
 		'  pointer-events: none !important;',
 		'}',
-		// 跟手期间关掉过渡：位移必须与手指 1:1（主列与鲸鱼同一条规则，避免两者不同步）。
-		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] #dshr-mobile-whale {',
-		'  transition: none !important;',
-		'}',
+		// 跟手期间关掉过渡：位移必须与手指 1:1。
+		// T105：这条原来只写 transition:none；现在把 transform 与 !important 一起并到
+		// `#dshr-mobile-whale` 基规则之后那条同名规则里（见下），避免两条分散、便于对照。
 		// 侧栏展开时主会话浮层整卡可跟手拖；禁止浏览器把左滑吃成滚动。
 		'html.' + ROOT_CLASS + '[data-dshr-expanded="1"] [data-dshr-main-col],',
 		'html.' + ROOT_CLASS + '[data-dshr-expanded="1"] #dshr-mobile-drawer-mask {',
@@ -667,11 +768,36 @@
 		// 于是 hook 里两条互不知情的规则（拖动闸 + 展开闸，都是 display:none !important）
 		// 在拖动第 1 帧、手指还没动时就把鲸鱼抹掉了（三次重复一致，见 report §B）。
 		// 现在它与主列读同一个变量 ⇒ 同一帧同一缓动交接，不存在"一个先动一个后动"。
+		//
+		// ⚠ T105 修正：上面这条只用 `--dshr-drawer-x`（**拖动期**变量）是**不完整**的。
+		// `--dshr-drawer-x` 只在 data-dshr-dragging=1 期间存在，松手落位时
+		// `clearDrawerVisual()`（:3893 附近）会 removeProperty ⇒ 鲸鱼瞬间回落到回退值 0，
+		// 而主列由展开态规则（`translateX(var(--dshr-drawer-width))`）落在 360.19。
+		// 真机逐帧真值（scratch/t105/ev/perframe-base-full.json）：拖动期 164 帧
+		// `whale.x − (10 + mainX)` **恒 0**，松手后 0.34s 内单调退化到 **−360.19**
+		// —— 正是用户说的"鲸鱼会飘"（卡片往右落位、鲸鱼同时横扫 360px 飞回左侧）。
+		// 修法：**展开态（非拖动）**补一条同源位移，读 JS 每帧解析出来的 px 变量
+		// `--dshr-drawer-shift`（= 主列终态 translateX 的解析值，见 syncDrawerMetrics），
+		// 缓动与时长与主列逐字相同 ⇒ 同帧同缓动落位。
+		// 拖动期两条规则同时命中，故下面那条带 !important 的拖动规则排在后面压住它。
 		'  transform: translateX(var(--dshr-drawer-x, 0px));',
 		'  transition: transform 0.34s cubic-bezier(0.32, 0.72, 0, 1);',
 		'  will-change: transform;',
 		'}',
 		'#dshr-mobile-whale svg { display: block; width: 27px; height: 20px; }',
+		// T105：展开终态 —— 鲸鱼跟着**主列**（不是抽屉）停在卡片左上角，
+		// 与卡片保持恒定相对位置（卡片内 10px）。`--dshr-drawer-shift` 一定是 px
+		// （不能复用 --dshr-drawer-width：手机档它是 calc(100% - 52px)，而 translateX 的
+		// 百分比对**元素自身**宽度解析 —— 鲸鱼只有 48px 宽，会算成 −4px）。
+		'html.' + ROOT_CLASS + '[data-dshr-expanded="1"] #dshr-mobile-whale {',
+		'  transform: translateX(var(--dshr-drawer-shift, 0px));',
+		'}',
+		// 拖动期：位移必须与手指 1:1（读拖动变量本身），且压住上面的展开态规则
+		// （两条特异度相同 0-1-3-1，全靠这条的 !important + 源码顺序）。
+		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] #dshr-mobile-whale {',
+		'  transition: none !important;',
+		'  transform: translateX(var(--dshr-drawer-x, 0px)) !important;',
+		'}',
 		// T82 产品最终形态（用户拍板）：鲸鱼**跟着抽屉一路滑到右边并停住**，不淡出、不隐藏。
 		// 因此这里从"仅 expanded=0 显示"放宽为"ready 即显示"。
 		// 安全性：三条隐藏规则（rightbar-fullscreen / explorer-details / dialog）都带
@@ -2136,6 +2262,8 @@
 	// 拿它判重会永不相等，去抖就成了空转（每轮 syncDom 都过桥）。
 	var lastUiDiagKey = null;
 	var uiDiagBridgeMissing = false;
+	// T112（S1）：断开持续态里"按电平重推"的次数（只读证据；健康稳态恒 0）。
+	var uiDiagLevelPushes = 0;
 
 	// T31-3/T31-4 的共享状态。**必须在这里声明**：collectUiDiag（第 ~1180 行）
 	// 会读 lastDisconnectAt，而它在 IIFE 顶部的 reportUiDiag() 调用点之前就被求值。
@@ -2144,12 +2272,17 @@
 	// 而这一轮的诉求是"不再等 30 秒"——把确认窗口压到 400ms 是这条时间线最短的一段。
 	var RESUME_MIN_INTERVAL_MS = 8000;
 	// T38-2 新增的两道防风暴闸：二次确认的延后时长，以及单页面生命周期的硬上限。
-	// T82：15s→8s、3→6。风暴边界核算见 report §C：
-	//   6 次 × (0.4s 确认 + 8s 间隔) ≈ 50.4s 窗口，与上游自身退避梯子
-	//   12.75–25.5s（H=2000ms 时 31.3s）**同量级、非同密度**；
-	//   且只在"断开持续态"才走这条路径，健康时零开销。
+	// T82：15s→8s、3→6。
+	// T112b：**6 → 2**。依据是 T110 的决定性 A/B（`scratch/t110/report.md` §8.4 ①，同一装置、
+	//   链路始终健康、只做一次前后台切换）：上限 6 时 rc.2.7/rc.2.8 各推 6 次、
+	//   **6 次全是真的掐断**（≈50s 内连掉 6 次）；上限 2 把最坏窗口从 6×(0.4s 确认 + 8s 间隔)
+	//   ≈ 50.4s 压到 2×8.4s ≈ 17s。核心理由不是"少推几次"，而是：**这条路径上任何一次多推
+	//   都是用户可见的掉线**（推 = 掐断在用 socket），所以上限必须按"最坏情况用户能忍几次"
+	//   来定，而不是按"退避梯子的同量级"来定（T82 那套核算的前提在 T110 里已被证否）。
+	//   配合下面 requestUpstreamReconnect 的按来源分流（只有 WS 观测到的真 close 才允许掐断），
+	//   上限 2 只是**第二道**兜底：分流负责"不该掐的绝不掐"，上限负责"该掐的也别一直掐"。
 	var RESUME_CONFIRM_DELAY_MS = 400;
-	var RESUME_MAX_NUDGES = 6;
+	var RESUME_MAX_NUDGES = 2;
 	// T82：断开持续态的巡检步长。健康时这个 tick 只做一次判据读取就返回（零开销）。
 	var RESUME_DOWN_TICK_MS = 1000;
 	// ── T95：回前台"主动探活" + 回前台首次推不等间隔 ──
@@ -2171,20 +2304,45 @@
 	//      mux 健康空闲 75s 内**收 0 帧 / 发 0 帧**（§1.8）⇒ **不能**用"静默"当半开判据，
 	//      只能回前台**主动探活**一次。
 	//
-	// 风控边界一行未放宽：主动探活只在"回前台 + 后台待够 RESUME_VERIFY_MIN_HIDDEN_MS"时才发，
-	// 一次回前台最多 1 个请求、3s 硬超时；"跳过间隔"只给回前台这 5s 窗口（自到期，不长期放宽）；
-	// 上限 6 次 / 8s 间隔 / 二次确认三道具在。
+	// 风控边界（T112 之后）：
+	//   · 主动探活只在"回前台 + 后台待够 RESUME_VERIFY_MIN_HIDDEN_MS"时才发；
+	//   · 一次回前台最多 **2 个**请求（主探 + 确认探），**都不是常开**；
+	//   · 主探 3s 硬超时（取值不变），确认探 6s；
+	//   · **连续两次失败才判"传输层已死"**（T112，见下），一次失败只记账、不动作；
+	//   · "跳过间隔"只给回前台这 5s 窗口（自到期，不长期放宽）；
+	//   · 上限 6 次 / 8s 间隔 / 二次确认三道具在。
+	//
+	// T112 改动依据（半开装置上的原始真值见 report §1/§5）：
+	//   改前：**一次** 3s 超时就直接写 60s "传输层已死"闩锁 + 立刻推一次 nudge
+	//   （`requestUpstreamReconnect()` ⇒ 派发 offline→online ⇒ 客户端 **abort 当前连接并新建**）。
+	//   真机刚从深休眠/换网回来时，第一次 TLS/TCP 往返超 3s 并不罕见 ⇒ 一次超时 =
+	//   60s 假"正在重连" + **自造一次真重连**。这正是用户报的"频繁重连 / 发消息要等"。
+	//   现在：① 主探失败只记账并排一次**确认探**（间隔 400ms，沿用既有二次确认语义）；
+	//         ② 确认探超时放宽到 6s（专门吸收"刚回前台链路还没热"的那一段）；
+	//         ③ **两次都失败**才判死 ⇒ 才写信任闩锁、才推 nudge（"信任期只授予确认过的判定"）；
+	//         ④ 信任期 60s → 20s：即使仍有残余误判，用户可见窗口从 60s 收到 20s；且 20s 之后
+	//            若链路真死，WS 层（close 宽限 / CONNECTING 宽限）会独立把判据重新置真，不会漏。
+	//   半开发现时延代价（真值见 §5）：最坏 3 + 0.4 + 6 = 9.4s（改前 3s）；确认探**快速失败**
+	//   （连接被拒/网络变更）时 ≈ 3.4s，与改前同级。
 	var RESUME_VERIFY_MIN_HIDDEN_MS = 20000;   // 只有"后台待够久"才探活 ⇒ 健康前台零请求
 	var RESUME_VERIFY_TIMEOUT_MS = 3000;       // 探活硬超时：超过即认为传输层已死
-	var RESUME_VERIFY_TRUST_MS = 60000;        // 一次"传输层已死"判定的有效期（期间判据恒"断"）
+	var RESUME_VERIFY_CONFIRM_DELAY_MS = 400;  // T112：主探失败 → 确认探之间的间隔（二次确认语义）
+	var RESUME_VERIFY_CONFIRM_TIMEOUT_MS = 6000; // T112：**确认探**的超时（更宽容）
+	var RESUME_VERIFY_CONFIRM_FAILS = 2;       // T112：连续失败 2 次才判"传输层已死"
+	var RESUME_VERIFY_TRUST_MS = 20000;        // 一次"传输层已死"判定的有效期（期间判据恒"断"）
 	var RESUME_BYPASS_WINDOW_MS = 5000;        // 回前台这条路径允许"跳过最小间隔"的时间窗
 	var RESUME_HARD_MIN_GAP_MS = 1500;         // 任何两次推之间的**硬地板**（回前台窗口也不能破）
 	var resumeHiddenSince = 0;                 // 进入 hidden 的时刻（0 = 已回前台/从未隐藏）
 	var resumeBypassUntil = 0;                 // >now 时，推 nudge 不受 RESUME_MIN_INTERVAL_MS 约束
 	var resumeVerifyDownAt = 0;                // 主动探活判定"传输层已死"的时刻（0 = 未判定）
-	var resumeVerifyResult = 'never';          // 'never'/'ok'/'timeout'/'error'
+	var resumeVerifyResult = 'never';          // 'never'/'ok'/'timeout'/'error'/'fail-1'（已失败一次，等确认探）
 	var resumeVerifyRunning = false;           // 探活进行中（防重入）
 	var resumeVerifyAt = 0;                    // 最近一次探活发起时刻
+	// T112：连续失败计数 + 确认探的排程（判断"传输层已死"要**两次**独立失败）。
+	var resumeVerifyFailCount = 0;
+	var resumeVerifyFailAt = 0;
+	var resumeVerifyRetryTimer = 0;
+	var resumeVerifyProbeCount = 0;            // 本次页面生命周期内发出的探活请求总数（只读证据）
 	// "这一拍是回前台进来的"意图位。**不用形参**：`scripts/test-resume-recovery.mjs`
 	// 逐字匹配 `function probeResumeRecovery()`，形参会让那条契约变红（不许改那个脚本）。
 	var resumeFromResumeIntent = false;
@@ -2538,6 +2696,43 @@
 		return collectUiDiag();
 	};
 
+	/**
+	 * T112（S1）：把**当前**连接态原样重推一次 —— 绕过去抖键，但推完仍然更新去抖键。
+	 *
+	 * 为什么必须有它：`wsState` 在原生侧是**电平闩锁**（`MainActivity.hookConnState` 只在
+	 * `setUiDiag` 到达时改变，`handleReconnectProbe` 每 500ms 把它 OR 进观测），而
+	 * `reportUiDiag()` 状态不变就不推 ⇒ 只要出现过一次 `reconnecting`，除非 hook 再发生
+	 * 一次**翻转**，原生就永远认为"正在重连"，`HIDE_STREAK=3` 永远凑不满（横幅钉死）。
+	 *
+	 * 调用点只有一处：断开持续态的 1s 巡检（`ensureResumeDownTick`）—— 只在**判为断**时
+	 * 每拍重推一次电平，恢复的那一拍推一次真实态。健康稳态**零调用**、零定时器。
+	 * 成本：1 次 `JSON.stringify(collectUiDiag())` + 1 次桥调用 / 秒，只在断开期间。
+	 */
+	function reportUiDiagLevel() {
+		var diag, payload, key;
+		try {
+			diag = collectUiDiag();
+			payload = JSON.stringify(diag);
+			key = uiDiagDedupeKey(diag);
+		} catch (ignoredLevelJson) { return false; }
+		// 记账在**桥判空之前**：这个计数器要回答的是"断开态里电平重推**被调用**了几次"，
+		// 而不是"过桥成功了几次" —— 真值台上没有原生桥（headless Chrome），
+		// 记账若放在桥判空之后，机制在真值台上就永远读不到（M2 变异将无法反证）。
+		uiDiagLevelPushes += 1;
+		try {
+			if (!window.DshRemoteApp || typeof window.DshRemoteApp.setUiDiag !== 'function') {
+				uiDiagBridgeMissing = true;
+				return false;
+			}
+		} catch (ignoredLevelProbe) { return false; }
+		lastUiDiagKey = key;
+		if (uiDiagBridgeMissing) uiDiagBridgeMissing = false;
+		try {
+			window.DshRemoteApp.setUiDiag(payload);
+		} catch (ignoredLevelBridge) { return false; }
+		return true;
+	}
+
 	function isPortraitViewport() {
 		try {
 			if (window.matchMedia) {
@@ -2560,6 +2755,34 @@
 		return false;
 	}
 
+	/**
+	 * T105：把「主列展开终态的 translateX 解析值」算成 px 写到 `--dshr-drawer-shift`。
+	 *
+	 * 为什么需要它：主列的终态位移是 `translateX(var(--dshr-drawer-width))`，手机档那个
+	 * token 是 `calc(100% - 52px)` —— 这个 100% 对**主列自身宽度**解析（= 视口宽，实测 412.19）。
+	 * 鲸鱼只有 48px 宽，若直接复用同一 token，百分比会按 48px 解析（48 − 52 = **−4px**），
+	 * 于是「跟手 0 漂移、松手飞回左边」。所以鲸鱼必须读一个**已经是 px** 的值。
+	 * 平板档 drawer 分支本身就写 px（`drawer + 'px'`），直接照抄即可。
+	 *
+	 * 复用既有的 `drawerPeekPx()`（:3763，从 `--dshr-drawer-peek` 读数值、缺省 52），
+	 * **不另起同名函数**（同作用域重名会靠声明顺序覆盖，是个地雷）。
+	 *
+	 * 只在 resize / 档位重算 / 手势起手 / 落位前计算（不进任何每帧热路径）。
+	 */
+	function syncDrawerShift() {
+		var root = document.documentElement;
+		if (root.getAttribute('data-dshr-tablet') === '1') {
+			root.style.setProperty('--dshr-drawer-shift', root.style.getPropertyValue('--dshr-drawer-width') || '0px');
+			return;
+		}
+		var frame = findFrame();
+		var main = frame ? findMainCol(frame) : null;
+		var w = 0;
+		try { w = main ? main.getBoundingClientRect().width : 0; } catch (ignoredW) { w = 0; }
+		if (!w) w = window.innerWidth || 390;
+		root.style.setProperty('--dshr-drawer-shift', Math.max(0, w - drawerPeekPx()) + 'px');
+	}
+
 	function syncDrawerMetrics() {
 		var root = document.documentElement;
 		var vw = window.innerWidth || 390;
@@ -2572,6 +2795,7 @@
 			root.style.setProperty('--dshr-drawer-peek', '52px');
 			root.style.setProperty('--dshr-drawer-width', 'calc(100% - 52px)');
 		}
+		syncDrawerShift();
 	}
 
 	// ── hook 启用（WEB-02 单一源：同一份脚本、两种平台行为，运行时区分） ──
@@ -2608,8 +2832,10 @@
 
 	/**
 	 * 启用矩阵（契约 3.4）。三条分支各自等价于一种既有行为：
-	 *   - 'tablet'：任意朝向 OFF。平板的系统栏让位由原生容器负责（契约 3.6），
-	 *     页面不得再写任何 DOM，故走 teardownHookTraces 的严格 OFF。
+	 *   - 'tablet'：任意朝向 OFF。T115 起平板档的系统栏让位**由页面自己承担**
+	 *     （原生把 WebView 外边距恒写 0 + 四向 inset 写进 --dshr-inset-*，见文件头
+	 *     「平板档第三处例外」），页面仍走 teardownHookTraces 的严格 OFF：
+	 *     不装观察器、不标 DOM，只保留那批 CSS 与四个 inset 变量。
 	 *   - 'phone' ：竖屏 ON（现有全部移动适配），横屏 OFF（维持现状：官方布局 +
 	 *     dshr-official-inset 让出状态栏，G3/D1「维持现状」）。
 	 *   - 'auto'  ：完全等价于本文件改动前的既有行为——壳内只看竖屏，web 端只看
@@ -2622,8 +2848,9 @@
 		return !!mql.matches;
 	}
 
-	// 严格 OFF 只属于 'tablet' 档：原生已经把 WebView 让出系统栏空间，页面必须
-	// 回到「与完全不注入一致」的零痕迹状态。'phone' 横屏与 'auto' 仍走既有 OFF 分支。
+	// 严格 OFF 只属于 'tablet' 档：T115 起页面要自己让位，因此它在 <html> 上**保留**
+	// 四个 --dshr-inset-* 变量（那是让位的输入），其余一切照旧回到零痕迹状态。
+	// 'phone' 横屏与 'auto' 仍走既有 OFF 分支。
 	function isStrictOff() {
 		return deviceMode === 'tablet';
 	}
@@ -2641,6 +2868,15 @@
 	 *      规则外，全部规则都以 html.dshr-mobile / html.dshr-official-inset 开头，
 	 *      这两个类已被移除，故无一条规则命中官方 DOM；那四个裸 ID 规则的宿主
 	 *      节点本函数已从 DOM 删除，规则同样无宿主。
+	 *      ⚠ T101 起有**一处例外**：那 2 条平板档圆角规则（见 MOBILE_CSS 里
+	 *      「T101：平板档圆角」一段）以 `html:not(.dshr-mobile):not(.dshr-official-inset)`
+	 *      开头，**正是要在平板档命中官方 frame / main 列**——它们改的只是绘制
+	 *      （frame 底色与主区列的圆角/裁剪），不写节点、不写属性、不写类名，
+	 *      因此仍是「最小痕迹」；代价是上面这句话在平板档不再逐字成立。
+	 *      ⚠ T115 起再有**一组例外**：以同一作用域开头的平板档让位规则（三列 padding 四向
+	 *      + 会话面板列的底色）。它同样是「改绘制/布局、不写节点/属性/类名」。
+	 *      另外 <html> 上的四个 --dshr-inset-* 变量本函数**刻意不摘**——平板档正靠它们让位，
+	 *      摘掉就等于把让位一起摘掉（换回 phone 档时 set() 会重写同一批变量，不留脏值）。
 	 *   2. MutationObserver——严格 OFF 下根本不安装（它会在 <html> 上写
 	 *      data-dshr-observer，本身就是痕迹）；syncDom() 亦在入口早退，切回
 	 *      phone 档时由 recomputeDeviceScope 补装。
@@ -2655,6 +2891,7 @@
 		removeHookAttributes(root);
 		root.style.removeProperty('--dshr-drawer-width');
 		root.style.removeProperty('--dshr-drawer-peek');
+		root.style.removeProperty('--dshr-drawer-shift');
 		root.style.removeProperty('--dshr-ime');
 		root.style.removeProperty('--dshr-vv-height');
 		// 2) hook 创建的节点：悬浮鲸鱼、抽屉遮罩、状态栏挡板、drag handle。
@@ -2721,11 +2958,12 @@
 		// `window.WebSocket`（零痕迹不只 DOM），启用态安装（幂等）。必须放在下面那条
 		// strictOff 早退**之前**，否则切到平板档时构造器还原不掉。
 		syncWsStateWatch(on && !isStrictOff());
-		// T97：平板档「左上角品牌区（鲸鱼 + deepseek HARNESS）长按 = 打开 App 连接设置页」
-		// 也跟着档位走。**只平板档挂**；手机档 / auto 档一个监听器都不挂 ⇒ 既有鲸鱼、
-		// 抽屉拖动、右栏、焦点守卫等手势零影响。同样必须放在下面那条 strictOff 早退
-		// 之前，否则切到平板档时监听挂不上、切走时也摘不掉。
-		syncBrandLongPress(isStrictOff());
+		// T97/T103：档位闸（T103 起手机档也挂）。**只**由 brandLongPressWanted() 决定：
+		// 平板档（严格 OFF）与手机档（hook 启用态 = 竖屏）挂；手机横屏 / auto 档
+		// **一个监听器都不挂** ⇒ 那些档位的既有鲸鱼、抽屉拖动、右栏、焦点守卫零影响。
+		// 同样必须放在下面那条 strictOff 早退**之前**，否则切到平板档时监听挂不上、
+		// 切走时也摘不掉。
+		syncBrandLongPress(brandLongPressWanted());
 		var root = document.documentElement;
 		if (!on && isStrictOff()) {
 			// 平板档：官方布局零改动，直接走拆除路径（不写 dshr-official-inset）。
@@ -2740,6 +2978,9 @@
 		else {
 			root.style.removeProperty('--dshr-drawer-width');
 			root.style.removeProperty('--dshr-drawer-peek');
+			// T105：鲸鱼展开态位移变量同属这一族，摘 hook 时一起清干净
+			// （否则平板档零痕迹契约的 `documentElement 行内样式一致` 断言会红）。
+			root.style.removeProperty('--dshr-drawer-shift');
 		}
 		applyImeLift();
 		reportImeFocusToNative();
@@ -2770,23 +3011,38 @@
 	bindImeLift();
 	bindFocusGuard();
 
-	// ── 原生 inset 变量（MainActivity 在页面加载/焦点变化时调用） ──
-	// 平板档由原生容器给 WebView 让位（契约 3.6），页面不再持有这两个行内变量；
-	// 但仍记住最后一次收到的值，切回 phone 档时立刻补写，保证可逆。
+	// ── 原生 inset 变量（MainActivity 在页面加载/焦点变化/让位重算时调用） ──
+	// T115：**平板档也写**。改前这里是 `if (isStrictOff()) return;` —— 平板档一个变量都不写，
+	// 因为那时让位由原生容器（WebView 外边距）承担。T115 起用户口径是「系统栏走安卓原生透明 +
+	// 页面自己让位」：WebView 覆盖全窗，页面必须自己把内容让开系统栏，因此平板档**必须**拿到
+	// 这四个值。这与 T101 的「最小 hook」契约同源放宽：新增痕迹只有 <html> 上四个 CSS 自定义
+	// 属性（--dshr-inset-*），仍然**不新增 DOM 节点 / 类名 / data-dshr-* 属性**，
+	// 消费它们的 CSS 也仍写在既有的 <style data-dshr-mobile-css> 里。
+	// 左右两向是 T115 新增（挖孔 / 横屏三键导航）；旧调用方只传两个参数时左右按 0 处理。
 	var lastInsetTop = 0;
 	var lastInsetBottom = 0;
+	var lastInsetLeft = 0;
+	var lastInsetRight = 0;
 	window.__dshRemoteInsets = {
-		set: function (topPx, bottomPx) {
+		set: function (topPx, bottomPx, leftPx, rightPx) {
 			var top = Number(topPx);
 			var bottom = Number(bottomPx);
+			var left = Number(leftPx);
+			var right = Number(rightPx);
 			if (isNaN(top)) top = 0;
 			if (isNaN(bottom)) bottom = 0;
+			if (isNaN(left)) left = 0;
+			if (isNaN(right)) right = 0;
 			lastInsetTop = top;
 			lastInsetBottom = bottom;
-			if (isStrictOff()) return;
+			lastInsetLeft = left;
+			lastInsetRight = right;
 			var rootStyle = document.documentElement.style;
 			rootStyle.setProperty('--dshr-inset-top', top + 'px');
 			rootStyle.setProperty('--dshr-inset-bottom', bottom + 'px');
+			rootStyle.setProperty('--dshr-inset-left', left + 'px');
+			rootStyle.setProperty('--dshr-inset-right', right + 'px');
+			if (isStrictOff()) return;
 			applyImeLift();
 		},
 	};
@@ -3597,6 +3853,10 @@
 	/** 定向开/关侧栏；已是目标态时不 toggle，避免连点把抽屉又打开。 */
 	function setSidebarOpen(open) {
 		open = !!open;
+		// T105：这条路是"抽屉状态真的要被改写为 open"的唯一收口（手势 settle /
+		// 官方折叠按钮 / 右栏兜底都汇到这里）⇒ 在改写前刷一次鲸鱼的终态位移，
+		// 保证它读到的 px 与主列这一帧的真实宽度一致（一次布局读，非每帧）。
+		if (open) syncDrawerShift();
 		// 官方 React 提交可能晚于手指松开；即使 DOM 仍是旧状态也要记住最终意图。
 		if (toggleBusy) {
 			pendingSidebarOpen = open;
@@ -3703,6 +3963,10 @@
 			// margin 说明：那一帧的重排来自 margin/max-height 的 0.34s 过渡（margin 参与布局），
 			// 本轮把两处 8px margin 删掉后该帧不再做整列布局，真机帧率真值见 report §B。
 			setSidebarOpen(true);
+			// T105：手上这笔手势一定会走"松手落位"，而落位后鲸鱼读的是
+			// `--dshr-drawer-shift`（主列终态位移的 px 值）。这里在**起手**（每笔手势一次、
+			// 不在每帧热路径上）刷一次，保证它与这一帧的主列宽度一致。
+			syncDrawerShift();
 		}
 		var max = drawerVisual.max;
 		x = Math.max(0, Math.min(max, x));
@@ -3796,6 +4060,10 @@
 		if (!state) return setSidebarOpen(!!wantOpen);
 		if (wantOpen) {
 			// 展开落位：去掉跟手样式，让官方 transform 接管，目标态已展开。
+			// T105：落位前再刷一次鲸鱼的终态位移（一次布局读，不在每帧路径上）——
+			// 官方折叠按钮那条路径不经过 setDrawerVisual，只有这里能保证
+			// `--dshr-drawer-shift` 与"这一帧主列真实的 px 宽度"一致。
+			syncDrawerShift();
 			var result = setSidebarOpen(true);
 			clearDrawerVisual(true);
 			return result;
@@ -3806,6 +4074,22 @@
 			drawerVisual = null;
 			if (settleAnim) { window.cancelAnimationFrame(settleAnim); settleAnim = 0; }
 			if (drawerRaf) { window.cancelAnimationFrame(drawerRaf); drawerRaf = 0; }
+			// T112b（V1 P2-2，1 帧观感修正）：**这一帧**必须先把鲸鱼的"展开终态位移"归零。
+			//
+			// 真值（两台设备、同一套逐帧判据 `|whaleX − (10 + mainX)|`）：
+			//   · V1 真机（`scratch/v1/pf-drawer-close.json` t=427549）：`dr=null, ex='1'`，漂移 **+42.97px**；
+			//   · 我的装置（`scratch/t112b/exp-drawer-close-new.json`）：同一个交接帧漂移 **+111.73px**
+			//     （峰值的绝对值取决于该帧多长，机制相同）。
+			// 机制：`data-dshr-dragging` 在这一行被摘掉，而 `setSidebarOpen(false)` 是**异步**提交
+			// （官方 React），于是有 1–2 帧同时满足「拖动规则已失效」+「`data-dshr-expanded` 还是 1」
+			// ⇒ 鲸鱼回落到展开态规则 `translateX(var(--dshr-drawer-shift))`，而那个变量此刻是
+			// **360px**（展开态的解析值）⇒ 它带着 0.34s 的 transition 朝右飞，下一帧 expanded=0
+			// 再把它拽回来（观感：鲸鱼抖一下）。
+			// 修法：关闭落位的终态里，主列终态位移**本来就是 0**（rail 态 translateX=0），
+			// 所以这里把它显式写 0 —— 交接帧的目标就是 10px（鲸鱼该在的位置），不再有"朝 360 飞"。
+			// 安全性：**任何**打开路径都会先 `setSidebarOpen(true)`，而它第一件事就是
+			// `syncDrawerShift()`（:3788）重算成正确的 px 值 ⇒ 这条归零不可能污染打开态。
+			document.documentElement.style.setProperty('--dshr-drawer-shift', '0px');
 			document.documentElement.removeAttribute('data-dshr-dragging');
 			document.documentElement.style.removeProperty('--dshr-drawer-x');
 			document.documentElement.style.removeProperty('--dshr-card-p');
@@ -4583,22 +4867,75 @@
 				if (longPress !== null) window.clearTimeout(longPress);
 				longPress = null;
 			}
+			/**
+			 * T103：长按既然已经进了 App 连接设置页，**这一次手势后面那记 click 必须吞掉**。
+			 *
+			 * 实测真值（`scratch/t103/ev/p03-diag.json`：真机 WebView + CDP 触摸 + 临时探针）：
+			 *   touchstart@34ms → 650ms 定时器触发（设置页弹出）→ touchend@868ms → **click@872ms**
+			 *   （isTrusted=true / detail=1，落在鲸鱼上、未被 preventDefault）。
+			 * 也就是说只靠 touchend 里那句 `!longPressFired` 不 toggle 是**不够**的：click handler
+			 * 里 `suppressClickUntil` 当时仍是 0 ⇒ 又 toggleSidebar() 一次 ⇒ 抽屉 collapsed
+			 * true→false（实测：长按进设置页的同时把侧栏也打开了）。800ms 窗口与短按路径同值、
+			 * 同一变量；click handler 对窗口内**每一次** click 都吞（T97 的教训：一次长按可能
+			 * 跟来两次 click）。本函数不新增任何监听器、不写任何 DOM。
+			 *
+			 * 两个置位点：长按触发那一刻（覆盖没有 touchend 的 contextmenu 路径）与 touchend
+			 * （覆盖「按住远超 800ms 才抬手」——那时窗口早已过期）。
+			 */
+			function armClickSuppress() {
+				suppressClickUntil = Date.now() + 800;
+			}
+			// T103：多指防线的**文档级**临时守卫（只在长按在案期间挂，抬手/取消即摘）。
+			// 为什么必须是文档级：实测（`scratch/t103/ev/v02-diagmulti.json`）第二根手指
+			// 落在鲸鱼**之外**的另一棵子树时，`touchstart` 的 event.target 是那个元素 ——
+			// 挂在鲸鱼自己身上的 handler **根本收不到这一次**，于是 650ms 定时器照旧触发、
+			// 设置页照样弹出（改前实测：两指按住 1.1s ⇒ 设置页出现，
+			// 见 `scratch/t103/ev/phone-whale-prepatch-multi.json`）。
+			// 常态监听器数量**一个都不增加**（本守卫在长按立案时挂、抬手/取消/触发即摘，
+			// 与 T97 的 `brandGuards` 同一套「手势进行中的临时守卫」做法）。
+			var multiGuard = null;
+			function guardMultiTouch() {
+				if (multiGuard) return;
+				multiGuard = function (event) {
+					if (event.touches && event.touches.length > 1) cancelLongPress();
+				};
+				document.addEventListener('touchstart', multiGuard, { passive: true, capture: true });
+			}
+			function unguardMultiTouch() {
+				if (!multiGuard) return;
+				try { document.removeEventListener('touchstart', multiGuard, { capture: true }); } catch (ignoredMultiUnbind) {}
+				multiGuard = null;
+			}
 			whale.addEventListener('contextmenu', function (event) {
 				event.preventDefault();
 				cancelLongPress();
+				unguardMultiTouch();
 				longPressFired = true;
+				armClickSuppress();
 				openAppSettings();
 			});
 			whale.addEventListener('touchstart', function (event) {
 				var touch = event.touches && event.touches[0];
+				// T103：多指不立案（与 T97 品牌区同一条口径）。第二根手指**落在鲸鱼上**时
+				// 这一次 handler 就会看到 touches.length===2 ⇒ 立即取消（落在别处的情形由
+				// 上面那个文档级 multiGuard 兜住）。**只**关掉长按立案，不动短按那条既有
+				// 路径（touchend 里的 toggle 判据一字未改）。
+				if (!event.touches || event.touches.length !== 1) {
+					cancelLongPress();
+					unguardMultiTouch();
+					return;
+				}
 				touchStartX = touch ? touch.clientX : 0;
 				touchStartY = touch ? touch.clientY : 0;
 				touchMoved = false;
 				longPressFired = false;
 				cancelLongPress();
+				guardMultiTouch();
 				longPress = window.setTimeout(function () {
 					longPress = null;
 					longPressFired = true;
+					unguardMultiTouch();
+					armClickSuppress();
 					openAppSettings();
 				}, 650);
 			}, { passive: true });
@@ -4609,15 +4946,21 @@
 					Math.abs(touch.clientY - touchStartY) > 10) {
 					touchMoved = true;
 					cancelLongPress();
+					unguardMultiTouch();
 				}
 			}, { passive: true });
 			whale.addEventListener('touchcancel', function () {
 				touchMoved = true;
 				cancelLongPress();
+				unguardMultiTouch();
 			}, { passive: true });
 			whale.addEventListener('touchend', function (event) {
 				var shouldToggle = !longPressFired && !touchMoved;
+				// T103：长按路径（含「按住远超 800ms 才抬手」）把窗口推到抬手那一刻，
+				// 保证紧随其后的那记 click 被吞；短按路径照旧在下面用同一个变量抑制。
+				if (longPressFired) armClickSuppress();
 				cancelLongPress();
+				unguardMultiTouch();
 				if (!shouldToggle) return;
 				// Android WebView 不一定会在带 touch 监听器的 fixed 按钮后合成 click；
 				// 因此短按在 touchend 内直接切换，并抑制可能随后到达的重复 click。
@@ -4708,8 +5051,22 @@
 	// 阈值 600ms（BRAND_LONG_PRESS_MS）：Android 系统
 	// `ViewConfiguration.getLongPressTimeout()` 为 500ms，取 600ms 在系统长按判定之上
 	// 留一档余量（手慢一点的单击不会被吞成设置页），又落在 500–800ms 的通行长按区间内。
-	// **刻意不动**手机档悬浮鲸鱼的既有 650ms —— 那是本脚本自加按钮、没有单击语义，
-	// 强行统一会改到已验收的手机档行为。
+	// **刻意不动**手机档悬浮鲸鱼的既有 650ms —— 那是本脚本自加按钮、单击有语义
+	// （toggle 抽屉），改阈值等于改已验收的手势；T103 只给它补了 click 抑制
+	// （见 ensureFloatingControls 的 armClickSuppress），阈值一字未动。
+	//
+	// ── T103：本段从**平板档专属**放宽到「平板档 + 手机档」 ──────────────────────
+	// 用户口径：进连接设置页只保留长按这一条路。T102 取消「返回键进设置页」之后，
+	// 手机档在「抽屉展开」这个状态下**一个入口都没有**（悬浮鲸鱼那时是
+	// `pointer-events:none !important`，点不到；品牌区又没挂监听）。
+	// 真值依据：手机档抽屉展开时品牌区锚点命中且几何与平板档同构
+	// （T102 `ev/p16-phone-longpress.json`：rect=[16,70,216×24]、aria="New session"），
+	// 而当时长按它**不进设置页**（hasResumeButton=false）。
+	// 实现代价 = **同一个** `document` touchstart 监听器（本来平板档就挂了这一个），
+	// **不新增**第二个监听器、不写 DOM、不改阈值/取消条件/click 抑制逻辑一行。
+	// 另外：手机档抽屉展开时那片区域正好压在悬浮鲸鱼的几何位置上（鲸鱼此时
+	// pointer-events:none ⇒ 触摸落在品牌按钮上）⇒ 「左上角那一块长按 = 设置页」
+	// 在抽屉开/关两种状态下语义一致。
 	//
 	// 误触防线（逐条对应实测，见 scratch/t97/report.md §3）：
 	//   ① 位移 > BRAND_MOVE_TOLERANCE_PX(10px) ⇒ 取消（与手机档鲸鱼同阈值）；
@@ -4735,9 +5092,24 @@
 	/** T97：手势进行中挂的临时守卫（entries=[[type,fn,opts],…]，手势结束即摘）。 */
 	var brandGuards = null;
 
-	/** T97：只在平板档（严格 OFF 档 = `device==='tablet'`）生效，其余档位一律不挂监听。 */
+	/**
+	 * T97：档位闸（T103 放宽）。
+	 *
+	 * T103 之前：只在平板档（严格 OFF = `device==='tablet'`）挂 —— 手机档一个监听器都不挂。
+	 * T103 起：**手机档也挂**，理由是真机真值（见交付报告 §1）：
+	 *   · 手机档会话页「长按左上角品牌区」在 T102 后**完全不触发**（T102 §3.2 P6 已证），
+	 *     而抽屉**展开**时那片区域正是用户看得见的唯一入口 —— 悬浮鲸鱼此时是
+	 *     `pointer-events:none !important`（MOBILE_CSS 的 `[data-dshr-expanded="1"]` 规则），
+	 *     点不到，于是「抽屉开着」这个状态下手机档没有任何进设置页的手势入口。
+	 *   · 品牌区这个锚点手机档**命中得了**：T102 `ev/p16-phone-longpress.json` 实测
+	 *     `[data-slot="sidebar"] [data-window-drag="true"] > button` 在手机档抽屉展开时
+	 *     rect=[16,70,216×24]、aria="New session"，与平板档同构。
+	 * 闸门写成「严格 OFF **或** 手机档 + hook 启用态」，**刻意不含 `auto`**：
+	 * `auto` 的契约是「等价于本文件改动前的既有行为」，T97 之前 auto 就没有这条监听。
+	 * 手机横屏（`hookOn=false`）同样不挂 ⇒ 该档位连监听器都不存在。
+	 */
 	function brandLongPressWanted() {
-		return isStrictOff();
+		return isStrictOff() || (deviceMode === 'phone' && hookOn === true);
 	}
 
 	/**
@@ -4895,9 +5267,10 @@
 	}
 
 	/**
-	 * T97：按档位同步（`applyWidthScope` 唯一的调用点，幂等）。
-	 * 平板档 ⇒ 挂上**唯一**那个 `touchstart` 监听（capture 阶段，保证官方若在
-	 * touchstart 上 stopPropagation 也拦不住我们）；其余档位 ⇒ 一个不留地摘掉。
+	 * T97/T103：按档位同步（`applyWidthScope` 唯一的调用点，幂等）。
+	 * 生效档位（平板档严格 OFF + 手机档 hook 启用态）⇒ 挂上**唯一**那个 `touchstart`
+	 * 监听（capture 阶段，保证官方若在 touchstart 上 stopPropagation 也拦不住我们）；
+	 * 其余档位（手机横屏 / auto）⇒ 一个不留地摘掉。
 	 */
 	function syncBrandLongPress(enabled) {
 		if (enabled) {
@@ -5628,10 +6001,13 @@
 	recomputeDeviceScope = function () {
 		applyWidthScope();
 		if (!hookOn) return;
-		// 平板档期间原生 inset 只被记住、没写进 DOM，这里补写回来保证可逆。
+		// T115：原生 inset 现在**无论哪个档位都当场写**（见 __dshRemoteInsets.set），
+		// 这里补写只是「切档后按最后一次收到的值重算一遍」的兜底，保证可逆。
 		var rootStyle = document.documentElement.style;
 		rootStyle.setProperty('--dshr-inset-top', lastInsetTop + 'px');
 		rootStyle.setProperty('--dshr-inset-bottom', lastInsetBottom + 'px');
+		rootStyle.setProperty('--dshr-inset-left', lastInsetLeft + 'px');
+		rootStyle.setProperty('--dshr-inset-right', lastInsetRight + 'px');
 		startObserver();
 		syncDom();
 	};
@@ -5696,14 +6072,27 @@
 	//      不安装、不写全局；切换到平板档时 `uninstallWsStateWatch()` 把
 	//      `window.WebSocket` 还原成原生构造器并删掉自检全局。
 	//
-	// 判据（`wsWatchDown()`）逐条：
-	//   ① 有 socket 处于 OPEN            ⇒ 健康（有活口即健康）；
-	//   ② 观测到过 close 且现在没有活口  ⇒ **断**（重连期间新 socket 还在 CONNECTING，仍是断）；
-	//   ③ 只有一个 socket 且它 CONNECTING 超过 WS_CONNECT_GRACE_MS ⇒ **断**
+	// 判据（`wsWatchDown()`）逐条（**T112 重写**，改前只有①②③且都没有宽限）：
+	//   ① 有**同类**（与页面同源）socket 处于 OPEN            ⇒ 健康（有活口即健康）；
+	//   ② 一条**曾经 OPEN 过**的同类 socket 关了、且此刻没有别的活口 ⇒ **WS_CLOSE_GRACE_MS
+	//      宽限**后判"断"（不再是"close 后 0ms 就算断"）；
+	//   ③ 有同类 socket 已构造但迟迟没 OPEN，超过 WS_CONNECT_GRACE_MS ⇒ **断**
 	//      （覆盖"页面加载时就连不上、一直在重连"：TCP 直接失败会走 ②，
 	//        半死链路上长期 CONNECTING 由 ③ 兜住）；
-	//   ④ 还没见过任何 socket（app 还没建）⇒ 未知 ⇒ **不算断**（宁可漏报不误报）。
-	//   ⇒ 冷启首连那 0–2s 恒为假，不会把"正在建立首连"误报成断线。
+	//   ④ 还没见过任何同类 socket（app 还没建）⇒ 未知 ⇒ **不算断**（宁可漏报不误报）。
+	//   ⇒ 冷启首连那 0–8s 恒为假，不会把"正在建立首连"误报成断线。
+	//
+	// T112 三条修正（每一条都对着本轮"稳定链路被判成断开"的真值，见 report §1）：
+	//   · **只认同类 socket**（S10）：改前包装器包住页面里**所有** `new WebSocket`，
+	//     任何一条别的 socket 关闭都会把全局 `closeSeen` 置真、并且把 `openNow` **减到 0**
+	//     （`openNow` 是"open 事件数 − close 事件数"，不是"当前活着的 socket 数"）⇒
+	//     别家连接一关就误报主连接断开，而且此后主连接**不再产生 open 事件**，
+	//     这个假"断"会**钉死到页面重建**为止（这正是用户报的"频繁重连"里最毒的一条）。
+	//     现在非同源 socket 只旁观计数（`bystanders`），一个判据字段都不碰。
+	//   · **每条 socket 自己记 open 过没有**：没 open 过的 socket 关闭**不减** `openNow`
+	//     （它从来不是活口），只把"正在连"的起点保住。
+	//   · **close 有宽限**（S3）：新 socket 在宽限内 open ⇒ 不算断。
+	// 宽限带来的"判据变真"延迟由 `wsWatchRecheck()` 的一次性截止定时器补上（不是轮询）。
 
 	// 注意：`WS_WATCH_KEY` / `WS_CONNECT_GRACE_MS` / `wsWatchState` 三个 var 与下面这一组
 	// 函数**分开**：它们必须在本函数体**第一行**（`installWsStateWatch()` 那次最早的调用）
@@ -5717,13 +6106,27 @@
 		} catch (ignoredWsWatchDevice) { return false; }
 	}
 
+	/**
+	 * T112：这条 socket 是不是"页面自己那条"（host 与页面一致）。
+	 * 判据只认同源 socket；不同源的一律只旁观（S10）。
+	 * 解析失败 ⇒ 保守判成同源（宁可照旧观测，也不因为一条解析不出来的 URL 丢掉真信号）。
+	 */
+	function wsWatchSameOrigin(url) {
+		try {
+			var u = new URL(String(url), window.location.href);
+			return u.host === window.location.host;
+		} catch (ignoredWsOrigin) { return true; }
+	}
+
 	/** T90：连接态是否"断"。**只读、无副作用**，不依赖任何 UI 文案。 */
 	function wsWatchDown() {
 		var s = wsWatchState;
 		if (!s || !s.installed) return false;
 		if (s.openNow > 0) return false;
-		if (s.closeSeen) return true;
-		if (s.connectSince > 0 && Date.now() - s.connectSince >= WS_CONNECT_GRACE_MS) return true;
+		// ② 曾经 OPEN 过的同类 socket 关了、且没有别的活口：给一个宽限期（S3）。
+		if (s.closeAt > 0 && Date.now() - s.closeAt >= WS_CLOSE_GRACE_MS) return true;
+		// ③ 有同类 socket 构造出来了却迟迟没 open：超过 CONNECTING 宽限即断（S4）。
+		if (s.pendingSince > 0 && Date.now() - s.pendingSince >= WS_CONNECT_GRACE_MS) return true;
 		return false;
 	}
 
@@ -5745,51 +6148,123 @@
 		return wsWatchDown();
 	}
 
-	/** 观测到一次 socket 生命周期事件：更新计数 → 重算 → 报给原生与自愈。 */
-	function wsWatchEvent(kind, opened) {
+	/**
+	 * T112b：把"这一次判据是被哪一层认出来的"算成**一个**取值，供 nudge 的动作分流用。
+	 * 取值与 `resumeRecoveryState().wsSrc` **同口径**（同一段表达式，只是抽成函数避免两处漂移）：
+	 *   1 = 官方 `<button data-phase="connecting">` / 2 = 老文案路径（两者都是 **DOM 渲染**）
+	 *   3 = WS 观测（`open`/`close` 事件，**事实**）/ 4 = 只有回前台探活命中 / 0 = 健康。
+	 *
+	 * 为什么要分"渲染"与"事实"：DOM 文案只是页面对状态的**渲染**（它可能还没被清掉、
+	 * 也可能是别人渲染的），而 WS 的 close 事件是浏览器给出的**事实**。只有事实才值得
+	 * 用"掐断在用连接"这种动作去修（见 requestUpstreamReconnect 的 T112b 段）。
+	 */
+	function connectionDownSource() {
+		var detail = findReconnectStatusDetail();
+		if (detail.src > 0) return detail.src;
+		var wsDown = false;
+		try { wsDown = wsWatchDown(); } catch (ignoredSrcWs) { wsDown = false; }
+		if (wsDown) return 3;
+		if (resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS) return 4;
+		return 0;
+	}
+
+	/** 重算判据；**只有翻转**才通知（稳态零动作）。宽限到期由 wsWatchRecheck 负责再调一次。 */
+	function wsWatchNotifyEdge() {
 		var s = wsWatchState;
-		if (!s) return;
-		if (opened) {
-			s.openNow += 1;
-			s.closeSeen = false;
-			s.connectSince = 0;
-			// T95：新 socket 真开了 ⇒ 撤销"传输层已死"的判定（探活的结论只活到链路自己给出证据）。
-			resumeVerifyDownAt = 0;
-			resumeVerifyResult = 'ok';
-		} else {
-			s.openNow = s.openNow > 0 ? s.openNow - 1 : 0;
-			s.closeSeen = true;
-			s.connectSince = 0;
-		}
-		s.eventCount += 1;
-		s.lastEvent = kind;
-		s.lastEventAt = Date.now();
+		if (!s) return false;
 		var down = wsWatchDown();
 		var flipped = down !== s.lastDown;
 		s.lastDown = down;
-		// 只有**翻转**才通知：稳态下（例如重连期间反复 close/open）不产生额外动作。
-		if (!flipped) return;
+		if (!flipped) return false;
 		try {
 			if (typeof s.notify === 'function') s.notify(down);
 		} catch (ignoredWsWatchNotify) { /* 通知失败绝不影响 socket 自身 */ }
+		return true;
+	}
+
+	/** 观测到一次 socket 生命周期事件：更新计数（判据翻转交给 wsWatchNotifyEdge）。 */
+	function wsWatchEvent(rec, opened, ev) {
+		var s = wsWatchState;
+		if (!s || !rec || rec.bystander) return;
+		if (opened) {
+			if (rec.opened) return;      // 同一条 socket 重复派发 open 不重复计数
+			rec.opened = true;
+			s.openNow += 1;
+			s.pendingSince = 0;
+			s.closeAt = 0;
+			s.closeSeen = false;
+			// T95：新 socket 真开了 ⇒ 撤销"传输层已死"的判定（探活的结论只活到链路自己给出证据）。
+			resumeVerifyDownAt = 0;
+			resumeVerifyResult = 'ok';
+			resumeVerifyFailCount = 0;
+			cancelResumeVerifyRetry();
+			// T112（S1）：撤销探活判定本身会改变 isConnectionDown()（而 wsWatchDown() 可能
+			// 一直没变）⇒ 这次相变不会从"翻转"通道出去，这里补一次上桥（去抖键变了才真推）。
+			try { reportUiDiag(); } catch (ignoredWsOpenDiag) { /* 上报失败不影响判据 */ }
+		} else if (rec.opened) {
+			if (s.openNow > 0) s.openNow -= 1;
+			if (s.openNow === 0) { s.closeAt = Date.now(); s.closeSeen = true; }
+		} else {
+			// 从来没 OPEN 过的 socket 关了：它**从来不是活口** ⇒ 绝不动 openNow（改前会把它
+			// 减成 0 ⇒ 健康链路上一次无关的失败尝试就误报断开，S10）。
+			s.closeSeen = true;
+			if (s.pendingSince === 0) s.pendingSince = Date.now();
+		}
+		if (!opened) {
+			// T112b：把 CloseEvent 的三个**事实**字段记下来（改前只记 `lastEvent='close'`）。
+			// 为什么是这三个：`code`/`reason`/`wasClean` 是浏览器给出的唯一"这次关闭是谁干的、
+			// 干净不干净"的权威信息 —— 1006（异常关闭，`wasClean=false`）与正常关闭（1000/1001）
+			// 正是"隧道/网络抖动"与"对端正常收缩"的分水岭。**纯记账**：
+			// 不参与任何判据、不排定时器、不碰 DOM、不新增监听器（用的就是既有的这条 close 监听）。
+			var code = 0, reason = '', wasClean = null;
+			try {
+				if (ev) {
+					if (typeof ev.code === 'number') code = ev.code;
+					if (typeof ev.reason === 'string') reason = ev.reason.slice(0, 80);
+					if (typeof ev.wasClean === 'boolean') wasClean = ev.wasClean;
+				}
+			} catch (ignoredCloseDetail) { /* 取不到就保持 0/''/null，绝不抛 */ }
+			s.lastCloseCode = code;
+			s.lastCloseReason = reason;
+			s.lastCloseClean = wasClean;
+			s.lastCloseAt = Date.now();
+			s.lastCloseOpened = !!rec.opened;     // 这次关的是"曾 OPEN 过"的还是"从没连上"的
+			s.lastCloseUrl = String(rec.url || '').slice(0, 200);
+			if (wasClean === false || code === 1006) s.closeAbnormalCount += 1;
+			else if (code > 0) s.closeCleanCount += 1;
+		}
+		s.eventCount += 1;
+		s.lastEvent = opened ? 'open' : 'close';
+		s.lastEventAt = Date.now();
 	}
 
 	/** 包一条 socket：只挂监听。 */
 	function wsWatchSocket(socket) {
 		var s = wsWatchState;
 		if (!s || !socket) return;
+		var url = '';
+		try { url = String(socket.url || ''); } catch (ignoredWsWatchUrl) {}
+		s.lastUrl = url.slice(0, 200);
+		// 每条 socket 一份自己的记录：**是否 OPEN 过** + 是否同类（S10）+ 自己的 URL（T112b 记账用）。
+		var rec = { opened: false, bystander: !wsWatchSameOrigin(url), url: url.slice(0, 200) };
+		if (rec.bystander) {
+			s.bystanders += 1;
+			s.lastBystanderUrl = url.slice(0, 200);
+			return;
+		}
 		s.sockets += 1;
-		try { s.lastUrl = String(socket.url || '').slice(0, 200); } catch (ignoredWsWatchUrl) {}
-		if (s.openNow === 0 && s.connectSince === 0) s.connectSince = Date.now();
+		if (s.openNow === 0 && s.pendingSince === 0) s.pendingSince = Date.now();
+		wsWatchRecheck();
 		try {
-			socket.addEventListener('open', function () { wsWatchEvent('open', true); });
-			socket.addEventListener('close', function () { wsWatchEvent('close', false); });
+			socket.addEventListener('open', function () { wsWatchEvent(rec, true); wsWatchRecheck(); wsWatchNotifyEdge(); });
+			// T112b：把 CloseEvent 本体透传给记账（用的就是这条既有监听器，不新增监听器数量）。
+			socket.addEventListener('close', function (ev) { wsWatchEvent(rec, false, ev); wsWatchRecheck(); wsWatchNotifyEdge(); });
 			// error 不单独判"断"：Chromium 里失败路径必然紧跟 close，重复计数会让
 			// openNow/closeSeen 失衡（T90 实测：只认 open/close，真机 45s 断线窗口内
 			// 事件序列恒为 close→(重连)→open）。
 			socket.addEventListener('error', function () { s.errors += 1; });
 		} catch (ignoredWsWatchListen) {
-			try { socket.onclose = function () { wsWatchEvent('close', false); }; } catch (ignoredWsWatchOnClose) {}
+			try { socket.onclose = function (ev) { wsWatchEvent(rec, false, ev); wsWatchRecheck(); wsWatchNotifyEdge(); }; } catch (ignoredWsWatchOnClose) {}
 		}
 	}
 
@@ -5820,12 +6295,31 @@
 			openNow: 0,
 			closeSeen: false,
 			connectSince: 0,
+			// T112 新增（旧字段名保留：closeSeen / connectSince 继续作为只读自检的等价别名）：
+			//   closeAt       —— 最近的"已 OPEN 的同类 socket 关了且无活口"的时刻（0 = 无）
+			//   pendingSince  —— 最早的"已构造但尚未 OPEN"的同类 socket 的时刻（0 = 无）
+			//   bystanders    —— 被**排除在判据之外**的非同源 socket 数（S10，只旁观）
+			closeAt: 0,
+			pendingSince: 0,
+			bystanders: 0,
+			lastBystanderUrl: '',
+			recheckTimer: 0,
+			recheckDue: 0,
 			sockets: 0,
 			errors: 0,
 			eventCount: 0,
 			lastEvent: '',
 			lastEventAt: 0,
 			lastUrl: '',
+			// T112b：最近一次 close 的事实字段 + 干净/异常关闭计数（纯只读证据）。
+			lastCloseCode: 0,
+			lastCloseReason: '',
+			lastCloseClean: null,
+			lastCloseAt: 0,
+			lastCloseOpened: false,
+			lastCloseUrl: '',
+			closeCleanCount: 0,
+			closeAbnormalCount: 0,
 			lastDown: false,
 			notify: null,
 		};
@@ -5882,9 +6376,19 @@
 			return {
 				installed: state.installed, reason: state.reason,
 				sockets: state.sockets, errors: state.errors, openNow: state.openNow,
-				closeSeen: state.closeSeen, connectSince: state.connectSince,
+				closeSeen: state.closeAt > 0, connectSince: state.pendingSince,
 				events: state.eventCount, lastEvent: state.lastEvent, lastEventAt: state.lastEventAt,
 				url: state.lastUrl, down: state.down(),
+				// T112 新增只读字段（判据真值 + 反证用）：
+				closeAt: state.closeAt, closeGraceMs: WS_CLOSE_GRACE_MS,
+				pendingSince: state.pendingSince, connectGraceMs: WS_CONNECT_GRACE_MS,
+				bystanders: state.bystanders, lastBystanderUrl: state.lastBystanderUrl,
+				recheckArmed: state.recheckTimer !== 0,
+				// T112b 新增只读字段：最近一次 close 的三个事实字段 + 干净/异常计数。
+				lastCloseCode: state.lastCloseCode, lastCloseReason: state.lastCloseReason,
+				lastCloseClean: state.lastCloseClean, lastCloseAt: state.lastCloseAt,
+				lastCloseOpened: state.lastCloseOpened, lastCloseUrl: state.lastCloseUrl,
+				closeClean: state.closeCleanCount, closeAbnormal: state.closeAbnormalCount,
 			};
 		};
 		try { window[WS_WATCH_KEY] = state; } catch (ignoredWsWatchGlobal) { /* 自检入口写不上不影响观测 */ }
@@ -5903,6 +6407,7 @@
 		s.installed = false;
 		s.reason = 'uninstalled';
 		s.notify = null;
+		wsWatchCancelRecheck();
 		return true;
 	}
 
@@ -5926,6 +6431,53 @@
 		if (!wsWatchState) return false;
 		wsWatchState.notify = fn;
 		return true;
+	}
+
+	// ── T112：宽限到期的一次性截止定时器（**不是轮询**）──────────────────────────────
+	//
+	// 为什么需要它：判据从"close 后 0ms 就算断"改成"宽限期满才算断"之后，"变真"这件事
+	// 不再由事件触发，而是由**时间**触发。没有它，一次真实的 close 会永远停在"宽限中"，
+	// 原生与自救层都看不到断线。所以这里排一个一次性定时器，到点重算一次判据并通知。
+	//
+	// 成本边界（可证明极小）：
+	//   · 只在"有 close 且无活口"或"有 socket 尚未 open"时武装；一条 socket **open** 就
+	//     立刻撤销 ⇒ **健康稳态零定时器**（与 T90/T82 的"健康零开销"契约一致，真值见 report §6）；
+	//   · 到点后重算：仍未到判"断"条件（宽限内又来了新 socket）就顺延，不空转；
+	//   · 定义在观测块**之外**（观测块"只能被动监听、不引入定时器"的既有契约（见
+	//     `scripts/test-mobile-chrome.mjs` 的 T90 段）不破）：块内只**调用**它，不定义它。
+	function wsWatchCancelRecheck() {
+		var s = wsWatchState;
+		if (!s || !s.recheckTimer) return;
+		try { window.clearTimeout(s.recheckTimer); } catch (ignoredRecheckClear) {}
+		s.recheckTimer = 0;
+		s.recheckDue = 0;
+	}
+
+	/** 按当前状态算出"下一次判据可能翻转"的截止点并武装/更新一次性定时器。 */
+	function wsWatchRecheck() {
+		var s = wsWatchState;
+		if (!s || !s.installed || s.openNow > 0 || (!s.closeAt && !s.pendingSince)) {
+			wsWatchCancelRecheck();
+			return;
+		}
+		var due = 0;
+		if (s.closeAt > 0) due = s.closeAt + WS_CLOSE_GRACE_MS;
+		if (s.pendingSince > 0) {
+			var cd = s.pendingSince + WS_CONNECT_GRACE_MS;
+			if (!due || cd < due) due = cd;
+		}
+		if (!due) { wsWatchCancelRecheck(); return; }
+		if (s.recheckTimer && s.recheckDue === due) return;   // 同一个截止点，不重排
+		wsWatchCancelRecheck();
+		s.recheckDue = due;
+		s.recheckTimer = window.setTimeout(function () {
+			var st = wsWatchState;
+			if (!st) return;
+			st.recheckTimer = 0;
+			st.recheckDue = 0;
+			wsWatchNotifyEdge();
+			wsWatchRecheck();      // 仍未到判"断"条件（宽限内又来了新 socket）⇒ 顺延
+		}, Math.max(20, due - Date.now() + 20));
 	}
 
 	// ── T31-3 / T38-2：切后台 / 锁屏回来时，若连接**确实**断了就立刻恢复 ──
@@ -6036,6 +6588,25 @@
 	 *
 	 * 会话/草稿安全：不 reload、不碰 cookie、不导航 ⇒ 会话与未发送的草稿不受影响。
 	 * 禁止 Page.reload。
+	 *
+	 * ── T112b：按"判据来源"分流（这是 T110 给出的最小修法）────────────────────────
+	 * T110 的原始真值（`scratch/t110/report.md` §8.4 ①，链路**始终健康**、只做一次前后台切换）：
+	 *   rc.2.5/rc.2.6（动作只有 `online`）⇒ 派发 `offline` **0** 次、**真掐断 0 次**；
+	 *   rc.2.7/rc.2.8（动作是 `offline`→`online`）⇒ 派发 `offline` **6** 次、**真掐断 6 次**。
+	 * ⇒ 差别只在动作：`offline` 那一下会让上游 `setNetworkAvailable(false)` 真的
+	 *   `current.abort(NETWORK_STATE_CHANGED)`。**一次误报 = 一次用户可见掉线**。
+	 *
+	 * 分流规则（唯一一条）：**只有 `wsSrc === 3`（WS 观测到真 close）才允许派 `offline`**；
+	 * 来源是 DOM 文案（1/2）或探活（4）时**一律退回 `online`-only** —— 那条路是幂等短路
+	 * （健康时 `networkAvailable` 本来就是 true ⇒ `setNetworkAvailable(true)` 第一行 return），
+	 * 所以**一定无害**，同时仍然保留"若真有睡着的退避，`online` 也能让客户端重算网络态"的兜底。
+	 *
+	 * 为什么这条能修 T110 那两个 arm（判据为真但链路健康）：
+	 *   · S4（注入可见非交互"重新连接中" + 一次前后台切换）的来源是 **2（DOM 文案）** ⇒ online-only；
+	 *   · S2（`/health` 首字节 4.5s 超时）的来源是 **4（探活）** ⇒ online-only。
+	 * ⚠️ 代价（明说）：来源 4 的**真半开**因此在 hook 这一层不再"掐断重建"，只推 `online`；
+	 *   半开的重建改由原生自救层（`StuckRescue` 的受控重载）与"两次失败才判死 + 20s 信任期"
+	 *   之后的真实 close 兜住；探活结论照旧喂给诊断与原生（真值见 report §3）。
 	 */
 	function requestUpstreamReconnect() {
 		var handle = findUpstreamConnectionHandle();
@@ -6044,6 +6615,13 @@
 				handle.reconnect();
 				return 'connection-reconnect';
 			} catch (ignoredReconnect) { /* 落到下一层 */ }
+		}
+		// T112b 分流闸：非"WS 观测到真 close"的来源一律只用 `online`（幂等短路 = 无害）。
+		var src = connectionDownSource();
+		if (src !== 3) {
+			// 只推 online：上游 `setNetworkAvailable(true)` 第一行幂等短路 ⇒ **不掐断任何 socket**。
+			window.dispatchEvent(new Event('online'));
+			return 'network-transition-online-only';
 		}
 		// 瞬态对必须**同任务**内完成：中间不插入 await/setTimeout，
 		// 免得用户看到（或被其它逻辑观测到）一个假的"离线"中间态。
@@ -6061,11 +6639,24 @@
 	/**
 	 * T82：断开持续态巡检。装上之后每 RESUME_DOWN_TICK_MS 探一次；
 	 * 一旦恢复（或到达上限）立刻卸掉 —— 健康时**零开销**（没有定时器）。
+	 *
+	 * T112（S1）：这一拍顺便把"当前连接态"**按电平重推**给原生（`reportUiDiagLevel`），
+	 * 因为原生那份是电平闩锁、没有周期刷新时一次假判会被钉死（见 reportUiDiagLevel 的说明）。
+	 * 定时器仍然只存在于断开期间；恢复的那一拍推一次**真实态**（去抖键变了 ⇒ 必推）再卸表。
 	 */
 	function ensureResumeDownTick() {
 		if (resumeDownTick) return;
 		resumeDownTick = window.setInterval(function () {
 			if (document.visibilityState !== 'visible') return;
+			var stillDown = false;
+			try { stillDown = isConnectionDown(); } catch (ignoredTickDown) { stillDown = false; }
+			if (stillDown) {
+				try { reportUiDiagLevel(); } catch (ignoredTickLevel) { /* 上报失败不影响自愈 */ }
+				probeResumeRecovery();
+				return;
+			}
+			// 恢复：先如实推一次（wsState 已变 ⇒ 判重键不同 ⇒ 一定过桥），再走既有入口卸表。
+			try { reportUiDiag(); } catch (ignoredTickUp) { /* 上报失败不影响自愈 */ }
 			probeResumeRecovery();
 		}, RESUME_DOWN_TICK_MS);
 	}
@@ -6097,12 +6688,22 @@
 			reconnectSrc: detail.src,
 			// wsSrc 语义不变（DOM 层优先，其次 WS 观测，再次探活）+ 语义仍为"哪一层认出来的"：
 			//   1 = 官方按钮 / 2 = 文案 / 3 = WS 观测 / **4 = 只有回前台探活命中** / 0 = 健康。
-			wsSrc: detail.src > 0 ? detail.src
-				: (wsDown ? 3 : ((resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS) ? 4 : 0)),
+			// T112b：改由 connectionDownSource() 统一算（**同一个**取值也被 nudge 的动作分流读，
+			// 两处必须是同一口径 ⇒ 抽成一个函数，见那里的说明）。
+			wsSrc: connectionDownSource(),
 			wsSeen: !!(ws && ws.installed),
 			wsDown: wsDown,
 			wsEvents: ws ? ws.eventCount : 0,
 			wsLastEvent: ws ? ws.lastEvent : '',
+			// T112b：最近一次 **同类 socket 的 close** 的三个事实字段（改前只记 lastEvent='close'，
+			// 丢掉了一半信息）。这是把"隧道抖动"（1006/未干净关闭）与"对端正常收缩"
+			// 分开的唯一钥匙；纯只读，不参与任何判据/定时器/nudge。
+			lastCloseCode: ws ? ws.lastCloseCode : 0,
+			lastCloseReason: ws ? ws.lastCloseReason : '',
+			lastCloseClean: ws ? ws.lastCloseClean : null,
+			lastCloseAt: ws ? ws.lastCloseAt : 0,
+			closeClean: ws ? ws.closeCleanCount : 0,
+			closeAbnormal: ws ? ws.closeAbnormalCount : 0,
 			downSince: resumeDownSince,
 			armed: resumeNudgeArmed,
 			maxNudges: RESUME_MAX_NUDGES,
@@ -6115,6 +6716,11 @@
 			verifyDown: resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS,
 			verifyResult: resumeVerifyResult,
 			verifyAt: resumeVerifyAt,
+			// T112 只读证据：连续失败计数 / 探活请求总数 / 按电平重推次数（健康稳态恒 0）。
+			verifyFails: resumeVerifyFailCount,
+			verifyProbes: resumeVerifyProbeCount,
+			verifyRetryArmed: resumeVerifyRetryTimer !== 0,
+			levelPushes: uiDiagLevelPushes,
 			hiddenSince: resumeHiddenSince,
 			bypassUntil: resumeBypassUntil,
 		};
@@ -6139,17 +6745,49 @@
 	 * 判定为死时会立刻走断开分支（推一次 nudge 逼客户端新建 socket = 修半开），
 	 * 并把真相经既有 `reportUiDiag()` 通道喂给原生自救层。
 	 */
+	/** T112：撤销排程中的"确认探"（新 socket 真开了 / hook 关闭时调用，不留尾巴）。 */
+	function cancelResumeVerifyRetry() {
+		if (!resumeVerifyRetryTimer) return false;
+		try { window.clearTimeout(resumeVerifyRetryTimer); } catch (ignoredVerifyRetryClear) {}
+		resumeVerifyRetryTimer = 0;
+		return true;
+	}
+
 	function verifyResumeTransport() {
 		if (resumeVerifyRunning) return false;
 		resumeVerifyRunning = true;
 		resumeVerifyAt = Date.now();
+		resumeVerifyProbeCount += 1;
 		var settled = false;
+		// 第一次探活（failCount === 0）用 RESUME_VERIFY_TIMEOUT_MS；确认探（已有失败记录）
+		// 用更宽容的 RESUME_VERIFY_CONFIRM_TIMEOUT_MS。
+		var timeoutMs = resumeVerifyFailCount > 0 ? RESUME_VERIFY_CONFIRM_TIMEOUT_MS : RESUME_VERIFY_TIMEOUT_MS;
 		var finish = function (alive, why) {
 			if (settled) return;
 			settled = true;
 			resumeVerifyRunning = false;
 			resumeVerifyResult = why;
-			if (alive) { resumeVerifyDownAt = 0; return; }
+			if (alive) {
+				// 活 ⇒ 撤销一切（含此前那次失败的记账）：一次失败不是证据。
+				resumeVerifyDownAt = 0;
+				resumeVerifyFailCount = 0;
+				resumeVerifyFailAt = 0;
+				return;
+			}
+			// T112（S2）：单次失败**不判死**、不写信任闩锁、**不推 nudge**。
+			resumeVerifyFailCount += 1;
+			resumeVerifyFailAt = Date.now();
+			if (resumeVerifyFailCount < RESUME_VERIFY_CONFIRM_FAILS) {
+				resumeVerifyResult = why + '-1';
+				// 排一次确认探：间隔沿用既有的 400ms 二次确认语义（同任务不插 await）。
+				cancelResumeVerifyRetry();
+				resumeVerifyRetryTimer = window.setTimeout(function () {
+					resumeVerifyRetryTimer = 0;
+					try { verifyResumeTransport(); } catch (ignoredVerifyRetry) { /* 失败即当没探过 */ }
+				}, RESUME_VERIFY_CONFIRM_DELAY_MS);
+				return;
+			}
+			// 连续两次独立失败 ⇒ **确认判死**：只有到这里才写信任闩锁、才推 nudge。
 			resumeVerifyDownAt = Date.now();
 			// 判定为死 = 刚知道断开 ⇒ 重开 5s 窗口，让紧跟的这一推也不被 8s 间隔压住。
 			resumeBypassUntil = Date.now() + RESUME_BYPASS_WINDOW_MS;
@@ -6162,7 +6800,7 @@
 			var timer = window.setTimeout(function () {
 				try { if (ctl) ctl.abort(); } catch (ignoredVerifyAbort) { /* abort 失败也要落地结论 */ }
 				finish(false, 'timeout');
-			}, RESUME_VERIFY_TIMEOUT_MS);
+			}, timeoutMs);
 			var url = location.origin + '/__dsh_remote__/health?__dshr_probe=' + String(Date.now());
 			window.fetch(url, {
 				method: 'GET',

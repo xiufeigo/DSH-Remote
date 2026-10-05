@@ -49,6 +49,12 @@ const HOP_BY_HOP = new Set([
 const INJECT_MAX_BYTES = 2 * 1024 * 1024;
 
 /**
+ * T113：注入后的 HTML 参与压缩的最小原文长度。
+ * 比这更短的页面压了也省不了几十字节，不值得多一层编解码（与 nginx `gzip_min_length` 同思路）。
+ */
+const GATEWAY_HTML_MIN_COMPRESS_BYTES = 1024;
+
+/**
  * PERF-01：只有"可能返回待注入 HTML"的请求才强制 identity。
  * 判定：GET/HEAD + （根路径 / 目录 / .html 结尾 / Accept 含 text/html）。
  * 其余（JS/CSS/图片字体、/api JSON、WS 之前的普通 GET）透传客户端的
@@ -472,6 +478,40 @@ export function proxyHttp(
 						}
 					}
 					const injected = transformHtml(html);
+					// T113：注入完成后再压一次（**顺序只可能是"先改字节再压"**，反了会注入失败）。
+					// 为什么以前没压：`/` 必须让上游以 identity 回原文才能注入（wantsHtmlIdentity），
+					// 于是它成了唯一不压缩的文本响应 —— 实测裸传 35,443 B（T111 §3.2）。
+					// 现在 body 已在手里、注入已做完，按客户端 accept-encoding 压一次即可。
+					// 判据：客户端声明了编码 ∧ 原文 ≥ GATEWAY_HTML_MIN_COMPRESS_BYTES ∧
+					// 压完确实更小（小页面压了反而变大的不压，与 nginx gzip_min_length 同思路）。
+					const injectedEncoding = selectGatewayEncoding(req.headers["accept-encoding"]);
+					if (injectedEncoding !== undefined && injected.length >= GATEWAY_HTML_MIN_COMPRESS_BYTES) {
+						let compressed: Buffer | undefined;
+						try {
+							const cap = { maxOutputLength: INJECT_MAX_BYTES } as const;
+							compressed = injectedEncoding === "br"
+								? zlib.brotliCompressSync(injected, {
+									params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4 },
+									...cap,
+								})
+								: injectedEncoding === "gzip"
+									? zlib.gzipSync(injected, cap)
+									: zlib.deflateSync(injected, cap);
+						} catch {
+							compressed = undefined;
+						}
+						if (compressed !== undefined && compressed.length < injected.length) {
+							outHeaders["content-encoding"] = injectedEncoding;
+							outHeaders["content-length"] = String(compressed.length);
+							const vary = String(outHeaders["vary"] ?? "");
+							outHeaders["vary"] = vary === ""
+								? "Accept-Encoding"
+								: (/accept-encoding/i.test(vary) ? vary : `${vary}, Accept-Encoding`);
+							res.writeHead(status, outHeaders);
+							res.end(compressed);
+							return;
+						}
+					}
 					outHeaders["content-length"] = String(injected.length);
 					res.writeHead(status, outHeaders);
 					res.end(injected);

@@ -29,6 +29,12 @@ public final class ProfileStore {
 	public static final String KEY_BOUND_PORT = "tunnel_bound_port";
 	/** 与 KEY_BOUND_PORT 成对落盘：当前前台隧道实际服务的配置组 id。复用探测据此判断能否直接复用。 */
 	public static final String KEY_TUNNEL_PROFILE = "tunnel_profile_id";
+	/**
+	 * T104：与 KEY_BOUND_PORT 成对落盘 —— 当前前台隧道**实际生效的打洞策略**。
+	 * 复用存活隧道时要比它：策略变了就必须重启隧道（否则"切档"会名不副实，
+	 * 用户看到新选项被选中、跑的却还是旧配置）。
+	 */
+	public static final String KEY_TUNNEL_STRATEGY = "tunnel_strategy";
 
 	public static final String DEFAULT_MODE = "xtcp";
 	public static final String DEFAULT_TUNNEL_NAME = "dsh-remote";
@@ -85,6 +91,17 @@ public final class ProfileStore {
 		public String authToken = "";
 		public String secretKey = "";
 		public String mode = DEFAULT_MODE;
+		/**
+		 * T104：打洞策略（每个配置组各自保存）。{@code p2p}=打洞优先（默认，行为与改前逐字相同）；
+		 * {@code relay}=只用中转。**是否真正可选由电脑端形态决定**，见
+		 * {@link ProfileStore#p2pAvailable} / {@link ProfileStore#relayAvailable}。
+		 */
+		public String strategy = VisitorConfig.STRATEGY_P2P;
+		/**
+		 * T104：电脑端隧道形态（导入链接里的 mode：entry/stcp/xtcp；空 = 未知，手工填的配置组没有）。
+		 * 只用于 UI 如实标注「哪一档在你这台电脑上成立」，不参与 toml 生成。
+		 */
+		public String pcMode = "";
 		/** 与电脑端 frp.name 一致，写进 frps 的 proxy 名；不是配置组显示名。 */
 		public String tunnelName = DEFAULT_TUNNEL_NAME;
 		/**
@@ -115,6 +132,10 @@ public final class ProfileStore {
 			c.authToken = authToken;
 			c.bindPort = BIND_PORT;
 			c.fingerprint = CertPin.normalizeFingerprint(fingerprint);
+			// T104：策略原样带过去；"打洞优先在这台电脑上不成立"时由 VisitorConfig.effectiveStrategy()
+			// 统一落回 relay（判据只有一处，UI 与 toml 不会各说一套）。
+			c.strategy = effectiveStrategy(this);
+			c.pcMode = VisitorConfig.normalizePcMode(pcMode);
 			return c;
 		}
 
@@ -128,6 +149,8 @@ public final class ProfileStore {
 				o.put("authToken", authToken);
 				o.put("secretKey", secretKey);
 				o.put("mode", mode);
+				o.put("strategy", VisitorConfig.normalizeStrategy(strategy));
+				o.put("pcMode", VisitorConfig.normalizePcMode(pcMode));
 				o.put("tunnelName", tunnelName);
 				o.put("fingerprint", fingerprint);
 			} catch (Exception ignored) {
@@ -145,6 +168,10 @@ public final class ProfileStore {
 			p.secretKey = o.optString("secretKey", "");
 			String mode = o.optString("mode", DEFAULT_MODE);
 			p.mode = "stcp".equals(mode) ? "stcp" : DEFAULT_MODE;
+			// T104：存量配置组没有这两个键（optString 兜空）⇒ 落回「打洞优先 + 形态未知」，
+			// 与改前行为逐字一致，绝不因为升级而把用户静默切成中转。
+			p.strategy = VisitorConfig.normalizeStrategy(o.optString("strategy", ""));
+			p.pcMode = VisitorConfig.normalizePcMode(o.optString("pcMode", ""));
 			p.tunnelName = normalizeTunnelName(o.optString("tunnelName", DEFAULT_TUNNEL_NAME));
 			// 存量配置组没有这个键（optString 兜空），由 toVisitorConfig() 规范化为空串
 			// ⇒ 退化到 TOFU，不会拿旧值误判。
@@ -292,6 +319,73 @@ public final class ProfileStore {
 		}
 	}
 
+	// ---------- T104：打洞策略在「这台电脑端形态」下是否成立 ----------
+	//
+	// 两档的成立条件完全由**电脑端注册了哪条代理**决定（frp 的 visitor 只能消费 serverName
+	// 对应的那条 proxy）：
+	//   xtcp 形态 → 同时注册 `<名>-stcp`(stcp) 与 `<名>`(xtcp) ⇒ 打洞优先 ✅ / 只用中转 ✅
+	//   stcp 形态 → 只注册 `<名>`(stcp)                        ⇒ 打洞优先 ❌ / 只用中转 ✅
+	//   entry 形态 → 一条访客代理都没有（公网入口）            ⇒ 两档都 ❌
+	// 形态从导入链接的 mode 参数来；手工填的配置组形态未知（""），按 xtcp 保守处理——
+	// 宁可让用户点了之后失败时能看到真话（诊断行会说实际路径），也不谎称某档"不可用"。
+
+	/** 打洞优先是否可用：电脑端必须是 xtcp 形态（只有它额外注册了 xtcp 代理）。 */
+	public static boolean p2pAvailable(Profile p) {
+		if (p == null) return false;
+		if (!DEFAULT_MODE.equals(p.mode)) return false; // stcp 档：没有 xtcp 代理
+		return !"stcp".equals(VisitorConfig.normalizePcMode(p.pcMode))
+			&& !VisitorConfig.PC_MODE_ENTRY.equals(VisitorConfig.normalizePcMode(p.pcMode));
+	}
+
+	/** 只用中转是否可用：电脑端必须注册了 stcp 代理（xtcp 的 `<名>-stcp` 或 stcp 的 `<名>`）。 */
+	public static boolean relayAvailable(Profile p) {
+		if (p == null) return false;
+		return !VisitorConfig.PC_MODE_ENTRY.equals(VisitorConfig.normalizePcMode(p.pcMode));
+	}
+
+	/** 电脑端是 entry 形态：不注册任何访客代理 ⇒ 两档都用不上（UI 必须如实说清，不许假装能用）。 */
+	public static boolean tunnelUnavailable(Profile p) {
+		return p != null && VisitorConfig.PC_MODE_ENTRY.equals(VisitorConfig.normalizePcMode(p.pcMode));
+	}
+
+	/**
+	 * T104：电脑端形态 → 访客 toml 形态。这两者是**绑死的**：
+	 * stcp 形态的电脑端只注册了 `<名>`(stcp) 一条代理 ⇒ 访客也必须是 stcp
+	 * （xtcp 访客会去找根本不存在的 `<名>`(xtcp) 代理，必然连不上——这正是导入链接里
+	 * mode=stcp 时改前的老毛病）。其余形态（xtcp / entry / 未知）沿用历史 xtcp 访客。
+	 */
+	public static String modeForPcMode(String pcMode) {
+		return "stcp".equals(VisitorConfig.normalizePcMode(pcMode)) ? "stcp" : DEFAULT_MODE;
+	}
+
+	/**
+	 * T104：把用户选的档位收敛成**在这一档上真正成立**的那一档。
+	 *
+	 * <p>⚠ 只在不成立时收敛，成立时**原样尊重用户的选择** —— 这是 T104 设备级验证抓到的真 bug：
+	 * 第一版写成「p2p 成立就强制回 p2p」，结果电脑端是 xtcp（两档都成立）时，用户点「只用中转」
+	 * 会被立刻弹回「打洞优先」，**"人工二选一"名存实亡**（截图佐证：scratch/t104/ev/p03b-*.png
+	 * 点完仍高亮打洞优先）。收敛的方向必须是"从不成立→成立"，绝不能是"总是回默认"。
+	 *
+	 * <p>entry 形态两档都不成立：UI 已把两个按钮都禁用并写明理由，这里**不偷偷改**
+	 * （保持历史行为：entry 档仍按 mode=xtcp 生成访客配置，与改前逐字相同）。
+	 */
+	public static String coerceStrategy(Profile p, String selected) {
+		String want = VisitorConfig.normalizeStrategy(selected);
+		if (p == null || tunnelUnavailable(p)) return want;
+		if (VisitorConfig.STRATEGY_P2P.equals(want) && !p2pAvailable(p)) return VisitorConfig.STRATEGY_RELAY;
+		if (VisitorConfig.STRATEGY_RELAY.equals(want) && !relayAvailable(p)) return VisitorConfig.STRATEGY_P2P;
+		return want;
+	}
+
+	/**
+	 * T104：本档**实际会写进 toml** 的策略（= 用户选择经可用性收敛后的结果）。
+	 * UI 显示的档位与 toml 里那一档必须来自这同一个函数，否则两边会各说一套。
+	 */
+	public static String effectiveStrategy(Profile p) {
+		if (p == null) return VisitorConfig.STRATEGY_P2P;
+		return coerceStrategy(p, p.strategy);
+	}
+
 	public static String normalizeTunnelName(String raw) {
 		if (TextUtils.isEmpty(raw)) return DEFAULT_TUNNEL_NAME;
 		String trimmed = raw.trim();
@@ -362,6 +456,10 @@ public final class ProfileStore {
 		p.authToken = legacy.authToken;
 		p.secretKey = legacy.secretKey;
 		p.mode = "stcp".equals(legacy.mode) ? "stcp" : DEFAULT_MODE;
+		// T104：存量单条配置没有策略键 ⇒ 打洞优先（与改前行为逐字一致）；
+		// 形态未记录 ⇒ 未知（按 xtcp 保守处理，不谎称某档不可用）。
+		p.strategy = VisitorConfig.normalizeStrategy(legacy.strategy);
+		p.pcMode = VisitorConfig.normalizePcMode(legacy.pcMode);
 		p.tunnelName = normalizeTunnelName(legacy.serverName);
 		upsert(prefs, p);
 		setActiveId(prefs, p.id);

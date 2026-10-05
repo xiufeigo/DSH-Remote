@@ -6,26 +6,31 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 
 /**
- * T99「平板档一次返回直接进 App 连接设置页」源码契约测试（纯 JVM，不需要模拟器/设备）。
+ * 返回键源码契约测试（纯 JVM，不需要模拟器/设备）。
+ * 文件与类名沿用 T99 的名字（改动面最小），判据在 <b>T102</b> 之后钉的是**新语义**：
+ * 「先关官方弹层/右栏 → 没有可关的 ⇒ 退到后台」，**不再**进 App 连接设置页。
  *
  * <p>判据四组，都只读 {@code MainActivity.java}：
  * <ol>
  *   <li><b>平板档分支存在且形状正确</b>：{@code handleAppBack()} 的 WEB 分支里，
  *       <b>先</b>按 {@code isTabletClass()} 分叉，平板档先跑只读探针
- *       {@code TABLET_BACK_OVERLAY_PROBE_JS}，拿到 {@code none} 才直接 {@code finishWebBack()}
- *       （= 一次返回进设置页），否则退回既有桥。**关键负例**：桥的字面量不得出现在
- *       平板判据<b>之前</b>（那正是 T99 之前"先关左抽屉"的形状）。</li>
+ *       {@code TABLET_BACK_OVERLAY_PROBE_JS}，拿到 {@code none} 才直接
+ *       {@code finishWebBack()}（T102 起 = 会话根退后台），否则退回既有桥。**关键负例**：
+ *       桥的字面量不得出现在平板判据<b>之前</b>（那正是 T99 之前"先关左抽屉"的形状）。</li>
  *   <li><b>探针只读且不看左抽屉</b>：探针里不得出现任何写/事件 API；也不得出现
  *       {@code isSidebarOpen} / {@code data-sidebar-collapsed} 等左抽屉判据
- *       —— 平板档返回键**连问都不问**左抽屉，这才是"不再先关左抽屉"的结构性保证。</li>
+ *       —— 平板档返回键**连问都不问**左抽屉。</li>
  *   <li><b>右栏语义不许退</b>（T43/T47）：探针必须按官方右栏的展开标记
  *       （{@code [data-sidebar-right-panel]} + {@code data-sidebar-right-open} + {@code aria-hidden}）
  *       与模态弹框（{@code [role="dialog"][aria-modal="true"]}）判定，桥那条通道仍被调用；
- *       桥的 JS 字面量与 T99 之前**逐字相同**（手机档语义逐字不变）。</li>
- *   <li><b>不回归 T94/T96 与 D6.1</b>：T94（{@code PAGE_BG_PROBE_JS} / {@code dshr-immersive}）
- *       与 T96（{@code StuckRescue} / {@code handleReconnectProbe} / {@code RELOAD_ARM_TIMEOUT_MS}）
- *       的标记仍在；{@code finishWebBack()} 末尾仍是 {@code settingsViaBackKey = true}
- *       + {@code showConnectionSettings()}；设置页文案仍按 {@code settingsViaBackKey} 分两支。</li>
+ *       桥的 JS 字面量与 T99 之前**逐字相同**（收弹层通道一字未改）。</li>
+ *   <li><b>T102 新语义 + 不回归 T94/T96</b>：{@code finishWebBack()} 末尾是
+ *       {@code moveTaskToBack(true)} 且**不**调用 {@code showConnectionSettings()}；
+ *       {@code settingsViaBackKey} 字段与其置位/清零/消费点**全部删除**（无死代码）；
+ *       设置页文案**只有一句**、不再承诺系统返回键；{@code showConnectionSettings()} 本身
+ *       仍在（它还有别的调用点，不许被误删）；T94（{@code PAGE_BG_PROBE_JS} /
+ *       {@code dshr-immersive}）与 T96（{@code StuckRescue} / {@code handleReconnectProbe} /
+ *       {@code RELOAD_ARM_TIMEOUT_MS}）的标记仍在。</li>
  * </ol>
  *
  * <p>行为臂（探针在 DOM 桩上真跑）见 {@code android/tests/t99-probe-dom-stub.mjs}
@@ -207,30 +212,58 @@ public final class T99BackKeyTest {
 		check(closeBody.contains("if (webView == null) return;"),
 			"closeOverlaysThenFinish() 有自保空判（抽方法后不引 NPE）");
 
-		// ── 4. 不回归 T94 / T96 / D6.1 ───────────────────────────────────
+		// ── 4. T102 新语义（返回键不进设置页）+ 不回归 T94 / T96 ──────────
 		check(src.indexOf("PAGE_BG_PROBE_JS") >= 0 && src.indexOf("dshr-immersive") >= 0,
 			"T94 标记仍在（沉浸系统栏未被回退）");
 		check(src.indexOf("StuckRescue") >= 0 && src.indexOf("handleReconnectProbe") >= 0
 				&& src.indexOf("RELOAD_ARM_TIMEOUT_MS") >= 0,
 			"T96 标记仍在（卡住自救未被回退）");
-		check(src.indexOf("private boolean settingsViaBackKey = false;") >= 0,
-			"settingsViaBackKey 字段仍在（D6.1 判据）");
 
+		// 4a. 「返回键 → 设置页」这条路必须**彻底消失**（手机档 / 平板档都消失）。
 		String finish = methodBody(src, "private void finishWebBack()");
-		int setAt = finish.indexOf("settingsViaBackKey = true;");
-		int showAt = finish.indexOf("showConnectionSettings();");
-		check(setAt > 0 && showAt > setAt, "finishWebBack() 末尾仍是置位 + showConnectionSettings()（顺序不变）");
+		check(back.indexOf("showConnectionSettings") < 0,
+			"handleAppBack() 里没有任何 showConnectionSettings() 调用（返回键不再进设置页）");
+		check(finish.length() > 100, "finishWebBack() 方法体抠出");
+		check(finish.indexOf("showConnectionSettings") < 0,
+			"finishWebBack() 不再调用 showConnectionSettings()（T65/T99 的「会话根进设置页」被本任务取消）");
+		check(finish.indexOf("moveTaskToBack(true)") > 0,
+			"★ finishWebBack() 末尾改为 moveTaskToBack(true)（会话根 ⇒ 退到后台）");
+		check(finish.indexOf("moveTaskToBack(true)") > finish.indexOf("webView.clearHistory()"),
+			"退后台在「没有同网关上一页可回」之后（goBack 语义仍在最前面）");
 		check(finish.indexOf("isTabletClass()") < 0,
-			"finishWebBack() 不再按档位分叉（T65 的成果不许回退）");
-		check(finish.indexOf("moveTaskToBack") < 0,
-			"finishWebBack() 不直接退后台（两档都先到设置页，再按一次才退）");
+			"finishWebBack() 仍不按档位分叉（T65 的成果不许回退）");
 
+		// 4b. settingsViaBackKey 的**全部**代码痕迹必须清掉（字段 + 置位 + 清零 + 消费），
+		//     不留死代码。注释里提到历史名字是允许的（那是改动留痕），所以只钉代码形态。
+		check(src.indexOf("private boolean settingsViaBackKey") < 0,
+			"settingsViaBackKey 字段已删除（不再是死字段）");
+		check(src.indexOf("settingsViaBackKey = ") < 0,
+			"settingsViaBackKey 无任何赋值点（置位点与清零点一并删除）");
+		check(src.indexOf("if (settingsViaBackKey)") < 0,
+			"settingsViaBackKey 无任何消费点（HOME 分支的退后台判据已删）");
+
+		// 4c. 设置页的返回键只剩「回会话」一条（不再有「本次由返回键进来」的分叉）。
+		String homeBlock = blockAfter(back, "if (uiState == UiState.HOME)", '{', '}');
+		String resumeBlock = blockAfter(homeBlock, "if (canResumeSession)", '{', '}');
+		check(resumeBlock.length() > 20 && resumeBlock.indexOf("resumeSession();") > 0,
+			"有活会话时设置页返回键 = resumeSession()（既有语义不变）");
+		check(resumeBlock.indexOf("moveTaskToBack") < 0,
+			"有活会话时设置页返回键不再退后台（D6.1 的死循环判据已随成因消失删除）");
+
+		// 4d. 设置页文案：唯一一句、不再承诺系统返回键、不含已删字段的分叉。
 		String settings = methodBody(src, "private void showConnectionSettings()");
-		check(settings.indexOf("settingsViaBackKey") >= 0
-				&& settings.indexOf("隧道仍在运行。点上方「返回当前会话」继续，无需重新连接。") >= 0
-				&& settings.indexOf("隧道仍在运行。点上方「返回当前会话」或系统返回键继续，无需重新连接。") >= 0,
-			"设置页文案仍按 settingsViaBackKey 分两支（文案与行为一致性判据未动）");
+		check(settings.indexOf("隧道仍在运行。点上方「返回当前会话」继续，无需重新连接。") >= 0,
+			"设置页文案仍是那句「只承诺上方按钮」的原文");
+		check(settings.indexOf("或系统返回键") < 0,
+			"★ 设置页文案不再承诺系统返回键（T102 文案口径）");
+		check(settings.indexOf("settingsViaBackKey") < 0,
+			"设置页文案不再按「本次是不是返回键进来的」分两支");
 
-		System.out.println("\nT99 back-key source contract: " + passed + " passed, 0 failed");
+		// 4e. showConnectionSettings() 本身**不许**被误删（它还有别的入口在用）。
+		check(settings.length() > 100, "showConnectionSettings() 方法体抠出（功能保留）");
+		check(src.indexOf("openSettings()") > 0 && src.indexOf("runOnUiThread(() -> showConnectionSettings());") > 0,
+			"showConnectionSettings() 仍有其它入口（AppBridge.openSettings，T102 未动它）");
+
+		System.out.println("\nback-key source contract (T99 shape + T102 semantics): " + passed + " passed, 0 failed");
 	}
 }

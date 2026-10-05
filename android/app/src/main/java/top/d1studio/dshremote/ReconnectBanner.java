@@ -1,54 +1,39 @@
 package top.d1studio.dshremote;
 
-import android.content.Context;
-import android.graphics.Color;
-import android.util.TypedValue;
-import android.view.Gravity;
-import android.view.View;
-import android.view.ViewGroup;
-import android.widget.FrameLayout;
-import android.widget.TextView;
-
 /**
- * T78：主界面可见的重连状态横幅（原生覆盖条）。
+ * 重连状态**探针**与防抖状态机（原生侧；无 Android 运行时依赖）。
  *
- * <p><b>为什么是原生 View 而不是页面 DOM</b>：平板档的移动适配 hook 是**严格关闭**的
- * （{@code mobile-web.js} 的 {@code resolveHookEnabled()}：{@code device==='tablet'} ⇒ 任意朝向 OFF），
- * 往页面里注入任何节点都会破坏「平板零痕迹」这条既有契约。原生 {@link TextView} 与 WebView
- * 同级、只在屏幕顶部叠一条，页面 DOM 一个字节都不变 ⇒ 两档走同一条路径、平板档天然零痕迹。
+ * <p><b>T109：显示层已删除，这个类只剩"采样 + 判据"。</b>
+ * 用户口径原话：『把重连横幅去了吧，这样可以少一半的耗电』。删掉的是：
+ * <ul>
+ *   <li>{@code Bar}（与 WebView 同级、{@code layout_gravity=top} 的原生 {@code TextView} 覆盖条）；</li>
+ *   <li>它的出入场 alpha 动画（{@code FADE_MS}）与文案常量 {@code TEXT}；</li>
+ *   <li>它与"官方那条是否可见 + 带区是否重叠"的抑制几何
+ *       （{@code isOnScreen} / {@code bandHeightPx} / {@code shouldSuppress} / {@code BAND_FALLBACK_DP}）；
+ *       没有横幅就无所谓"同一条信息画两遍"。</li>
+ * </ul>
+ * 保留的是下面这一整块，**一个字都没动**：
+ * <ul>
+ *   <li>{@link #PROBE_JS}（只读探针：不写 DOM、不改全局、平板档逐字节零痕迹）；</li>
+ *   <li>它用到的正则/名单字面量（{@link #STATUS_RE_JS}、{@link #OFFICIAL_PHASE}、
+ *       {@link #COMPOSER_DENY_JS}、{@link #ARIA_RE_JS}、{@link #COMPOSER_ROLE_JS}）——
+ *       两端同源断言（{@code scripts/test-mobile-chrome.mjs}）按这份字面量逐字符比对，
+ *       改一端必须同时改另一端；</li>
+ *   <li>{@link #POLL_INTERVAL_MS} 与 {@link Debouncer}（连续 {@link #SHOW_STREAK} 次真 /
+ *       连续 {@link #HIDE_STREAK} 次假）。</li>
+ * </ul>
  *
- * <p><b>状态信号</b>：{@link #PROBE_JS} 是一段**只读**脚本，经
- * {@code WebView.evaluateJavascript} 每 {@link #POLL_INTERVAL_MS} 毫秒跑一次。
- * 它与 hook 的 {@code findReconnectStatusElement()}（{@code mobile-web.js} 的
- * {@code RECONNECT_STATUS_RE} / {@code isInteractiveNode()} / {@code isVisible()}）
- * **同源**：元素级、整串锚定、只见「有布局盒」的节点；正则字面量逐字符相同
- * （见 {@link #STATUS_RE_JS}，由单测钉死）。
- * 它**不依赖 hook 是否装上**，所以手机档 / 平板档是同一个真相源，没有第二个判据。
- *
- * <p><b>T86：两条匹配层</b>（缺口①——官方 0.2.0-rc.2 的状态**是按钮**，旧探针按设计看不见它）
+ * <p><b>删除后这个防抖器还有什么用</b>（必须在代码里留下答案，否则后来人会把"没人看的
+ * 状态机"当死代码删掉）：
  * <ol>
- *   <li><b>层 1（官方按钮）</b>：{@code [data-phase]}&nbsp;且值恰为 {@link #OFFICIAL_PHASE}
- *       （官方 {@code ConnectionIndicator} 的 connecting 分支就是
- *       {@code <button type="button" data-phase="connecting">}，文案在内层 {@code span.label}，
- *       后接 {@code aria-hidden} 的三点 dots）。这一层**不套用**「排除可交互控件」——
- *       否则又回到缺口①。代之以四道闸：可见性、**文案锚定**（整串或去尾点后整串，
- *       或 aria-label 含重连语义）、{@link #COMPOSER_DENY_JS} **显式排除清单**
- *       （发送 / 「+」等 composer 交互件的 aria-label 一律否决）、以及 T90 补上的
- *       {@link #COMPOSER_ROLE_JS} **composer 祖先否决**（与 hook 的
- *       {@code isInsideComposer()} 同算法，收掉 T88 遗留的那处两端差异）。</li>
- *   <li><b>层 2（非交互文案）</b>：T78 的旧路径原样保留（向后兼容）：只扫
- *       {@code div,span,p,…}、排除可交互节点与其后代、整串锚定。T86 额外把
- *       {@code [contenteditable]}（官方 composer 是 Lexical）也纳入排除——
- *       用户把「重新连接中」这五个字打进输入框时不算重连。</li>
+ *   <li>T108 的**自适应节拍**：确认仍在断开态时保持 500ms 快档
+ *       （{@code MainActivity.probeIntervalMs()}）；</li>
+ *   <li>{@link StuckRescue} 的观测量——"卡住"从发现到动手的时延全靠它。</li>
  * </ol>
- * 返回值里带 {@code src}（1 = 层 1，2 = 层 2），进 logcat 便于事后对账。
+ * 也就是说：省掉的是**耗电的显示与动画**，采样这条链一秒都没省。
  *
- * <p><b>防抖</b>（缺一不可，全部在这里的 {@link Debouncer} 里，可被 JVM 单测瞬时喂序列验证）：
- * 连续 {@link #SHOW_STREAK} 次为真才显示（≈1.0s），连续 {@link #HIDE_STREAK} 次为假才隐藏（≈1.5s），
- * {@code UNKNOWN}（页面正在导航 / 求值失败）不参与计数。
- *
- * <p>纯逻辑（{@link Debouncer}、{@link #isOnScreen}、{@link #shouldSuppress}）不碰 Android 运行时，
- * 由 {@code android/tests/ReconnectBannerTest.java} 在 JVM 上直接验证。
+ * <p>状态呈现改由设置页的只读诊断行负责（{@code MainActivity.reconnectDiagLine()}：
+ * hook 连接态 / 上次断线 / 探针拍数 / 最近观测 / 当前节拍）。
  */
 public final class ReconnectBanner {
 
@@ -57,14 +42,10 @@ public final class ReconnectBanner {
 
 	/** 轮询周期（ms）。500ms 一次只读探针；也天然限制了状态翻转频率。 */
 	public static final int POLL_INTERVAL_MS = 500;
-	/** 出现防抖：连续 N 次观测到「正在重连」才显示 ⇒ 最短 2×500ms = 1.0s。 */
+	/** 出现防抖：连续 N 次观测到「正在重连」才算确认（最短 2×500ms = 1.0s）。 */
 	public static final int SHOW_STREAK = 2;
-	/** 消失防抖：连续 N 次观测到「已恢复」才隐藏 ⇒ 最短 3×500ms = 1.5s。 */
+	/** 消失防抖：连续 N 次观测到「已恢复」才算解除（最短 3×500ms = 1.5s）。 */
 	public static final int HIDE_STREAK = 3;
-	/** 横幅文案。官方侧栏那条实际是「重新连接中...」，原生条不复刻省略号。 */
-	public static final String TEXT = "重新连接中";
-	/** 淡入/淡出时长（ms）。只做 alpha，不做位移（避免与页面 IME 抬页打架）。 */
-	public static final int FADE_MS = 150;
 
 	/** 一次探针观测。{@code UNKNOWN} = 本轮读不到页面，不参与计数。 */
 	public enum Observed {
@@ -73,7 +54,7 @@ public final class ReconnectBanner {
 		UNKNOWN
 	}
 
-	/** 横幅可见性状态机状态。 */
+	/** 防抖状态机状态。T109：不再驱动任何 View，只驱动节拍与自救观测量。 */
 	public enum State {
 		HIDDEN,
 		SHOWN
@@ -114,11 +95,11 @@ public final class ReconnectBanner {
 		/**
 		 * 喂一次观测。
 		 *
-		 * @return true 表示本次发生了跃迁（调用方据此 show/hide）
+		 * @return true 表示本次发生了跃迁
 		 */
 		public boolean feed(Observed observed) {
 			if (observed == Observed.UNKNOWN) {
-				// 导航期静默：既不显示、也不累计——否则「连续为真」会跨页面错误累加。
+				// 导航期静默：既不确认、也不累计——否则「连续为真」会跨页面错误累加。
 				trues = 0;
 				falses = 0;
 				return false;
@@ -153,59 +134,9 @@ public final class ReconnectBanner {
 	}
 
 	/**
-	 * 官方状态元素是否**真的落在视口里**（CSS 像素语义）。
-	 *
-	 * <p>⚠️ 不能只看 {@code getClientRects().length > 0}：侧栏用 {@code left:-320px} 收起时
-	 * 元素仍有布局盒、仍被判「可见」（T68 §2.6 实测），但用户根本看不见。这里要求矩形与
-	 * 视口相交，才等价于「用户已经看得见官方那条」。
-	 */
-	public static boolean isOnScreen(int x, int y, int w, int h, int viewportW, int viewportH) {
-		if (w <= 0 || h <= 0 || viewportW <= 0 || viewportH <= 0) return false;
-		return x + w > 0 && x < viewportW && y + h > 0 && y < viewportH;
-	}
-
-	/**
-	 * T86：横幅**将要占据的带区**高度（px）。缺口②——横幅 {@code GONE} 时
-	 * {@code getWidth()/getHeight()} 恒 0，拿它当重叠判据会让「重叠」恒为假 ⇒ 自锁。
-	 *
-	 * <p>取值优先级：已布局实高 &gt; 按内容 measure 出的自然高 &gt; 兜底常量（≥ 实际高度）。
-	 * 兜底刻意取大一点：带区偏大只会让「判成重叠 ⇒ 照常显示」，偏小会误抑制。
-	 *
-	 * @param laidOutPx  已布局高度（{@code Bar.getHeight()}），未布局时 0
-	 * @param measuredPx 按内容测量出的高度，测不出时 0
-	 * @param fallbackPx 兜底高度（px）
-	 */
-	public static int bandHeightPx(int laidOutPx, int measuredPx, int fallbackPx) {
-		if (laidOutPx > 0) return laidOutPx;
-		if (measuredPx > 0) return measuredPx;
-		return fallbackPx > 0 ? fallbackPx : 1;
-	}
-
-	/** 兜底带高（dp）：13sp 单行 + 8dp×2 内边距 ≈ 32dp，取 40dp 略大一侧。 */
-	public static final int BAND_FALLBACK_DP = 40;
-
-	/**
-	 * 官方那条已经可见、且与**横幅带区**不重叠 ⇒ 抑制横幅（同一条信息不显示两遍）。
-	 *
-	 * <p>T86 改判据对象：参数从「横幅当前 rect」改成「横幅将要占据的带区」
-	 * （{@code bandLeft..bandRight} × {@code bandTop..bandTop+bandHeight}，同 rootLayout 坐标 px）。
-	 * 未显示时横幅 rect 恒 {@code [0,0,0,0]}，用它判重叠恒为「不重叠」⇒ 只要探针能看见官方那条
-	 * 就永远抑制 ⇒ 横幅**第一次显示不出来**（T83 §5 实测的自锁）。
-	 *
-	 * <p>带区与官方那条**重叠**时不抑制：两条信息落在同一块像素上，抑制横幅等于什么都看不见。
-	 */
-	public static boolean shouldSuppress(boolean officialOnScreen, int ex, int ey, int ew, int eh,
-										 int bandLeft, int bandTop, int bandRight, int bandHeight) {
-		if (!officialOnScreen) return false;
-		int bandBottom = bandTop + bandHeight;
-		boolean overlap = ex < bandRight && ex + ew > bandLeft && ey < bandBottom && ey + eh > bandTop;
-		return !overlap;
-	}
-
-	/**
 	 * 与 hook 的 {@code RECONNECT_STATUS_RE}（{@code packages/gateway/assets/mobile-web.js}）
 	 * **逐字符一致**的正则字面量。这是单一真相源：上游换文案时
-	 * {@code ReconnectBannerTest} 的「同源」断言先红，而不是横幅静默失效。
+	 * {@code ReconnectBannerTest} 的「同源」断言先红，而不是探针静默失效。
 	 * 由 {@code android/tests/ReconnectBannerTest.java} 直接与源文件比对（断言 7）。
 	 */
 	public static final String STATUS_RE_JS =
@@ -279,7 +210,7 @@ public final class ReconnectBanner {
 	 * <ol>
 	 *   <li>扫 {@code [data-phase]}，{@code data-phase} 小写后必须**恰等于**
 	 *       {@link #OFFICIAL_PHASE}（{@code disconnected} 不认：「连接异常，刷新重试」不是
-	 *       「重新连接中」，横幅文案会错）；</li>
+	 *       「重新连接中」）；</li>
 	 *   <li>aria-label 命中 {@link #COMPOSER_DENY_JS} ⇒ 直接否决（显式排除清单）；</li>
 	 *   <li>必须有布局盒（{@code getClientRects().length > 0}）；</li>
 	 *   <li>文案锚定：取该元素**去掉 {@code aria-hidden="true"} 子树后**的文字
@@ -310,6 +241,9 @@ public final class ReconnectBanner {
 	 * **逐 token 求值**把它抽出来在真实/桩 DOM 上跑，`//` 会被当成非法 token 直接抛错。
 	 * T90 的 {@code insideComposer}（composer 祖先否决）因此只写代码、解释写在
 	 * {@link #COMPOSER_ROLE_JS} 的 javadoc 里。
+	 *
+	 * <p>T109：探针**逐字节未改**（横幅显示层的删除不经过这里）——
+	 * 它是 StuckRescue 与 T108 节拍的唯一采样源，也是平板档"零痕迹"那条契约的载体。
 	 */
 	public static final String PROBE_JS =
 		"(function(){try{"
@@ -402,121 +336,4 @@ public final class ReconnectBanner {
 		+ "return hit(el,2);}"
 		+ "return {ok:1,re:0};"
 		+ "}catch(probeFailed){return {ok:0};}})()";
-
-	/**
-	 * 覆盖条本体：与 WebView 同级的 {@link TextView}，{@code layout_gravity=top}。
-	 *
-	 * <p>不聚焦、不点击、不参与无障碍树 ⇒ 不会弹软键盘、不会吃掉页面的触摸与焦点。
-	 * 遵守系统栏 insets 由调用方用**平板让位那一套取值**（{@code systemBars|displayCutout|tappableElement}
-	 * 的逐方向并集）经 {@link #applySystemBarInsets} 写进来，横幅顶边落在系统栏之下。
-	 */
-	public static final class Bar extends TextView {
-
-		private final Runnable finishHide = () -> {
-			setVisibility(View.GONE);
-			setAlpha(1f);
-		};
-
-		public Bar(Context context) {
-			super(context);
-			setText(TEXT);
-			setTextColor(Color.WHITE);
-			setBackgroundColor(0xFF2B2B2B);
-			setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
-			setGravity(Gravity.CENTER);
-			setSingleLine(true);
-			int p = dp(context, 8);
-			setPadding(p, p, p, p);
-			setVisibility(View.GONE);
-			setAlpha(1f);
-			// 显式写死三件套：不可聚焦、不可点击、不用可编辑控件（防回归）。
-			setFocusable(false);
-			setFocusableInTouchMode(false);
-			setClickable(false);
-			setLongClickable(false);
-			setTextIsSelectable(false);
-			setSoundEffectsEnabled(false);
-			setHapticFeedbackEnabled(false);
-			setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-		}
-
-		private static int dp(Context context, int v) {
-			return Math.round(v * context.getResources().getDisplayMetrics().density);
-		}
-
-		/** 四向系统栏 inset（px）：作为外边距写进 8dp 内边距之外 ⇒ 顶边不低于系统栏。 */
-		public void applySystemBarInsets(int left, int top, int right, int bottom) {
-			ViewGroup.LayoutParams raw = getLayoutParams();
-			if (!(raw instanceof FrameLayout.LayoutParams)) return;
-			FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) raw;
-			if (lp.leftMargin == left && lp.topMargin == top
-				&& lp.rightMargin == right && lp.bottomMargin == bottom) {
-				return;
-			}
-			lp.leftMargin = left;
-			lp.topMargin = top;
-			lp.rightMargin = right;
-			lp.bottomMargin = bottom;
-			setLayoutParams(lp);
-		}
-
-		/**
-		 * T86：横幅「按内容测量」出的高度（px），已布局时直接给实高；测不出给 0。
-		 *
-		 * <p>{@code GONE} 的 View 从不参与布局 ⇒ {@code getHeight()} 恒 0，但
-		 * {@code measure()} 仍能算出自然高度（单行 13sp + 8dp×2 内边距）。
-		 * 带区判定的高度兜底链第一环就靠它，避免用魔法常量。
-		 */
-		public int measureContentHeight() {
-			int h = getHeight();
-			if (h > 0) return h;
-			int w = getWidth();
-			if (w <= 0) {
-				int pw = 0;
-				ViewGroup.LayoutParams raw = getLayoutParams();
-				if (getParent() instanceof View) pw = ((View) getParent()).getWidth();
-				int margins = 0;
-				if (raw instanceof ViewGroup.MarginLayoutParams) {
-					ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) raw;
-					margins = m.leftMargin + m.rightMargin;
-				}
-				w = pw > 0 ? Math.max(0, pw - margins) : 0;
-			}
-			if (w <= 0) return 0;
-			measure(MeasureSpec.makeMeasureSpec(w, MeasureSpec.AT_MOST),
-				MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
-			return getMeasuredHeight();
-		}
-
-		/** 显示（150ms 淡入，无位移）。 */
-		public void show() {
-			removeCallbacks(finishHide);
-			animate().cancel();
-			if (getVisibility() != View.VISIBLE) {
-				setAlpha(0f);
-				setVisibility(View.VISIBLE);
-			}
-			animate().alpha(1f).setDuration(FADE_MS).start();
-		}
-
-		/** 隐藏（150ms 淡出后 GONE）。 */
-		public void hide() {
-			if (getVisibility() != View.VISIBLE) {
-				setAlpha(1f);
-				return;
-			}
-			removeCallbacks(finishHide);
-			animate().cancel();
-			animate().alpha(0f).setDuration(FADE_MS).start();
-			postDelayed(finishHide, FADE_MS);
-		}
-
-		/** 立即隐藏（无动画）：onPageCommitVisible / 退后台 / 离开会话页用，不留上一页的残留。 */
-		public void hideNow() {
-			removeCallbacks(finishHide);
-			animate().cancel();
-			setAlpha(1f);
-			setVisibility(View.GONE);
-		}
-	}
 }

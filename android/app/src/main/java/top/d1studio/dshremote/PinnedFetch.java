@@ -1,6 +1,7 @@
 package top.d1studio.dshremote;
 
 import android.util.Log;
+import android.webkit.CookieManager;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -69,6 +70,12 @@ import javax.net.ssl.X509TrustManager;
  * <p>⚠️ 闸门<b>只排队不拒绝</b>的理由见 {@link #GATE} 的注释：这里返回 null
  * 不是「放行走正常网络」，而是让 SW 子系统自己发那个必然死在自签证书上的请求
  * ⇒ 白屏（T49 §2.2 实测）。这条不能被后来的人「优化」掉。
+ *
+ * <h3>T114：本条通道必须自带设备凭据（否则 401 ⇒ 永久重连 + 白屏）</h3>
+ * 被接管的请求<b>不会</b>自动带 cookie，而网关只认 cookie {@code dr_device}。
+ * 现在发请求前按 {@link #isSameOriginUrl} 判同源，同源才注入
+ * {@link #cookieFor} 取到的凭据；缺凭据<b>失败关闭</b>（唯一的例外是网关侧
+ * 免认证的 {@link #PUBLIC_HEALTH_PATH}）。401 一律不返回字节 ⇒ 不可能进落盘缓存。
  */
 final class PinnedFetch {
 
@@ -139,6 +146,23 @@ final class PinnedFetch {
 		queuedWaits.set(0);
 		shed.set(0);
 		bytesTotal.set(0);
+		// T114 凭据计数与上面四项同一零点（openGateway），便于「首连 vs 二次进入」对比。
+		credAttached.set(0);
+		credMissing.set(0);
+		credCrossOrigin.set(0);
+		credPublicPath.set(0);
+		credDenied401.set(0);
+	}
+
+	/**
+	 * T114：凭据侧摘要（附上 / 缺凭据失败关闭 / 非同源不附 / 公开路径放行 / 401）。
+	 * 挂进下面那条 {@code pinnedFetch ok} 结算行——与 T60 的四个指标同一理由：
+	 * 「一次 logcat 读全」，不留事后无法反推的暗数。
+	 */
+	private static String credSummary() {
+		return "凭据[附 " + credAttached.get() + " 缺 " + credMissing.get()
+			+ " 非同源 " + credCrossOrigin.get() + " 公开 " + credPublicPath.get()
+			+ " 401 " + credDenied401.get() + "]";
 	}
 
 	/** 连接设置页那行只读诊断用的摘要（纯展示，无点击）。 */
@@ -168,6 +192,102 @@ final class PinnedFetch {
 			this.cacheControl = cacheControl;
 			this.body = body;
 		}
+	}
+
+	// ---------- T114：设备凭据（缺它 ⇒ 网关 401 ⇒ 永久重连 + 白屏） ----------
+
+	/**
+	 * T114 背景（真值见 scratch/t114/report.md）：
+	 *
+	 * <p>Android 的 {@code shouldInterceptRequest} / {@code ServiceWorkerClient} **不会**
+	 * 自动给被接管的请求带 cookie，而网关的 {@code deviceTokenOf()}
+	 * （{@code packages/gateway/src/auth.ts:37-38,239-240}）**只认** cookie
+	 * {@code dr_device}，缺失即 {@code 401 no-device-token}；没有 Authorization 旁路。
+	 * ⇒ 本通道以前发出的每一条请求都是未鉴权的：静态资源 401（白屏）、
+	 * {@code /plugins/events} 401（长连接永远建不起来 ⇒ 横幅常驻 / 无限重连）。
+	 * 实测：{@code pinnedFetch 非 200 status=401 url=…/assets/vendor-CCJJTK99.js}。
+	 *
+	 * <p>修法（本类内自足，**不改任何调用点**）：发请求前用
+	 * {@link CookieManager#getCookie(String)} 取该 URL 在当前 WebView cookie 罐里的凭据
+	 * （设备令牌是 HttpOnly cookie，{@code document.cookie} 看不到，但 CookieManager 拿得到），
+	 * 非空则设 {@code Cookie} 头。
+	 */
+	private static final AtomicLong credAttached = new AtomicLong();
+	private static final AtomicLong credMissing = new AtomicLong();
+	private static final AtomicLong credCrossOrigin = new AtomicLong();
+	private static final AtomicLong credPublicPath = new AtomicLong();
+	private static final AtomicLong credDenied401 = new AtomicLong();
+
+	/**
+	 * 网关侧**免认证**的公开探针路径。证据：{@code packages/gateway/src/server.ts:441}
+	 * 在认证闸门**之前** `return 200`，响应体固定 {@code {"ok":true}}，无信息泄露。
+	 *
+	 * <p>为什么单独列它：它是 tier2 救援探针的目标（{@code MainActivity} 链路探针）。
+	 * 对**公开**路径，「cookie 为空」不是鉴权缺陷，失败关闭会把「网关其实活着」判成
+	 * 「链路不通」⇒ 该重载时不重载（那是新引入的回归）。所以这一条路径允许在无凭据时
+	 * **不带任何凭据**发出去；它只可能是 200，既不可能 401 也不泄露任何东西。
+	 * 其余所有路径缺凭据一律失败关闭。
+	 */
+	private static final String PUBLIC_HEALTH_PATH = "/__dsh_remote__/health";
+
+	/**
+	 * T114：**同源判据**（凭据泄露红线）。
+	 *
+	 * <p>{@code host}/{@code port} 由调用点传入，全部取自 {@code activeGatewayHost} /
+	 * {@code activeGatewayPort}——也就是 WebView 当前页面所在的那个网关。因此
+	 * 「与传入目标一致」==「与页面同源」。在这里**自己再判一遍**是纵深防御：
+	 * 判据收在凭据唯一出口处，将来任何调用点少判一道，凭据也不会被送去第三方域。
+	 *
+	 * <p>逐项比较：scheme 必须 https、host 忽略大小写相等（**不是**后缀/包含匹配：
+	 * {@code 127.0.0.1.evil.com} 与 {@code 127.0.0.1} 不相等）、有效端口相等
+	 * （缺省端口按 443 折叠，与 {@code MainActivity.effectivePort} 同语义）。
+	 *
+	 * <p>写成 URL 字符串入参的**无副作用纯函数**，是为了能在 JVM 上直接喂用例
+	 * （scenario 见 {@code android/tests/T114CredentialInjectionTest.java} 与
+	 * scratch/t114 的动态负例装置），不必起模拟器。
+	 */
+	static boolean isSameOriginUrl(String url, String host, int port) {
+		if (url == null || host == null || host.isEmpty() || port <= 0) return false;
+		try {
+			URL u = new URL(url);
+			if (!"https".equalsIgnoreCase(u.getProtocol())) return false;
+			String h = u.getHost();
+			if (h == null || !host.equalsIgnoreCase(h)) return false;
+			int p = u.getPort();
+			if (p == -1) p = 443; // 显式写出 443 与省略等价：都算同一个源
+			return p == port;
+		} catch (Exception e) {
+			// 解析不了 ⇒ 判不了同源 ⇒ 不给凭据（fail-closed，不放行凭据）。
+			return false;
+		}
+	}
+
+	/** 取该 URL 在 WebView cookie 罐里的凭据；异常/取不到一律返回空串（由调用方决定是否失败关闭）。 */
+	static String cookieFor(String url) {
+		try {
+			String c = CookieManager.getInstance().getCookie(url);
+			return c == null ? "" : c.trim();
+		} catch (Throwable t) {
+			// WebView 未初始化等异常不得击穿取数通道：按「无凭据」处理，绝不吞成成功。
+			Log.w("dshr-perf", "pinnedFetch 读 cookie 失败（按无凭据处理）：" + t + " url=" + url);
+			return "";
+		}
+	}
+
+	/**
+	 * 只暴露 cookie 的**名字**与总长度，**绝不**把令牌值写进 logcat。
+	 * （logcat 是给真机取证用的，不能顺手变成凭据泄露面。）
+	 */
+	private static String cookieNames(String cookie) {
+		StringBuilder sb = new StringBuilder();
+		for (String part : cookie.split(";")) {
+			int eq = part.indexOf('=');
+			String name = (eq > 0 ? part.substring(0, eq) : part).trim();
+			if (name.isEmpty()) continue;
+			if (sb.length() > 0) sb.append(',');
+			sb.append(name);
+		}
+		return sb.length() == 0 ? "?" : sb.toString();
 	}
 
 	/**
@@ -208,6 +328,37 @@ final class PinnedFetch {
 			final long transportBudgetMs = Math.max(1000L, TOTAL_DEADLINE_MS - (System.currentTimeMillis() - t0));
 
 			URL parsed = new URL(url);
+			// ---- T114：设备凭据只发同源；缺凭据失败关闭 ----
+			// 顺序很关键：先判同源（凭据泄露红线），再取 cookie，最后才决定发不发。
+			final String cookie;
+			if (!isSameOriginUrl(url, host, port)) {
+				// 非同源目标：一个字节的凭据都不给。仍然照旧发请求（语义与改动前一致），
+				// 只是不带凭据 —— 跨源目标本来也不该拿到本网关的设备令牌。
+				credCrossOrigin.incrementAndGet();
+				cookie = null;
+				Log.w("dshr-perf", "pinnedFetch 非同源目标 ⇒ 不附凭据 url=" + url
+					+ " 活动网关=" + host + ":" + port);
+			} else {
+				String c = cookieFor(url);
+				if (!c.isEmpty()) {
+					credAttached.incrementAndGet();
+					cookie = c;
+					Log.i("dshr-perf", "pinnedFetch 附设备凭据 names=" + cookieNames(c)
+						+ " len=" + c.length() + " url=" + url);
+				} else if (PUBLIC_HEALTH_PATH.equals(parsed.getPath())) {
+					// 免认证的公开探针路径（见 PUBLIC_HEALTH_PATH 注释）：不带凭据放行，
+					// 失败关闭在这里反而是回归（把活着的网关判成不通）。
+					credPublicPath.incrementAndGet();
+					cookie = null;
+					Log.i("dshr-perf", "pinnedFetch 无凭据，但目标是免认证公开路径 ⇒ 不带凭据放行 url=" + url);
+				} else {
+					// 失败关闭：不把必然 401 的未鉴权请求发出去当「成功」，
+					// 也不再让 401 有机会被当成内容写进落盘缓存。
+					credMissing.incrementAndGet();
+					Log.w("dshr-perf", "pinnedFetch 无凭据（cookie 空）⇒ 失败关闭 url=" + url);
+					return null;
+				}
+			}
 			SSLContext ctx = SSLContext.getInstance("TLS");
 			ctx.init(null, new TrustManager[]{pinningTrustManager(store, profileId, host, port, tag)},
 				new SecureRandom());
@@ -225,9 +376,19 @@ final class PinnedFetch {
 			conn.setRequestProperty("Accept-Encoding", "gzip, deflate");
 			conn.setRequestProperty("Accept", "*/*");
 			conn.setRequestProperty("User-Agent", "DSHRemoteAndroid/pinned-fetch");
+			// T114：只在同源目标上带凭据（cookie==null 表示「不该带」，不是「没取到」）。
+			if (cookie != null) conn.setRequestProperty("Cookie", cookie);
 			int status = conn.getResponseCode();
 			if (status != 200) {
-				Log.i("dshr-perf", "pinnedFetch 非 200 status=" + status + " url=" + url);
+				if (status == 401) {
+					// T114：401 一律**不返回字节** ⇒ 调用点拿不到 Result ⇒ 走不到
+					// StaticDiskCache.put，绝不可能把未鉴权响应当内容落盘污染缓存。
+					// 单独一条文案是为了和「静态资源 401」这条事故特征一眼对上。
+					credDenied401.incrementAndGet();
+					Log.w("dshr-perf", "pinnedFetch 401 未鉴权 ⇒ 返回 null（不落盘、不缓存）url=" + url);
+				} else {
+					Log.i("dshr-perf", "pinnedFetch 非 200 status=" + status + " url=" + url);
+				}
 				return null;
 			}
 			String encoding = conn.getContentEncoding();
@@ -261,7 +422,8 @@ final class PinnedFetch {
 			// 结算行带峰值/排队/拒绝/累计四项 —— 验收的四个指标一次 logcat 读全。
 			Log.i("dshr-perf", "pinnedFetch ok bytes=" + body.length + " enc=" + encoding
 				+ " peak=" + inFlightPeak.get() + " queued=" + queuedWaits.get()
-				+ " shed=" + shed.get() + " total=" + bytesTotal.get() + " url=" + url);
+				+ " shed=" + shed.get() + " total=" + bytesTotal.get()
+				+ " " + credSummary() + " url=" + url);
 			return new Result(status, conn.getContentType(), conn.getHeaderField("cache-control"), body);
 		} catch (Exception e) {
 			// 证书未受信 / 网络失败一律不放行。证书那条的具体理由由

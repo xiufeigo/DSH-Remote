@@ -1,5 +1,6 @@
-# T99「平板档一次返回直接进 App 连接设置页」的 JVM 源码契约测试（臂①，纯源码扫描）
+# 返回键的源码契约测试（臂①，纯源码扫描；文件与臂名沿用 T99）
 #   + 探针在极简 DOM 桩上真跑的行为臂（臂②，需要 node）。
+# 判据在 T102 之后钉的是**新语义**：先关官方弹层/右栏 → 没有可关的 ⇒ 退到后台（不再进设置页）。
 # 只读 android/app/src/main/java/top/d1studio/dshremote/MainActivity.java，不写任何产品文件。
 #
 # 必须用 pwsh -File 运行（Windows PowerShell 5.1 会把 UTF-8 脚本读成 ANSI、非 ASCII 字面量会坏）。

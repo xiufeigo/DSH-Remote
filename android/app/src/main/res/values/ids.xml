@@ -1,8 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- T78：原生重连横幅的稳定 id。
-     仅新增一个 id 资源（不引用任何 drawable/string/color），供
-     `adb shell uiautomator dump` 用 resource-id 精确定位横幅（断言 2）。
-     View.getId() 返回的就是这里生成的 R.id.dshrReconnectBanner。 -->
+<!-- T109：`dshrReconnectBanner` 这个 id 已随重连横幅的**显示层**一起删除。
+     删除理由（用户口径原话）："把重连横幅去了吧，这样可以少一半的耗电"。
+     删掉的只是"把重连状态画到屏幕上"这一层；喂给 StuckRescue 的采样
+     （ReconnectBanner.PROBE_JS 合并探针 + T108 自适应节拍）一个字未动，
+     连接状态改由**设置页只读诊断行**体现（MainActivity.reconnectDiagLine()）。
+     这里刻意保留**空** resources 文件而不删文件：aapt2 按目录逐文件编译，
+     空 resources 合法；留一个带说明的空文件能让后来人一眼看到
+     "这个 id 曾经存在、为什么不在了"，比文件凭空消失更不容易被误会成漏提交。
+     注意：XML 注释里不许出现连续两个短横线，所以这里不写任何命令行开关原文。 -->
 <resources>
-	<item name="dshrReconnectBanner" type="id" />
 </resources>

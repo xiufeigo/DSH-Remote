@@ -70,7 +70,9 @@ public final class T94ImmersiveTest {
 			System.exit(2);
 		}
 		String src = read(args[0]);
-		System.out.println("== T94 immersive source contract： " + args[0]);
+		String hook = args.length >= 2 ? read(args[1]) : null;
+		System.out.println("== T94 immersive source contract： " + args[0]
+			+ (hook != null ? " + " + args[1] : ""));
 
 		// ── 1. 只读探针 ────────────────────────────────────────────────
 		String probe = literal(src, "PAGE_BG_PROBE_JS = ");
@@ -130,6 +132,74 @@ public final class T94ImmersiveTest {
 			"T80: the four-way avoidance still consumes readSystemBarInsetsPx()");
 		check(apply.indexOf("webView.setPadding(") < 0,
 			"T80: no regression to webView.setPadding (proven ineffective in T80)");
+
+		// ── 5. T115：让位改由页面承担（用户口径「系统栏走安卓原生透明 + 页面自己让位」）──
+		// 这一组是 T115 新增的：它把「谁钉住了谁」写进断言——
+		//   · 上面第 4 组钉「外边距仍是唯一能改布局盒的地方、且四向仍来自 readSystemBarInsetsPx」
+		//     （即 T80 的取值本体不许退化）；
+		//   · 本组钉「让位动作现在写的是 0 外边距 + 把四向交给页面」，两者缺一即红。
+		// 改前那一版（让位落外边距）由 T115 明确废弃：外边距一缩，系统栏后面只剩父容器一种底色，
+		// 而平板官方布局贴边那一行是两色 ⇒ 单色带必然在面板那侧留 ΔRGB=(6,5,4) 硬缝。
+		check(apply.contains("setWebViewInsetsBox(0, 0, 0, 0)"),
+			"T115: the avoidance writes ZERO layout-box margins (WebView covers the whole window)");
+		check(apply.contains("writeInsetsToPage(webView"),
+			"T115: the avoidance hands the four-way insets to the page (single page write entry)");
+		check(apply.indexOf("setWebViewInsetsBox(left") < 0 && apply.indexOf("setWebViewInsetsBox(avoid") < 0,
+			"T115: no path writes the four-way insets back onto the layout box (would double-inset)");
+		String write = methodBody(src, "private void writeInsetsToPage(");
+		check(write.contains("__dshRemoteInsets") && write.contains("s.set("),
+			"T115: the page write goes through the existing __dshRemoteInsets.set channel (no new API)");
+		check(write.contains("+ top + \",\" + bottom + \",\" + left + \",\" + right + \""),
+			"T115: the page write carries all four directions (left/right added for cutout/landscape)");
+		// 两个写点必须同源：平板档 applyInsetsToPage 也用 readSystemBarInsetsPx()，
+		// 否则「谁后跑谁赢」——实测抓到过 statusBars(24px) 覆盖并集(36px)。
+		String insetsToPage = methodBody(src, "private void applyInsetsToPage(");
+		check(insetsToPage.contains("if (isTabletClass())") && insetsToPage.contains("readSystemBarInsetsPx()"),
+			"T115: applyInsetsToPage uses the SAME source as the avoidance for the tablet class (no race between two writers)");
+		check(insetsToPage.contains("getInsets(WindowInsets.Type.statusBars())")
+			&& insetsToPage.contains("getInsets(WindowInsets.Type.navigationBars())"),
+			"T115: the phone path keeps its verified statusBars/navigationBars source value-for-value");
+
+		// ── 6. T115：系统栏「原生透明」字面一致（含 API 30–34 的形态） ──
+		String barsInit = methodBody(src, "private void configureSystemBars()");
+		check(barsInit.contains("setNavigationBarColor(Color.TRANSPARENT)"),
+			"T115: configureSystemBars no longer paints the shell colour on the navigation bar");
+		check(barsInit.indexOf("setNavigationBarColor(shellColor(") < 0,
+			"T115: the literal setNavigationBarColor(shell_background) is gone (it contradicted 'native transparent')");
+		check(barsInit.contains("setStatusBarColor(Color.TRANSPARENT)"),
+			"T115: status bar is native-transparent too");
+		check(barsInit.contains("setNavigationBarContrastEnforced(false)")
+			&& barsInit.contains("setStatusBarContrastEnforced(false)"),
+			"T115: contrast enforcement stays off (kept from before, no scrim over the page)");
+		check(bars.contains("if (tabletSession) nav = Color.TRANSPARENT;"),
+			"T115: in a tablet session the nav bar is genuinely transparent (page paints the band)");
+		check(bars.contains("if (tabletSession) getWindow().setStatusBarColor(Color.TRANSPARENT);"),
+			"T115: in a tablet session the status bar is genuinely transparent (page paints the band)");
+		check(bars.contains("setSystemBarsAppearance(dark ? 0 : mask, mask)"),
+			"T115: the pageDark / setSystemBarsAppearance icon-brightness logic is preserved");
+
+		// ── 7. T115：hook 的平板作用域必须真的消费 --dshr-inset-* ──────────
+		// 第 5/6 组只证明原生「把四向交给了页面」；消费者在 hook 里，缺了它页面也不会让位。
+		if (hook != null && hook.length() > 1000) {
+			check(hook.contains("--dshr-inset-left") && hook.contains("--dshr-inset-right"),
+				"T115: hook writes/consumes the left/right inset variables too (cutout / landscape)");
+			check(hook.contains("div:has(> [data-slot=\"main\"])"),
+				"T115: tablet scope anchors the official columns structurally (single-level :has(), no hashed class)");
+			check(hook.contains("'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;'"),
+				"T115: the tablet scope pads with the SAME var(...) expression style as the phone scope");
+			check(hook.contains("box-sizing: border-box !important;"),
+				"T115: column padding is border-box (official columns are height:100% - otherwise they overflow)");
+			check(hook.contains("html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset)"),
+				"T115: tablet scope selector unchanged in shape (still the minimal-hook carrier)");
+			// 严格 OFF 不许再把 inset 变量挡在门外（那正是平板档四个变量为空的原因）
+			int setAt = hook.indexOf("window.__dshRemoteInsets = {");
+			int topAt = hook.indexOf("--dshr-inset-top", setAt);
+			int strictAt = hook.indexOf("if (isStrictOff()) return;", setAt);
+			check(setAt > 0 && topAt > setAt && (strictAt < 0 || strictAt > topAt),
+				"T115: the strict-OFF early return no longer sits in front of the inset writes (tablet gets the vars)");
+		} else {
+			check(false, "T115: hook source missing (pass it as the 2nd arg from test-immersive.ps1)");
+		}
 
 		System.out.println("T94 immersive tests passed: " + passed);
 	}

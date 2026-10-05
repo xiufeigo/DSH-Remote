@@ -1746,17 +1746,32 @@ try {
 			/rootLayout\s*\.\s*post\s*\(/.test(onResumeBody72)
 				&& javaCallArgs(onResumeBody72, "post").some((c) => c.args.includes(applierName72)),
 			`onResume段长=${onResumeBody72.length} 兜底post=${/rootLayout\s*\.\s*post\s*\(/.test(onResumeBody72) && javaCallArgs(onResumeBody72, "post").some((c) => c.args.includes(applierName72))}`);
-		// 平板档页面零痕迹：让位仍然只改原生布局，不得注入 DOM/CSS。
-		// T80：判据从「出现 webView.setPadding(」换成「**写到 WebView 的布局盒上**」——
-		// 依据是设备实测：`setPadding` 对页面零效果（视口不变、内容不动），
-		// 只有外边距/父容器 padding 这类**改变 View 自身尺寸**的写法才真的让位。
-		const boxWrite72 = /\.setMargins\s*\(/.test(chainCode)
-			&& /webView\s*\.\s*getLayoutParams\s*\(/.test(chainCode);
-		const zeroTrace72 = boxWrite72
-			&& !/evaluateJavascript|__dshRemoteInsets|setProperty|insertRule|classList/.test(chainCode);
-		ok72("D-inset-zero-trace 让位只落 WebView 的**布局盒**（外边距），不注入 DOM/CSS（平板档页面零痕迹契约）",
-			zeroTrace72,
-			`落布局盒=${boxWrite72}（setMargins=${/\.setMargins\s*\(/.test(chainCode)} 取WebView布局参数=${/webView\s*\.\s*getLayoutParams\s*\(/.test(chainCode)}） 出现注入痕迹=${/evaluateJavascript|__dshRemoteInsets|setProperty|insertRule|classList/.test(chainCode)}`);
+		// 平板档页面零痕迹：**T115 起让位改由页面承担**（用户口径「系统栏走安卓原生透明 +
+		// 页面自己让位」，见 MainActivity.applyDeviceClassInsets 的注释）。
+		//
+		// ⚠ 这一条是 T115 改写的旧契约：T80 时它断言「让位只落 WebView 布局盒、链上不许出现
+		// evaluateJavascript/__dshRemoteInsets」。用户口径变了以后那个形态**必须**反过来——
+		// 原生给 WebView 留外边距时，系统栏后面只剩父容器**一种**底色，而平板官方布局贴边那一行
+		// 本来就是两色（左栏 --dsw-specific-sidebar-fill / 面板 --dsw-alias-bg-base），
+		// 单色带必然在面板那一侧留一道硬缝（T115 实测 2560 宽里 1919 px = 75.0% 差 ΔRGB=(6,5,4)）。
+		//
+		// 新判据两条一起钉，判别力不降（详见 T115 报告 §变异反证）：
+		//   ① 布局盒必须**恒 0**（全窗覆盖）——把 0 改成 left/top/right/bottom 立刻红；
+		//   ② 四向必须**写进页面**（同一个 __dshrRemoteInsets.set 通道）——删掉页面写立刻红。
+		// 四向取值本身仍被 D-inset-mask / D-inset-legacy 与下面的行为夹具逐格钉死。
+		const boxZero72 = /\.setMargins\s*\(/.test(chainCode)
+			&& /webView\s*\.\s*getLayoutParams\s*\(/.test(chainCode)
+			&& /setWebViewInsetsBox\s*\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/.test(chainCode);
+		// 注意：`chain72.code` 里的字符串字面量**已被 mask 成空格**（javaMethodSpans 的 decl 就是
+		// 掩码版），所以「有没有把四向写给页面」不能用 `__dshRemoteInsets` 这个字面量去判
+		//（那样恒为 false ⇒ 假红）。这里判**结构**：让位链上必须出现 evaluateJavascript（页面是载体），
+		// 四向取值本身则由 D-inset-mask / D-inset-legacy 与下面的行为夹具逐格钉死——
+		// 只删页面写、留一个别的 evaluateJavascript 是骗不过这层的：行为夹具会看到页面四向变成
+		// 0,0,0,0，11 格立刻红。
+		const pageOwns72 = /evaluateJavascript\s*\(/.test(chainCode);
+		ok72("D-inset-page-owns 让位改由页面承担：WebView 布局盒恒 0（全窗覆盖）+ 四向写进页面 --dshr-inset-*",
+			boxZero72 && pageOwns72,
+			`布局盒恒0=${boxZero72}（setMargins=${/\.setMargins\s*\(/.test(chainCode)} 取WebView布局参数=${/webView\s*\.\s*getLayoutParams\s*\(/.test(chainCode)} 写0=${/setWebViewInsetsBox\s*\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/.test(chainCode)}） 四向写进页面=${pageOwns72}（链上 evaluateJavascript=${/evaluateJavascript\s*\(/.test(chainCode)}；值由行为夹具 11 格逐格钉死）`);
 
 		// ── 行为验证：抠出真方法体，javac 真编译真跑 ──
 		const findJdkBin72 = (tool) => {
@@ -1854,6 +1869,10 @@ try {
 				"    int pl, pt, pr, pb;",
 				// 真布局里 WebView 挂在 FrameLayout 下、参数是 MATCH_PARENT（四向默认 0）
 				"    ViewGroup.LayoutParams lp = new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);",
+				// T115：让位改由页面承担 ⇒ 夹具必须能看见「写进页面的那段 JS」。
+				// 记下最后一次 evaluateJavascript 的脚本文本，行为断言从它里面解析四向。
+				"    String lastJs = null;",
+				"    public void evaluateJavascript(String js, Object cb){ lastJs = js; }",
 				"    public ViewGroup.LayoutParams getLayoutParams(){ return lp; }",
 				"    public void setLayoutParams(ViewGroup.LayoutParams p){ lp = p; }",
 				"    public int getPaddingLeft(){return pl;} public int getPaddingTop(){return pt;}",
@@ -1873,6 +1892,11 @@ try {
 				"    public int getSafeInsetRight(){return r;} public int getSafeInsetBottom(){return b;}",
 				"  }",
 				"  static class Build { static class VERSION { static int SDK_INT = 30; } }",
+				// T115：让位四向先换算成 CSS px 再写页面（density 取 1.0 ⇒ px 与 CSS px 同值，
+				// 下面 11 格的期望值因此与 T80 时代逐字相同，只是落点从布局盒换成了页面）。
+				"  static class DisplayMetrics { public float density = 1.0f; }",
+				"  static class Resources { public DisplayMetrics getDisplayMetrics(){ return getDisplayMetricsStatic; } }",
+				"  static DisplayMetrics getDisplayMetricsStatic = new DisplayMetrics();",
 				"  static class WindowInsets {",
 				"    // AOSP WindowInsets.Type 的真实取值：替身按此解码掩码，所以「掩码里有没有 ime()」在行为上真的可判。",
 				"    static final int T_STATUS = 1, T_NAV = 2, T_CUTOUT = 8, T_TAPPABLE = 32, T_IME = 2048;",
@@ -1908,6 +1932,7 @@ try {
 				"    WebView webView = new WebView();",
 				"    UiState uiState = UiState.BOOTSTRAP;",
 				"    boolean tablet = true;",
+				"    Resources getResources(){ return new Resources(); }",
 				// T79：取值方法用它当返回缓冲（复用字段、不每次 new）。替身必须提供同名同型字段，
 				// 否则调用链一被收进来就编译失败——那正是开工时那第 3 条红的形态。
 				"    int[] systemBarInsetsPx = new int[4];",
@@ -1927,6 +1952,20 @@ try {
 				"      return f.leftMargin + \",\" + f.topMargin + \",\" + f.rightMargin + \",\" + f.bottomMargin; }",
 				"    return \"NO-BOX\";",
 				"  }",
+				// T115：从最后一次 evaluateJavascript 的脚本里抠出写进页面的四向。
+				// **入参顺序是 (top, bottom, left, right)**（__dshrRemoteInsets.set 的签名），
+				// 这里换算成断言一贯的 (left, top, right, bottom) 口径再返回，11 格的期望值
+				// 因此与 T80 时代逐字相同。
+				// 没有页面写（手机档 / 本地壳页的门禁）⇒ 返回 none，调用处按 0,0,0,0 记。
+				"  static String page(WebView w){",
+				"    String js = w.lastJs;",
+				"    if (js == null) return \"none\";",
+				"    int i = js.indexOf(\"s.set(\"); if (i < 0) return \"NO-SET\";",
+				"    int j = js.indexOf(')', i); if (j < 0) return \"NO-CLOSE\";",
+				"    String[] p = js.substring(i + 6, j).replace(\" \", \"\").split(\",\");",
+				"    if (p.length != 4) return \"BAD-ARITY(\" + p.length + \")\";",
+				"    return p[2] + \",\" + p[0] + \",\" + p[3] + \",\" + p[1];",
+				"  }",
 				"  static void run(String name, int sdk, boolean tablet, UiState st, int[] status, int[] nav,",
 				"      int[] cut, int[] tap, int[] ime, int[] sys, int stableB, String expect) {",
 				"    Subject s = new Subject();",
@@ -1938,8 +1977,9 @@ try {
 				"    s.rootInsets.stableB=stableB;",
 				"    if (cut != null) s.rootInsets.dc = new DisplayCutout(cut[0],cut[1],cut[2],cut[3]);",
 				`    s.${applierName72}();`,
-				"    String got = box(s.webView);",
-				"    System.out.println(\"ROW|\" + name + \"|\" + got + \"|\" + expect);",
+				"    String pageVals = page(s.webView).replace(\"none\", \"0,0,0,0\");",
+				"    String boxVals = box(s.webView);",
+				"    System.out.println(\"ROW|\" + name + \"|\" + pageVals + \"|\" + boxVals + \"|\" + expect);",
 				"  }",
 				"  // 时序格：BOOTSTRAP 期那次 insets 分发按门禁写 0；随后进入会话页**不触发任何 insets 事件**。",
 				"  // 让位能不能成立，全看 setUiState 这一次赋值有没有顺带重算 —— 这正是 T67 缺项①，",
@@ -1953,7 +1993,8 @@ try {
 				"    String boot = box(s.webView);",
 				`    s.${entryOwner72.name}(UiState.WEB);`,
 				"    String web = box(s.webView);",
-				"    System.out.println(\"SEQ|\" + name + \"|\" + boot + \"|\" + web + \"|\" + expectBoot + \"|\" + expectWeb);",
+				"    String webPage = page(s.webView).replace(\"none\", \"0,0,0,0\");",
+				"    System.out.println(\"SEQ|\" + name + \"|\" + boot + \"|\" + web + \"|\" + webPage + \"|\" + expectBoot + \"|\" + expectWeb);",
 				"  }",
 				"  public static void main(String[] a){",
 				...CASES.map(caseCall72),
@@ -1975,47 +2016,56 @@ try {
 				} else {
 					const run = spawnSync(java72, ["-cp", cls, "T72AvoidHarness"], { encoding: "utf8" });
 					const rows = new Map();
+					const boxes = new Map();
 					for (const line of String(run.stdout || "").split(/\r?\n/)) {
-						const m = /^ROW\|([^|]+)\|(-?\d+,-?\d+,-?\d+,-?\d+)\|(-?\d+,-?\d+,-?\d+,-?\d+)$/.exec(line.trim());
-						if (m) rows.set(m[1], m[2]);
+						const m = /^ROW\|([^|]+)\|(-?\d+,-?\d+,-?\d+,-?\d+)\|(-?\d+,-?\d+,-?\d+,-?\d+)\|(-?\d+,-?\d+,-?\d+,-?\d+)$/.exec(line.trim());
+						if (m) { rows.set(m[1], m[2]); boxes.set(m[1], m[3]); }
 					}
 					const bad = [];
+					const badBox = [];
 					for (const c of CASES) {
 						const got = rows.get(c.name) || "缺输出";
 						const want = c.expect.join(",");
 						if (got !== want) bad.push(`${c.name} 期望 ${want} 实得 ${got}`);
+						// T115：布局盒必须恒 0（让位不再走外边距）
+						const bx = boxes.get(c.name) || "缺输出";
+						if (bx !== "0,0,0,0") badBox.push(`${c.name} 布局盒 ${bx}`);
 					}
-					ok72("D-inset-behavior 行为验证：真方法体在 11 类几何下四向输出全对（任务栏 tappableElement/状态栏落左右/IME/导航栏隐藏/挖孔）",
+					ok72("D-inset-behavior 行为验证：真方法体在 11 类几何下四向写进页面 --dshr-inset-* 全对（任务栏 tappableElement/状态栏落左右/IME/导航栏隐藏/挖孔）",
 						run.status === 0 && rows.size === CASES.length && bad.length === 0,
 						bad.length ? `不符 ${bad.length} 项：${bad.join("；")}` : `${rows.size}/${CASES.length} 格全对`);
-					// 逐格留痕：真值进报告，回归时能对账
+					// 逐格留痕：真值进报告，回归时能对账。**页面四向与布局盒恒 0 一起断言**——
+					// 只判其中一条都会漏：只判页面 ⇒ 有人把外边距写回去（双倍留白）也全绿；
+					// 只判布局盒 ⇒ 四向取值坏了也全绿。
 					CASES.forEach((c, i) => {
-						ok72(`D-inset-behavior 格 ${i + 1}/${CASES.length} ${c.name} → ${c.expect.join(",")}`,
-							rows.get(c.name) === c.expect.join(","), `${rows.get(c.name) || "缺输出"}｜${c.why}`);
+						ok72(`D-inset-behavior 格 ${i + 1}/${CASES.length} ${c.name} → 页面 ${c.expect.join(",")} / 布局盒 0,0,0,0`,
+							rows.get(c.name) === c.expect.join(",") && boxes.get(c.name) === "0,0,0,0",
+							`页面 ${rows.get(c.name) || "缺输出"} 布局盒 ${boxes.get(c.name) || "缺输出"}｜${c.why}`);
 					});
 					// ── 时序格（负控制所在）──
 					// 几何用 emulator-5800 实测的格 A：statusBars top=48、navigationBars bottom=64、
 					// tappableElement bottom=64。BOOTSTRAP 写 0 之后**不制造任何 insets 事件**，
 					// 只靠 setUiState(WEB) 这一次赋值把让位补上——摘掉它就重现用户症状。
 					const seqLine = String(run.stdout).split(/\r?\n/)
-						.map((l) => /^SEQ\|([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)$/.exec(l.trim()))
+						.map((l) => /^SEQ\|([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)$/.exec(l.trim()))
 						.find(Boolean);
 					if (!seqLine) {
 						ok72("D-inset-timing 冷启动进会话：BOOTSTRAP 写 0 后不触发 insets，仅靠 setUiState(WEB) 补上让位（负控制所在）",
 							false, "没拿到 SEQ 输出");
 					} else {
-						const [, , boot, web, wantBoot, wantWeb] = seqLine;
+						const [, , boot, web, webPage, wantBoot, wantWeb] = seqLine;
 						const [wl, wt, wr, wb] = wantWeb.split(",").map(Number);
 						// 系统栏占位：格 A 实测 top=48、bottom=64，左右无系统栏
 						const ovTop = Math.max(0, 48 - wt);
 						const ovBottom = Math.max(0, 64 - wb);
-						ok72("D-inset-timing 冷启动进会话：BOOTSTRAP 期让位按设计写 0（门禁 uiState!=WEB，外边距四向 0）",
-							boot === wantBoot, `BOOTSTRAP=${boot} 期望=${wantBoot}`);
-						ok72("D-inset-timing 仅靠 setUiState(WEB) 一次赋值就把让位补齐，不依赖任何 insets 事件",
-							web === wantWeb, `进入WEB=${web} 期望=${wantWeb}（BOOTSTRAP 是 ${boot}）`);
+						ok72("D-inset-timing 冷启动进会话：BOOTSTRAP 期让位按设计写 0（门禁 uiState!=WEB，外边距四向 0 且不写页面）",
+							boot === wantBoot, `BOOTSTRAP 布局盒=${boot} 期望=${wantBoot}`);
+						ok72("D-inset-timing 仅靠 setUiState(WEB) 一次赋值就把让位补齐（四向写进页面，布局盒仍 0）",
+							webPage === wantWeb && web === "0,0,0,0",
+							`进入WEB 页面=${webPage} 布局盒=${web} 期望 页面=${wantWeb} 布局盒=0,0,0,0（BOOTSTRAP 布局盒是 ${boot}）`);
 						ok72("D-inset-timing 冷启动首帧重叠量 top=0px 且 bottom=0px（摘掉 setUiState 的重算即 >0，重现用户症状）",
 							ovTop === 0 && ovBottom === 0,
-							`重叠 top=${ovTop}px bottom=${ovBottom}px（系统栏 top=48 bottom=64 − 让位 t=${wt} b=${wb}）`);
+							`重叠 top=${ovTop}px bottom=${ovBottom}px（系统栏 top=48 bottom=64 − 页面让位 t=${wt} b=${wb}）`);
 					}
 				}
 			} finally {

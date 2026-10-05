@@ -1,5 +1,7 @@
 package top.d1studio.dshremote;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -7,17 +9,14 @@ import java.nio.file.Paths;
 import java.util.regex.Pattern;
 
 /**
- * T78（T86 扩充）：重连横幅状态机与判据的 JVM 行为测试（无模拟器）。
+ * T78（T86 扩充，T109 去横幅）：重连状态探针与防抖状态机的 JVM 行为测试（无模拟器）。
  *
  * <p>钉死这几件事：
  * <ol>
- *   <li><b>防抖状态机</b>：连续 {@value top.d1studio.dshremote.ReconnectBanner#SHOW_STREAK} 次真才显示、
- *       连续 {@value top.d1studio.dshremote.ReconnectBanner#HIDE_STREAK} 次假才隐藏；{@code UNKNOWN}
- *       （导航期）不参与计数；{@code reset()} 立即清零。</li>
- *   <li><b>抑制判据</b>：官方那条"可见"必须是**真的在视口里**（侧栏 {@code left:-320px} 收起时
- *       {@code getClientRects().length > 0} 但用户看不见），且不与**横幅带区**
- *       重叠（T86：判据对象从"横幅当前 rect"改成"横幅将要占据的带区"——前者在横幅未布局时
- *       恒 0×0，会让重叠恒为假而自锁）。</li>
+ *   <li><b>防抖状态机</b>：连续 {@value top.d1studio.dshremote.ReconnectBanner#SHOW_STREAK} 次真才确认、
+ *       连续 {@value top.d1studio.dshremote.ReconnectBanner#HIDE_STREAK} 次假才解除；{@code UNKNOWN}
+ *       （导航期）不参与计数；{@code reset()} 立即清零。T109 起它不再驱动任何 View，
+ *       只驱动 T108 快档节拍与 {@code StuckRescue} 观测量。</li>
  *   <li><b>探针只读</b>：{@code PROBE_JS} 里不得出现任何写 DOM / 写全局的 API
  *       （平板档零痕迹是硬契约）。</li>
  *   <li><b>文案同源</b>：探针正则与 hook 的 {@code RECONNECT_STATUS_RE}
@@ -25,11 +24,20 @@ import java.util.regex.Pattern;
  *   <li><b>T86 缺口①</b>：探针必须有**官方 {@code data-phase="connecting"} 按钮**那一层，
  *       且该层不得套用"排除可交互控件"；探针里的匹配字面量（FULL / DENY / ARIA）会被
  *       抽出来用 Java 正则**真跑**一组正例/负例（官方按钮 = 真；发送 / 「+」/ composer = 假）。</li>
- *   <li><b>T86 缺口②</b>：{@code bandHeightPx} 的兜底链 + {@code officialStatusDetail}
- *       不再把横幅当前 rect 喂进 {@code shouldSuppress}（有源码路径参数时才查）。</li>
+ *   <li><b>T109 去横幅</b>（用户口径原话：「把重连横幅去了吧，这样可以少一半的耗电」）：
+ *       显示层必须**整层不存在** —— {@code Bar} / {@code TEXT} / {@code FADE_MS} /
+ *       {@code isOnScreen} / {@code bandHeightPx} / {@code BAND_FALLBACK_DP} /
+ *       {@code shouldSuppress} 一个都不许回来（反射逐个查，防"偷偷加回来"）；
+ *       而**喂 StuckRescue 的那条链必须还在**（探针常量 + 防抖器 + MainActivity 接线），
+ *       否则省电省成"没人发现断线"。</li>
  * </ol>
  *
- * 用法：{@code java ... ReconnectBannerTest [<仓库根>/packages/gateway/assets/mobile-web.js]
+ * <p>⚠️ 判据类（静态白名单 / 本网关协议族 / 陈旧上界）的**行为**臂不在这里，而在
+ * {@code android/test-reconnect-banner.ps1} 的「T109 臂 A/B」：那两处是
+ * {@code MainActivity} 的方法体，只有把**原文**抠出来配替身 javac 真跑才钉得住
+ * （T40 §8 M1/M2：只做字符串断言，删掉关键一行照样全绿）。
+ *
+ * <p>用法：{@code java ... ReconnectBannerTest [<仓库根>/packages/gateway/assets/mobile-web.js]
  * [<仓库根>/android/app/src/main/java/top/d1studio/dshremote/MainActivity.java]}
  * （参数缺省时跳过对应那项，其余照跑。）
  */
@@ -110,44 +118,120 @@ public class ReconnectBannerTest {
 		throw new AssertionError("unbalanced method body: " + signature);
 	}
 
+	/** T109：某个名字在本类（{@code ReconnectBanner}）里是不是**真存在**（字段或方法/嵌套类）。 */
+	static boolean declaredInBanner(String name) {
+		for (Field f : ReconnectBanner.class.getDeclaredFields()) {
+			if (f.getName().equals(name)) return true;
+		}
+		for (Method m : ReconnectBanner.class.getDeclaredMethods()) {
+			if (m.getName().equals(name)) return true;
+		}
+		for (Class<?> c : ReconnectBanner.class.getDeclaredClasses()) {
+			if (c.getSimpleName().equals(name)) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * T109：把 Java 源码里的**注释**换成等长空格，返回代码部分。
+	 *
+	 * <p>为什么必须"等长空格"而不是删掉：后面的结构断言用的是 {@code indexOf} 下标，
+	 * 等长替换才能让下标 1:1 可复用（与 {@code scripts/test-device-class.mjs} 的
+	 * {@code maskJavaNoise} 同一动机）。
+	 *
+	 * <p>为什么不许"直接删注释"：这个测试要断言的东西里有几处**只出现在注释里**是对的
+	 * ——例如 {@code MainActivity} 的 javadoc 会解释「{@code ReconnectBanner.Bar} 为什么被删」
+	 * ——所以"不得再有 X"这一类断言必须打在**代码**上，否则会把解释性注释误判成回归。
+	 * 反过来也不能用朴素的 `//` 截断：文件里有大量含 `https://` 的 JS 字符串字面量，
+	 * 朴素截断会把半行代码吃掉 ⇒ 假绿。因此这里按"字符串/字符字面量状态机"走。
+	 */
+	static String stripJavaComments(String src) {
+		StringBuilder out = new StringBuilder(src.length());
+		int i = 0;
+		int n = src.length();
+		while (i < n) {
+			char c = src.charAt(i);
+			char next = i + 1 < n ? src.charAt(i + 1) : '\0';
+			if (c == '"' || c == '\'') {
+				char quote = c;
+				out.append(c);
+				i++;
+				while (i < n) {
+					char d = src.charAt(i);
+					if (d == '\\' && i + 1 < n) {
+						out.append(d).append(src.charAt(i + 1));
+						i += 2;
+						continue;
+					}
+					out.append(d);
+					i++;
+					if (d == quote) break;
+				}
+				continue;
+			}
+			if (c == '/' && next == '/') {
+				while (i < n && src.charAt(i) != '\n') {
+					out.append(' ');
+					i++;
+				}
+				continue;
+			}
+			if (c == '/' && next == '*') {
+				while (i < n) {
+					boolean end = src.charAt(i) == '*' && i + 1 < n && src.charAt(i + 1) == '/';
+					if (end) {
+						out.append("  ");
+						i += 2;
+						break;
+					}
+					out.append(src.charAt(i) == '\n' ? '\n' : ' ');
+					i++;
+				}
+				continue;
+			}
+			out.append(c);
+			i++;
+		}
+		return out.toString();
+	}
+
 	public static void main(String[] args) throws Exception {
 		// ① 时间常数（500ms 轮询 / 2 真出 / 3 假收 ⇒ 1.0s 与 1.5s）
 		check(ReconnectBanner.POLL_INTERVAL_MS == 500, "poll interval is 500ms");
-		check(ReconnectBanner.SHOW_STREAK == 2, "show needs 2 consecutive true samples");
-		check(ReconnectBanner.HIDE_STREAK == 3, "hide needs 3 consecutive false samples");
+		check(ReconnectBanner.SHOW_STREAK == 2, "the reconnect state needs 2 consecutive true samples");
+		check(ReconnectBanner.HIDE_STREAK == 3, "the healthy state needs 3 consecutive false samples");
 		check(ReconnectBanner.SHOW_STREAK * ReconnectBanner.POLL_INTERVAL_MS == 1000,
-			"appearance latency floor is 1000ms");
+			"state-confirmation latency floor is 1000ms");
 		check(ReconnectBanner.HIDE_STREAK * ReconnectBanner.POLL_INTERVAL_MS == 1500,
-			"disappearance latency floor is 1500ms");
-		check("重新连接中".equals(ReconnectBanner.TEXT), "banner text is 重新连接中");
+			"state-release latency floor is 1500ms");
 
 		// ② 设计文档里的验收序列 [f,f,t,t,f,f,f,f,t]
 		ReconnectBanner.Debouncer d = new ReconnectBanner.Debouncer();
 		ReconnectBanner.Observed[] seq = {F, F, T, T, F, F, F, F, T};
 		ReconnectBanner.State[] st = feedAll(d, seq);
-		check(st[0] == ReconnectBanner.State.HIDDEN, "[f] still hidden");
-		check(st[1] == ReconnectBanner.State.HIDDEN, "[f] still hidden");
-		check(st[2] == ReconnectBanner.State.HIDDEN, "1st true is NOT enough to show");
-		check(st[3] == ReconnectBanner.State.SHOWN, "2nd consecutive true shows the banner");
-		check(st[4] == ReconnectBanner.State.SHOWN, "1st false does not hide");
-		check(st[5] == ReconnectBanner.State.SHOWN, "2nd false does not hide");
-		check(st[6] == ReconnectBanner.State.HIDDEN, "3rd consecutive false hides the banner");
-		check(st[7] == ReconnectBanner.State.HIDDEN, "stays hidden");
-		check(st[8] == ReconnectBanner.State.HIDDEN, "single true after hide does not re-show");
+		check(st[0] == ReconnectBanner.State.HIDDEN, "[f] still HIDDEN");
+		check(st[1] == ReconnectBanner.State.HIDDEN, "[f] still HIDDEN");
+		check(st[2] == ReconnectBanner.State.HIDDEN, "1st true is NOT enough to confirm");
+		check(st[3] == ReconnectBanner.State.SHOWN, "2nd consecutive true confirms the reconnecting state");
+		check(st[4] == ReconnectBanner.State.SHOWN, "1st false does not release");
+		check(st[5] == ReconnectBanner.State.SHOWN, "2nd false does not release");
+		check(st[6] == ReconnectBanner.State.HIDDEN, "3rd consecutive false releases");
+		check(st[7] == ReconnectBanner.State.HIDDEN, "stays released");
+		check(st[8] == ReconnectBanner.State.HIDDEN, "single true after release does not re-confirm");
 
 		// ③ 单次抖动不闪（200ms 抖动 = 1 次真后立刻假）
 		ReconnectBanner.Debouncer jitter = new ReconnectBanner.Debouncer();
 		feedAll(jitter, T, F, F, F, F, F);
-		check(jitter.state() == ReconnectBanner.State.HIDDEN, "one-sample blip never shows the banner");
+		check(jitter.state() == ReconnectBanner.State.HIDDEN, "one-sample blip never confirms");
 
-		// ④ 「刚连上又断」不闪：已显示时 3 次假才隐藏；中间的 1 次真把假计数清零（重新数 3 次）
+		// ④ 「刚连上又断」不闪：已确认时 3 次假才解除；中间的 1 次真把假计数清零（重新数 3 次）
 		ReconnectBanner.Debouncer flappy = new ReconnectBanner.Debouncer();
 		feedAll(flappy, T, T, F, F, T, F, F);
 		check(flappy.state() == ReconnectBanner.State.SHOWN,
-			"false-run interrupted by one true does not hide (counter restarts)");
+			"false-run interrupted by one true does not release (counter restarts)");
 		flappy.feed(F);
 		check(flappy.state() == ReconnectBanner.State.HIDDEN,
-			"three falses after the interruption do hide");
+			"three falses after the interruption do release");
 
 		// ⑤ 导航期 UNKNOWN 不推进计数：真/未知/真 不足两次「连续」真
 		ReconnectBanner.Debouncer nav = new ReconnectBanner.Debouncer();
@@ -157,61 +241,43 @@ public class ReconnectBannerTest {
 		nav.feed(T);
 		check(nav.state() == ReconnectBanner.State.HIDDEN, "UNKNOWN breaks the run of trues");
 		nav.feed(T);
-		check(nav.state() == ReconnectBanner.State.SHOWN, "two trues after the gap do show");
+		check(nav.state() == ReconnectBanner.State.SHOWN, "two trues after the gap do confirm");
 
-		// ⑥ onPageCommitVisible ⇒ reset()：立即隐藏 + 清零
+		// ⑥ onPageCommitVisible ⇒ reset()：立即解除 + 清零
 		ReconnectBanner.Debouncer navReset = new ReconnectBanner.Debouncer();
 		feedAll(navReset, T, T);
-		check(navReset.state() == ReconnectBanner.State.SHOWN, "shown before page commit");
+		check(navReset.state() == ReconnectBanner.State.SHOWN, "confirmed before page commit");
 		navReset.reset();
-		check(navReset.state() == ReconnectBanner.State.HIDDEN, "reset() hides immediately");
+		check(navReset.state() == ReconnectBanner.State.HIDDEN, "reset() releases immediately");
 		navReset.feed(T);
 		check(navReset.state() == ReconnectBanner.State.HIDDEN,
 			"reset() also zeroes the streak (one true after commit is not enough)");
 
-		// ⑦ 断开前不常驻：一直健康 ⇒ 恒隐藏（不显示也不会在恢复后残留计数）
+		// ⑦ 健康页不常驻：一直健康 ⇒ 恒 HIDDEN（也不会在恢复后残留计数）
 		ReconnectBanner.Debouncer healthy = new ReconnectBanner.Debouncer();
 		feedAll(healthy, F, F, F, F, F, F, F, F, F, F);
-		check(healthy.state() == ReconnectBanner.State.HIDDEN, "healthy page never shows the banner");
+		check(healthy.state() == ReconnectBanner.State.HIDDEN, "healthy page never confirms reconnecting");
 
-		// ⑧ 负控制友好的可注入阈值：1 真即显示 / 1 假即隐藏（真实实现用默认构造器）
+		// ⑧ 负控制友好的可注入阈值：1 真即确认 / 1 假即解除（真实实现用默认构造器）
 		ReconnectBanner.Debouncer injected = new ReconnectBanner.Debouncer(1, 1);
 		injected.feed(T);
-		check(injected.state() == ReconnectBanner.State.SHOWN, "injected showStreak=1 shows on first true");
+		check(injected.state() == ReconnectBanner.State.SHOWN, "injected showStreak=1 confirms on first true");
 		injected.feed(F);
-		check(injected.state() == ReconnectBanner.State.HIDDEN, "injected hideStreak=1 hides on first false");
+		check(injected.state() == ReconnectBanner.State.HIDDEN, "injected hideStreak=1 releases on first false");
 
-		// ⑨ 官方可见性判据：必须真的在视口内
-		check(ReconnectBanner.isOnScreen(12, 47, 88, 23, 411, 800), "element inside viewport is on screen");
-		check(!ReconnectBanner.isOnScreen(-320, 47, 300, 23, 411, 800),
-			"sidebar collapsed with left:-320px has layout boxes but is NOT on screen");
-		check(!ReconnectBanner.isOnScreen(0, 900, 100, 20, 411, 800), "element below the fold is not on screen");
-		check(!ReconnectBanner.isOnScreen(10, 10, 0, 20, 411, 800), "zero-width box is not on screen");
-		check(!ReconnectBanner.isOnScreen(10, 10, 20, 20, 0, 0), "no viewport size means not on screen");
+		// ⑨ T109：**显示层必须整层不存在**（反射逐个查；"偷偷加回来"立刻变红）
+		for (String gone : new String[] {"Bar", "TEXT", "FADE_MS", "isOnScreen", "bandHeightPx",
+			"BAND_FALLBACK_DP", "shouldSuppress"}) {
+			check(!declaredInBanner(gone),
+				"T109 去横幅：ReconnectBanner 里不得再有 " + gone + "（显示层/带区几何整层删除）");
+		}
+		// 而"采样这条链"必须还在（省电不许省成"没人发现断线"）
+		check(declaredInBanner("PROBE_JS") && declaredInBanner("Debouncer")
+				&& declaredInBanner("POLL_INTERVAL_MS") && declaredInBanner("SHOW_STREAK")
+				&& declaredInBanner("HIDE_STREAK"),
+			"T109 去横幅：喂 StuckRescue / T108 节拍的那条链（探针 + 防抖 + 周期）一个都不许少");
 
-		// ⑩ 抑制判据（T86：判据对象 = 横幅**带区**，不是横幅当前 rect）
-		//    带区取自 T83 §3 的手机档真值：系统栏底边 128px、横幅实高 92px ⇒ 带区 (0,128,1080,92)。
-		//    ① 官方那条「可见且压在带区内」⇒ 不抑制（**首次显示也不自锁**，T86 缺口②的关键一条）
-		check(!ReconnectBanner.shouldSuppress(true, 29, 135, 299, 92, 0, 128, 1080, 92),
-			"official status inside the banner band does NOT suppress it (no self-lock on first show)");
-		//    ② 官方那条「可见且不与带区重叠」（T83 实测 y=337 落在 128–220 之下）⇒ 抑制
-		check(ReconnectBanner.shouldSuppress(true, 29, 337, 299, 92, 0, 128, 1080, 92),
-			"official status on screen and clear of the band suppresses it");
-		//    ③ 官方那条在视口外 / 不可见 ⇒ 不抑制
-		check(!ReconnectBanner.shouldSuppress(false, 29, 337, 299, 92, 0, 128, 1080, 92),
-			"official status off screen never suppresses the banner");
-		//    边界：恰好压在带区底边（ey == bandBottom）算不重叠
-		check(ReconnectBanner.shouldSuppress(true, 29, 220, 299, 92, 0, 128, 1080, 92),
-			"an element starting exactly at the band bottom is not an overlap");
-		check(!ReconnectBanner.shouldSuppress(true, 29, 219, 299, 92, 0, 128, 1080, 92),
-			"an element ending one pixel inside the band is an overlap");
-		//    负控制（缺口② 的自锁本体）：把**未布局横幅的 0 矩形**当带区输入 ⇒ 恒判「不重叠」⇒ 恒抑制。
-		//    这一条把「判据对象必须是带区、不能是横幅当前 rect」钉死在断言里：
-		//    谁把实现换回 0 矩形（或让 bandHeightPx 返回 0），①与这条的差就没了。
-		check(ReconnectBanner.shouldSuppress(true, 29, 135, 299, 92, 0, 0, 0, 0),
-			"negative control: feeding the not-yet-laid-out 0x0 banner rect suppresses forever (the T83 §5 self-lock)");
-
-		// ⑪ 探针是只读的：不得出现任何写 DOM / 写全局的 API
+		// ⑩ 探针是只读的：不得出现任何写 DOM / 写全局的 API
 		String probe = ReconnectBanner.PROBE_JS;
 		for (String forbidden : new String[] {
 			"appendChild", "insertBefore", "removeChild", "innerHTML", "outerHTML",
@@ -231,26 +297,14 @@ public class ReconnectBannerTest {
 			"probe is a self-contained IIFE expression");
 		check(probe.contains("return {ok:0};"), "probe reports 'unreadable page' instead of throwing");
 
-		// ⑫ 文案同源（断言 7）：探针正则 === hook 的 RECONNECT_STATUS_RE
+		// ⑪ 文案同源（断言 7）：探针正则 === hook 的 RECONNECT_STATUS_RE
 		check(ReconnectBanner.STATUS_RE_JS.equals(
 				"/^(?:正在重新连接|重新连接中|正在重连中|正在重连|重连中|reconnecting)[\\.\u2026]{0,3}$/i"),
 			"STATUS_RE_JS is the hook's regex, character for character");
 		check(probe.contains("var FULL=" + ReconnectBanner.STATUS_RE_JS + ";"),
 			"probe uses STATUS_RE_JS as its single source");
 
-		// ⑬ T86 缺口②：带区高度（未布局横幅 ⇒ 按内容测量 ⇒ 40dp 兜底，永不返回 0）
-		check(ReconnectBanner.bandHeightPx(92, 0, 105) == 92,
-			"band height prefers the laid-out banner height");
-		check(ReconnectBanner.bandHeightPx(0, 88, 105) == 88,
-			"band height falls back to the measured content height before the constant");
-		check(ReconnectBanner.bandHeightPx(0, 0, 105) == 105,
-			"band height falls back to the fallback constant when nothing measures");
-		check(ReconnectBanner.bandHeightPx(0, 0, 0) == 1,
-			"band height never returns 0 (a 0-height band would self-lock again)");
-		check(ReconnectBanner.BAND_FALLBACK_DP >= 24,
-			"fallback band is at least one text line tall");
-
-		// ⑭ T86 缺口①：探针的**匹配字面量**抽出来真跑（不是只查子串）
+		// ⑫ T86 缺口①：探针的**匹配字面量**抽出来真跑（不是只查子串）
 		//    官方 0.2.0-rc.2 的「重新连接中」是 <button data-phase="connecting">：
 		//      · 正例 = 官方那一条（文案 + 三点 dots / 英文 Reconnecting）
 		//      · 负例 = 发送按钮 / 「+」按钮 / composer 文本 / disconnected 文案
@@ -289,11 +343,11 @@ public class ReconnectBannerTest {
 		check(!full.matcher("重新连接中，请稍候").matches(),
 			"NEGATIVE composer-like prose with extra text does not match (整串锚定)");
 		check(!full.matcher("连接异常，刷新重试").matches(),
-			"NEGATIVE disconnected 文案不匹配（横幅文案是「重新连接中」，认它就会说错话）");
+			"NEGATIVE disconnected 文案不匹配（认它就会把「连接异常」说成「正在重连」）");
 		check(!full.matcher("正在重新连接中").matches(),
 			"NEGATIVE prefix-extended copy does not match (no partial matching)");
 
-		// ⑮ T86：两层的**结构语义**（谁能认、谁必须排除）
+		// ⑬ T86：两层的**结构语义**（谁能认、谁必须排除）
 		String tier1 = between(probe, "querySelectorAll('[data-phase]')", "return hit(el,1);}");
 		check(tier1.contains("if(DENY.test(aria(el)))continue;"),
 			"tier-1 applies the explicit composer denylist");
@@ -314,7 +368,7 @@ public class ReconnectBannerTest {
 		check(interBody.contains("[contenteditable]"),
 			"tier-2 exclusion also covers [contenteditable] (官方 composer 是 Lexical，打字不算重连)");
 
-		// ⑰ T90：层 1 的 ⑤ **composer 祖先否决**（收口 T88 遗留的那处两端差异）。
+		// ⑭ T90：层 1 的 ⑤ **composer 祖先否决**（收口 T88 遗留的那处两端差异）。
 		//    两端现在同名单、同走法、同位置；hook 侧由 `scripts/test-mobile-chrome.mjs`
 		//    抽 COMPOSER_ROLE_RE/COMPOSER_ROLE_JS 做逐字符比较钉住。
 		check(probe.contains("var CROLE=" + ReconnectBanner.COMPOSER_ROLE_JS + ";"),
@@ -348,25 +402,53 @@ public class ReconnectBannerTest {
 		check(!crole.matcher("button").matches() && !crole.matcher("textboxish").matches(),
 			"composer role list matches exactly（整串锚定：button / textboxish 都不算 composer）");
 
-		// ⑯ T86 缺口②：MainActivity 侧的判据来源（有路径参数时才查）
+		// ⑮ T109：MainActivity 侧的**接线契约**（有路径参数时才查）。
+		//    "显示层不许回来" + "采样链不许断" + "陈旧上界必须存在且只作用于投票"。
 		if (args.length > 1 && args[1] != null && !args[1].isEmpty()) {
 			Path mainSrc = Paths.get(args[1]);
 			check(Files.isRegularFile(mainSrc), "MainActivity source exists: " + mainSrc);
 			String main = new String(Files.readAllBytes(mainSrc), StandardCharsets.UTF_8);
-			String osd = javaMethodBody(main, "private String officialStatusDetail(JSONObject o)");
-			check(osd.contains("readSystemBarInsetsPx()"),
-				"MainActivity builds the suppression band from the same system-bar insets as the banner margins");
-			check(osd.contains("ReconnectBanner.bandHeightPx("),
-				"MainActivity takes the band height from ReconnectBanner.bandHeightPx (not from the live rect)");
-			check(!osd.contains("reconnectBanner.getWidth()"),
-				"MainActivity no longer feeds the live banner rect (0x0 while GONE) into shouldSuppress");
+			// 「不得再有 X」这类断言只许打在**代码**上：MainActivity 的 javadoc 里刻意
+			// 留着「ReconnectBanner.Bar / dshrReconnectBanner 为什么被删」的解释，
+			// 那是文档不是实现（见 stripJavaComments 的注释）。
+			String code = stripJavaComments(main);
+			// ① 显示层：View / id / show / hide 一处都不许留（代码里）
+			for (String gone : new String[] {"ReconnectBanner.Bar", "dshrReconnectBanner",
+				"installReconnectBanner", "applyReconnectBannerInsets", "reconnectBanner.show(",
+				"reconnectBanner.hide(", "reconnectBanner.getHeight(", "officialStatusDetail",
+				"shouldSuppress", "bandHeightPx", "ReconnectBanner.isOnScreen"}) {
+				check(!code.contains(gone), "T109 去横幅：MainActivity 代码里不得再有 " + gone);
+			}
+			check(code.contains("rootLayout.addView(webView"), "T109：根布局仍挂 WebView");
+			// ② 采样链：探针仍由探针节拍发起，且仍喂 StuckRescue
+			check(main.contains("webView.evaluateJavascript(ReconnectBanner.PROBE_JS, this::handleReconnectProbe)"),
+				"T109 去横幅：只读探针仍按节拍发起（采样链未断）");
 			String hpr = javaMethodBody(main, "private void handleReconnectProbe(String value)");
-			check(hpr.contains("probeLogKey("),
-				"handleReconnectProbe 用 probeLogKey 去重（只比观测值会让 SUPPRESS 在现场不可见）");
-			String keyFn = javaMethodBody(main,
-				"private static String probeLogKey(ReconnectBanner.Observed observed, String detail)");
-			check(keyFn.contains("verdict") && keyFn.contains("src="),
-				"probeLogKey 把抑制判定与匹配层算进去重键");
+			check(hpr.contains("runStuckRescue(pageReconnecting, observed);"),
+				"T109 去横幅：探针结果仍喂 StuckRescue（自救不许被省掉）");
+			check(hpr.contains("reconnectDebounce.feed(observed);"),
+				"T109 去横幅：防抖器仍在推进（T108 快档节拍与自救观测量依赖它）");
+			check(!hpr.contains(".show(") && !hpr.contains(".hide("),
+				"T109 去横幅：handleReconnectProbe 里不再有任何显示动作");
+			// ③ 陈旧上界（S1）：必须存在、必须只作用于"投票"，不得把 hookSelfHealLive 一起抹掉
+			check(main.contains("HOOK_CONN_STATE_MAX_AGE_MS"),
+				"T109 S1：hook 连接态必须有陈旧上界（一次假 reconnecting 不许永久钉死）");
+			check(main.contains("private String freshHookConnState() {"),
+				"T109 S1：必须有一个「新鲜度」读法供投票处使用");
+			check(hpr.contains("freshHookConnState()"),
+				"T109 S1：handleReconnectProbe 的投票必须走新鲜度（否则一次假推送把状态钉死）");
+			check(hpr.contains("\"reconnecting\".equals(hookConnState)"),
+				"T90 源码契约保留：`\"reconnecting\".equals(hookConnState)` 字面量仍在（test:mobile 逐字查它）");
+			String selfHeal = javaMethodBody(main, "private boolean hookSelfHealLive()");
+			check(selfHeal.contains("hookConnState != null") && !selfHeal.contains("freshHookConnState"),
+				"T109 S1：hookSelfHealLive 问的是「桥装没装过」（历史事实），不得被新鲜度抹掉"
+					+ "——否则健康静默 20s 后兜底探针从 5s 掉到 1s，与省电目标相反");
+			String interval = javaMethodBody(main, "private long probeIntervalMs()");
+			check(interval.contains("freshHookConnState()"),
+				"T109 S1：快档节拍也走新鲜度（陈旧的 reconnecting 不许把 500ms 快档一直挂着）");
+			// ④ 诊断行：状态必须改由设置页体现（横幅的替代面）
+			check(main.contains("reconnectDiagLine()"),
+				"T109 去横幅：设置页只读诊断行必须接上（否则用户侧再没有任何状态可见面）");
 		} else {
 			System.out.println("skip MainActivity source comparison (no second path argument)");
 		}

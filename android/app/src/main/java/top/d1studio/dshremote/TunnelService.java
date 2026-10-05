@@ -7,12 +7,21 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.util.Log;
+
+import java.net.InterfaceAddress;
+import java.net.NetworkInterface;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.TreeSet;
 
 /**
  * 隧道前台服务：保活 frpc visitor（stcp/xtcp）。
@@ -48,6 +57,11 @@ public class TunnelService extends Service {
 	private final Object frpcLock = new Object();
 	private final Handler mainHandler = new Handler(Looper.getMainLooper());
 	private FrpcManager frpc;
+
+	/** T113：隧道环境巡检（网络变化清零 + 粘性挂载，见 {@link #watchTunnelEnvironment}）。 */
+	private Runnable stickyWatch;
+	/** T113：本次 frpc 启动实际用的配置对象（巡检要它能改到下一次重启写出的 toml）。 */
+	private volatile VisitorConfig runningCfg;
 
 	public static void updateSessionNotice(Context ctx, String title, String text, boolean running) {
 		sessionTitle = title == null ? "" : title.trim();
@@ -118,14 +132,41 @@ public class TunnelService extends Service {
 		cfg.bindPort = port;
 		// 端口与「本隧道服务的配置组 id」成对落盘：MainActivity 复用探测据此
 		// 判断存活隧道是否属于本次所选配置组，防止错复用连到旧 server。
+		// T104：再落一个「实际生效的打洞策略」——复用探测也要比它，否则用户切了档
+		// 却因为端口还活着被复用，跑到下一次重启前都还是旧档（切档名不副实）。
 		getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
 			.putInt(ProfileStore.KEY_BOUND_PORT, port)
 			.putString(ProfileStore.KEY_TUNNEL_PROFILE, profile.id)
+			.putString(ProfileStore.KEY_TUNNEL_STRATEGY, cfg.effectiveStrategy())
 			.apply();
 
 		publishForeground();
 
+		// ── T113：打洞回落的两个处置（粘性 / 网络清零）────────────────────────
+		// 顺序要求：必须在上面的 KEY_TUNNEL_STRATEGY 落盘（用户档位）**之后**再改 cfg.strategy，
+		// 否则 MainActivity 的「复用存活隧道」探测会拿"粘性中转"去比"用户选的打洞优先"，
+		// 每次都判成策略变了而反复重启隧道。
+		try {
+			String netId = networkId();
+			String ctx = stickyContext(netId);
+			boolean ctxChanged = TunnelPath.noteStickyContext(ctx);
+			Log.i(TAG, "T113 网络身份=" + netId + " 粘性作用域=" + ctx
+				+ (ctxChanged ? "（上下文变化 ⇒ 已清零：" + TunnelPath.stickyResetReason() + "）" : "（未变化）")
+				+ " 连续打洞失败=" + TunnelPath.holeFailStreak() + " 粘住中转=" + TunnelPath.stickyRelay());
+			// 只有"用户选打洞优先"这一档才谈粘性；用户显式选「只用中转」时本来就写纯 stcp toml。
+			if (VisitorConfig.STRATEGY_P2P.equals(cfg.effectiveStrategy()) && TunnelPath.stickyRelay()) {
+				// 复用 T104 已有的「只用中转」toml（同一条 stcp 访客分支），不新发明任何 toml 写法。
+				cfg.strategy = VisitorConfig.STRATEGY_RELAY;
+				TunnelPath.noteStickyApplied();
+				Log.i(TAG, "T113 粘性回落生效：连续 " + TunnelPath.holeFailStreak()
+					+ " 次打洞超时 ⇒ 本次隧道直接用纯中转 toml（0 空等），换网络或重开 App 后自动重试打洞");
+			}
+		} catch (Exception e) {
+			Log.w(TAG, "T113 粘性判定失败（按用户档位原样启动）：" + e);
+		}
+
 		final VisitorConfig toStart = cfg;
+		runningCfg = cfg;
 		new Thread(() -> {
 			synchronized (frpcLock) {
 				if (frpc != null) frpc.stop();
@@ -134,7 +175,119 @@ public class TunnelService extends Service {
 				frpc = next;
 			}
 		}, "frpc-start").start();
+		watchTunnelEnvironment();
 		return START_STICKY;
+	}
+
+	/**
+	 * T113：隧道环境巡检（每 3 秒一次，随服务生命周期结束而撤销）。两件事：
+	 *
+	 * <ol>
+	 *   <li><b>网络变化清零</b>：重算网络身份，与 {@link TunnelPath} 记的作用域比对；变了就清零粘性
+	 *       （新网络重新试打洞）。这是本 App **真正生效**的联网变化判据 —— 没有
+	 *       ACCESS_NETWORK_STATE 权限时 {@code registerDefaultNetworkCallback} 注册会抛异常，
+	 *       只剩"定期比对网卡快照"这条无权限路径（见 {@link #networkId()}）。</li>
+	 *   <li><b>粘性挂载</b>：一旦判定粘住，把当前配置对象改成 relay —— FrpcManager 的**任何一次**
+	 *       重启都会写出纯中转 toml。**绝不主动重启 frpc**：那会掐断在途连接（页面加载、
+	 *       WS 复用通道），用户看到的是白屏/断线横幅，那是回归不是优化。</li>
+	 * </ol>
+	 */
+	private void watchTunnelEnvironment() {
+		if (stickyWatch != null) mainHandler.removeCallbacks(stickyWatch);
+		stickyWatch = new Runnable() {
+			@Override public void run() {
+				if (instance != TunnelService.this) return;
+				try {
+					String netId = networkId();
+					if (TunnelPath.noteStickyContext(stickyContext(netId))) {
+						Log.i(TAG, "T113 网络变化（网卡快照比对）⇒ 粘性回落清零，新网络身份=" + netId
+							+ "（下次 frpc 启动重新试打洞）");
+					}
+					VisitorConfig cfg = runningCfg;
+					if (cfg != null && VisitorConfig.STRATEGY_P2P.equals(cfg.strategy) && TunnelPath.stickyRelay()) {
+						cfg.strategy = VisitorConfig.STRATEGY_RELAY;
+						TunnelPath.noteStickyApplied();
+						Log.i(TAG, "T113 粘性回落已挂到当前配置：后续 frpc 若重启将直接用纯中转 toml（不打断在途连接）");
+					}
+				} catch (Exception e) {
+					Log.w(TAG, "T113 环境巡检失败：" + e);
+				}
+				mainHandler.postDelayed(this, 3000);
+			}
+		};
+		mainHandler.postDelayed(stickyWatch, 3000);
+	}
+
+	/**
+	 * T113：“网络身份”字符串 —— 粘性回落的作用域判据之一。
+	 *
+	 * <p><b>为什么不用 ConnectivityManager 做主判据</b>：本 App 的 Manifest **没有**
+	 * {@code ACCESS_NETWORK_STATE}（T113 不在产品侧加新权限），`getActiveNetwork()` /
+	 * `registerDefaultNetworkCallback()` 在设备上直接抛 SecurityException（装置日志有原文）。
+	 * 因此主判据走**网卡快照**：{@code NetworkInterface.getNetworkInterfaces()} 的
+	 * 「接口名 + 该接口上的地址」集合（排除回环、未启用的接口），Java 侧无需任何权限。
+	 *
+	 * <p>能测到的"换网络"：Wi-Fi↔流量（wlan0 出现/消失、rmnet_* 出现）、飞行模式（全部消失 ⇒ none）、
+	 * 换 Wi-Fi/换 AP（wlan0 的 IP 变）、VPN 起停（tun0 出现/消失）。
+	 * **测不到的**：同一接口上 IP 不变而公网出口变化的场景（如运营商侧 NAT 重排）——如实标注。
+	 */
+	private String networkId() {
+		try {
+			java.util.TreeMap<String, String> ifaces = new java.util.TreeMap<>();
+			java.util.Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces();
+			if (en != null) {
+				while (en.hasMoreElements()) {
+					NetworkInterface ni = en.nextElement();
+					if (ni == null || ni.isLoopback()) continue;
+					boolean up;
+					try {
+						up = ni.isUp();
+					} catch (Exception e) {
+						up = true;
+					}
+					if (!up) continue;
+					StringBuilder addrs = new StringBuilder();
+					java.util.List<InterfaceAddress> list = ni.getInterfaceAddresses();
+					java.util.TreeSet<String> sorted = new java.util.TreeSet<>();
+					if (list != null) {
+						for (InterfaceAddress ia : list) {
+							if (ia == null || ia.getAddress() == null) continue;
+							String host = ia.getAddress().getHostAddress();
+							if (host == null) continue;
+							// 链路本地/回环一律不参与身份（jitter 会让"网络没变"看起来变了）。
+							String bare = host.split("%", 2)[0];
+							if (bare.startsWith("127.") || bare.startsWith("169.254.") || bare.equals("::1") || bare.startsWith("fe80:")) continue;
+							sorted.add(bare + "/" + ia.getNetworkPrefixLength());
+						}
+					}
+					ifaces.put(ni.getName(), sorted.toString());
+				}
+			}
+			if (ifaces.isEmpty()) return "none";
+			StringBuilder b = new StringBuilder();
+			for (java.util.Map.Entry<String, String> e : ifaces.entrySet()) {
+				b.append(e.getKey()).append('=').append(e.getValue()).append(';');
+			}
+			return b.toString();
+		} catch (Throwable e) {
+			return "unknown";
+		}
+	}
+
+	/** T113：粘性作用域 = 网络身份 | 配置组 id | 用户档位。任一变化 ⇒ 粘性清零、重新试打洞。 */
+	private String stickyContext(String netId) {
+		String id = "";
+		String strategy = VisitorConfig.STRATEGY_P2P;
+		try {
+			SharedPreferences prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
+			ProfileStore.Profile active = ProfileStore.getActive(prefs);
+			if (active != null) {
+				id = active.id == null ? "" : active.id;
+				strategy = ProfileStore.effectiveStrategy(active);
+			}
+		} catch (Exception ignored) {
+		}
+		return netId + "|" + id + "|" + strategy;
 	}
 
 	private void publishForeground() {
@@ -279,6 +432,18 @@ public class TunnelService extends Service {
 		sessionRunning = false;
 		sessionTitle = "";
 		sessionText = "";
+		// T113：停掉环境巡检（网络变化清零 + 粘性挂载）。巡检是自续期的，必须显式摘掉，
+		// 否则服务销毁后回调还挂在主线程上（虽然 Runnable 里有 instance 判断兜底）。
+		if (stickyWatch != null) {
+			mainHandler.removeCallbacks(stickyWatch);
+			stickyWatch = null;
+		}
+		runningCfg = null;
+		// T104：隧道停止 ⇒ 路径判定一起清掉，诊断行回落「隧道未启动（无法判定）」，，
+		// 绝不把上一档的「打洞成功/回退中转」留在屏上冒充这一次。
+		// T113：TunnelPath.clear() **不清**粘性回落状态（同一前台会话内"断开→再连接"不再白等一遍），
+		// 粘性的清零只由 noteStickyContext（网络/配置组/策略变化）与 App 进程退出负责。
+		TunnelPath.clear();
 		synchronized (frpcLock) {
 			if (frpc != null) {
 				frpc.stop();

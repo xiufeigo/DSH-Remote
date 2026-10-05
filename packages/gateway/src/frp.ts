@@ -300,7 +300,10 @@ bindAddr = "${options.bindAddr ?? "127.0.0.1"}"
 bindPort = ${options.bindPort}
 keepTunnelOpen = true
 fallbackTo = "${stcpVisitor}"
-fallbackTimeoutMs = 5000
+# T113：打洞尝试的超时预算。原为 frp 缺省的 5000 —— 实测**每一条新建 TCP 连接**都要付一次
+# （5057–5162ms，与资源体积无关），稳态首屏两段就白等 10.37s（T111 report §3.3）。
+# 800ms 与 Android 侧 VisitorConfig.FALLBACK_TIMEOUT_MS 必须同值（cross-end.mjs 逐行对齐）。
+fallbackTimeoutMs = 800
 `;
 }
 

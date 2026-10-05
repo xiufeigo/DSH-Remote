@@ -14,7 +14,7 @@
  */
 
 import assert from "node:assert/strict";
-import { rm } from "node:fs/promises";
+import { rm, readFile } from "node:fs/promises";
 import { test, before, after } from "node:test";
 // PLG-03：公共夹具收敛到 scripts/test-harness.mjs（本文件不再复刻请求/WS/假上游实现）。
 import { startFakeUpstream, requestTls, wsConnect, makeTempHome } from "./test-harness.mjs";
@@ -327,7 +327,22 @@ test("renderVisitorToml：访客配置与 proxy 通过 serverName+secretKey 关�
 	assert.match(toml, /bindPort = 18443/);
 	assert.match(toml, /bindPort = -1/);
 	assert.match(toml, /fallbackTo = "dsh-remote-stcp-visitor"/);
-	assert.match(toml, /fallbackTimeoutMs = 5000/);
+	// T113：这里原先把超时硬编码成 5000；T113 把"打洞回落空等"从 5000 降到 800（实测每次建连白等
+	// 约 5s；800ms ≈ 移动网 RTT 的 5–13 倍），Android 侧同步为 VisitorConfig.FALLBACK_TIMEOUT_MS。
+	// 于是这条断言过期 ⇒ 改成**跨端守卫**：直接从 Android 源文件抽常量再比对。
+	// （`scratch/t104/cross-end.mjs` 做的同类对齐在 scratch/ 下、被 gitignore，**不进 CI** ⇒ 由本条兜住。）
+	const javaSrc = await readFile(
+		new URL("../android/app/src/main/java/top/d1studio/dshremote/VisitorConfig.java", import.meta.url),
+		"utf8",
+	);
+	const javaFallback = Number(/FALLBACK_TIMEOUT_MS\s*=\s*(\d+)/.exec(javaSrc)?.[1]);
+	assert.ok(Number.isInteger(javaFallback), "Android 侧 FALLBACK_TIMEOUT_MS 常量应可抽取");
+	assert.equal(javaFallback, 800, "打洞回落空等默认值应为 800ms（改回 5000 会让每次建连白等约 5s）");
+	assert.match(
+		toml,
+		new RegExp(`fallbackTimeoutMs = ${javaFallback}\\b`),
+		"访客 toml 的 fallbackTimeoutMs 必须与 Android 侧 VisitorConfig.FALLBACK_TIMEOUT_MS 同值",
+	);
 	assert.match(toml, /auth\.token = "tok"/, "visitor 也要登录 frps");
 });
 

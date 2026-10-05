@@ -630,9 +630,15 @@ function assertSourceContracts() {
 			throw new Error("源码契约：T90 观测安装必须早于 __dshRemoteMobileInstalled 幂等闸（pending 路径会漏掉 app 的首条 socket）");
 		}
 		// 常量必须在最早那次调用之前赋值（否则 wsWatchDown 读到的宽限期是 undefined）。
-		const atConst = src.indexOf("var WS_CONNECT_GRACE_MS = 2000;");
+		// T112：两个宽限的取值都是本轮重新定的（CONNECTING 2000→8000、新增 close 宽限 1500），
+		// 断言跟着改字面量，但"必须在最早那次 installWsStateWatch() 之前赋值"这条**不放宽**。
+		const atConst = src.indexOf("var WS_CONNECT_GRACE_MS = 8000;");
+		const atConstClose = src.indexOf("var WS_CLOSE_GRACE_MS = 1500;");
 		if (!(atConst > 0 && atConst < atInstall)) {
 			throw new Error("源码契约：T90 WS_CONNECT_GRACE_MS 必须在 installWsStateWatch() 那次最早调用之前赋值（var 提升不提升赋值）");
+		}
+		if (!(atConstClose > 0 && atConstClose < atInstall)) {
+			throw new Error("源码契约：T112 WS_CLOSE_GRACE_MS 必须在 installWsStateWatch() 那次最早调用之前赋值");
 		}
 		// 判据接线：probeResumeRecovery 与 collectUiDiag 都必须换成 isConnectionDown()，
 		// **不得**再只认 DOM 文案 —— 这正是 rail 盲区（T88 §E.4）的成因。
@@ -671,8 +677,79 @@ function assertSourceContracts() {
 			}
 		}
 		// 两处"必须保留"的风暴边界（T82/T88 成果不得回退）。
-		for (const keep of ["RESUME_MAX_NUDGES = 6", "RESUME_MIN_INTERVAL_MS = 8000", "RESUME_CONFIRM_DELAY_MS"]) {
-			if (!src.includes(keep)) throw new Error(`源码契约：T90 不得回退既有风暴边界（缺 ${keep}）`);
+		// T112b：`RESUME_MAX_NUDGES` 的**取值**由本任务重定为 2（依据 T110 §8.4 ①：上限 6 时
+		// 同一误报下真掐断 6 次 ≈ 50s 连掉 6 次）。**钉住的是取值本身**，不是随便一个 ≤ 6 的数：
+		// 改回 6 这条断言立刻红（变异 M3 的反证点）。
+		for (const keep of ["var RESUME_MAX_NUDGES = 2;", "RESUME_MIN_INTERVAL_MS = 8000", "RESUME_CONFIRM_DELAY_MS"]) {
+			if (!src.includes(keep)) throw new Error(`源码契约：T90/T112b 不得回退风暴边界（缺 ${keep}）`);
+		}
+		// T112b：nudge 动作必须按**来源**分流 —— 只有 wsSrc===3（WS 观测到真 close）才允许
+		// `offline`→`online`（那一对会让上游真的 abort 在用 socket = 用户可见掉线）；
+		// DOM 文案（1/2）与探活（4）退回 online-only（幂等短路 ⇒ 无害）。依据 T110 §8.4 ①。
+		// 钉住两件事：① 分流那道闸在 requestUpstreamReconnect 里、且用 connectionDownSource()；
+		// ② 两个分支的返回值（`-online-only` 与 `network-transition`）都存在 ⇒ 去掉分流必红。
+		{
+			const fnAt = src.indexOf("function requestUpstreamReconnect() {");
+			if (fnAt < 0) throw new Error("源码契约：T112b 找不到 requestUpstreamReconnect");
+			const fnEnd = src.indexOf("\n\tfunction ", fnAt);
+			const body = src.slice(fnAt, fnEnd > 0 ? fnEnd : fnAt + 2000);
+			if (!body.includes("var src = connectionDownSource();")) {
+				throw new Error("源码契约：T112b nudge 动作必须按来源分流（缺 connectionDownSource() 读取）");
+			}
+			if (!body.includes("if (src !== 3) {")) {
+				throw new Error("源码契约：T112b 只有 wsSrc===3（WS 观测到真 close）才允许掐断连接");
+			}
+			if (!body.includes("return 'network-transition-online-only';") || !body.includes("return 'network-transition';")) {
+				throw new Error("源码契约：T112b 分流的两条分支必须都保留（online-only / 掐断对）");
+			}
+			// 分流闸必须**早于** offline 派发：否则等于没分流（offline 先出去，连接已被掐）。
+			const gateAt = body.indexOf("if (src !== 3) {");
+			const offlineAt = body.indexOf("window.dispatchEvent(new Event('offline'));");
+			if (!(offlineAt > gateAt)) {
+				throw new Error("源码契约：T112b 分流闸必须早于 offline 派发（晚于它就等于没分流）");
+			}
+			// 同一口径：resumeRecoveryState().wsSrc 与分流读的必须是**同一个**函数。
+			if (!src.includes("wsSrc: connectionDownSource(),")) {
+				throw new Error("源码契约：T112b resumeRecoveryState().wsSrc 必须与分流同口径（同一个 connectionDownSource()）");
+			}
+			// 分流闸读的那个函数必须**没丢层**：③4 = 只有探活命中（T95 那条断言的新落点）。
+			const srcFnAt = src.indexOf("function connectionDownSource() {");
+			if (srcFnAt < 0) throw new Error("源码契约：T112b 缺少 connectionDownSource()");
+			const srcFnEnd = src.indexOf("\n\tfunction ", srcFnAt);
+			const srcBody = src.slice(srcFnAt, srcFnEnd > 0 ? srcFnEnd : srcFnAt + 1200);
+			for (const [needle, why] of [
+				["if (detail.src > 0) return detail.src;", "DOM 层（1/2）必须仍然优先报出"],
+				["if (wsDown) return 3;", "WS 观测层（3）"],
+				["if (resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS) return 4;", "只有探活命中这一层（4）"],
+				["return 0;", "健康"],
+			]) {
+				if (!srcBody.includes(needle)) throw new Error(`源码契约：T112b connectionDownSource 缺 ${why}（${needle}）`);
+			}
+		}
+		// T112b：close 的三个事实字段必须被记账（改前只记 lastEvent='close'，丢掉一半信息）。
+		{
+			const at = src.indexOf("function wsWatchEvent(rec, opened, ev) {");
+			if (at < 0) throw new Error("源码契约：T112b wsWatchEvent 必须接收 CloseEvent（第三个形参 ev）");
+			const end = src.indexOf("function wsWatchSocket(socket) {");
+			const body = src.slice(at, end > 0 ? end : at + 4000);
+			for (const [needle, why] of [
+				["if (typeof ev.code === 'number') code = ev.code;", "必须记 CloseEvent.code"],
+				["if (typeof ev.reason === 'string') reason = ev.reason.slice(0, 80);", "必须记 CloseEvent.reason（截断）"],
+				["if (typeof ev.wasClean === 'boolean') wasClean = ev.wasClean;", "必须记 CloseEvent.wasClean"],
+				["s.lastCloseCode = code;", "只读诊断字段 lastCloseCode"],
+				["s.closeAbnormalCount += 1;", "干净/异常关闭必须分桶计数"],
+			]) {
+				if (!body.includes(needle)) throw new Error(`源码契约：T112b close 记账缺 ${why}（${needle}）`);
+			}
+			// 记账不得新增监听器：close 监听器仍然只有**两条**（addEventListener + onclose 兜底）。
+			const watchStart = src.indexOf("function wsWatchSocket(socket) {");
+			const watchEnd = src.indexOf("function installWsStateWatch() {");
+			const watchBlock = src.slice(watchStart, watchEnd);
+			const closeListeners = (watchBlock.match(/addEventListener\('close'/g) || []).length;
+			const openListeners = (watchBlock.match(/addEventListener\('open'/g) || []).length;
+			if (closeListeners !== 1 || openListeners !== 1) {
+				throw new Error(`源码契约：T112b/常态监听器数量不许增加（close=${String(closeListeners)} open=${String(openListeners)}，各应为 1）`);
+			}
 		}
 		// 原生侧：横幅的数据源必须是"hook 上报 OR DOM 探针"两路，且 hook 那路不覆盖 UNKNOWN。
 		const main = readFileSync(join(ROOT, "android/app/src/main/java/top/d1studio/dshremote/MainActivity.java"), "utf8");
@@ -741,7 +818,8 @@ function assertSourceContracts() {
 			throw new Error("源码契约：T95 回前台必须通过意图位进入（不得出现 probeResumeRecovery(true)）");
 		}
 		// ④ 硬边界逐字不动 + 窗口推过一次即关（防风暴语义与改前相同）。
-		for (const keep of ["RESUME_MIN_INTERVAL_MS = 8000", "RESUME_MAX_NUDGES = 6", "RESUME_CONFIRM_DELAY_MS = 400",
+		// T112b：`RESUME_MAX_NUDGES` 由本任务 6→2（同上，钉住取值）。
+		for (const keep of ["RESUME_MIN_INTERVAL_MS = 8000", "var RESUME_MAX_NUDGES = 2;", "RESUME_CONFIRM_DELAY_MS = 400",
 			"if (bypassInterval || (resumeLastNudgeAt > 0 && Date.now() - resumeLastNudgeAt >= RESUME_MIN_INTERVAL_MS)) {",
 			"resumeBypassUntil = 0;",
 			// T95：跳过间隔的窗口还额外被"硬地板"压着 —— DOM 真值台实测到过"迟到/重复的回前台意图
@@ -763,8 +841,12 @@ function assertSourceContracts() {
 		if (!src.includes("|| (resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS),")) {
 			throw new Error("源码契约：T95 resumeRecoveryState().reconnecting 必须与 isConnectionDown() 同口径（含探活那一路）");
 		}
-		if (!src.includes(": (wsDown ? 3 : ((resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS) ? 4 : 0)),")) {
-			throw new Error("源码契约：T95 wsSrc 必须报出「只有探活命中」这一层（4）");
+		// T112b：这一条的老落点是 resumeRecoveryState 里那串内联三元式；本任务把"哪一层认出来的"
+		// 抽成 connectionDownSource()（**同一个**取值同时被 nudge 的分流闸读，两处必须同口径），
+		// 所以「4 = 只有探活命中」这一层现在钉在**那个函数体内**（上面的 T112b 段），
+		// 这里改为钉"同口径"这件事本身 —— 少了它，两处会各自漂移。
+		if (!src.includes("wsSrc: connectionDownSource(),")) {
+			throw new Error("源码契约：T95/T112b wsSrc 必须报出「只有探活命中」这一层（4）—— 见 connectionDownSource()");
 		}
 	}
 	// ── WEB-05：抽屉接管接入横向滚动容器豁免 ──

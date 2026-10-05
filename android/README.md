@@ -88,7 +88,7 @@ pwsh -File android\build.ps1 -Debug      # 等价 $env:DSH_DEBUG=1
 |---|---|---|
 | 产物名 | `dsh-remote.apk` | `dsh-remote-debug.apk` |
 | `aapt2 link` 参数 | 不传 `--debug-mode` | 传 `--debug-mode` |
-| versionName | `0.2.0-rc.2.8` | `0.2.0-rc.2.8+debug` |
+| versionName | `0.2.0-rc.2.9` | `0.2.0-rc.2.9+debug` |
 | manifest `android:debuggable` | **属性不存在** | `true` |
 | WebView DevTools | 关 | 按 `FLAG_DEBUGGABLE` 开 `setWebContentsDebuggingEnabled(true)` |
 
@@ -203,10 +203,18 @@ pwsh -File android\test-direct-nodes.ps1
 # CertPin tests passed: 32
 # TunnelReady tests passed: 25     ⇒ 合计 77 断言，EXIT=0
 
-pwsh -File android\test-immersive.ps1         # T94 系统栏沉浸契约（48 断言）
-pwsh -File android\test-reconnect-banner.ps1  # 重连横幅 122 + StuckRescue 79 + 探针 DOM 桩 32
+pwsh -File android\test-immersive.ps1         # T94+T115 系统栏沉浸契约（68 断言，rc.2.8 时 48）
+pwsh -File android\test-reconnect-banner.ps1  # 探针/防抖 131 + StuckRescue 79 + 探针 DOM 桩 32
+                                              #   + T109 判据臂：静态白名单 14 + 本网关协议族 13
 pwsh -File android\test-backkey.ps1           # 返回键探针 66 + DOM 桩 18
 ```
+
+> **T109 起 `test-reconnect-banner.ps1` 的构成变了**（横幅显示层删除）：
+> 与「画出来」有关的臂（`isOnScreen` / `bandHeightPx` / `shouldSuppress` / `TEXT`）已删，
+> 换来两条**行为**臂——把 `MainActivity` 里 `isStaticCachePath` / `isStreamingPath` /
+> `isActiveGatewayUri` 及其四个 helper 的**方法体原文**抠出来，配 `Uri`/`TextUtils` 替身
+> `javac` 真编译真跑（T40 §8 M1/M2：只做字符串断言，删掉关键一行照样全绿）。
+> 采样那条链（`PROBE_JS` + `Debouncer` + `StuckRescueTest` 79 项）**一个字未动**。
 
 > ⚠️ **调用纪律**：`android\test-*.ps1` **一律用 `pwsh -File`**。用 Windows PowerShell 5.1 会把
 > UTF-8 脚本按 ANSI 读 ⇒ 非 ASCII 字面量被破坏、传参变空（脚本会拿 `MainActivity` 当 hook 源）
@@ -272,6 +280,24 @@ frpc 真实就绪关键字，并显式断言 `establishing nat hole…` 与 5 �
 > `D4466D0D58B272877E7EDC7287F1C0E5D047642B214F5548AFEE0CAC8923B26A`（**317998 B、CR=0**），
 > 源 = `res/raw` 副本（= APK 内嵌，见下）。Lead 侧另有 `scratch/lead-rc28-regression.log`
 > （14 项 + T47 44/44，全 exit 0），两者结论一致。
+>
+> **rc.2.9 总台账（本任务在**最终字节**上复跑，逐项 exit 0）**：`scratch/t116/regression.log`
+> —— **17 项全部 exit 0**：`typecheck` / `test:mobile` / **`test:device` 断言合计 158：通过 158、
+> 失败 0、跳过 0**（原文 `test:device 通过：真实 0.2.0-rc.2 页面上的手机/平板/横屏/运行中切换矩阵全部符合契约。`）/
+> `test:fixes`(17/17) / `test:perf`(25/25) / `test:routes`(17/17) / `test:session`(18/18) /
+> `test:client` / `test:desktop`(10/10) / `smoke`(**22/22**) / `smoke:edge`(**19/19**) /
+> `ws-keepalive`(19/19) / `test-resume-recovery`(**12/12**) / `t47/harness.mjs`(**44/44**) /
+> `android\test-immersive.ps1`(**68**) / `android\test-reconnect-banner.ps1`(**131 + 79 + 14 + 13 + 32**) /
+> `android\test-backkey.ps1`(**77 + 18**)。受测 hook 为
+> `FD0F443417E66D02FB10BC78B1DE05432F06F6BFC1B1EB91979FA5251FCD20C0`（**363829 B、CR=0**），
+> 源 = `res/raw` 副本 = **APK 内嵌**（release 与 `-Debug` **两个包都核过**，三处逐字节相同）。
+>
+> ⚠️ **与 rc.2.8 相比的三处断言数变化，都是本批改动的直接后果，不是漏跑**：
+> `test-immersive` **48 → 68**（T115 新增 24 条，旧 44 条**一条未删**）；
+> `test-backkey` **66 → 77**（T99/T102 源码契约形状扩展）；
+> `test-reconnect-banner` 由 `122 + 79 + 32` 变为 **`131 + 79 + 14 + 13 + 32`**
+> （横幅**显示层**那批臂删除，换来 T109 的两条**行为**臂：静态白名单 14 + 本网关协议族 13）。
+> **本批台账已把 `smoke` / `smoke:edge` 列在内**（见上方验收纪律最后一条）。
 
 > **验收纪律（rc.2.6 两条 + rc.2.7 两条 + rc.2.8 三条，都能把「环境问题」误读成「代码回归」）**：
 > - **网关有 240 次/分、按 IP 共享的限流。** 本机同一 IP 上**并行**跑多个验收任务时会互相打点，
@@ -680,6 +706,122 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
     `未拦 主文档 2 · /api 0 · 非白名单 1 · 非GET 26 · 非本网关 1`。
     **这是远程场景下拿不到 logcat 时，用户自证缓存行为的唯一途径。**
   - 证据：`scratch/t60/report.md` §1.4、§8（诊断行取证方式）；`scratch/t65/report.md` §2.1、§6.2。
+
+## T109 原生侧收口（去横幅 / wss 冷握手 / SSE 不接管 / 陈旧上界）
+
+本批在原生产生的四条变更，**都在 `MainActivity.java` / `ReconnectBanner.java` / `res/values/ids.xml` 内**，
+不碰 hook（`mobile.js` 与 `mobile-web.js` 由另一批改）。逐条的「为什么」与设备真值见
+`scratch/t109/report.md`；这里只留工程结论。
+
+1. **去重连横幅的显示层**（用户口径：「把重连横幅去了吧，这样可以少一半的耗电」）。
+   - 删：`ReconnectBanner.Bar`、`TEXT`、`FADE_MS`、`isOnScreen`、`bandHeightPx`、
+     `BAND_FALLBACK_DP`、`shouldSuppress`、`R.id.dshrReconnectBanner`、
+     `installReconnectBanner()`、`applyReconnectBannerInsets()`、根布局里那条第二条 View、
+     以及 `handleReconnectProbe` 里的 `show()/hide()` 与抑制几何。
+   - 留（**一个字都没省**）：`ReconnectBanner.PROBE_JS` 与它的全部字面量、`Debouncer`、
+     T108 的合并探针与自适应节拍、`runStuckRescue` 的接线。防抖器仍决定「确认仍在断开态时
+     保持 500ms 快档」；探针照旧 `webView.evaluateJavascript(ReconnectBanner.PROBE_JS, this::handleReconnectProbe)`。
+   - 状态改由设置页只读诊断行体现：新增一段 `重连探针：hook=… · 上次断线 … · 拍数 … · 最近 … · 节拍 …ms`，
+     与既有几段同一块只读文本、**不新增任何可点控件**。
+   - 回归钉在哪：`android/test-reconnect-banner.ps1` 的 `ReconnectBannerTest` 里加了「显示层不许回来」
+     的**反射断言**（`Bar`/`TEXT`/`FADE_MS`/`isOnScreen`/`bandHeightPx`/`BAND_FALLBACK_DP`/`shouldSuppress`
+     逐个查存在性，谁偷偷加回来立刻红）＋「采样链不许断」的正向断言。
+2. **`wss://` 视同 `https://`**（发布阻塞 P0-3）。`isActiveGatewayUri()` 的协议族扩到
+   `{http, https, ws, wss}` 并要求**两端安全级别一致**；主机/端口判定一个字没放松。
+   `effectivePort()` 把 wss 折叠到 443。`handleSslError()` 的**每一支都打日志**（含放行支的 `scheme=`）：
+   改前「非网关 URI ⇒ cancel」是纯静默的，真机上「连不上且毫无线索」正是它。
+3. **SSE / 流式端点不接管**。白名单从 `startsWith("/plugins/")` 收成「`/assets/` 目录段 +
+   **精确** `/plugins`」（与 `pwa.ts` 的 `/^\/plugins\/?$/` 同语义），并**显式排除流式端点**
+   （路径 `/plugins/events` 或请求头 `Accept: text/event-stream`，任一命中即放行）。
+   `interceptStaticAsset` 里新增放行计数 `passthroughStream`，进诊断行的「未拦 … SSE n」。
+4. **hook 连接态的陈旧上界**（T106 静态审计 S1）。`hookConnStateAt` + `HOOK_CONN_STATE_MAX_AGE_MS = 20000`，
+   读法统一走 `freshHookConnState()`；`hookSelfHealLive()` 刻意**不**用新鲜度（那问的是「桥装没装过」，
+   是历史事实）。20s 的账：> T108 的 8s 快档窗口与 5s 兜底周期，且等于 20 次 hook 断开态重推
+   （`RESUME_DOWN_TICK_MS = 1000`）都没到。
+
+> ⚠️ **P1-1「设置页触摸穿透」的复核结论（与工单前提不同，如实写明）**：用**真 adb 触摸**
+> （`input swipe` 0 距离长按 + `input tap`）在**改前与改后两个 APK 上各测一遍**，
+> 点「背后鲸鱼位置」时抽屉 `data-dshr-expanded` **两次都保持 0，没有穿透**。
+> V1 那条 `scratch/v1/whale-tap-after.json`（expanded 0→1）由 **CDP `Input.dispatchTouchEvent`** 产生，
+> 而 CDP 事件直接进渲染器、**绕过 Android 的 View 分发**——本批用同一手法在**改后**的包上复现出
+> 完全一样的 `0 → 1`（`scratch/t109/p11-cdp-control.json`）⇒ 那条证据测的是工具，不是应用。
+> 机制上也对得上：`showConnectionSettings()` / `showEditor()` 都把 `webView` 设成 `View.GONE`，
+> 设置页期间**下层根本没有可接收触摸的兄弟 View**。
+> 本批仍按方向做了加固（`insetScroll()` 里 `scroll.setClickable(true)`，一行 + 注释），
+> 它是**正确性加固**（让覆盖层自给自足，将来若有「覆盖层与可见 WebView 共存」的布局就靠它挡住），
+> **不是**「复现→修复」的闭环；未达成的部分写在 `scratch/t109/report.md` 的未决里。
+
+## rc.2.9 原生侧收口（打洞回落 800ms + 粘性中转 / 接管通道带凭据 / 系统栏原生透明 + 页面让位）
+
+逐条的「为什么」与设备真值见 `scratch/t113/report.md`、`scratch/t114/report.md`、`scratch/t115/report.md`；
+这里只留工程结论。
+
+1. **打洞回落超时 5000 → 800 ms + 连续 2 次失败粘住中转**（T113，本批用户可感知最大的一项）。
+   - `VisitorConfig.java:82` `FALLBACK_TIMEOUT_MS = 800`（`:159` 写进 toml）；网关侧
+     `frp.ts:306` **同值**（`scratch/t104/cross-end.mjs` 逐行对齐，两端生成的 toml 不许漂移）。
+     **同一个 toml 键只改数值**，T104 的「打洞优先 / 只用中转」二选一语义与写法一字未新。
+   - `TunnelPath.java:56` `HOLE_FAIL_STREAK_TO_STICK = 2`：连续 2 次打洞超时后，**下一次 frpc 启动**
+     直接用「只用中转」toml。**打洞成功立刻解除**；**换网络 / 换配置组 / 换档位**与**进程退出**清零；
+     **「停隧道」不清零**。
+   - **绝不主动重启 frpc**（会掐断在途连接 ⇒ 用户看到断线闪烁）：粘性只在「反正要重启」的时刻
+     （新隧道启动 / frpc 崩溃自重启）生效；`TunnelService.watchTunnelEnvironment()` 每 3 s 巡检网络变化。
+   - 诊断行（设备 UI dump 原文）：`打洞策略（配置）：打洞优先（先试 P2P，0.8 秒打不通自动回退中转）· 电脑端形态 xtcp` /
+     `本次隧道：打洞优先 · 已粘性回落中转（连续 2 次打洞超时后不再等；换网络或重开 App 自动重试打洞）`。
+   - 真值：稳态「点连接→可交互」**13,573/14,206 ms → 5,562/5,399/6,396/5,094 ms**；
+     空等 **10.30–10.38 s → 1.88–2.06 s**（均值 1.97，有 3 次 ≥2 s，如实）；
+     粘性生效后 **2,398/2,750/2,903 ms**、空等 **0**；冷启动 28,507/29,258 → **8,108/7,811 ms**。
+2. **接管通道带上设备凭据**（T114，真机「频繁重连 / 白屏」的主因）。
+   - `PinnedFetch.java`：`cookieFor()` 走 `CookieManager.getCookie(url)`（设备令牌是 HttpOnly，
+     `document.cookie` 看不到，CookieManager 拿得到）；`isSameOriginUrl()` 要求 `https` + host 全等 +
+     有效端口（缺省折叠 443），**只对同源附带**，并在**凭据唯一出口再判一遍**。
+   - **无凭据 ⇒ 失败关闭**（`return null`，连接都不建）；**401 ⇒ 单独分支 + `return null`**
+     ⇒ 调用点拿不到结果 ⇒ `StaticDiskCache.put` **不可达** ⇒ 401 不污染落盘缓存。
+   - **唯一 fail-open**：网关侧免认证的 `GET /__dsh_remote__/health`，且**不带任何凭据**。
+   - 真值：401 **12–16 次/次进入 → 0**；`#root kids=0 → 1`（正文 909 字）；
+     稳定链路 **655.2 s：0 401 / 0 `connection lost` / 0 横幅 / 0 handshake failed**；
+     安全负例 **16/16**（跨 host / 跨端口 ⇒ 服务端收到 `Cookie: null`）。
+3. **系统栏改走原生透明 + 页面自己让位**（T115，见下节「平板档让位」）。
+4. **原生不再涂导航栏色**：`configureSystemBars()` 与 `applySystemBars()` 在两个 API 段都写
+   `Color.TRANSPARENT`（改前是 `shellColor(R.color.shell_background)`，API 30–34 上会真的涂上去）；
+   对比度强制仍关；`setSystemBarsAppearance` 的图标明暗逻辑原样保留。
+5. **页面让位写入口收敛**：新增唯一页面写入口 `writeInsetsToPage`，`applyInsetsToPage` 增左右两向
+   且**与让位同源**（同一个 `readSystemBarInsetsPx()` 口径，否则两个写点会打架——实测抓到过
+   24px/36px 竞态）。`applyDeviceClassInsets` 改为**布局盒恒 0 + 四向写页面**。
+
+> ⚠️ **T115 披露的一处写域外改动**：路线「布局盒恒 0 + 四向写页面」与
+> `scripts/test-device-class.mjs` 里 T72/T79/T80 的旧契约（「让位只落 WebView 布局盒」）**直接对立**。
+> 处理方式 = 按「谁移动了被钉代码，谁负责更新断言」的口径**同批改写该块**，
+> **断言总数仍 158**、四向取值仍被逐格钉死（变异 M1 反证：改回布局盒 ⇒ 通过数 158→145）。
+> 这条**不在 T115 的写域白名单里**，已在其实报告 §0.3 明确披露。
+
+## 平板档让位：从「原生外边距」改为「页面 CSS padding」（rc.2.9，T115）
+
+- **改前**：平板档让位靠**原生**给 WebView 加外边距（`lp.setMargins`）⇒ 两条系统栏露出的是
+  **`rootLayout` 的底**（一个原生单色）。而平板官方面板贴边那一行**本来就是两色**
+  （左栏 `--dsw-specific-sidebar-fill` / 会话面板 `--dsw-alias-bg-base`）
+  ⇒ **单色带必然在面板那一侧留一道缝**（改前上带 **1919/2560** 像素与贴边行不同、ΔRGB=(6,5,4)；下带 **1925/2560**）。
+- **改后**：WebView **外边距置 0**（覆盖全窗），四向 inset 交给**页面 CSS**
+  （`--dshr-inset-top/right/bottom/left`）。**「带 = 页面自己画的像素」成为构造性事实**，不存在第二个色源。
+
+| 判据 | 改前 | 改后 |
+|---|---|---|
+| 四向遮挡（`WebView` 屏上框） | `[0,72][2560,1536]` ⇒ **0/72/0/64** | `[0,0][2560,1600]` ⇒ **0/0/0/0** |
+| 页面视口 | `1280×732`（比整屏少 68 CSS px） | **`1280×800`**（= 2560×1600 ÷ dpr 2） |
+| 页面 `--dshr-inset-*` | 四个全空 | **top 36px / bottom 32px / left 0 / right 0** |
+| 两条带 vs 页面（跨旧带边逐像素） | 上 1919/2560、下 1925/2560 不同 | **ΔRGB = 0（四个主题组合全 0）** |
+| 带内页面内容墨迹 | — | **0 行**（内容顶边 `top=36` CSS px） |
+| **手机档** | 四向 0/0/0/0；`--dshr-inset-top: 46px` / `bottom: 24px` | **逐字不变**（手机档 CSS 未改一行） |
+
+- **hook 侧**（平板作用域）：`__dshRemoteInsets.set` 收下左右两向，且**不再被「严格 OFF」早退挡在 inset 写入之前**；
+  新增一组平板作用域 CSS（三列 `box-sizing:border-box` + 四向 `padding: var(--dshr-inset-*, env(...))`，
+  会话面板列/右侧栏列补官方底色 token）。**契约在这批明确为「允许最小 hook + 允许新增 CSS 规则」**。
+- **app 自己的可对账日志（新格式，含「谁在让位」）**：
+  `I dshr-inset: avoid(px) l=0 t=72 r=0 b=64 page(css) l=0 t=36 r=0 b=32 box=0,0,0,0 tablet=true uiState=WEB`
+- ⚠️ **未取证的形态（如实）**：**左右挖孔 / 三键栏**只有**源级证据**——测试 AVD 的
+  `displayCutout` **恒 0**，左右两向只做到「原生写入 + 页面消费 + 源级断言」三级，**未在设备上跑过**；
+  **平板右侧栏打开态（三列）未做像素取证**（右栏列已按同一 token 处理）。
+- ⚠️ **API 30–34 未取真机真值**：本机是 Android 15，`dumpsys` 已不再暴露 legacy 导航栏色字段
+  ⇒ 「透明」由**代码层断言 + 像素层无遮挡**两条共同证明。
 
 ## 平板档设置入口
 

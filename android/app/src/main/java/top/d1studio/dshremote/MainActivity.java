@@ -29,7 +29,6 @@ import android.text.TextUtils;
 import android.util.Log;
 import android.view.ContextThemeWrapper;
 import android.view.DisplayCutout;
-import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -157,6 +156,17 @@ public class MainActivity extends Activity {
 	private ScrollView setupScroll;
 	private LinearLayout directNodesBox;
 	private EditText etName, etServer, etCport, etTunnel, etSk, etToken;
+	/**
+	 * T104：连接设置页的「打洞策略」二选一（打洞优先 / 只用中转）。
+	 * 与既有卡片同一套控件与配色（styledButton + card），不新造控件类型。
+	 */
+	private Button stratP2pBtn, stratRelayBtn;
+	/** T104：二选一下方那行「为什么某一档不可用」的说明（可用性由电脑端形态决定）。 */
+	private TextView strategyNote;
+	/** T104：编辑中的档位（保存时落进配置组；不可用的档会在渲染时被收敛到可用那一档）。 */
+	private String editingStrategy = VisitorConfig.STRATEGY_P2P;
+	/** T104：编辑中配置组的电脑端形态（导入链接带来的；空 = 未知）。 */
+	private String editingPcMode = "";
 	private TextView tvTunnelState;
 	/** T22-D：连接设置页的只读诊断行（无点击、无控件），显示 hook 最近一次上报。 */
 	private TextView tvUiDiag;
@@ -165,15 +175,17 @@ public class MainActivity extends Activity {
 	private WebView webView;
 	private ValueCallback<Uri[]> fileCallback;
 	/**
-	 * T78：主界面可见的重连状态横幅（原生覆盖条）。与 WebView 同级、{@code layout_gravity=top}，
-	 * 页面 DOM 一个字节都不写 ⇒ 手机档 / 平板档同一条路径，平板档天然零痕迹。
-	 * 状态信号来自**只读** {@code evaluateJavascript} 探针（{@link ReconnectBanner#PROBE_JS}），
-	 * 不依赖 hook，也不读 hook 的诊断载荷。
-	 */
-	private ReconnectBanner.Bar reconnectBanner;
-	/**
-	 * T78：防抖状态机（连续 2 次真才显示 / 连续 3 次假才隐藏 / UNKNOWN 不计数）。
-	 * **只允许经 {@link #hideReconnectBannerNow()} 清零**，避免上一页的累计带到新页面。
+	 * T78：重连状态探针的**防抖状态机**（连续 2 次真才"显示" / 连续 3 次假才"隐藏" /
+	 * UNKNOWN 不计数）。**只允许经 {@link #hideReconnectBannerNow()} 清零**，
+	 * 避免上一页的累计带到新页面。
+	 *
+	 * <p><b>T109</b>：横幅的显示层已删（用户口径「去了吧，少一半耗电」），但这个防抖器
+	 * **留着**——它现在只服务两件与显示无关的事：
+	 * <ol>
+	 *   <li>{@link #probeIntervalMs()}：确认"仍在断开态"时保持 500ms 快档；</li>
+	 *   <li>{@link #runStuckRescue} 的观测量（仍按原判据给 OK/RECONNECTING/UNKNOWN）。</li>
+	 * </ol>
+	 * T108 的合并探针与自适应节拍一个字未动，删除的只是"把状态画出来"这一层。
 	 */
 	private final ReconnectBanner.Debouncer reconnectDebounce = new ReconnectBanner.Debouncer();
 	/**
@@ -215,11 +227,38 @@ public class MainActivity extends Activity {
 	 * 这里把它与 DOM 探针做 **OR**：任一为真即「正在重连」。
 	 *
 	 * <p>生命周期：**页面级**（新文档开始时置 null，见 {@code onPageStarted}）。
-	 * hook 每次装上都经 {@code reportUiDiag()} 推一次当前状态，所以新文档必然有一次刷新；
-	 * 不需要 TTL —— 它本来就是"当前状态"而不是"心跳"。{@code volatile}：写在 WebView 的
-	 * JS 桥线程、读在主线程（{@code reconnectPollTick}）。
+	 * hook 每次装上都经 {@code reportUiDiag()} 推一次当前状态，所以新文档必然有一次刷新。
+	 *
+	 * <p><b>T109（S1·陈旧上界）</b>：改前这里**只增不减**——值只在下一次 {@code setUiDiag}
+	 * 到达时被覆盖，而四条清零点（{@code onPageStarted} 除外）一条都不清它 ⇒ 一次假的
+	 * {@code reconnecting} 会把"正在重连"**永久**钉在判据里（T106 静态审计 S1）。
+	 * 现在配一个**陈旧上界** {@link #HOOK_CONN_STATE_MAX_AGE_MS}：超过 N 毫秒没收到新推送，
+	 * 这个值就不再参与投票（读的地方一律走 {@link #freshHookConnState()}）。
+	 * 与 hook 侧 T112 的"断开态 1s 重推 + 恢复立刻推 + open 撤闩"**配对**：
+	 * 正常断开时推送每 1s 来一次，永远不陈旧；推送链路真坏了也不会把状态钉死。
+	 * {@code volatile}：写在 WebView 的 JS 桥线程、读在主线程（{@code reconnectPollTick}）。
 	 */
 	private volatile String hookConnState = null;
+	/** T109：{@link #hookConnState} 的写入时刻（ms，0 = 从未写入）。与它同写同清，见各赋值点。 */
+	private volatile long hookConnStateAt = 0L;
+	/**
+	 * T109：hook 连接态推送的**陈旧上界**（ms）。
+	 *
+	 * <p>取 20000 的账：
+	 * <ul>
+	 *   <li>**下界**要容得下"正常但没有翻转"的静默期：健康态兜底探针周期是 5s
+	 *       （{@link #PROBE_IDLE_HOOK_MS}），快档窗口 8s（{@link #PROBE_FAST_WINDOW_MS}）；
+	 *       20s = 4 拍兜底 + 2.5 个快档窗口，不会在正常静默里误判为陈旧；</li>
+	 *   <li>**上界**要短到"一次假 reconnecting 不会把用户钉死"：T112 在 hook 侧对断开态
+	 *       每 1s 重推一次 ⇒ 真断开时推送**永远新鲜**，20s 陈旧等价于"连续 20 次重推都没到"，
+	 *       那时链路侧已经出了别的问题，退回 UNKNOWN（不投票）比继续投假票更安全；</li>
+	 *   <li>与 hook 自身的退避上限（指数退避到数十秒）无关：这里的判据是**推送有没有到**，
+	 *       不是**页面有没有在重连**——两者混用就会把"退避中"误当成"没在重连"。</li>
+	 * </ul>
+	 */
+	private static final long HOOK_CONN_STATE_MAX_AGE_MS = 20000L;
+	/** T109：陈旧上界触发时只打一行日志（避免每拍刷屏），值一变就复位。 */
+	private volatile boolean hookConnStateStaleLogged = false;
 	/**
 	 * T78：系统栏/挖孔/任务栏的逐方向并集（px）。T72 的平板让位与 T78 的横幅外边距
 	 * **共用这一份取值**，不各自算一套——否则两处会各自漂移。
@@ -230,22 +269,6 @@ public class MainActivity extends Activity {
 	/** 从会话进入连接设置时暂存，用于「返回会话」而不必重连。 */
 	private String resumeUrl = "";
 	private boolean canResumeSession = false;
-	/**
-	 * 本次连接设置页是不是「会话根返回键」进来的（D6.1）。为 true 时设置页的
-	 * 返回键退到后台而不是回会话——否则「会话根 → 设置 → 返回 → 会话 → 返回 →
-	 * 设置」死循环，用返回键退不出 App。一次性消费：退后台那一刻立即清零，任何离开设置页
-	 * 的路径也都经 clearResumeSession() 清零，故再次进入会话/设置不会残留。
-	 *
-	 * <p><b>T65：置位点从「平板档」放宽到「任意档位」</b>。改前唯一置位点在
-	 * {@code finishWebBack()} 的 {@code if (isTabletClass())} 分支内 ⇒ 手机档恒为 false
-	 * ⇒ 手机档会话根按返回键落到 {@code moveTaskToBack(true)} 直接退到桌面，而设置页文案
-	 * 却在承诺「点上方「返回当前会话」或系统返回键继续」⇒ <b>行为与承诺不一致</b>
-	 * （T48/T58/T59 三轮都踩到同一个现象：会话页里按返回键直接回桌面）。
-	 * 现在两档一致：会话根按返回键 → 连接设置页（隧道/会话活性保持），
-	 * 设置页再按一次才退到后台。平板档语义（D6.1）**逐字不变**，
-	 * 只是手机档从此也适用同一套判据。
-	 */
-	private boolean settingsViaBackKey = false;
 	/**
 	 * 当前页面状态。**只允许通过 {@link #setUiState(UiState)} 写入**：
 	 * 平板档的系统栏让位绑在这个跃迁上（见 setUiState 的注释），直接赋值会漏掉让位重算。
@@ -458,8 +481,6 @@ public class MainActivity extends Activity {
 		// 任务栏显隐/导航模式/旋转，但「冷启动 + 后台期间状态变化」这条路上未必有新 insets
 		// 事件；这里 post 一次重算（幂等，成本一次 setPadding），保证冷启动首帧就避让。
 		if (rootLayout != null) rootLayout.post(this::applyDeviceClassInsets);
-		// T78：横幅的四向外边距与平板让位同源同值，回前台补算一次（幂等）。
-		if (rootLayout != null) rootLayout.post(this::applyReconnectBannerInsets);
 		// T78：回前台重启重连状态轮询（onPause 停掉的那条）。
 		startReconnectPolling();
 		// T96：回前台是**新起点**——退后台期间连接可能已经死了（页面侧 JS 被 pauseTimers 冻住），
@@ -524,9 +545,8 @@ public class MainActivity extends Activity {
 		// AND-03/AND-06：先关统一线程池——中断在途的隧道就绪轮询与返回会话探测，
 		// 等待轮询线程不再持有 Activity 空转。
 		destroyed = true;
-		// T78：停掉重连状态轮询并摘掉横幅引用（rootLayout 随 Activity 一起销毁）。
+		// T78：停掉重连状态轮询（rootLayout 随 Activity 一起销毁）。
 		stopReconnectPolling();
-		reconnectBanner = null;
 		bgExecutor.shutdownNow();
 		// T23-B：frpc 就绪回调是静态字段且持有本 Activity，销毁即注销
 		//（正常路径由 waitAndOpen 的 finally 注销，这里兜底重建/异常路径）。
@@ -629,7 +649,11 @@ public class MainActivity extends Activity {
 		getWindow().setSoftInputMode(imeMode | WindowManager.LayoutParams.SOFT_INPUT_STATE_UNCHANGED);
 		if (Build.VERSION.SDK_INT >= 30) getWindow().setDecorFitsSystemWindows(false);
 		getWindow().setStatusBarColor(Color.TRANSPARENT);
-		getWindow().setNavigationBarColor(shellColor(R.color.shell_background));
+		// T115：与用户口径「系统栏改走安卓原生透明」一致——这里不再涂 shell 底色。
+		// 本行原来写 shellColor(R.color.shell_background)（不透明 #F2F3F6），虽然紧随其后的
+		// applySystemBars() 会把它覆盖掉（那条路径逐状态重算），但「代码字面」与「原生透明」
+		// 相反，API 30–34 上若哪天这条覆盖路径被绕开就会真的涂成不透明色。
+		getWindow().setNavigationBarColor(Color.TRANSPARENT);
 		if (Build.VERSION.SDK_INT >= 28) {
 			getWindow().setNavigationBarDividerColor(Color.WHITE);
 			WindowManager.LayoutParams attrs = getWindow().getAttributes();
@@ -940,6 +964,34 @@ public class MainActivity extends Activity {
 			InputType.TYPE_TEXT_VARIATION_PASSWORD);
 		box.addView(form, cardParams(d));
 
+		// ── T104：打洞策略人工二选一 ─────────────────────────────────────────
+		// 用户要的是「自由选择打洞还是中转」。两档的**含义**必须写在脸面上，
+		// 代价也要说清（只用中转：建连更快更确定，但数据经过 VPS）。
+		// 哪一档成立由**电脑端形态**决定（来自导入链接的 mode），不成立的档
+		// 按用户要求「如实标注/禁用 + 给出理由」，绝不做成"看起来能点、点了连不上"。
+		LinearLayout strategyCard = card(d);
+		strategyCard.addView(cardTitle("打洞策略（二选一）", d));
+		strategyCard.addView(hintText("打洞优先：先试 P2P 直连，5 秒打不通就自动回退中转。"
+			+ "只用中转：不试打洞，直接经 VPS 中转——建连更快更确定，但数据经过 VPS。", d));
+		LinearLayout strategyRow = new LinearLayout(this);
+		strategyRow.setOrientation(LinearLayout.HORIZONTAL);
+		stratP2pBtn = styledButton("打洞优先", true, d);
+		stratP2pBtn.setOnClickListener(v -> setEditingStrategy(VisitorConfig.STRATEGY_P2P));
+		strategyRow.addView(stratP2pBtn, new LinearLayout.LayoutParams(0, dp(44, d), 1f));
+		stratRelayBtn = styledButton("只用中转", false, d);
+		stratRelayBtn.setOnClickListener(v -> setEditingStrategy(VisitorConfig.STRATEGY_RELAY));
+		LinearLayout.LayoutParams relayParams = new LinearLayout.LayoutParams(0, dp(44, d), 1f);
+		relayParams.leftMargin = dp(8, d);
+		strategyRow.addView(stratRelayBtn, relayParams);
+		strategyCard.addView(strategyRow);
+		strategyNote = new TextView(this);
+		strategyNote.setTextSize(13);
+		strategyNote.setTag("muted");
+		strategyNote.setLineSpacing(0, 1.25f);
+		strategyNote.setPadding(0, dp(8, d), 0, 0);
+		strategyCard.addView(strategyNote);
+		box.addView(strategyCard, cardParams(d));
+
 		Button save = styledButton("保存", true, d);
 		save.setOnClickListener(v -> saveEditor());
 		LinearLayout.LayoutParams saveParams = new LinearLayout.LayoutParams(
@@ -959,11 +1011,107 @@ public class MainActivity extends Activity {
 			new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 	}
 
+	// ---------- T104：打洞策略二选一 ----------
+
+	/**
+	 * 用**当前表单里的电脑端形态**造一个临时 Profile，只为了问一件事：
+	 * 「这一档在你这台电脑上成立吗」。判据只有一处（ProfileStore 的可用性矩阵），
+	 * UI 与写进 toml 的档位因此不会各说一套。
+	 */
+	private ProfileStore.Profile editingProfileView() {
+		ProfileStore.Profile p = new ProfileStore.Profile();
+		p.pcMode = VisitorConfig.normalizePcMode(editingPcMode);
+		p.mode = ProfileStore.modeForPcMode(p.pcMode);
+		p.strategy = VisitorConfig.normalizeStrategy(editingStrategy);
+		return p;
+	}
+
+	private void setEditingStrategy(String value) {
+		editingStrategy = VisitorConfig.normalizeStrategy(value);
+		renderStrategyChoice();
+	}
+
+	/**
+	 * 画出二选一的选中态 + 可用性说明。
+	 *
+	 * <p>不成立的那一档会**被收敛到成立的那一档**（而不是"选中但禁用"）：用户切回来
+	 * 保存时不会存下一个自相矛盾的组合，写进 toml 的也就是屏上显示的那一档。
+	 * 电脑端形态 = entry 时两档都不成立：两个按钮都禁用，并给出**可执行的**下一步
+	 * （去电脑端改形态再重新导入），不假装能用。
+	 */
+	private void renderStrategyChoice() {
+		if (stratP2pBtn == null || stratRelayBtn == null) return;
+		ProfileStore.Profile view = editingProfileView();
+		boolean p2pOk = ProfileStore.p2pAvailable(view);
+		boolean relayOk = ProfileStore.relayAvailable(view);
+		// T104：收敛只在**选的那一档不成立**时发生（判据收在 ProfileStore.coerceStrategy 一处，
+		// 与写进 toml 的档位同源）。成立时绝不改动用户的选择——第一版在这里写成
+		// 「p2p 成立就强制回 p2p」，结果 xtcp 电脑端上点「只用中转」会被立刻弹回去，
+		// 人工二选一形同虚设（设备级验证当场抓到，见 scratch/t104/report.md §3.2）。
+		editingStrategy = ProfileStore.coerceStrategy(view, editingStrategy);
+		applyChoiceStyle(stratP2pBtn, VisitorConfig.STRATEGY_P2P.equals(editingStrategy));
+		applyChoiceStyle(stratRelayBtn, VisitorConfig.STRATEGY_RELAY.equals(editingStrategy));
+		stratP2pBtn.setEnabled(p2pOk);
+		stratRelayBtn.setEnabled(relayOk);
+		stratP2pBtn.setAlpha(p2pOk ? 1f : 0.4f);
+		stratRelayBtn.setAlpha(relayOk ? 1f : 0.4f);
+		String pc = view.pcMode;
+		String note;
+		if (!p2pOk && !relayOk) {
+			note = "电脑端形态：entry（公网入口）—— 它不注册任何访客隧道代理，这两档都用不上。"
+				+ "请到电脑端「设置 → 插件 → DSH Remote → 隧道形态」改成 xtcp（可打洞、失败自动回退）"
+				+ "或 stcp（只用中转），再重新扫码导入。";
+		} else if (!p2pOk) {
+			note = "电脑端形态：stcp —— 它只注册了中转代理、没有 P2P 代理，"
+				+ "「打洞优先」不成立，已固定为「只用中转」。";
+		} else if ("xtcp".equals(pc)) {
+			note = "电脑端形态：xtcp —— 同时注册了 P2P 与中转两条代理，两档都可用。";
+		} else if ("entry".equals(pc)) {
+			note = "电脑端形态：entry（公网入口）—— 两档都不适用（见上方说明）。";
+		} else {
+			note = "电脑端形态：未知（这个配置组是手工填的，不是扫码导入）—— 按 xtcp 处理，两档都可用；"
+				+ "连上之后诊断行会给出本次实际走的路径。";
+		}
+		if (strategyNote != null) strategyNote.setText(note);
+	}
+
+	/** T104：二选一按钮的选中态配色（与 styledButton 的 primary/secondary 同一套）。 */
+	private void applyChoiceStyle(Button button, boolean selected) {
+		float d = getResources().getDisplayMetrics().density;
+		GradientDrawable background = new GradientDrawable();
+		background.setCornerRadius(10 * d);
+		if (selected) {
+			background.setColor(0xFF1B66FF);
+			button.setTextColor(0xFFFFFFFF);
+		} else {
+			background.setColor(0xFFFFFFFF);
+			background.setStroke(Math.max(1, dp(1, d)), 0xFFD9DBE0);
+			button.setTextColor(0xFF1B1B1F);
+		}
+		button.setBackground(background);
+		button.setTag(selected ? "primary-button" : "secondary-button");
+	}
+
 	private ScrollView insetScroll(View child) {
 		ScrollView scroll = new ScrollView(this);
 		scroll.addView(child);
 		scroll.setBackgroundColor(0xFFF2F3F6);
 		scroll.setVisibility(View.GONE);
+		// ── T109（P1-1）：设置页必须**消费**触摸 ───────────────────────────────
+		// 改前这两个页面（homeScroll / setupScroll）都是 MATCH_PARENT 的 ScrollView，
+		// 自身不可点、内容又不滚动 ⇒ 落在"没有控件的地方"（标题、卡片间隙）的那次
+		// ACTION_DOWN 一路返回 false，ViewGroup 继续往下层兄弟派发 ⇒ 落到背后的 WebView
+		// （V1 实测：长按鲸鱼进设置页后，点标题处 = 背后鲸鱼位置，抽屉被 toggle
+		// expanded 0→1，设置页自己纹丝不动：scratch/v1/whale-tap-after.json）。
+		//
+		// 修法只加这一行：clickable 的 View 在 onTouchEvent 里对 ACTION_DOWN 返回 true
+		// ⇒ 这次手势被本 View 吃掉，不再回溯到兄弟节点。
+		// 为什么**不破坏**既有点击控件与滚动：
+		//   · 子 View 派发顺序在 ViewGroup.dispatchTouchEvent 里**先于**自身 onTouchEvent
+		//     （先给能接的 child，谁都不要才轮到自己）⇒ 按钮/输入框的点击一个字都不变；
+		//   · ScrollView 的滚动走 onInterceptTouchEvent + onTouchEvent 的既有路径，
+		//     与 clickable 无关（clickable 只决定"没人要时要不要自己吃掉"）。
+		scroll.setClickable(true);
 		scroll.setOnApplyWindowInsetsListener((view, insets) -> {
 			int top;
 			int bottom;
@@ -1120,15 +1268,16 @@ public class MainActivity extends Activity {
 			resumeSessionBtn.setVisibility(canResumeSession ? View.VISIBLE : View.GONE);
 		}
 		if (tvTunnelState != null && canResumeSession) {
-			// D6.1：由返回键进入设置时，返回键 = 退到后台（不回会话，否则死循环），
-			// 这时不能再承诺「系统返回键继续」——只承诺上方按钮。其余入口（通知动作 /
-			// 长按鲸鱼等）返回键确实回会话，原文案成立。
-			// T65：判据从 `settingsViaBackKey && isTabletClass()` 收窄为 `settingsViaBackKey`
-			// —— 置位点已放宽到任意档位（见字段注释），再加 isTabletClass() 会让手机档
-			// 重新落进「承诺系统返回键、实际退桌面」的旧坑，正是本任务要修的那条。
-			tvTunnelState.setText(settingsViaBackKey
-				? "隧道仍在运行。点上方「返回当前会话」继续，无需重新连接。"
-				: "隧道仍在运行。点上方「返回当前会话」或系统返回键继续，无需重新连接。");
+			// T102：文案**不再承诺系统返回键**。
+			//
+			// 改前这里按「本次是不是从返回键路径进来」的那个一次性标记分两支：返回键路径进来的
+			// 那一支只承诺上方按钮，其余入口那一支多承诺了一句「系统返回键也能继续」。T102 取消了
+			// 「返回键进设置页」，设置页只剩显式入口（平板长按品牌区 / 设置按钮 / 通知动作 /
+			// AppBridge.openSettings），而返回键语义与「本次怎么进来的」已经无关，再按入口分叉
+			// 就是**把行为差异写进文案**（历史上正是这条分歧导致 T48/T58/T59/T65 反复踩坑）。
+			// 因此收敛成**唯一一句**：只承诺上方按钮。少承诺不会误导（返回键在这里仍回会话，
+			// 见 handleAppBack() 的 HOME 分支），多承诺才会。
+			tvTunnelState.setText("隧道仍在运行。点上方「返回当前会话」继续，无需重新连接。");
 		}
 		if (homeScroll != null) homeScroll.setVisibility(View.VISIBLE);
 		if (setupScroll != null) setupScroll.setVisibility(View.GONE);
@@ -1170,7 +1319,39 @@ public class MainActivity extends Activity {
 		// 同样只读纯文本、同样不新增可点控件，formatUiDiag 的载荷契约一个字没动。
 		tvUiDiag.setText(base + "\n" + chooser + "\n" + PinnedFetch.statsSummary()
 			+ "\n" + StaticDiskCache.statsSummary()
-			+ "\n" + staticPassthroughSummary());
+			+ "\n" + staticPassthroughSummary()
+			+ "\n" + strategyDiagLine()
+			// T109：横幅删除后，连接态/探针节拍这一层的**唯一可见面**就是这一段。
+			// 同样只读纯文本、同样不新增可点控件。
+			+ "\n" + reconnectDiagLine());
+	}
+
+	/**
+	 * T104：诊断里那两行「打洞策略 / 本次实际路径」——用户要"能看出这次到底走了哪条"。
+	 *
+	 * <p>两个数据源，都不许编：
+	 * <ul>
+	 *   <li>第一段 = **配置真值**：当前生效配置组里那一档（经形态收敛后真正会写进 toml 的档），
+	 *       外加电脑端形态（导入链接里的 mode）。形态未知就写"未知"，不冒充 xtcp。</li>
+	 *   <li>第二段 = **实际路径真值**：{@link TunnelPath} 从 frpc 自己的日志里认出来的
+	 *       打洞成功 / 5s 超时回退中转；没有可辨识的判据就写「尚未判定」——
+	 *       **查不到可靠信号时只显示配置策略，绝不把配置当事实**。</li>
+	 * </ul>
+	 */
+	private String strategyDiagLine() {
+		ProfileStore.Profile active = ProfileStore.getActive(prefs());
+		String pc = active == null ? "" : VisitorConfig.normalizePcMode(active.pcMode);
+		String pcLabel = pc.length() > 0 ? pc : "未知";
+		String configLabel;
+		if (active == null) {
+			configLabel = "无配置组";
+		} else if (ProfileStore.tunnelUnavailable(active)) {
+			configLabel = "两项都不适用（电脑端是 entry 形态，没有访客代理）";
+		} else {
+			configLabel = TunnelPath.strategyLabel(ProfileStore.effectiveStrategy(active));
+		}
+		return "打洞策略（配置）：" + configLabel + " · 电脑端形态 " + pcLabel
+			+ "\n" + TunnelPath.summary();
 	}
 
 	/**
@@ -1271,9 +1452,6 @@ public class MainActivity extends Activity {
 	private void clearResumeSession() {
 		canResumeSession = false;
 		resumeUrl = "";
-		// 离开连接设置页的所有出口（返回会话、返回键退后台之外的重连、直连、showHome）
-		// 都经这里，顺带把「本次来自返回键路径」的一次性标记清掉，不留残值。
-		settingsViaBackKey = false;
 		if (resumeSessionBtn != null) resumeSessionBtn.setVisibility(View.GONE);
 	}
 
@@ -1337,6 +1515,10 @@ public class MainActivity extends Activity {
 			etTunnel.setText(ProfileStore.DEFAULT_TUNNEL_NAME);
 			etToken.setText("");
 			etSk.setText("");
+			// T104：新建配置组没有电脑端形态信息（手工填的）⇒ 形态未知，两档都摆出来，
+			// 默认打洞优先（与改前行为逐字一致）。
+			editingPcMode = "";
+			editingStrategy = VisitorConfig.STRATEGY_P2P;
 		} else {
 			editingProfileId = existing.id;
 			etName.setText(existing.name);
@@ -1346,7 +1528,11 @@ public class MainActivity extends Activity {
 				? ProfileStore.DEFAULT_TUNNEL_NAME : existing.tunnelName);
 			etToken.setText(existing.authToken);
 			etSk.setText(existing.secretKey);
+			editingPcMode = VisitorConfig.normalizePcMode(existing.pcMode);
+			editingStrategy = VisitorConfig.normalizeStrategy(existing.strategy);
 		}
+		// 渲染必须在表单值就位之后：可用性判据吃的是编辑中这一档的电脑端形态。
+		renderStrategyChoice();
 		if (homeScroll != null) homeScroll.setVisibility(View.GONE);
 		if (setupScroll != null) setupScroll.setVisibility(View.VISIBLE);
 		if (webView != null) webView.setVisibility(View.GONE);
@@ -1376,7 +1562,13 @@ public class MainActivity extends Activity {
 			return;
 		}
 		p.tunnelName = ProfileStore.normalizeTunnelName(tunnelRaw);
-		p.mode = ProfileStore.DEFAULT_MODE;
+		// T104：形态与策略一起落盘。
+		// mode 由**电脑端形态**决定（stcp 形态的电脑端只注册了 `<名>`(stcp) 一条代理，
+		// 访客也必须是 stcp 才连得上）；改前这里无条件写 DEFAULT_MODE，
+		// 会把扫码导入的 stcp 配置组在"编辑一次"之后改回 xtcp ⇒ 从此连不上。
+		p.mode = ProfileStore.modeForPcMode(editingPcMode);
+		p.pcMode = VisitorConfig.normalizePcMode(editingPcMode);
+		p.strategy = VisitorConfig.normalizeStrategy(editingStrategy);
 		if (TextUtils.isEmpty(p.name)) p.name = p.serverAddr;
 		if (!p.isValid()) {
 			Toast.makeText(this, "请填写完整：VPS 地址、控制端口、登录密钥、访客密钥", Toast.LENGTH_LONG).show();
@@ -1448,7 +1640,13 @@ public class MainActivity extends Activity {
 		p.serverPort = c.serverPort;
 		p.authToken = c.authToken;
 		p.secretKey = c.secretKey;
-		p.mode = ProfileStore.DEFAULT_MODE;
+		// T104：链接里的 mode 就是**电脑端形态**。stcp 形态下访客也必须用 stcp
+		// （否则会拿着 xtcp 访客去找一条不存在的 xtcp 代理）；entry/未知沿用历史 xtcp。
+		p.pcMode = VisitorConfig.normalizePcMode(c.pcMode);
+		p.mode = ProfileStore.modeForPcMode(p.pcMode);
+		// T104：新导入的配置组默认「打洞优先」（与改前行为逐字一致）；若电脑端是 stcp 形态，
+		// 编辑器/连接时的可用性矩阵会把它如实收敛成「只用中转」。
+		p.strategy = VisitorConfig.STRATEGY_P2P;
 		p.tunnelName = ProfileStore.normalizeTunnelName(c.serverName);
 		// T23-A：二维码里的网关自签指纹必须随配置组一起存下来。改前这里没拷，
 		// Profile 也没有该字段 ⇒ 指纹在导入那一刻就被丢弃，后续首连前的「预置指纹」
@@ -1545,8 +1743,13 @@ public class MainActivity extends Activity {
 			// server——启动改为手选后，换配置组连接是常规路径，错复用会连到旧 server。
 			String tunnelProfile = prefs().getString(ProfileStore.KEY_TUNNEL_PROFILE, "");
 			int savedPort = prefs().getInt(ProfileStore.KEY_BOUND_PORT, 0);
+			// T104：存活隧道还必须**同一档策略**才算能复用。"切了档但端口还活着"若照样复用，
+			// 用户会看到新选项被选中、实际跑的却还是旧档（frpc 的 toml 没换），切档名不副实。
+			// 策略不一致就当作"没有存活隧道"⇒ 重启隧道（与换配置组连接同一条路径）。
+			String tunnelStrategy = prefs().getString(ProfileStore.KEY_TUNNEL_STRATEGY, "");
+			boolean sameStrategy = cfg.effectiveStrategy().equals(tunnelStrategy);
 			int reusePort = 0;
-			if (profile.id.equals(tunnelProfile)) {
+			if (profile.id.equals(tunnelProfile) && sameStrategy) {
 				if (savedPort >= 1 && savedPort <= 65535 && isLocalPortOpen(savedPort)) reusePort = savedPort;
 				else if (isLocalPortOpen(ProfileStore.BIND_PORT)) reusePort = ProfileStore.BIND_PORT;
 			}
@@ -2034,7 +2237,31 @@ public class MainActivity extends Activity {
 	 * {@code /__dsh_remote__/*}（App 本地供给的 SW 脚本，不经网络）、
 	 * {@code /favicon.svg} 等其余路径（数量小、不在首屏关键路径上，交给浏览器侧缓存）。
 	 */
-	private static final String[] STATIC_CACHE_PREFIXES = {"/assets/", "/plugins/"};
+	private static final String STATIC_CACHE_ASSETS_PREFIX = "/assets/";
+
+	/**
+	 * T109：{@code /plugins/} 组合包的**精确**路径（{@code /plugins} 与 {@code /plugins/} 两种写法）。
+	 *
+	 * <p>改前这里是 {@code path.startsWith("/plugins/")} 的**前缀**匹配，而浏览器侧
+	 * {@code pwa.ts} 的白名单是同一条语义的**精确**匹配
+	 * （{@code FINGERPRINTED_PATH = /^\/plugins\/?$/}，T49 定下的）。前缀匹配让原生比 SW
+	 * 多吞了一整类路径：{@code /plugins/events}（SSE 长连接）也被判进白名单 ⇒
+	 * 打到 {@link PinnedFetch}（15s 读超时 / 45s 总预算，且**读满整体才返回**）⇒
+	 * 事件流永远回不来，用户体感"掉线后半天回不来"。收成精确路径后与 SW 判定重合，
+	 * 恢复「一侧判定 = 另一侧判定」这条既有不变量。
+	 */
+	private static final String STATIC_CACHE_PLUGIN_BUNDLE = "/plugins";
+
+	/**
+	 * T109：**流式 / SSE 端点**——永不接管。判据是路径，写在白名单之外，与
+	 * {@link #STATIC_CACHE_ASSETS_PREFIX} 同级生效（在 {@link #isStaticCachePath} 的第一行）。
+	 *
+	 * <p>为什么单独列：这类端点**语义上就是长连接**，接管的代价不是"慢一点"而是
+	 * "永远不回来"（{@link PinnedFetch} 读满整体才返回）。网关侧对应的排除见
+	 * {@code packages/gateway/src/proxy.ts:169}（{@code content-type} 含
+	 * {@code text/event-stream} 不压缩）。两处都是"按端点类别放行"，不是按路径前缀猜。
+	 */
+	private static final String[] STREAMING_PATHS = {"/plugins/events"};
 
 	/** 落盘目录名（相对 {@code getFilesDir()}）。 */
 	private static final String STATIC_CACHE_DIR = "static-cache";
@@ -2051,6 +2278,9 @@ public class MainActivity extends Activity {
 		new java.util.concurrent.atomic.AtomicInteger();
 	private final java.util.concurrent.atomic.AtomicInteger passthroughOrigin =
 		new java.util.concurrent.atomic.AtomicInteger();
+	/** T109：流式/SSE 放行计数（`/plugins/events` 或 `Accept: text/event-stream`）。 */
+	private final java.util.concurrent.atomic.AtomicInteger passthroughStream =
+		new java.util.concurrent.atomic.AtomicInteger();
 
 	private File staticCacheDir() {
 		if (staticCacheDir == null) {
@@ -2066,7 +2296,8 @@ public class MainActivity extends Activity {
 	private String staticPassthroughSummary() {
 		return "未拦 主文档 " + passthroughMainDoc.get() + " · /api " + passthroughApi.get()
 			+ " · 非白名单 " + passthroughOther.get() + " · 非GET " + passthroughNonGet.get()
-			+ " · 非本网关 " + passthroughOrigin.get();
+			+ " · 非本网关 " + passthroughOrigin.get()
+			+ " · SSE " + passthroughStream.get();
 	}
 
 	/**
@@ -2113,7 +2344,14 @@ public class MainActivity extends Activity {
 			passthroughApi.incrementAndGet();
 			return null;
 		}
-		// ⑤ 静态白名单（两个前缀）。
+		// ⑤ 静态白名单（{@code /assets/} 目录段 + 精确 {@code /plugins}）。
+		// T109：白名单**之前**先挡流式/SSE——路径名单（`/plugins/events`）与协议标记
+		// （Accept: text/event-stream）两条任一命中就放行。放行计数在
+		// passthroughStream 里单列，验收要能读到"SSE 一次都没被接管"。
+		if (isStreamingPath(path) || isEventStreamRequest(request)) {
+			passthroughStream.incrementAndGet();
+			return null;
+		}
 		if (!isStaticCachePath(path)) {
 			passthroughOther.incrementAndGet();
 			return null;
@@ -2142,12 +2380,64 @@ public class MainActivity extends Activity {
 		return webResourceResponse(r.contentType, r.cacheControl, r.body, true);
 	}
 
-	/** T65 静态白名单判定（两个前缀）。WebViewClient 与 ServiceWorkerClient 两条通道共用。 */
+	/**
+	 * T65 静态白名单判定（{@code /assets/} 目录段 + {@code /plugins} 组合包精确路径）。
+	 * WebViewClient 与 ServiceWorkerClient 两条通道共用。
+	 *
+	 * <p>T109 两处收紧（与浏览器侧 {@code pwa.ts} 同语义）：
+	 * <ol>
+	 *   <li>{@code /plugins/} 由**前缀**改**精确**（见 {@link #STATIC_CACHE_PLUGIN_BUNDLE}）；
+	 *   <li>流式端点（{@link #STREAMING_PATHS}）**先**被否掉——即使将来有人把它加回白名单，
+	 *       这一条也仍然成立（判据在函数第一行，不依赖白名单内容）。</li>
+	 * </ol>
+	 */
 	private static boolean isStaticCachePath(String path) {
-		for (String p : STATIC_CACHE_PREFIXES) {
-			if (path.startsWith(p)) return true;
+		if (path == null || path.isEmpty()) return false;
+		if (isStreamingPath(path)) return false;
+		if (path.startsWith(STATIC_CACHE_ASSETS_PREFIX)) return true;
+		return STATIC_CACHE_PLUGIN_BUNDLE.equals(path)
+			|| (STATIC_CACHE_PLUGIN_BUNDLE + "/").equals(path);
+	}
+
+	/**
+	 * T109：这条路径是不是**流式/SSE 端点**（长连接，接管即空等）。
+	 *
+	 * <p>纯函数、无 Android 依赖，由 {@code android/tests/T109StreamingPathTest.java} 逐条钉死；
+	 * 判定与 {@link #isStaticCachePath} 同源（同一份 {@link #STREAMING_PATHS}）。
+	 */
+	static boolean isStreamingPath(String path) {
+		if (path == null) return false;
+		for (String p : STREAMING_PATHS) {
+			if (p.equals(path)) return true;
 		}
 		return false;
+	}
+
+	/**
+	 * T109：请求头 {@code Accept} 里带 {@code text/event-stream} ⇒ 这是一次 SSE 请求，放行。
+	 *
+	 * <p>为什么路径判据之外还要这一条：{@code /plugins/events} 只是**当前**那一个端点，
+	 * 而 {@code Accept: text/event-stream} 是 SSE 的**协议级**标记（与网关侧
+	 * {@code proxy.ts} 认 {@code content-type: text/event-stream} 同一类判据）。
+	 * 将来上游换端点名，路径名单会漂，这一条不会。两条都只做**放行**，不做任何接管。
+	 */
+	private static boolean isEventStreamRequest(WebResourceRequest request) {
+		try {
+			Map<String, String> headers = request.getRequestHeaders();
+			if (headers == null) return false;
+			String accept = headers.get("Accept");
+			if (accept == null) {
+				for (Map.Entry<String, String> e : headers.entrySet()) {
+					if (e.getKey() != null && "accept".equalsIgnoreCase(e.getKey())) {
+						accept = e.getValue();
+						break;
+					}
+				}
+			}
+			return accept != null && accept.toLowerCase(Locale.US).contains("text/event-stream");
+		} catch (Exception ignored) {
+			return false;
+		}
 	}
 
 	/**
@@ -2329,7 +2619,10 @@ public class MainActivity extends Activity {
 				// openGateway→onPageStarted 的差值里。
 				// T90：**页面级**数据源随文档一起重置 —— 上一页 hook 推来的连接态一律不许
 				// 带到新文档（新文档的 hook 装好后会经 reportUiDiag 推一次当前状态）。
+				// T109：时刻戳同时清零（否则上一条推送的"新鲜度"会跨文档续命）。
 				hookConnState = null;
+				hookConnStateAt = 0L;
+				hookConnStateStaleLogged = false;
 				// T94：同理作废上一页采样到的页面底色——新文档首帧不该沿用旧页的颜色
 				//（新文档就绪后由轮询/enterSessionPage 重采）。
 				resetPageBackground();
@@ -2486,25 +2779,18 @@ public class MainActivity extends Activity {
 		});
 		rootLayout.addView(webView,
 			new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
-		installReconnectBanner();
+		// T109：`installReconnectBanner()` 已删——根布局里现在只有 WebView 一个子节点
+		// （homeScroll / setupScroll 那两个原生页是另外挂的、平时 GONE）。
 	}
 
-	/**
-	 * T78：把原生重连横幅挂进根布局。
-	 *
-	 * <p>挂在 WebView **之后**（同级、z 序在上）、{@code layout_gravity=top}：
-	 * 只叠与 WebView 无关的一条 View，页面侧零写入。初始 {@code GONE}——
-	 * 不显示时既不占位、也不参与触摸派发。
+	/*
+	 * T109：横幅的**显示层**整层删除（用户口径原话「把重连横幅去了吧，这样可以少一半的耗电」）。
+	 * 原来的「把原生重连横幅挂进根布局」那个安装方法、它的 inset 外边距方法、Bar 本体、
+	 * 出入场动画与 R.id.dshrReconnectBanner 一起没了。
+	 * 删掉之后 readSystemBarInsetsPx() 的调用者只剩平板让位那一处——取值本体一个字没动。
+	 * 喂给 StuckRescue 的采样（合并探针 + T108 自适应节拍）与状态呈现（设置页只读诊断行
+	 * reconnectDiagLine()）都不受影响；回归钉在 android/test-reconnect-banner.ps1 的 T109 臂里。
 	 */
-	private void installReconnectBanner() {
-		if (rootLayout == null || reconnectBanner != null) return;
-		ReconnectBanner.Bar bar = new ReconnectBanner.Bar(this);
-		bar.setId(R.id.dshrReconnectBanner);
-		rootLayout.addView(bar, new FrameLayout.LayoutParams(
-			FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP));
-		reconnectBanner = bar;
-		applyReconnectBannerInsets();
-	}
 
 	/**
 	 * T78：系统栏/挖孔/任务栏的逐方向并集（px）。与 T72 平板让位**同一份取值**。
@@ -2552,19 +2838,71 @@ public class MainActivity extends Activity {
 		return out;
 	}
 
-	/** T78：把系统栏 inset 作为外边距写给横幅 ⇒ 横幅顶边不低于系统栏底边（不压状态栏）。 */
-	private void applyReconnectBannerInsets() {
-		if (reconnectBanner == null) return;
-		int[] i = readSystemBarInsetsPx();
-		reconnectBanner.applySystemBarInsets(i[0], i[1], i[2], i[3]);
+	/**
+	 * T109：横幅的 inset 外边距随显示层一起删除。
+	 *
+	 * <p>删掉之后 {@link #readSystemBarInsetsPx()} 的调用者只剩平板让位那一处
+	 * ——**取值本体一个字没动**（T72/T79/T80 的「唯一写入口 + 调用链」结构照旧），
+	 * 只是它现在只服务一个消费者。{@code installImeInsetHandling} 里的
+	 * {@code applyReconnectBannerInsets()} 调用点也就地去掉了（见那里）。
+	 */
+
+	/**
+	 * T108：**快档窗口**长度。进入页面（onResume / 新文档提交）、收到 hook 的连接态推送、
+	 * 或探针自己看到「正在重连」时开一个；窗口内按 {@link ReconnectBanner#POLL_INTERVAL_MS}
+	 * （500ms）跑，窗口外按健康态兜底周期跑。
+	 */
+	private static final long PROBE_FAST_WINDOW_MS = 8000L;
+
+	/**
+	 * T108：**健康态兜底周期（有推送通道）**。手机档 hook 在连接态翻转时经
+	 * {@code setUiDiag} 推给原生（T90），翻转的时延由推送决定、不由周期决定 ⇒
+	 * 兜底周期只负责兜「推送链路本身坏了」这一类，可以慢到 5s。
+	 */
+	private static final long PROBE_IDLE_HOOK_MS = 5000L;
+
+	/**
+	 * T108：**健康态兜底周期（无推送通道）**。平板档 hook 严格 OFF、没有任何推送，
+	 * 真断线只能靠周期发现 ⇒ 这里**不能**降。取 1000ms 的账（与改前 500ms 对照）：
+	 * 断线到横幅的最坏时延 = 一拍发现（≤1000ms）+ 因为看到「正在重连」立刻切快档 ⇒
+	 * 第二拍 500ms 后凑满 SHOW_STREAK=2 ⇒ **≤1.5s**（改前 ≤1.0s，要求 ≤1.5–2s）。
+	 */
+	private static final long PROBE_IDLE_MS = 1000L;
+
+	/** T108：快档窗口截止时刻（0 = 不在窗口内）。 */
+	private long probeFastUntil = 0L;
+	/** T108：下一次把「配色采样」并进合并探针的时刻（0 = 下一拍就采）。 */
+	private long nextBgSampleAt = 0L;
+
+	/** T108：开（或延长）快档窗口。只增不减，幂等。 */
+	private void armProbeFastWindow(long ms) {
+		probeFastUntil = Math.max(probeFastUntil, System.currentTimeMillis() + ms);
 	}
 
-	/** T78：启动重连状态轮询（幂等）。 */
+	/**
+	 * T108：当前节拍周期。三个"快档"条件（任一成立就是 500ms）：
+	 * <ol>
+	 *   <li>在快档窗口内（刚进页面 / 刚收到推送 / 刚看到重连）；</li>
+	 *   <li>hook 说正在重连（手机档的推送通道）；</li>
+	 *   <li>横幅已经显示（断开态，与改前一样保持 500ms）。</li>
+	 * </ol>
+	 * 其余是健康态：有推送通道（手机档且 hook 至少上报过一次）走 5s 兜底，
+	 * 没有通道（平板档 / hook 没上报过）走 1s 兜底——见两个常量的账。
+	 */
+	private long probeIntervalMs() {
+		if (System.currentTimeMillis() < probeFastUntil) return ReconnectBanner.POLL_INTERVAL_MS;
+		if ("reconnecting".equals(freshHookConnState())) return ReconnectBanner.POLL_INTERVAL_MS;
+		if (reconnectDebounce.state() == ReconnectBanner.State.SHOWN) return ReconnectBanner.POLL_INTERVAL_MS;
+		return hookSelfHealLive() ? PROBE_IDLE_HOOK_MS : PROBE_IDLE_MS;
+	}
+
+	/** T78：启动重连状态轮询（幂等）。T108：回前台是一次"进入"，开快档窗口。 */
 	private void startReconnectPolling() {
 		if (rootLayout == null || destroyed || reconnectPolling) return;
 		reconnectPolling = true;
+		armProbeFastWindow(PROBE_FAST_WINDOW_MS);
 		rootLayout.removeCallbacks(reconnectPollTick);
-		rootLayout.postDelayed(reconnectPollTick, ReconnectBanner.POLL_INTERVAL_MS);
+		rootLayout.postDelayed(reconnectPollTick, probeIntervalMs());
 	}
 
 	/** T78：停止重连状态轮询（幂等）。 */
@@ -2576,13 +2914,16 @@ public class MainActivity extends Activity {
 	/**
 	 * T78：轮询节拍。守卫照抄既有会话页判据（{@code uiState == WEB && webView 可见}）：
 	 * 不满足即立即收起横幅并清零计数，不推进状态机。
+	 *
+	 * <p>T108：周期由 {@link #probeIntervalMs()} 动态给：健康态 1–5s 兜底，
+	 * 快档（刚进页面 / 收到推送 / 已判重连）500ms。
 	 */
 	private final Runnable reconnectPollTick = new Runnable() {
 		@Override
 		public void run() {
 			if (destroyed) return;
 			pollReconnectOnce();
-			if (reconnectPolling) rootLayout.postDelayed(this, ReconnectBanner.POLL_INTERVAL_MS);
+			if (reconnectPolling && rootLayout != null) rootLayout.postDelayed(this, probeIntervalMs());
 		}
 	};
 
@@ -2591,6 +2932,9 @@ public class MainActivity extends Activity {
 	 *
 	 * <p>T90：探针之外**再 OR 一路 hook 上报的状态**（见 {@link #hookConnState}）——
 	 * 左栏收起时 DOM 探针恒探不到，rail 下的唯一信号是 hook 那条 WebSocket 观测。
+	 *
+	 * <p>T108：配色到点的那些拍走 {@link #MERGED_PROBE_JS}（两条探针一次求值），
+	 * 没到点的那拍只送横幅探针（配置色那段的开销不白付）。
 	 */
 	private void pollReconnectOnce() {
 		if (destroyed) return;
@@ -2598,8 +2942,41 @@ public class MainActivity extends Activity {
 			hideReconnectBannerNow();
 			return;
 		}
+		long now = System.currentTimeMillis();
+		boolean wantBg = pageBgPolling && now >= nextBgSampleAt;
+		if (wantBg) nextBgSampleAt = now + PAGE_BG_POLL_INTERVAL_MS;
 		try {
-			webView.evaluateJavascript(ReconnectBanner.PROBE_JS, this::handleReconnectProbe);
+			if (wantBg) {
+				webView.evaluateJavascript(MERGED_PROBE_JS, this::handleMergedProbe);
+			} else {
+				webView.evaluateJavascript(ReconnectBanner.PROBE_JS, this::handleReconnectProbe);
+			}
+		} catch (Exception e) {
+			if (wantBg) handleMergedProbe(null);
+			else handleReconnectProbe(null);
+		}
+	}
+
+	/**
+	 * T108：拆合并探针的返回值。两半各自喂给**既有**消费函数（判据、抑制、防抖、
+	 * 自救、配色应用一个字都没动）：{@code b} 原样交给 {@link #handleReconnectProbe}，
+	 * {@code g} 交给 {@link #handlePageBackgroundResult}。
+	 *
+	 * <p>空值/异常：两半都按"读不到"处理（横幅记 UNKNOWN、配色保留上一次的值），
+	 * 与两条独立探针各自的失败语义逐字一致。
+	 */
+	private void handleMergedProbe(String value) {
+		if (destroyed) return;
+		if (value == null || value.isEmpty() || "null".equals(value)) {
+			handleReconnectProbe(null);
+			return;
+		}
+		try {
+			JSONObject o = new JSONObject(value);
+			JSONObject b = o.optJSONObject("b");
+			JSONObject g = o.optJSONObject("g");
+			handleReconnectProbe(b == null ? null : b.toString());
+			if (g != null) handlePageBackgroundResult(g.toString());
 		} catch (Exception e) {
 			handleReconnectProbe(null);
 		}
@@ -2621,14 +2998,61 @@ public class MainActivity extends Activity {
 				value -> {
 					if (destroyed) return;
 					hookConnState = normaliseWsState(normaliseJsonString(value));
+					// T109：补读同样是一次**推送**（只是请求-应答式），刷新新鲜度戳。
+					hookConnStateAt = System.currentTimeMillis();
 				});
 		} catch (Exception ignored) { /* 读不到就不投票 */ }
 	}
 
-	/** T78：立即收起横幅并把防抖清零（onPageCommitVisible / 退后台 / 离开会话页）。 */
+	/**
+	 * T108：hook 推来一次**连接态翻转**（手机档；平板档 hook 严格 OFF ⇒ 永不进这里）。
+	 *
+	 * <p>做三件**只增不减**的事，任何一个都不改变既有判据：
+	 * <ol>
+	 *   <li>开快档窗口 ⇒ 接下来 8s 按 500ms 跑（翻转的确认窗口最需要密采样）；</li>
+	 *   <li>把配色采样的欠账清零 ⇒ 下一拍顺路重采一次（页面侧主题收敛与连接态上报同源）；</li>
+	 *   <li>把那拍补到现在（{@code postDelayed(…, 0)}）——**不等兜底周期**，所以手机档的
+	 *       横幅时延 ≈ 推送时延 + SHOW_STREAK 的一拍，与改前（每 500ms 轮询）持平或更快。</li>
+	 * </ol>
+	 */
+	private void onHookConnStateFlip() {
+		if (destroyed) return;
+		armProbeFastWindow(PROBE_FAST_WINDOW_MS);
+		nextBgSampleAt = 0L;
+		if (!reconnectPolling || rootLayout == null) return;
+		rootLayout.removeCallbacks(reconnectPollTick);
+		rootLayout.postDelayed(reconnectPollTick, 0L);
+	}
+
+	/** T78：把防抖清零（onPageCommitVisible / 退后台 / 离开会话页）。T109：横幅显示层已删，只清状态。 */
 	private void hideReconnectBannerNow() {
 		reconnectDebounce.reset();
-		if (reconnectBanner != null) reconnectBanner.hideNow();
+	}
+
+	/**
+	 * T109：**新鲜**的 hook 连接态；陈旧（超过 {@link #HOOK_CONN_STATE_MAX_AGE_MS} 没收到
+	 * 新推送）一律当 {@code null}（= 不投票 = UNKNOWN）。
+	 *
+	 * <p>这是 {@link #hookConnState} 的**唯一读法**（投票与节拍都用它）。
+	 * 刻意**不**用在 {@link #hookSelfHealLive()} 里：那条问的是"桥/脚本到底装没装过"
+	 * （历史事实，不该被新鲜度抹掉），而这条问的是"此刻该不该按它投票"（时效）。
+	 * 两者混用会让健康态静默 20s 后误判成"hook 不在场" ⇒ 兜底探针从 5s 掉到 1s，
+	 * 正好与"去横幅省电"的目标相反。
+	 */
+	private String freshHookConnState() {
+		String value = hookConnState;
+		if (value == null) return null;
+		long at = hookConnStateAt;
+		if (at <= 0L) return null;
+		long age = System.currentTimeMillis() - at;
+		if (age <= HOOK_CONN_STATE_MAX_AGE_MS) return value;
+		if (!hookConnStateStaleLogged) {
+			hookConnStateStaleLogged = true;
+			Log.i("dshr-reconnect", "hookConnState 陈旧 age=" + age + "ms > "
+				+ HOOK_CONN_STATE_MAX_AGE_MS + "ms（值=" + value + "）⇒ 本轮起视为 UNKNOWN，"
+				+ "不再 OR 进判据；下一条推送到达即恢复");
+		}
+		return null;
 	}
 
 	/**
@@ -2837,22 +3261,22 @@ public class MainActivity extends Activity {
 	 * T78：消费一次探针结果。
 	 *
 	 * <p>{@code ok=0} / 空串 / {@code null} / 解析失败 ⇒ {@code UNKNOWN}（导航期静默，不累计）。
-	 * 探针为真时再看**官方状态元素是否已经真的可见且不与横幅重叠**——是则抑制横幅，
-	 * 同一条信息不显示两遍。
 	 *
 	 * <p>T90：观测值 = 探针结果 **OR** hook 上报的连接态（见下面那条判定）。
 	 * 平板档 hook 严格 OFF ⇒ {@code hookConnState} 恒 null ⇒ 这一路完全不投票，
 	 * 行为与 T90 之前逐字相同（平板仍是纯 DOM 探针）。
+	 *
+	 * <p><b>T109（去横幅）</b>：这里不再有任何 `show()/hide()` —— 横幅的显示层整层删除。
+	 * 保留的是"采样 + 判据 + 记账"：观测值仍喂 {@link ReconnectBanner.Debouncer}
+	 * （它现在只决定 T108 快档节拍与自救观测量），原始真相仍喂 {@link #runStuckRescue}。
+	 * 状态呈现改由设置页只读诊断行（{@link #reconnectDiagLine()}）负责。
 	 */
 	private void handleReconnectProbe(String value) {
-		if (destroyed || reconnectBanner == null) return;
+		if (destroyed) return;
 		ReconnectBanner.Observed observed = ReconnectBanner.Observed.UNKNOWN;
 		String detail = "";
-		// T96：**原始真相**（探针 re=1）单独留一份。它跟 observed 的差别只有一处、
-		// 但那一处正是平板档实测里踩到的坑：官方那条**已可见且不重叠 ⇒ 抑制横幅**时
-		// observed 被映射成 OK，可页面的真相仍然是"正在重连"（实测 logcat 同刻：
-		// `probe=OK SUPPRESS|src=1 …` + 页面 `data-phase="connecting"`）。
-		// 自救判定必须吃原始真相，否则平板档永远不动（这正是本轮要修的"没人踹"）。
+		// T96：**原始真相**（探针 re=1）单独留一份。自救判定必须吃它：
+		// 页面确实处于"正在重连"是事实，与"要不要给用户画一条横幅"是两件事。
 		boolean pageReconnecting = false;
 		if (value != null && !value.isEmpty() && !"null".equals(value)) {
 			try {
@@ -2862,10 +3286,17 @@ public class MainActivity extends Activity {
 						observed = ReconnectBanner.Observed.OK;
 					} else {
 						pageReconnecting = true;
-						detail = officialStatusDetail(o);
-						observed = detail.startsWith("SUPPRESS|")
-							? ReconnectBanner.Observed.OK
-							: ReconnectBanner.Observed.RECONNECTING;
+						// T109：T86 那套"官方那条与横幅带区重不重叠 ⇒ 要不要抑制"的几何判据
+						// 随横幅一起删除（没有横幅就没有"同一条信息画两遍"这回事）。
+						// 保留的 detail 仍带**匹配层**与元素矩形：它是设备侧"原生看到了什么"
+						// 的唯一原始证据，事后对账全靠它。
+						detail = "src=" + o.optInt("src", 0)
+							+ " css=[" + Math.round(o.optDouble("x", 0)) + ","
+							+ Math.round(o.optDouble("y", 0)) + ","
+							+ Math.round(o.optDouble("w", 0)) + ","
+							+ Math.round(o.optDouble("h", 0)) + "]"
+							+ " vp=" + o.optInt("vw", 0) + "x" + o.optInt("vh", 0);
+						observed = ReconnectBanner.Observed.RECONNECTING;
 					}
 				}
 			} catch (Exception e) {
@@ -2874,119 +3305,93 @@ public class MainActivity extends Activity {
 		}
 		// T90：**两路 OR** —— 数据源 = hook 上报的连接态 ∪ 现有 DOM 探针。
 		//   ① hook 说 reconnecting（且探针没这么说）⇒ 判重连。左栏收起（rail）时官方那条
-		//      指示器不渲染、探针恒 re=0，这是唯一能让横幅出现的通道；
-		//   ② 探针说 reconnecting ⇒ 照旧走它自己的抑制判定（几何 / tier 语义**未动**）；
-		//   ③ hook 说 ok / ok-recovered ⇒ **不覆盖**探针的结论（wide 下探针能用元素级几何
-		//      做抑制，比 hook 粗粒度状态更精确），也**不把 UNKNOWN 抬成 OK**
+		//      指示器不渲染、探针恒 re=0，这是唯一能用的一路；
+		//   ② 探针说 reconnecting ⇒ 照旧（几何抑制已随横幅删除，语义见上）；
+		//   ③ hook 说 ok / ok-recovered ⇒ **不覆盖**探针的结论，也**不把 UNKNOWN 抬成 OK**
 		//      （导航期静默不累计是既有语义，抬了就会把"连续为真/连续为假"跨页面累加）。
-		if (hookConnState != null && "reconnecting".equals(hookConnState)) {
+		//
+		// T109（S1）：`hookConnState` 那半句是**源码契约**要求的字面量（T90 的"必须 OR
+		// hook 这一路"），`freshHookConnState()` 那半句才是 T109 新加的**陈旧上界**：
+		// 两条必须同时成立才投票 —— 值还在，且最近 20s 内真的收到过推送。
+		// 只有前者 ⇒ 一次假 reconnecting 永久钉死（正是 T106 §S1 的静态审计结论）。
+		if ("reconnecting".equals(hookConnState) && "reconnecting".equals(freshHookConnState())) {
 			pageReconnecting = true;
 			if (observed != ReconnectBanner.Observed.RECONNECTING) {
 				observed = ReconnectBanner.Observed.RECONNECTING;
 				detail = (detail.isEmpty() ? "" : detail + " ") + "hook=reconnecting";
 			}
 		}
-		// T96：自救判定。吃**原始真相**；横幅的抑制语义一个字没动（observed 照旧走上面那套）。
-		// 放在防抖的早退**之前**：横幅该不该显示与"要不要踹一脚"是两件事。
+		// T108：探针自己看到「正在重连」⇒ 立刻切快档。兜底周期（1s / 5s）只负责"发现"，
+		// 一旦发现就回到 500ms，把 SHOW_STREAK=2 的第二拍缩短到 500ms ——
+		// 于是"发现并确认断开态"的时延 = 一拍兜底 + 一拍快档
+		// （平板档最坏 1.5s，见 PROBE_IDLE_MS 的账），而不是"两拍兜底"（2s 甚至 10s）。
+		if (pageReconnecting || observed == ReconnectBanner.Observed.RECONNECTING) {
+			armProbeFastWindow(PROBE_FAST_WINDOW_MS);
+		}
+		reconnectProbeCount += 1;
+		lastProbeObserved = observed;
+		// T96：自救判定。吃**原始真相**；放在防抖的早退**之前**：
+		// "要不要踹一脚"与"该不该画一条"是两件事（横幅已删，但这条纪律照旧）。
 		runStuckRescue(pageReconnecting, observed);
-		// 只在**日志去重键**变化时打一行，避免每 500ms 刷屏；这一行是设备侧"原生看到了什么"的唯一原始证据。
-		// T86：键里除了观测值，还含**抑制判定**与**匹配层** —— 否则「官方那条可见且不重叠 ⇒ 抑制」
-		// 这一步（observed 从 UNKNOWN/OK 到 OK 不变）在 logcat 里完全看不见，
-		// 事后无法区分"没匹配上"与"按设计抑制了"。
-		String key = probeLogKey(observed, detail);
+		// 只在**日志去重键**变化时打一行，避免每 500ms 刷屏；这一行是设备侧"原生看到了什么"的
+		// 唯一原始证据。T109：去重键 = 观测值 + 匹配层/几何，抑制那一维随横幅删除。
+		String key = observed.name() + "|" + detail;
 		if (!key.equals(lastProbeKey)) {
 			lastProbeKey = key;
 			Log.i("dshr-reconnect", "probe=" + observed + " " + detail);
 		}
-		if (!reconnectDebounce.feed(observed)) return;
-		if (reconnectDebounce.state() == ReconnectBanner.State.SHOWN) {
-			reconnectBanner.show();
-			Log.i("dshr-reconnect", "横幅显示（文案=" + ReconnectBanner.TEXT + "）");
-		} else {
-			reconnectBanner.hide();
-			Log.i("dshr-reconnect", "横幅隐藏");
-		}
+		// T109：只推进防抖状态机（`state()` 供 probeIntervalMs 快档与诊断行使用），
+		// 不再有任何与显示相关的动作。
+		reconnectDebounce.feed(observed);
 	}
 
 	/** T78/T86：上一次探针日志去重键，只为"变化时才打日志"。 */
 	private String lastProbeKey = "";
 
-	/**
-	 * T86：探针日志的去重键 = 观测值 + **抑制判定** + **匹配层**。
-	 *
-	 * <p>为什么不能只用观测值：抑制（{@code SUPPRESS|…}）会被映射成 {@code Observed.OK}，
-	 * 于是"官方那条本来就在视口里、横幅按设计让位"这一步的观测值跟前一次相同 ⇒ 不打日志 ⇒
-	 * 现场只剩"没有横幅"，分不清是**没匹配上**还是**按设计抑制**。
-	 *
-	 * @param detail {@code officialStatusDetail} 的返回值，形如 {@code "SHOW|src=1 css=[…]"}；无匹配时为 {@code ""}
-	 */
-	private static String probeLogKey(ReconnectBanner.Observed observed, String detail) {
-		if (detail == null || detail.isEmpty()) return observed.name();
-		int bar = detail.indexOf('|');
-		String verdict = bar < 0 ? detail : detail.substring(0, bar);
-		String src = "";
-		int at = detail.indexOf("src=");
-		if (at >= 0) {
-			int end = detail.indexOf(' ', at);
-			src = end < 0 ? detail.substring(at) : detail.substring(at, end);
-		}
-		return observed.name() + "|" + verdict + "|" + src;
-	}
+	/** T109：探针累计拍数（设置页诊断行展示，替代横幅成为"原生在采样"的证据）。 */
+	private int reconnectProbeCount = 0;
+	/** T109：最近一次探针观测值（设置页诊断行展示）。 */
+	private volatile ReconnectBanner.Observed lastProbeObserved = ReconnectBanner.Observed.UNKNOWN;
 
 	/**
-	 * T78：官方那条重连文案是不是已经"用户看得见"（在视口内）且不与横幅**带区**重叠。
+	 * T109：**设置页诊断行**里的"重连/探针"那一段——横幅删除后状态的唯一可见面。
 	 *
-	 * <p>⚠️ 只有 {@code getClientRects().length > 0} 是不够的：侧栏用 {@code left:-320px}
-	 * 收起时元素仍有布局盒、仍算"可见"（T68 §2.6 实测），但用户根本看不见。
-	 * 探针回的是 CSS 像素矩形，这里按 WebView **实际内容宽度 / CSS 视口宽度**换算成设备像素
-	 * （不用 density，缩放下才准），再与横幅在 rootLayout 里的矩形比对。
-	 *
-	 * <p><b>T86 缺口②</b>：比对对象从「横幅当前 rect」换成「横幅**将要占据的带区**」——
-	 * 横幅 {@code GONE} 时 {@code getWidth()/getHeight()} 恒 0，拿它判重叠恒为「不重叠」，
-	 * 于是只要探针能看见官方那条且在视口内就永远抑制，横幅**第一次显示不出来**（T83 §5 实测）。
-	 * 带区 = 系统栏 top inset 起的整幅宽度 × 横幅高度
-	 * （{@code ReconnectBanner.bandHeightPx}：已布局实高 &gt; 按内容测量 &gt; 40dp 兜底）。
-	 *
-	 * @return {@code "SUPPRESS|…"} 表示抑制横幅；{@code "SHOW|…"} 表示照常显示；
-	 *         后缀是原始判据（进 logcat，便于事后对账）
+	 * <p>四项各自对应一个可被追问的问题：
+	 * <ol>
+	 *   <li><b>hook 连接态</b>：页面侧 WebSocket 观测现在报什么（{@code null} = 未上报）；
+	 *       带 {@code (陈旧)} 后缀表示超过了 {@link #HOOK_CONN_STATE_MAX_AGE_MS} 没收到新推送
+	 *       ⇒ 已经不参与判据（S1 的上界可见化，不用翻 logcat）；</li>
+	 *   <li><b>上次断线</b>：复用 {@code formatUiDiag} 同一份 {@code lastDisconnectAt}；</li>
+	 *   <li><b>探针</b>：累计拍数 + 最近一次观测值 + 当前节拍（ms）——三者一起才能自证
+	 *       "T108 的合并探针还在跑、而且跑在正确的档位上"；</li>
+	 *   <li><b>快档</b>：还在快档窗口内与否（节拍的动态来源）。</li>
+	 * </ol>
+	 * 纯只读文本，不新增任何可点控件。
 	 */
-	private String officialStatusDetail(JSONObject o) {
-		if (webView == null || reconnectBanner == null) return "SHOW|no-webview";
-		int vw = o.optInt("vw", 0);
-		int vh = o.optInt("vh", 0);
-		int webW = webView.getWidth();
-		double cx = o.optDouble("x", 0);
-		double cy = o.optDouble("y", 0);
-		double cw = o.optDouble("w", 0);
-		double ch = o.optDouble("h", 0);
-		int[] ins = readSystemBarInsetsPx();
-		int bandLeft = ins[0];
-		int bandTop = ins[1];
-		int rootW = rootLayout != null ? rootLayout.getWidth() : 0;
-		int bandWidth = Math.max(0, (rootW > 0 ? rootW : webW) - ins[0] - ins[2]);
-		int bandHeight = ReconnectBanner.bandHeightPx(reconnectBanner.getHeight(),
-			reconnectBanner.measureContentHeight(),
-			Math.round(ReconnectBanner.BAND_FALLBACK_DP * getResources().getDisplayMetrics().density));
-		String raw = "src=" + o.optInt("src", 0)
-			+ " css=[" + Math.round(cx) + "," + Math.round(cy) + ","
-			+ Math.round(cw) + "," + Math.round(ch) + "] vp=" + vw + "x" + vh
-			+ " band=[" + bandLeft + "," + bandTop + "," + bandWidth + "," + bandHeight + "]";
-		if (vw <= 0 || vh <= 0 || webW <= 0) return "SHOW|" + raw + " reason=no-scale";
-		double scale = (double) webW / (double) vw;
-		int x = (int) Math.round(cx * scale);
-		int y = (int) Math.round(cy * scale);
-		int w = (int) Math.round(cw * scale);
-		int h = (int) Math.round(ch * scale);
-		boolean onScreen = ReconnectBanner.isOnScreen(
-			(int) Math.round(cx), (int) Math.round(cy), (int) Math.round(cw), (int) Math.round(ch), vw, vh);
-		// 页面内容原点 = WebView 在 rootLayout 里的左上角（T80 起让位走**外边距**，
-		// 已体现在 getLeft/getTop 里）+ 自身 padding（恒 0，保留表达式以兼容历史形态）。
-		int ox = webView.getLeft() + webView.getPaddingLeft() + x;
-		int oy = webView.getTop() + webView.getPaddingTop() + y;
-		boolean suppress = ReconnectBanner.shouldSuppress(onScreen, ox, oy, w, h,
-			bandLeft, bandTop, bandLeft + bandWidth, bandHeight);
-		return (suppress ? "SUPPRESS|" : "SHOW|") + raw + " device=[" + ox + "," + oy + "," + w + "," + h
-			+ "] onScreen=" + onScreen;
+	private String reconnectDiagLine() {
+		String raw = hookConnState;
+		String hook;
+		if (raw == null) {
+			hook = "未上报";
+		} else {
+			long age = hookConnStateAt <= 0L ? -1L : System.currentTimeMillis() - hookConnStateAt;
+			boolean stale = age < 0 || age > HOOK_CONN_STATE_MAX_AGE_MS;
+			hook = raw + (stale ? "（陈旧 " + (age < 0 ? "?" : (age / 1000) + "s") + " ⇒ 不投票）" : "");
+		}
+		String last = "无";
+		try {
+			JSONObject o = TextUtils.isEmpty(uiDiagRaw) ? null : new JSONObject(uiDiagRaw);
+			if (o != null) {
+				Object v = o.opt("lastDisconnectAt");
+				if (v instanceof Number && ((Number) v).longValue() > 0) last = "有";
+				else if (v instanceof String && !TextUtils.isEmpty((String) v)) last = (String) v;
+			}
+		} catch (Exception ignored) {
+		}
+		boolean fast = System.currentTimeMillis() < probeFastUntil;
+		return "重连探针：hook=" + hook + " · 上次断线 " + last
+			+ " · 拍数 " + reconnectProbeCount + " · 最近 " + lastProbeObserved
+			+ " · 节拍 " + probeIntervalMs() + "ms" + (fast ? "（快档窗口内）" : "");
 	}
 
 	/**
@@ -3001,8 +3406,7 @@ public class MainActivity extends Activity {
 			applyImeShift(imeBottomPx(insets));
 			// 平板档的让位量直接取系统栏/挖孔，导航模式与横竖屏变化都要跟上。
 			applyDeviceClassInsets();
-			// T78：横幅的四向外边距与上面同一份取值（旋转/任务栏显隐/挖孔变化一起跟上）。
-			applyReconnectBannerInsets();
+			// T109：横幅的 inset 外边距随显示层删除 ⇒ 这里不再需要「同一份取值喂第二处」。
 			// 导航模式 / 平板任务栏变化未必触发页面加载或焦点事件。
 			// 下一帧读取最新 root insets；IME 动画中不注入 JS，避免重排。
 			if (!imeAnimating && webView != null) {
@@ -3137,31 +3541,75 @@ public class MainActivity extends Activity {
 	}
 
 	/**
-	 * 把状态栏/导航栏 inset 换算成 CSS 像素写入页面（--dshr-inset-top / --dshr-inset-bottom）。
+	 * 把状态栏/导航栏 inset 换算成 CSS 像素写入页面（--dshr-inset-top / --dshr-inset-bottom，
+	 * T115 起再带上 --dshr-inset-left / -right）。
 	 * 远端 DSH 页面由注入的 mobile.js 消费，本地壳页面自带同名接收端。
 	 * 状态栏透明（edge-to-edge）后页面内容下移让出系统栏、背景延伸到栏后，
 	 * 状态栏颜色与页面一致，实现安卓默认沉浸效果。
 	 * 键盘用 translationY 抬起整页，WebView 高度不变，CSS 底 inset 始终按导航栏，
 	 * 不要随 IME 清零，否则会再触发一次页面重排。
+	 *
+	 * <p><b>T115：平板档的取值口径与 {@link #applyDeviceClassInsets()} **逐值同源**</b>
+	 * （都用 {@link #readSystemBarInsetsPx()} 的四向并集）。两个写点写同一个 API，口径不同
+	 * 就会变成「谁后跑谁赢」的竞态——实测抓到了：本方法的 statusBars 口径写 24px，
+	 * 而让位入口的并集口径写 36px，最终页面上剩下 24px（该 AVD 的 captionBar 是 72px 高，
+	 * statusBars 只有 48px，并集取 max ⇒ 36 CSS px）；若页面停在 24px，内容会压在
+	 * captionBar 那一层里。
+	 * 手机档口径**逐值不变**（statusBars / navigationBars / DisplayCutout），
+	 * 它的 --dshr-inset-* 行为已被真机取证，不动。
 	 */
 	private void applyInsetsToPage(WebView view) {
 		if (view == null) return;
 		WindowInsets insets = getWindow().getDecorView().getRootWindowInsets();
 		if (insets == null) return;
-		int topPx;
-		int bottomPx;
-		if (Build.VERSION.SDK_INT >= 30) {
-			topPx = insets.getInsets(WindowInsets.Type.statusBars()).top;
-			bottomPx = insets.getInsets(WindowInsets.Type.navigationBars()).bottom;
-		} else {
-			topPx = insets.getSystemWindowInsetTop();
-			bottomPx = insets.getStableInsetBottom();
-		}
 		float density = getResources().getDisplayMetrics().density;
-		int top = Math.round(topPx / density);
-		int bottom = Math.round(bottomPx / density);
+		int top;
+		int bottom;
+		int left;
+		int right;
+		if (isTabletClass()) {
+			int[] avoid = readSystemBarInsetsPx();
+			left = Math.round(avoid[0] / density);
+			top = Math.round(avoid[1] / density);
+			right = Math.round(avoid[2] / density);
+			bottom = Math.round(avoid[3] / density);
+		} else {
+			int topPx;
+			int bottomPx;
+			int leftPx = 0;
+			int rightPx = 0;
+			if (Build.VERSION.SDK_INT >= 30) {
+				topPx = insets.getInsets(WindowInsets.Type.statusBars()).top;
+				bottomPx = insets.getInsets(WindowInsets.Type.navigationBars()).bottom;
+			} else {
+				topPx = insets.getSystemWindowInsetTop();
+				bottomPx = insets.getStableInsetBottom();
+			}
+			if (Build.VERSION.SDK_INT >= 28) {
+				DisplayCutout cut = insets.getDisplayCutout();
+				if (cut != null) {
+					leftPx = cut.getSafeInsetLeft();
+					rightPx = cut.getSafeInsetRight();
+				}
+			}
+			top = Math.round(topPx / density);
+			bottom = Math.round(bottomPx / density);
+			left = Math.round(leftPx / density);
+			right = Math.round(rightPx / density);
+		}
+		writeInsetsToPage(view, top, bottom, left, right);
+	}
+
+	/**
+	 * 页面 inset 的**唯一写入口**（T115）：把四向（CSS px）交给页面。
+	 * 与 {@link #applyInsetsToPage(WebView)} 共用同一段 JS，两条来源（系统栏口径 /
+	 * 避让四向口径）写的是同一个 API，页面上不会出现两个写点打架。
+	 */
+	private void writeInsetsToPage(WebView view, int top, int bottom, int left, int right) {
+		if (view == null) return;
 		view.evaluateJavascript(
-			"(function(){var s=window.__dshRemoteInsets;if(s&&typeof s.set==='function')s.set(" + top + "," + bottom + ");})()",
+			"(function(){var s=window.__dshRemoteInsets;if(s&&typeof s.set==='function')s.set("
+				+ top + "," + bottom + "," + left + "," + right + ");})()",
 			null);
 	}
 
@@ -3248,45 +3696,56 @@ public class MainActivity extends Activity {
 	private int lastAvoidL = -1, lastAvoidT = -1, lastAvoidR = -1, lastAvoidB = -1;
 
 	/**
-	 * 平板档位的系统栏让位（契约 3.6 / 验收 G5）：用 WebView 的**布局盒**（外边距）收缩内容视口，
-	 * 官方布局拿到的是一个「本来就小一号」的视口——不写任何 DOM/CSS。
+	 * 平板档位的系统栏让位（契约 3.6 / 验收 G5）。
 	 *
-	 * <p><b>T80 起让位落「外边距」而不是「内边距」</b>：T79 在平板上抓到「原生账面 72/64 与
-	 * dumpsys 逐值一致、页面却仍压进导航栏带 16px」，T80 做了决定性实验
-	 * （把 top 让位从 72 放大到 372）：{@code webView.setPadding()} 让页面 {@code innerHeight}
-	 * 仍为整屏 800、目标元素矩形逐字节不变、两张截图互相关最佳位移 **0px**；
-	 * 而把同样的数字写到 WebView 的 {@code FrameLayout} 外边距上，
-	 * 视口立刻变成 {@code (1600−72−64)/2 = 732}、内容恰好下移 72px（再加 300 就下移 300px）。
-	 * 根因：内边距既不改 View 自身的测量尺寸、也不被 Chromium 用来推导渲染视口。
-	 * 详见 {@link #setWebViewInsetsBox(int, int, int, int)} 与 {@code scratch/t80/report.md}。
+	 * <p><b>T115（用户口径「系统栏走安卓原生透明 + 页面自己让位」）：让位改由页面自己做。</b>
+	 * 本方法仍是**唯一让位入口**（触发时机不变：setUiState / onResume / 系统栏变化 / 旋转折叠），
+	 * 但它现在做两件事，而且顺序有语义：
+	 * <ol>
+	 *   <li>{@link #setWebViewInsetsBox(int, int, int, int)} <b>恒写 0</b>：WebView 覆盖全窗，
+	 *       状态栏/导航栏后面显示的是**页面自己画的像素**，不再是父容器底色——
+	 *       这正是「平板两条带与页面有 6 级色差硬缝」的根治点（带 = 页面，不可能再有缝）。</li>
+	 *   <li>把四向（CSS px）写进页面 {@code --dshr-inset-*}，由 hook 的**平板作用域 CSS**
+	 *       让内容（不是背景）让开系统栏。</li>
+	 * </ol>
 	 *
-	 * <p>手机档位恒为 0 让位，现有 edge-to-edge + --dshr-inset-* 透传完全不变；
-	 * 本地壳页（uiState != WEB）自带同名 CSS 变量接收端，也不走这里，避免双重留白。
+	 * <p><b>为什么不再用外边距</b>：T80 的实验结论（外边距改 View 尺寸 ⇒ 页面视口真的收缩）
+	 * 依然成立，但它的**代价**在平板档是结构性的：WebView 一缩，系统栏后面那圈就只剩
+	 * 父容器底色一种颜色，而平板官方布局在贴边那一行本来就是**两色**
+	 * （左侧栏 {@code --dsw-specific-sidebar-fill} / 会话面板 {@code --dsw-alias-bg-base}）。
+	 * 单色带不可能同时对上两色 ⇒ 面板那一侧必留缝。T115 实测：2560 宽里 1919 px（75.0%）
+	 * 与页面差 ΔRGB=(6,5,4)。页面自己让位时带就是页面本身，ΔRGB=0 是构造性的。
+	 *
+	 * <p><b>手机档逐值不变</b>：那里本来就恒 0 让位 + {@code --dshr-inset-*} 透传，
+	 * 本方法只是把同一形态推广到平板档；本地壳页（uiState != WEB）不写页面，避免双重留白。
 	 */
 	private void applyDeviceClassInsets() {
 		if (webView == null) return;
+		// ① 让位恒落「页面自己」：WebView 四向外边距一律 0（全窗覆盖）。
+		setWebViewInsetsBox(0, 0, 0, 0);
 		boolean pad = isTabletClass() && uiState == UiState.WEB;
-		if (!pad) {
-			setWebViewInsetsBox(0, 0, 0, 0);
-			return;
-		}
+		if (!pad) return;
 		WindowInsets insets = getWindow().getDecorView().getRootWindowInsets();
-		if (insets == null) {
-			setWebViewInsetsBox(0, 0, 0, 0);
-			return;
-		}
-		// T78：取值本体抽到 readSystemBarInsetsPx()，与重连横幅的四向外边距同源。
-		// 语义与抽出来之前**逐值相同**（readSystemBarInsetsPx 的注释保留原 T72/T67 的逐方向并集依据）。
+		if (insets == null) return;
+		// T78：取值本体抽到 readSystemBarInsetsPx()（掩码含 systemBars|displayCutout|tappableElement，
+		// 任务栏报成 tappableElement 时也兜得住）。T115 起这四向不再进外边距，而是进页面。
 		int[] avoid = readSystemBarInsetsPx();
-		int left = avoid[0], top = avoid[1], right = avoid[2], bottom = avoid[3];
-		setWebViewInsetsBox(left, top, right, bottom);
+		float density = getResources().getDisplayMetrics().density;
+		int left = Math.round(avoid[0] / density);
+		int top = Math.round(avoid[1] / density);
+		int right = Math.round(avoid[2] / density);
+		int bottom = Math.round(avoid[3] / density);
+		// ② 内容让位交给页面：四向 CSS px 写进 --dshr-inset-*（同一个 API，与 applyInsetsToPage 同源）。
+		writeInsetsToPage(webView, top, bottom, left, right);
 		// T72：让位量本身**上 logcat**。T67 之所以只能做代码路径级证明、拿不到像素级证据，
 		// 根因就是 padding 算完就丢、谁也看不见：这行日志让"系统栏占位 vs 应用留白"在真机上
-		// 直接可对账（dshr-inset 标签）。只在平板会话档且四向变化时打，避免刷屏。
-		if (pad && (left != lastAvoidL || top != lastAvoidT || right != lastAvoidR || bottom != lastAvoidB)) {
+		// 直接可对账（dshr-inset 标签）。T115 起同时打「原生像素四向」与「页面 CSS 四向」
+		// 以及布局盒取值，谁在让位一眼可辨。只在平板会话档且四向变化时打，避免刷屏。
+		if (left != lastAvoidL || top != lastAvoidT || right != lastAvoidR || bottom != lastAvoidB) {
 			lastAvoidL = left; lastAvoidT = top; lastAvoidR = right; lastAvoidB = bottom;
-			Log.i("dshr-inset", "avoid l=" + left + " t=" + top + " r=" + right + " b=" + bottom
-				+ " tablet=" + isTabletClass() + " uiState=" + uiState);
+			Log.i("dshr-inset", "avoid(px) l=" + avoid[0] + " t=" + avoid[1] + " r=" + avoid[2] + " b=" + avoid[3]
+				+ " page(css) l=" + left + " t=" + top + " r=" + right + " b=" + bottom
+				+ " box=0,0,0,0 tablet=" + isTabletClass() + " uiState=" + uiState);
 		}
 	}
 
@@ -3301,6 +3760,13 @@ public class MainActivity extends Activity {
 	 *
 	 * <p><b>不能与 setPadding 同时写</b>：两者都生效的设备上会叠加成双倍留白；
 	 * 而 T80 已实测内边距既不改视口也不挪内容，留着只会误导下一个人。
+	 *
+	 * <p><b>T115：这个方法是「全窗覆盖」的写入口，当前唯一调用值就是 0,0,0,0。</b>
+	 * 平板档的让位已改由页面承担（见 {@link #applyDeviceClassInsets()}）——因为外边距方案
+	 * 的代价是系统栏后面只剩父容器一种底色，而平板官方布局贴边那一行本来是两色，
+	 * 单色带必然留缝。本方法保留下来是因为它仍是**唯一**能改 WebView 布局盒的地方：
+	 * 换设备档位（平板↔手机、折叠展开、旋转）时必须有一条确定性的路径把外边距收回 0，
+	 * 否则上一次让位会残留在新档位上。
 	 *
 	 * <p>幂等：四向未变时直接返回，不触发多余的 {@code requestLayout()}
 	 * （{@code rootLayout} 上挂着 GlobalLayout 监听做 IME 兜底，无谓重排会把它拖成自激）。
@@ -3581,8 +4047,40 @@ public class MainActivity extends Activity {
 		+ "return {t:t,b:bo,d:!!(document.body&&document.body.hasAttribute('data-ds-dark-theme'))};"
 		+ "}catch(x){return {};}})()";
 
-	/** T94：轮询间隔。主题可能在页面里随时被改（官方设置面板手选浅色/深色）⇒ 只能定期只读重采。 */
-	private static final long PAGE_BG_POLL_INTERVAL_MS = 1500L;
+	/**
+	 * T108：**合并探针**——一次 {@code evaluateJavascript} 同时取回横幅判据与页面配色。
+	 *
+	 * <p>为什么能合并：两条探针本来就是**同源同只读**的两个 IIFE（各自返回一个对象），
+	 * 这里只在外面套一层壳、把两个返回值装进 {@code {b:…,g:…}}，**没有复制任何判据**
+	 * （{@code ReconnectBanner.PROBE_JS} 与 {@link #PAGE_BG_PROBE_JS} 仍是唯一真相源）。
+	 * 收益：需要采样配色的那一拍从 **2 次跨进程求值压成 1 次**（改前是两条独立定时器：
+	 * 横幅 500ms + 配色 1500ms ⇒ 每秒 2.67 次求值）。
+	 *
+	 * <p>⚠️ **声明位置必须在 {@link #PAGE_BG_PROBE_JS} 之后**：用简单名引用"文本上更晚声明的
+	 * static final 字段"属于 JLS 8.3.3 的 illegal forward reference，编译直接报
+	 * {@code 错误: 非法的前向引用}（本轮实测踩到，见 report §4.0）。所以这个常量放在这里，
+	 * 紧跟 {@code PAGE_BG_PROBE_JS}。
+	 */
+	private static final String MERGED_PROBE_JS =
+		"(function(){try{var b=" + ReconnectBanner.PROBE_JS + ";var g=" + PAGE_BG_PROBE_JS
+			+ ";return {b:b,g:g};}catch(e){return {b:{ok:0}};}})()";
+
+	/**
+	 * T94：轮询间隔。主题可能在页面里随时被改（官方设置面板手选浅色/深色）⇒ 只能定期只读重采。
+	 *
+	 * <p><b>T108：从「1.5s 常开轮询」改成「事件驱动优先 + 低频兜底」</b>。三个**事件**入口
+	 * 直接把 {@code nextBgSampleAt} 清零 ⇒ 下一拍立刻重采（不必等兜底周期）：
+	 * <ol>
+	 *   <li>{@code onResume}（回前台，用户可能在后台改过主题/系统深浅色）；</li>
+	 *   <li>{@code onPageCommitVisible}（新文档，首帧底色就该是新的）；</li>
+	 *   <li>hook 的连接态推送（同一份 {@code setUiDiag} 载荷里带着页面侧主题收敛的结果）；</li>
+	 * </ol>
+	 * 兜底周期取 {@code 3000ms}：它在**快档（500ms）**下是每 6 拍采一次、在**平板兜底（1000ms）**
+	 * 下是每 3 拍采一次，两种节奏下都比改前的 1.5s 密（旧值 1500ms 在 500ms 拍上根本不是整数倍，
+	 * 与横幅探针各跑各的 ⇒ 每秒 2.67 次跨进程求值）。主题跟随的最坏时延因此从 1.5s 放宽到
+	 * {@code 3000ms + 一拍}（实测真值见 scratch/t108/report.md §4.2），事件路径仍是即时。
+	 */
+	private static final long PAGE_BG_POLL_INTERVAL_MS = 3000L;
 
 	/** T94：读一次页面背景色。只读、幂等、失败静默。 */
 	private void requestPageBackground() {
@@ -3644,34 +4142,30 @@ public class MainActivity extends Activity {
 		return dark ? 0xFF141414 : Color.WHITE;
 	}
 
-	/** T94：启动页面背景轮询（幂等）。与重连轮询同一套生命周期（onResume 起 / onPause 停）。 */
+	/**
+	 * T94：启动页面背景采样（幂等）。T108：不再自带定时器——它只置一个"该采"的闸，
+	 * 真正的采样由重连探针那一拍顺路合并（见 {@link #MERGED_PROBE_JS}），
+	 * 于是**每秒跨进程求值次数**由两条定时器并成一条。
+	 *
+	 * <p>生命周期与改前逐字相同：{@code onResume} 起 / {@code onPause} 停
+	 * （T94ImmersiveTest 的源码契约钉的就是这两个入口的调用点）。
+	 */
 	private void startPageBgPolling() {
 		if (rootLayout == null || destroyed || pageBgPolling) return;
 		pageBgPolling = true;
-		rootLayout.removeCallbacks(pageBgPollTick);
-		rootLayout.postDelayed(pageBgPollTick, PAGE_BG_POLL_INTERVAL_MS);
+		nextBgSampleAt = 0L;   // 起的那一刻就欠一拍，合并探针下一拍立刻带上配色
 	}
 
-	/** T94：停止页面背景轮询（幂等）。 */
+	/** T94：停止页面背景采样（幂等）。T108：只落闸，没有定时器要停。 */
 	private void stopPageBgPolling() {
 		pageBgPolling = false;
-		if (rootLayout != null) rootLayout.removeCallbacks(pageBgPollTick);
 	}
-
-	/** T94：轮询节拍。守卫与重连轮询一致（WEB 且 WebView 可见），否则静默不读。 */
-	private final Runnable pageBgPollTick = new Runnable() {
-		@Override
-		public void run() {
-			if (destroyed) return;
-			requestPageBackground();
-			if (pageBgPolling && rootLayout != null) rootLayout.postDelayed(this, PAGE_BG_POLL_INTERVAL_MS);
-		}
-	};
 
 	/** T94：换了文档就作废上一页取到的颜色（一次导航的首帧不该沿用旧页底色）。 */
 	private void resetPageBackground() {
 		pageBgTop = PAGE_BG_NONE;
 		pageBgBottom = PAGE_BG_NONE;
+		nextBgSampleAt = 0L;   // T108：新文档 ⇒ 下一拍立刻重采（首帧底色必须对）
 	}
 
 	private void applySystemBars() {
@@ -3705,6 +4199,11 @@ public class MainActivity extends Activity {
 		// T94：取到页面真实底色后，底部这条也用页面色（= 页面自己画在那里的颜色）；
 		// 取不到时逐值退回改动前的「沉浸则透明 / 否则实色」。
 		int nav = sampled ? pageBgBottom : (edge ? Color.TRANSPARENT : (dark ? 0xFF141414 : Color.WHITE));
+		// T115：平板会话档让位已改由页面自己承担（WebView 覆盖全窗）⇒ 状态栏/导航栏交还给
+		// 页面自己的像素，原生两条栏**真的透明**（用户口径「系统栏改走安卓原生透明」）。
+		// 这里是显式覆盖而不是改写上面那两条取值式：T94 的「三条一致」契约在手机档与
+		// 本地壳页仍然逐字保留（那边页面本来就不覆盖系统栏区，靠取色对齐）。
+		if (tabletSession) nav = Color.TRANSPARENT;
 		WindowManager.LayoutParams attrs = getWindow().getAttributes();
 		View decor = getWindow().getDecorView();
 		int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
@@ -3735,6 +4234,9 @@ public class MainActivity extends Activity {
 		}
 		getWindow().setNavigationBarColor(nav);
 		if (Build.VERSION.SDK_INT >= 28) getWindow().setNavigationBarDividerColor(nav);
+		// T115：平板会话档两条栏一律透明（页面自己画到栏后，原生不得再盖一层不透明色）。
+		// 放在 if/else 之后覆盖两条分支，避免改写 T94 断言钉住的那两条取值式。
+		if (tabletSession) getWindow().setStatusBarColor(Color.TRANSPARENT);
 		getWindow().setAttributes(attrs);
 		decor.setSystemUiVisibility(flags);
 		if (Build.VERSION.SDK_INT >= 30) {
@@ -3804,6 +4306,9 @@ public class MainActivity extends Activity {
 		hideSettings();
 		setUiState(UiState.WEB);
 		applySystemBars();
+		// T108：进会话是"一次进入"——开快档窗口（进会话后前 8s 按 500ms 跑，
+		// 保证「刚进页面就断」这一档与改前同速发现），并欠一次配色采样。
+		armProbeFastWindow(PROBE_FAST_WINDOW_MS);
 		// T94：进会话立刻只读采一次页面底色（否则首帧会先用退回色，等下一次轮询才纠正）。
 		requestPageBackground();
 		if (webView != null && webView.getVisibility() != View.VISIBLE) {
@@ -3930,17 +4435,70 @@ public class MainActivity extends Activity {
 		}
 	}
 
+	/**
+	 * 「这个 URI 是不是**当前网关自己**」——只按 **主机 + 端口 + 同族协议** 判。
+	 *
+	 * <p><b>T109（P0-3·发布阻塞）</b>：改前这一行的协议判定是
+	 * {@code "http".equals(scheme) || "https".equals(scheme)}，于是 {@code wss://} 恒 false。
+	 * {@link #handleSslError} 的第一道闸就是 {@code !isActiveGatewayUri(...) ⇒ handler.cancel()}，
+	 * 而 WebSocket 的 TLS 握手错误**也**走 {@code onReceivedSslError}（{@code error.getUrl()}
+	 * 给的正是 {@code wss://…}）⇒ 每一次**冷**握手都被静默 cancel，只有 Chromium 复用
+	 * 一条已经建好的热 https 连接时才连得上。真机表现就是「换网/长时间空闲后 mux 连不上，
+	 * 而且毫无线索」（无日志、无弹窗）。
+	 *
+	 * <p><b>为什么只松协议这一维、不放松整体策略</b>：这条判定是**信任边界的门**——
+	 * 它决定「要不要用本网关的证书 pin / 要不要放行这个 TLS 错误」。放松主机或端口等于
+	 * 把任意第三方 origin 拉进 pin 语义（MITM 面直接打开）；放松协议的全部代价只是承认
+	 * 「{@code wss://host:port} 与 {@code https://host:port} 是同一个端点的两种传输形态」
+	 * ——RFC 6455 的 WebSocket 握手本来就是 HTTP/HTTPS 的升级（`Upgrade: websocket`），
+	 * 同一 host:port 上的 ws↔http / wss↔https 是**同一台服务器**，这不是新信任，是承认既有事实。
+	 * 因此这里只把「web 族」从 {http, https} 扩到 {http, https, ws, wss}，
+	 * 且**要求两端安全级别一致**（明文族 {http, ws} ↔ 加密族 {https, wss}）：
+	 * 明文 {@code ws://} 不会因为这条被当成 {@code https://} 网关的同一个端点。
+	 */
 	private boolean isActiveGatewayUri(Uri uri) {
 		if (TextUtils.isEmpty(activeUrl) || uri == null) return false;
 		try {
 			Uri base = Uri.parse(activeUrl);
 			String scheme = uri.getScheme();
-			boolean web = "http".equals(scheme) || "https".equals(scheme);
-			return web && TextUtils.equals(base.getHost(), uri.getHost())
+			return isGatewaySchemeFamily(scheme)
+				&& sameGatewaySecurityLevel(base.getScheme(), scheme)
+				&& TextUtils.equals(base.getHost(), uri.getHost())
 				&& effectivePort(base) == effectivePort(uri);
 		} catch (Exception ignored) {
 			return false;
 		}
+	}
+
+	/** T109：web 族协议（同一台服务器上的两种传输形态）。{@code null} 一律不是。 */
+	private static boolean isGatewaySchemeFamily(String scheme) {
+		return "http".equals(scheme) || "https".equals(scheme)
+			|| "ws".equals(scheme) || "wss".equals(scheme);
+	}
+
+	/** T109：加密族 = {https, wss}；明文族 = {http, ws}。跨族不算同一个端点。 */
+	private static boolean isSecureGatewayScheme(String scheme) {
+		return "https".equals(scheme) || "wss".equals(scheme);
+	}
+
+	/** T109：两端的**安全级别**必须一致（https↔wss 可以，http↔wss 不行）。 */
+	private static boolean sameGatewaySecurityLevel(String a, String b) {
+		return isGatewaySchemeFamily(a) && isGatewaySchemeFamily(b)
+			&& isSecureGatewayScheme(a) == isSecureGatewayScheme(b);
+	}
+
+	/**
+	 * T109：从 URL 里安全地取 scheme（只用于日志）。
+	 *
+	 * <p>为什么不直接用 {@code Uri.parse(url).getScheme()}：{@code handleSslError} 是
+	 * **异常路径**，日志本身绝不能再抛（抛了就把真正的失败原因盖掉了）。所以这里只做
+	 * 一次字符串切分：`scheme:` 之前那段，非法输入返回 {@code "-"}。
+	 */
+	private static String schemeOf(String url) {
+		if (TextUtils.isEmpty(url)) return "-";
+		int colon = url.indexOf(':');
+		if (colon <= 0) return "-";
+		return url.substring(0, colon).toLowerCase(Locale.US);
 	}
 
 	private boolean isActiveHttpsGatewayHost(String host) {
@@ -4107,7 +4665,10 @@ public class MainActivity extends Activity {
 
 	private static int effectivePort(Uri uri) {
 		if (uri.getPort() >= 0) return uri.getPort();
-		return "https".equals(uri.getScheme()) ? 443 : 80;
+		// T109：wss 与 https 同为 443、ws 与 http 同为 80（RFC 6455 §3：默认端口随底层传输）。
+		// 少了这半行，`wss://host/`（省略端口）会被算成 80 ⇒ 与 `https://host:443/` 的网关
+		// 判成两个端点，P0-3 那类"网关自己不算网关"的误判又会从另一条缝里钻回来。
+		return isSecureGatewayScheme(uri.getScheme()) ? 443 : 80;
 	}
 
 	private void showGatewayFailure(String message) {
@@ -4144,11 +4705,22 @@ public class MainActivity extends Activity {
 	 */
 	private void handleSslError(SslErrorHandler handler, SslError error) {
 		if (awaitingCertificateDecision) {
+			// T109：**每一次 cancel 都要留痕**。改前这里（以及下面"非网关 URI"那一支）
+			// 是完全静默的——现场只有"连不上"，连"谁把它取消了"都查不出来。
+			Log.w("dshr-ssl", "SslError cancel：上一次证书决定尚未落地（awaitingCertificateDecision）"
+				+ ", url=" + error.getUrl() + ", primaryError=" + error.getPrimaryError());
 			handler.cancel();
 			return;
 		}
 		String errorUrl = error.getUrl();
 		if (TextUtils.isEmpty(errorUrl) || !isActiveGatewayUri(Uri.parse(errorUrl))) {
+			// T109（P0-3 的诊断面）：这条路径改前是**纯静默 cancel**，于是
+			// 「wss:// 被误判成非网关 ⇒ WebSocket 冷握手被取消」在真机上没有任何线索。
+			// 现在把三件事一次说清：被判为非网关的 URL、当前网关 URL、底层错误码，
+			// 事后一条 logcat 就能区分「不是本网关（设计如此）」与「应该是本网关但判错了」。
+			Log.w("dshr-ssl", "SslError cancel：非当前网关 URI ⇒ 不 proceed"
+				+ ", url=" + errorUrl + ", active=" + activeUrl
+				+ ", primaryError=" + error.getPrimaryError());
 			handler.cancel();
 			return;
 		}
@@ -4199,6 +4771,16 @@ public class MainActivity extends Activity {
 				Log.i("dshr-perf", "sslPinned t+"
 					+ (System.currentTimeMillis() - connectStartMs) + "ms host=" + key);
 			}
+			// T109（P0-3 的验收钩子）：放行也要留痕，且**必须带上 scheme**。
+			// 为什么非打不可：cancel 那两支现在都有日志了，可"放行"这一支原本一条都没有
+			// ⇒ 事后无法回答"WebSocket 的 wss 握手到底有没有走到这里"。P0-3 的因果链正是
+			// 「wss 到达 handleSslError → 被 isActiveGatewayUri 判成非网关 → cancel」，
+			// 有了这一行，设备侧一次冷握手就能直接对上：`scheme=wss` 出现即证明
+			// WS 的 TLS 握手确实走这条路径（改前它在下一行就被静默 cancel 掉了）。
+			Log.i("dshr-ssl", "SslError 放行：本网关 URI ⇒ proceed"
+				+ ", scheme=" + (TextUtils.isEmpty(errorUrl) ? "-" : schemeOf(errorUrl))
+				+ ", url=" + schemeOf(errorUrl) + "://" + base.getHost() + ":"
+				+ effectivePort(base) + " (pin=" + decision.source + ")");
 			handler.proceed();
 			return;
 		}
@@ -4780,15 +5362,10 @@ public class MainActivity extends Activity {
 		}
 		if (uiState == UiState.HOME) {
 			if (canResumeSession) {
-				// D6.1：只有「本次由返回键路径进入设置」才退后台；其余入口
-				// （通知动作 / 长按鲸鱼等）仍回会话。
-				// 读取即消费：退后台前清零，标记不会带到下一次进入。
-				// T65：去掉 `&& isTabletClass()`，两档同一判据（见 settingsViaBackKey 注释）。
-				if (settingsViaBackKey) {
-					settingsViaBackKey = false;
-					moveTaskToBack(true);
-					return;
-				}
+				// T102：设置页的返回键**只有一条** —— 回会话（隧道/页面都还在，不重连）。
+				// 改前这里先看 `settingsViaBackKey`：为 true（会话根按返回键进设置）就退到后台
+				// —— 那是为了防止「会话 ⇄ 设置」死循环。返回键已不再进设置页（见 finishWebBack()），
+				// 死循环的成因消失，这个判据与它的字段一并删除（无死代码残留）。
 				resumeSession();
 				return;
 			}
@@ -4800,16 +5377,16 @@ public class MainActivity extends Activity {
 			return;
 		}
 		if (uiState == UiState.WEB && webView != null && webView.getVisibility() == View.VISIBLE) {
-			// T99：**平板档一次返回直接进 App 连接设置页**（不再先关官方左抽屉）。
+			// T102：**返回键不再进 App 连接设置页**（两档一致）。
 			//
 			// 判据只问一件事：**除左抽屉之外**还有没有要收的东西（弹层 / 官方右栏）？
 			//   有 → 走既有桥（与手机档同一条通道，T43/T47「右栏打开态只关右栏」逐字保留）；
-			//   无 → 直接 finishWebBack()，**连桥都不调**，左抽屉一动不动。
+			//   无 → 直接 finishWebBack() ⇒ 会话根落到 moveTaskToBack(true) 退到后台。
 			//
-			// 为什么不改桥本身：桥在 hook 里（mobile-web.js，T97 正在改，本次一个字节都不能碰），
+			// 为什么不改桥本身：桥在 hook 里（mobile-web.js，并行任务正在改，本次一个字节都不能碰），
 			// 且桥的「关左抽屉」是**最后一个**分支（前面依次是 sheet / explorer / dialog / 右栏）。
 			// 所以"先确认前几个分支都没东西可关 ⇒ 跳过整次调用"与"调用后恰好只走到最后一个分支
-			// 再把它当作什么都没关"在语义上等价，而跳过的代价是**左抽屉保持展开**——正是本任务要的。
+			// 再把它当作什么都没关"在语义上等价，而跳过的代价是**左抽屉保持展开**。
 			if (isTabletClass()) {
 				webView.evaluateJavascript(TABLET_BACK_OVERLAY_PROBE_JS, value -> {
 					if (value != null && value.contains("none")) {
@@ -4829,18 +5406,18 @@ public class MainActivity extends Activity {
 	}
 
 	/**
-	 * 会话内返回：先关官方弹层/侧栏（由 JS 处理）；再仅在同一网关内 goBack。
-	 * 在会话根改为打开 App 连接设置（D6 ①，<b>两档一致</b>）；设置页再按一次才退到后台。
+	 * 会话内返回（**只剩一件事**）：先关官方弹层/侧栏（由 JS 处理，见
+	 * {@link #closeOverlaysThenFinish()}）；再仅在同一网关内 goBack；
+	 * 到会话根、且没有任何东西可收 ⇒ {@code moveTaskToBack(true)} **退到后台**。
 	 *
-	 * <p>T99 起，平板档的「先关侧栏」只剩**官方右栏**：左抽屉不再被返回键收起
-	 * （手机档左抽屉的既有行为未动，见 {@link #handleAppBack()}）。
-	 *	 * <p>T65：改前 {@code if (isTabletClass())} 把「打开连接设置」限死在平板档，
-	 * 手机档直接落到 {@code moveTaskToBack(true)} 退到桌面，与设置页文案承诺的
-	 * 「系统返回键继续」不一致（T48/T58/T59 三轮复现）。平板档判据本身一字未改。
+	 * <p><b>T102</b>：本方法末尾不再打开连接设置页（T65「手机档也进设置页」与
+	 * T99「平板档一次返回进设置页」两条都被本任务取消 —— 进设置页只保留显式入口）。
+	 * 历史演变：T43/T47 起会话根就是「先关右栏/弹层，没得关就退到后台」（**原始语义**）；
+	 * T65 改成手机档进设置页；T99 改成平板档也进设置页、且平板档此处不再收官方左抽屉。
+	 * 本任务把末尾那一跳改回退后台，另两条成果**都保留**（桥通道与「不看左抽屉」一字未动）。
 	 *
-	 * <p><b>T99</b>：本方法的职责边界收窄了一句 —— 平板档到达这里之前**不再**收官方左抽屉
-	 * （见 {@link #handleAppBack()} 的平板分支）。也就是说"到达本方法"在平板档现在是
-	 * **一次返回键**（左抽屉展开时也一样），手机档语义逐字不变。
+	 * <p>方法名保留 {@code finishWebBack}（历史名，改动面最小）：现在的含义是
+	 * 「会话内返回处理到底」——要么 goBack、要么退到后台。
 	 */
 	private void finishWebBack() {
 		if (uiState != UiState.WEB || webView == null || webView.getVisibility() != View.VISIBLE) {
@@ -4861,32 +5438,28 @@ public class MainActivity extends Activity {
 			webView.clearHistory();
 		}
 		// 走到这里就是「会话根」：上面已判定没有官方弹层要关（JS 回调没关掉任何东西）、
-		// 没有侧栏要收（同一个回调）、WebView 也没有同网关的上一页可回。
-		// D6 ①：不装移动 hook 的平板档页面上没有长按鲸鱼入口，这里是兜底；
-		// 改为打开连接设置页；再按一次由 handleAppBack() 的 HOME 分支决定
-		// （有活会话就回会话，没有才退到后台）。showConnectionSettings() 不杀隧道、
-		// 不丢 WebView 页面，设置页自身的返回行为一字未改。
+		// 没有侧栏要收（同一个回调，或平板档探针已确认无弹层）、WebView 也没有同网关的上一页可回。
 		//
-		// T65：这一段**不再按档位分叉**——手机档也走「打开连接设置」而不是退到桌面。
-		// 右栏打开态不受影响：sidebar 收掉时上面那个 JS 回调返回 true，
-		// finishWebBack() 根本不会被调用（T43/T47 已验证的语义原样保留）。
-		//
-		// 记下本次是「返回键路径」进来的：设置页的返回键据此退到后台（D6.1），
-		// 而不是走 HOME 分支回会话——那会变成会话⇄设置死循环。
-		// 若此时没有活会话（fromSession 为 false），showConnectionSettings() 内部的
-		// clearResumeSession() 会把标记清掉——那种情况返回键本就走 super.onBackPressed()。
-		settingsViaBackKey = true;
-		showConnectionSettings();
+		// T102：**退到后台**（任务仍在 Recents、隧道与进程都活着，与 CONNECTING 分支同一条既有路径），
+		// 不再跳去 App 连接设置页（改前末尾那句调用已整句删除）。
+		// 因此这里也不会再有「会话根 → 设置 → 返回 → 会话」的死循环，
+		// 那个一次性标记（settingsViaBackKey）已随本次改动删除。
+		// 右栏/弹层打开态不受影响：桥收掉了东西时回调返回 true，本方法根本不会被调用
+		// （T43/T47 已验证的语义原样保留）。
+		moveTaskToBack(true);
 	}
 
 	/**
-	 * T99：会话页返回键的「收弹层」通道 —— 就是 T43/T47 起就有的那条 hook 返回键桥。
+	 * T99 起：会话页返回键的「收弹层」通道 —— 就是 T43/T47 起就有的那条 hook 返回键桥。
 	 *
 	 * <p>抽成方法**只为复用**（手机档 / 平板档+有弹层两条路径同一条），JS 字面量**逐字节未改**
 	 * （`!value.contains("true")` 才继续走 {@link #finishWebBack()} 的判据也没动）。
 	 * 桥的收拢顺序：sheet → Explorer 详情 → 模态弹框 → 官方右栏 → **最后才**官方左抽屉；
 	 * 因此"桥返回 true"既可能是收了右栏（要留在会话页），也可能是收了左抽屉（T99 起平板档
 	 * 不该发生——平板档只在探针确认有非左抽屉弹层时才会调到这里）。
+	 *
+	 * <p>T102：本方法**一字未改**（收弹层语义保留）；变的只是它下游
+	 * {@link #finishWebBack()} 在"什么都没收到"时退后台，而不是进设置页。
 	 */
 	private void closeOverlaysThenFinish() {
 		if (webView == null) return;
@@ -4903,8 +5476,8 @@ public class MainActivity extends Activity {
 	 *
 	 * <p>返回三个取值（`evaluateJavascript` 回话是 JSON 字符串，故原生侧用 {@code contains} 判）：
 	 * <ul>
-	 *   <li>{@code none}：没有任何弹层/右栏要收 ⇒ 原生**不调桥**，直接进连接设置页
-	 *       （左抽屉保持展开，绝不会被当作"要收的东西"）。</li>
+	 *   <li>{@code none}：没有任何弹层/右栏要收 ⇒ 原生**不调桥**，直接 {@link #finishWebBack()}
+	 *       （T102 起落到「会话根 ⇒ 退后台」；左抽屉保持展开，绝不会被当作"要收的东西"）。</li>
 	 *   <li>{@code overlay}：有 sheet / Explorer 详情 / 模态弹框 / 官方右栏 ⇒ 调既有桥收它，
 	 *       仍在会话页（T43/T47 右栏语义原样保留）。</li>
 	 *   <li>{@code error}：探针自身异常 ⇒ 原生按"非 none"处理，退回既有桥（fail-safe）。</li>
@@ -4938,7 +5511,13 @@ public class MainActivity extends Activity {
 
 		@JavascriptInterface
 		public void setPageDark(boolean dark) {
-			runOnUiThread(() -> applyPageDark(dark));
+			runOnUiThread(() -> {
+				applyPageDark(dark);
+				// T108：页面侧主题**翻转**才会过桥（hook 的 syncPageTheme 自带 lastPageDark 去重）
+				// ⇒ 这是一条真正的事件源：立刻只读重采一次页面底色，**不等兜底周期**。
+				// 改前靠 1.5s 常开轮询发现，改后靠这条事件（兜底 3s 只兜"事件没来"的漏）。
+				requestPageBackground();
+			});
 		}
 
 		@JavascriptInterface
@@ -4963,7 +5542,25 @@ public class MainActivity extends Activity {
 			uiDiagRaw = json == null ? "" : json;
 			// T90：同一份载荷里的 wsState 还是**重连横幅的第二个数据源**（rail 下 DOM 探针
 			// 探不到任何东西时唯一能用的那条）。这里只做一次纯字符串解析，绝不抛。
+			String previousConnState = hookConnState;
 			hookConnState = parseUiDiagWsState(json);
+			// T109：**每一次推送都刷新时刻戳**（不只是翻转时）——陈旧上界判的是
+			// "推送链路还有没有在说话"，不是"状态有没有变"。健康态下 hook 也会按
+			// 兜底节拍重复上报同一状态，那些重复正是"链路还活着"的证据。
+			hookConnStateAt = System.currentTimeMillis();
+			if (hookConnState != null && !hookConnState.equals(previousConnState)) {
+				// 值真的换了 ⇒ 陈旧告警的"只报一次"闸复位，下一次陈旧还能报出来。
+				hookConnStateStaleLogged = false;
+			}
+			// T108：**推送即真相**——连接态真的翻转时（hook 侧按去抖键只在翻转时上报），
+			// 原生不再等下一拍兜底：立刻切快档 + 补办一拍，横幅时延由推送决定。
+			// 只在这个字段**真的变化**时才投递（同状态重复上报不会产生任何额外工作）。
+			if (hookConnState != null && !hookConnState.equals(previousConnState)) {
+				// ⚠️ 必须写成 lambda 而不是 `this::onHookConnStateFlip`：这里的 `this` 是
+				// 内部类 AppBridge（不是 MainActivity），方法引用会绑定错对象、编译直接报
+				// "方法引用无效"（本轮实测踩到，见 report §4.0 的构建自证）。
+				runOnUiThread(() -> onHookConnStateFlip());
+			}
 			// hook 侧已按**判重键**（JSON.stringify 去掉 ts）去抖：载荷带 Date.now()，
 			// 若拿整份 payload 判重则同状态永远不相等；去掉 ts 后状态未变就不重复过桥。
 			// 这里再加一层按**摘要**去重：即使 hook 侧判重键因故失效（例如旧版 hook

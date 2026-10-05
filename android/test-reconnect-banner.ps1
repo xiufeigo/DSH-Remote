@@ -1,7 +1,15 @@
-# T78：重连横幅状态机 / 判据 / 探针只读性的 JVM 行为测试（生产 ReconnectBanner，无模拟器）。
+# 重连状态探针 / 防抖状态机的 JVM 行为测试（生产 ReconnectBanner，无模拟器）。
 # 与 test-direct-nodes.ps1 同一套编译/运行方式：只用 android.jar 当编译期符号，
-# 逻辑全在纯 Java 部分（Debouncer / isOnScreen / shouldSuppress / bandHeightPx / PROBE_JS 常量），
-# 运行时不触达任何 Android stub 方法。
+# 逻辑全在纯 Java 部分（Debouncer / PROBE_JS 常量）。
+#
+# T109 起：**横幅显示层已删除**（用户口径「去了吧，少一半耗电」），因此这个脚本里
+# 与"画出来"有关的臂（isOnScreen / bandHeightPx / shouldSuppress / TEXT）一并删除，
+# 换来两臂 T109 判据臂（见文件末尾的「T109 臂 A/B」）：
+#   · 臂 A：静态白名单 + 流式/SSE 排除（把 MainActivity.isStaticCachePath /
+#     isStreamingPath 的方法体**原文**抠出来，javac 真编译真跑一张真值表）；
+#   · 臂 B：本网关 URI 判定（`isActiveGatewayUri` 及其四个 helper 同样原文抠出来真跑；
+#     P0-3 的 `wss` 视同 `https` 就在这一臂里逐条钉死）。
+# 采样那一侧（探针 + 防抖 + 喂 StuckRescue）**一个字未动**，仍是本脚本的既有臂。
 #
 # T86 加了两样东西：
 #   · 参数：hook 源（断言 7 逐字符比对）+ MainActivity 源（缺口② 的判据来源断言）；
@@ -35,6 +43,161 @@ Write-Host "== T96 卡住自救臂（StuckRescue，纯 Java，真跑时间线）
 & "$jdk/bin/java.exe" "-Dstdout.encoding=UTF-8" "-Dstderr.encoding=UTF-8" -cp "$out/classes;$platform" `
     top.d1studio.dshremote.StuckRescueTest "$main" "$src/StuckRescue.java"
 if ($LASTEXITCODE -ne 0) { throw 'StuckRescue tests failed' }
+
+# ── T109 臂 A/B：把 MainActivity 里两处**纯字符串判据**的方法体原文抠出来真编译真跑 ──
+#
+# 为什么必须有：T109 改的两处判据（`isStaticCachePath` 的白名单语义、`isActiveGatewayUri`
+# 的协议族）都是"删掉/改回一行就复现 P0/P1 级缺陷"的关键行。只做源码字符串断言钉不住
+# （T40 §8 M1/M2：删掉关键那一行，回归照样全绿）⇒ 沿用 T65/`test-device-class.mjs`
+# 那套「方法体原文 + 极简替身 + javac 真跑」，但放在回归清单里已有的这个脚本里，
+# 保证每次回归都会被执行。
+Write-Host "== T109 臂 A/B（MainActivity 判据真跑：静态白名单 / 本网关协议族）=="
+
+# 花括号配平取一段方法体（含签名）。T109 这两组方法体里没有 `{}` 出现在字符串/注释里，
+# 因此朴素计数即可 —— 若将来有人往里面加带花括号的字面量，这里会**大声抛错**而不是静默截断。
+function Get-JavaBlock([string]$src, [string]$signature) {
+	$at = $src.IndexOf($signature)
+	if ($at -lt 0) { throw "T109 臂：MainActivity 里找不到 $signature" }
+	$open = $src.IndexOf('{', $at + $signature.Length)
+	if ($open -lt 0) { throw "T109 臂：找不到方法体 $signature" }
+	$depth = 0
+	for ($i = $open; $i -lt $src.Length; $i++) {
+		$c = $src[$i]
+		if ($c -eq '{') { $depth++ }
+		elseif ($c -eq '}') {
+			$depth--
+			if ($depth -eq 0) { return $src.Substring($at, $i - $at + 1) }
+		}
+	}
+	throw "T109 臂：括号不配平 $signature"
+}
+
+# 取一条字段声明（从签名到第一个分号）。
+function Get-JavaDecl([string]$src, [string]$signature) {
+	$at = $src.IndexOf($signature)
+	if ($at -lt 0) { throw "T109 臂：MainActivity 里找不到 $signature" }
+	$end = $src.IndexOf(';', $at)
+	if ($end -lt 0) { throw "T109 臂：声明没有分号 $signature" }
+	return $src.Substring($at, $end - $at + 1)
+}
+
+$mainSrcText = [System.IO.File]::ReadAllText($main)
+$armDir = Join-Path $out 't109arm'
+New-Item -ItemType Directory -Force $armDir | Out-Null
+
+# ── 臂 A：静态白名单 + 流式/SSE 排除 ────────────────────────────────────────────
+$armA = @'
+package top.d1studio.dshremote;
+
+public class T109PathArm {
+__FIELDS__
+__METHODS__
+	private static int checks;
+	private static void check(boolean ok, String label) {
+		if (!ok) throw new AssertionError(label);
+		checks++;
+		System.out.println("ok " + label);
+	}
+
+	public static void main(String[] a) {
+		check(isStaticCachePath("/assets/index-abc123.js"), "真资源：/assets/ 目录段命中白名单");
+		check(isStaticCachePath("/assets/"), "目录段本体 /assets/ 也算命中（原语义保留）");
+		check(isStaticCachePath("/plugins/"), "组合包精确路径 /plugins/ 命中（与 pwa.ts 的 /^\\/plugins\\/?$/ 同语义）");
+		check(isStaticCachePath("/plugins"), "组合包精确路径 /plugins 命中（尾部斜杠可选，同 pwa.ts）");
+		check(!isStaticCachePath("/plugins/events"),
+			"SSE 端点 /plugins/events **不得**命中白名单（改前 startsWith(\"/plugins/\") 会命中 ⇒ 被 PinnedFetch 接管 ⇒ 空等 15s）");
+		check(!isStaticCachePath("/plugins/其他.js"),
+			"前缀匹配回归守卫：/plugins/ 下的其它路径不再被吞（改前 startsWith 会吞掉整棵子树）");
+		check(!isStaticCachePath("/plugins/events/extra"), "流式端点子树也不接管");
+		check(!isStaticCachePath("/pluginsX"), "同前缀不同段不命中（不是前缀匹配）");
+		check(!isStaticCachePath("/api/sessions"), "/api/* 仍放行（动态面）");
+		check(!isStaticCachePath("/"), "主文档仍放行");
+		check(!isStaticCachePath(""), "空路径放行");
+		check(!isStaticCachePath(null), "null 安全");
+		check(isStreamingPath("/plugins/events"), "流式名单里就是 /plugins/events");
+		check(!isStreamingPath("/plugins/"), "组合包本身不是流式端点");
+		System.out.println("T109 path arm passed: " + checks);
+	}
+}
+'@
+$armA = $armA.Replace('__FIELDS__', (
+	(Get-JavaDecl $mainSrcText 'private static final String STATIC_CACHE_ASSETS_PREFIX') + "`n" +
+	(Get-JavaDecl $mainSrcText 'private static final String STATIC_CACHE_PLUGIN_BUNDLE') + "`n" +
+	(Get-JavaDecl $mainSrcText 'private static final String[] STREAMING_PATHS')
+))
+$armA = $armA.Replace('__METHODS__', (
+	(Get-JavaBlock $mainSrcText 'private static boolean isStaticCachePath(') + "`n" +
+	(Get-JavaBlock $mainSrcText 'static boolean isStreamingPath(')
+))
+$armASrc = Join-Path $armDir 'T109PathArm.java'
+Set-Content -Path $armASrc -Value $armA -Encoding utf8NoBOM
+
+# ── 臂 B：本网关 URI 判定（P0-3：wss 必须视同 https） ──────────────────────────
+$armB = @'
+package top.d1studio.dshremote;
+
+import android.net.Uri;
+import android.text.TextUtils;
+
+public class T109GatewayUriArm {
+	private String activeUrl = "";
+__METHODS__
+	private static int checks;
+	private static void check(boolean ok, String label) {
+		if (!ok) throw new AssertionError(label);
+		checks++;
+		System.out.println("ok " + label);
+	}
+
+	public static void main(String[] a) {
+		T109GatewayUriArm t = new T109GatewayUriArm();
+		t.activeUrl = "https://127.0.0.1:19192/";
+		check(t.isActiveGatewayUri(Uri.parse("https://127.0.0.1:19192/api/x")), "同源 https 子资源 = 本网关");
+		check(t.isActiveGatewayUri(Uri.parse("wss://127.0.0.1:19192/mux")),
+			"P0-3：wss 视同 https ⇒ 同一 host:port 的 WebSocket 握手算本网关（改前恒 false ⇒ TLS 错误被静默 cancel）");
+		check(!t.isActiveGatewayUri(Uri.parse("ws://127.0.0.1:19192/mux")),
+			"明文 ws 不算 https 网关的同一个端点（安全级别必须一致）");
+		check(!t.isActiveGatewayUri(Uri.parse("wss://evil.example:19192/mux")), "wss 也不放松主机判定");
+		check(!t.isActiveGatewayUri(Uri.parse("https://evil.example:19192/api/x")), "https 主机不同仍不算");
+		check(!t.isActiveGatewayUri(Uri.parse("wss://127.0.0.1/mux")),
+			"省略端口的 wss 按 443 折叠 ⇒ 与 :19192 的网关不是同一端点（端口判定没被放松）");
+		check(!t.isActiveGatewayUri(Uri.parse("https://127.0.0.1/api/x")), "省略端口的 https 同理");
+		check(!t.isActiveGatewayUri(Uri.parse("ftp://127.0.0.1:19192/x")), "非 web 族协议一律不算");
+		check(!t.isActiveGatewayUri(Uri.parse("data:text/plain,hi")), "解析不出 scheme/host ⇒ false（不抛）");
+		t.activeUrl = "http://127.0.0.1:8080/";
+		check(t.isActiveGatewayUri(Uri.parse("http://127.0.0.1:8080/api/x")), "明文网关：http 命中");
+		check(t.isActiveGatewayUri(Uri.parse("ws://127.0.0.1:8080/mux")), "明文网关：ws 视同 http");
+		check(!t.isActiveGatewayUri(Uri.parse("wss://127.0.0.1:8080/mux")), "明文网关不接受加密族");
+		t.activeUrl = "";
+		check(!t.isActiveGatewayUri(Uri.parse("wss://127.0.0.1:19192/mux")), "没有当前网关时一律 false");
+		System.out.println("T109 gateway-uri arm passed: " + checks);
+	}
+}
+'@
+$armBMethods = (
+	(Get-JavaBlock $mainSrcText 'private boolean isActiveGatewayUri(Uri uri)').Replace(
+		'private boolean isActiveGatewayUri(', 'public boolean isActiveGatewayUri(') + "`n" +
+	(Get-JavaBlock $mainSrcText 'private static boolean isGatewaySchemeFamily(') + "`n" +
+	(Get-JavaBlock $mainSrcText 'private static boolean isSecureGatewayScheme(') + "`n" +
+	(Get-JavaBlock $mainSrcText 'private static boolean sameGatewaySecurityLevel(') + "`n" +
+	(Get-JavaBlock $mainSrcText 'private static int effectivePort(')
+)
+$armB = $armB.Replace('__METHODS__', $armBMethods)
+$armBSrc = Join-Path $armDir 'T109GatewayUriArm.java'
+Set-Content -Path $armBSrc -Value $armB -Encoding utf8NoBOM
+
+& "$jdk/bin/javac.exe" -encoding UTF-8 -nowarn -cp "$platform" -d "$armDir/classes" `
+	"$PSScriptRoot/tests/stubs/android/net/Uri.java" "$PSScriptRoot/tests/stubs/android/text/TextUtils.java" `
+	$armASrc $armBSrc
+if ($LASTEXITCODE -ne 0) { throw 'T109 臂 javac 失败' }
+# ⚠️ 类路径顺序：stub classes 目录**在** android.jar 之前
+# （android.jar 里的 android.net.Uri / android.text.TextUtils 全是 `throw new RuntimeException("Stub!")`）。
+& "$jdk/bin/java.exe" "-Dstdout.encoding=UTF-8" "-Dstderr.encoding=UTF-8" -cp "$armDir/classes;$platform" `
+	top.d1studio.dshremote.T109PathArm
+if ($LASTEXITCODE -ne 0) { throw 'T109 静态白名单臂失败' }
+& "$jdk/bin/java.exe" "-Dstdout.encoding=UTF-8" "-Dstderr.encoding=UTF-8" -cp "$armDir/classes;$platform" `
+	top.d1studio.dshremote.T109GatewayUriArm
+if ($LASTEXITCODE -ne 0) { throw 'T109 本网关 URI 臂失败' }
 
 # ── 臂②：真实 PROBE_JS 的 DOM 桩行为臂 ─────────────────────────────────────
 $node = (Get-Command node -ErrorAction SilentlyContinue)

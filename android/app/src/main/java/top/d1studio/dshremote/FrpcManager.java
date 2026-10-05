@@ -72,6 +72,10 @@ public class FrpcManager {
 			OutputStream os = new FileOutputStream(conf);
 			os.write(cfg.toToml().getBytes(StandardCharsets.UTF_8));
 			os.close();
+			// T104：本次 frpc 生效的打洞策略 + 路径判定归零。
+			// 必须在 exec 之前置位：下一行起的任意日志都归属这一次的档位，
+			// 否则"切档后的第一条日志"会被算到上一档的判定里（诊断行说谎）。
+			TunnelPath.reset(cfg.effectiveStrategy());
 
 			ProcessBuilder pb = new ProcessBuilder(binFile.getAbsolutePath(), "-c", conf.getAbsolutePath());
 			pb.redirectErrorStream(true);
@@ -95,6 +99,10 @@ public class FrpcManager {
 				boolean signaled = false;
 				while ((line = reader.readLine()) != null) {
 					log(line);
+					// T104：认"这次到底走了哪条路"的判据只可能是 frpc 自己的话
+					// （打洞成功 / 5s 超时回退），所以每一行都喂给判定器；
+					// 它只认那两条原文，其余行原样忽略，绝不放行任何连接。
+					TunnelPath.observe(line);
 					if (!signaled && TunnelReady.isReadyLine(line)) {
 						signaled = true;
 						log("frpc 就绪信号：" + TunnelReady.readyKeywordOf(line)
