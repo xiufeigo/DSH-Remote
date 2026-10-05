@@ -18,7 +18,7 @@
 | 直连模式 | 备用：WebView 直接打开 `https://VPS:8443`（entry 形态）或局域网地址 |
 | 配对 | 复用网关配对页（一次性码），设备 Token 落 WebView Cookie 长期有效 |
 | 移动界面 | 启动后先进入 DSH 风格移动壳；真实工作区和会话仍由已认证的 DSH Web 提供 |
-| 设备档位 | 按原生 `smallestScreenWidthDp` 分档：手机竖屏＝手机界面；平板/折叠屏展开＝官方 DSH 桌面界面且零痕迹；手机横屏＝官方桌面布局。见 [移动界面](#移动界面) |
+| 设备档位 | 按原生 `smallestScreenWidthDp` 分档：手机竖屏＝手机界面；平板/折叠屏展开＝官方 DSH 桌面界面（rc.2.8 起 hook **最小化**：不新增 DOM 节点/属性/类名/样式）；手机横屏＝官方桌面布局。见 [移动界面](#移动界面) |
 | 设置一致性 | 连接设置为卡片式（与电脑端插件面板观感对齐）；「隧道形态」（xtcp/stcp）与电脑端「设置 → 插件 → DSH Remote」同名同义，手动配置时两端可逐项对照 |
 
 ## 构建
@@ -29,7 +29,7 @@
 - Android SDK：build-tools **35.0.0** + platforms;**android-36**
 
 ```powershell
-powershell -File android\build.ps1
+pwsh -File android\build.ps1
 # 输出 android\dist\dsh-remote.apk（已签名，直接侧载）
 ```
 
@@ -80,7 +80,7 @@ powershell -File android\build.ps1
 DevTools，不必再靠无障碍树反推 DOM：
 
 ```powershell
-powershell -File android\build.ps1 -Debug      # 等价 $env:DSH_DEBUG=1
+pwsh -File android\build.ps1 -Debug      # 等价 $env:DSH_DEBUG=1
 # 输出 android\dist\dsh-remote-debug.apk（另存名，绝不覆盖发布产物）
 ```
 
@@ -88,7 +88,7 @@ powershell -File android\build.ps1 -Debug      # 等价 $env:DSH_DEBUG=1
 |---|---|---|
 | 产物名 | `dsh-remote.apk` | `dsh-remote-debug.apk` |
 | `aapt2 link` 参数 | 不传 `--debug-mode` | 传 `--debug-mode` |
-| versionName | `0.2.0-rc.2.7` | `0.2.0-rc.2.7+debug` |
+| versionName | `0.2.0-rc.2.8` | `0.2.0-rc.2.8+debug` |
 | manifest `android:debuggable` | **属性不存在** | `true` |
 | WebView DevTools | 关 | 按 `FLAG_DEBUGGABLE` 开 `setWebContentsDebuggingEnabled(true)` |
 
@@ -144,7 +144,7 @@ C 平板 852×883 / D 平板 1280×800（平板档对照实验）、E 运行中 
 
 | 项 | 实测结果 |
 |---|---|
-| 断言总数 | **158/158 通过，失败 0，跳过 0**（rc.2.6 批次终局，退出码 0；`断言合计 158：通过 158，失败 0，跳过 0`，台账 `scratch/lead-rc26-regression.log:19`。**rc.2.7 复跑同值：158/158、失败 0、跳过 0**，台账 `scratch/lead-rc27-regression.log:17`）。其中 **34 条**是 rc.2.6 新增的平板档系统栏避让（6 条源码契约 + 四方向重叠 + 键盘 not-in-mask）；**140 条是本批次中期快照**（T72 收口时），55 条基线曾**连跑 4 次全绿**、91 条为 rc.2.3 批次、106 条为 rc.2.5 批次 |
+| 断言总数 | **158/158 通过，失败 0，跳过 0**（rc.2.6 批次终局，退出码 0；`断言合计 158：通过 158，失败 0，跳过 0`，台账 `scratch/lead-rc26-regression.log:19`。**rc.2.7 复跑同值：158/158、失败 0、跳过 0**，台账 `scratch/lead-rc27-regression.log:17`；**rc.2.8 复跑同值**，台账 `scratch/t100/regression.log` 与 `scratch/lead-rc28-regression.log:19`）。其中 **34 条**是 rc.2.6 新增的平板档系统栏避让（6 条源码契约 + 四方向重叠 + 键盘 not-in-mask）；**140 条是本批次中期快照**（T72 收口时），55 条基线曾**连跑 4 次全绿**、91 条为 rc.2.3 批次、106 条为 rc.2.5 批次 |
 | 零痕迹 | 平板档 C/D 与切换后的 OFF 态：`<html>` 无 `data-dshr-*`、无 hook 根类（含 `dshr-official-inset`）、无 hook 创建的可见节点、官方节点上无 `data-dshr-*` 标记——全部通过 |
 | 平板档对照 | C（852×883）与 D（1280×800）两视口**逐项像素差全 0**：frame / 三列 / header / composerCard / composerSeat / rightbar / bodyScrollHeight / documentScrollWidth / documentClientWidth |
 | 运行中切换 | `__dshrSetDevice('tablet'\|'phone')` 立即生效；**同值重复调用幂等**（第二次返回 `false`）；切回后根类、标记与几何可逆 |
@@ -198,11 +198,19 @@ Chrome 时打印原因并以退出码 0 自动跳过，不算失败。运行时�
 ### JVM 单测（无需模拟器、无需设备）
 
 ```powershell
-powershell -File android\test-direct-nodes.ps1
+pwsh -File android\test-direct-nodes.ps1
 # Direct node tests passed: 20
 # CertPin tests passed: 32
 # TunnelReady tests passed: 25     ⇒ 合计 77 断言，EXIT=0
+
+pwsh -File android\test-immersive.ps1         # T94 系统栏沉浸契约（48 断言）
+pwsh -File android\test-reconnect-banner.ps1  # 重连横幅 122 + StuckRescue 79 + 探针 DOM 桩 32
+pwsh -File android\test-backkey.ps1           # 返回键探针 66 + DOM 桩 18
 ```
+
+> ⚠️ **调用纪律**：`android\test-*.ps1` **一律用 `pwsh -File`**。用 Windows PowerShell 5.1 会把
+> UTF-8 脚本按 ANSI 读 ⇒ 非 ASCII 字面量被破坏、传参变空（脚本会拿 `MainActivity` 当 hook 源）
+> ⇒ **假红**。证据：`scratch/t94/report.md` §6.2。
 
 沿用既有 stub 测试风格（`main()` + `check()` + **直接跑真实生产类**）。`CertPin` /
 `TunnelReady` 是刻意做成**零 Android 依赖**的纯函数类（连 `TextUtils` 都不用），因此可在
@@ -227,6 +235,7 @@ frpc 真实就绪关键字，并显式断言 `establishing nat hole…` 与 5 �
 |---|---|---|
 | `pnpm test:device`（`scripts/test-device-class.mjs`） | **真页面**设备档位回归，唯一跑真实 DSH 0.2.0-rc.2 页面 + **158** 条断言的那条（rc.2.6 起的终局口径） | 需本机 DSH 与网关 `127.0.0.1:18443` 都在跑 |
 | `android\test-direct-nodes.ps1` | **JVM 纯函数**单测（`CertPin` / `TunnelReady`），无需模拟器、无需设备、无需 DSH | 改证书锁定 / 就绪轮询逻辑后**先跑这个**，秒级 |
+| `android\test-immersive.ps1` · `android\test-reconnect-banner.ps1` · `android\test-backkey.ps1` | **JVM + DOM 桩契约**（T94 沉浸 48 / 横幅 122+79+32 / 返回键 66+18），无需设备 | 改系统栏配色 / `StuckRescue` / 返回键语义后跑；**必须 `pwsh -File`** |
 | `scratch/t47/harness.mjs` | **手势 / 键盘**专项验收台（44/44），右栏关闭手势与 `+` 布防的证据都出自这里 | 改 hook 手势后跑；它是取证台不是回归门 |
 | `scratch/t51/` · `scratch/t52/` | 键盘布防、假牙与修复的逐轮报告与日志 | 结论以报告为准，不以单次日志为准 |
 
@@ -252,8 +261,19 @@ frpc 真实就绪关键字，并显式断言 `establishing nat hole…` 与 5 �
 > test:session / test:client / test:desktop 10/10 / smoke 22 / smoke:edge 19 / ws-keepalive /
 > **test-resume-recovery 12/12** / **T47 验收台 44/44**）。受测 hook 为
 > `DD2FDD02…A15420`（292936B、CR=0），源与 `res/raw` 副本逐字节相同。
+>
+> **rc.2.8 总台账（本任务在**最终字节**上复跑，逐项 exit 0）**：`scratch/t100/regression.log`
+> —— **17 项全部 exit 0**：`typecheck` / `test:mobile` / **`test:device` 断言合计 158：通过 158、
+> 失败 0、跳过 0** / `test:fixes`(17/17) / `test:perf`(25/25) / `test:routes`(17/17) /
+> `test:session` / `test:client` / `test:desktop`(10/10) / `smoke` / `smoke:edge`(19/19) /
+> `ws-keepalive`(19/19) / `test-resume-recovery`(**12/12**) / `t47/harness.mjs`(**44/44**) /
+> `android\test-immersive.ps1`(**48**) / `android\test-reconnect-banner.ps1`(**122 + 79 + 32**) /
+> `android\test-backkey.ps1`(**66 + 18**)。受测 hook 为
+> `D4466D0D58B272877E7EDC7287F1C0E5D047642B214F5548AFEE0CAC8923B26A`（**317998 B、CR=0**），
+> 源 = `res/raw` 副本（= APK 内嵌，见下）。Lead 侧另有 `scratch/lead-rc28-regression.log`
+> （14 项 + T47 44/44，全 exit 0），两者结论一致。
 
-> **验收纪律（rc.2.6 两条 + rc.2.7 两条，都能把「环境问题」误读成「代码回归」）**：
+> **验收纪律（rc.2.6 两条 + rc.2.7 两条 + rc.2.8 三条，都能把「环境问题」误读成「代码回归」）**：
 > - **网关有 240 次/分、按 IP 共享的限流。** 本机同一 IP 上**并行**跑多个验收任务时会互相打点，
 >   被限流的那几项返回 429 ⇒ **该轮结果一律判无效（不是失败）**，退避后**单跑**重取。
 >   证据：`scratch/t63/report.md` §1.0(1)。
@@ -271,6 +291,16 @@ frpc 真实就绪关键字，并显式断言 `establishing nat hole…` 与 5 �
 >   而右栏面板只有「会话 + 工作区」齐了才挂载 ⇒ 面板整个不存在、右栏一条都量不到；chooser 里
 >   工作区列表又卡在 `Loading workspaces…`（经网关的查询不返回），**无法从 UI 恢复**。
 >   唯一稳定的复位手段是**冷启 App 并重走它自己的「连接」**。证据：`scratch/t85/report.md` §3.1（第三个坑）。
+> - **`android\test-*.ps1` 必须用 `pwsh -File` 跑**（rc.2.8）。**Windows PowerShell 5.1 把 UTF-8
+>   脚本读成 ANSI** ⇒ 非 ASCII 字面量被破坏、传参变空（脚本会拿 `MainActivity` 当 hook 源）⇒ **假红**。
+>   证据：`scratch/t94/report.md` §6.2。
+> - **`adb shell input swipe x y x y 700` 在这种 WebView 里一个触摸事件都不投递**（rc.2.8，
+>   页面侧计数 `events=[]`）⇒ **长按类验证必须用 CDP `Input.dispatchTouchEvent`**
+>   （长按 700ms 实测能弹出设置页）。证据：`scratch/t97/report.md` §11.1。
+> - **Java 桥属性是只读的**（rc.2.8）：JS 间谍替换 `DshRemoteApp.*` **静默失败**
+>   （`String(window.DshRemoteApp.openSettings)` 仍是 `"[native code]"`）⇒ 间谍会给出「恒 0」的
+>   **假绿**；判据只能看**原生 UI**（设置页有没有真的出现 / 有没有跳转）。
+>   证据：`scratch/t97/report.md` §4、§11.1、`scratch/t99/report.md` §1。
 
 ### 模拟器端到端
 
@@ -366,10 +396,16 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
   | 档位 | 竖屏 | 横屏 |
   |---|---|---|
   | `phone`（`sw < 600`） | **手机界面**（下列各项适配全部生效） | 官方 DSH 桌面布局（沿用 `dshr-official-inset` 让位） |
-  | `tablet`（`sw ≥ 600`，含折叠屏展开） | **与官方 DSH 桌面版一致的界面**：hook 关闭、零痕迹 | 同左（官方桌面界面） |
+  | `tablet`（`sw ≥ 600`，含折叠屏展开） | **与官方 DSH 桌面版一致的界面**：hook **最小化**（rc.2.8 起契约变更，见下）、不新增任何 DOM 节点/属性/类名/样式 | 同左（官方桌面界面） |
 
   - **判定源唯一**是原生 `smallestScreenWidthDp`；**JS 不得用视口宽度反推档位**（部分机型 layout viewport 虚高，WEB-02 既有结论）。原生在注入 `mobile.js` **之前**把档位写进 `window.__DSHR_MOBILE__.device`（`phone` / `tablet` / `auto`），hook 只消费该值。
   - **平板档零痕迹**：`<html>` 上无 `data-dshr-*` 属性、无 hook 根类（含 `dshr-official-inset`），页面上无 hook 创建的可见节点（悬浮鲸鱼、drag handle、抽屉遮罩、状态栏挡板）。
+  - 🔴 **契约变更（rc.2.8，T97，用户明确授权）**：平板档由「hook **严格 OFF** / 零痕迹」改为
+    **「允许最小 hook，但不得新增 DOM 节点 / 属性 / 类名 / 样式」**。触发变更的是平板档
+    长按品牌区呼出连接设置页——那个手势只能由页面侧监听，原生接不到。**新判据**：
+    常态只有 **1 个 `touchstart` 监听器**（`{passive:true,capture:true}`），DOM 与全局**零新增**
+    （同机同态 base 与最终 APK 的 `outerHTML` **逐字节相同**；浏览器侧同页面只换 hook 源码
+    全量 DOM 相等）。证据：`scratch/t97/report.md` §1、§6.1–§6.3。
   - **平板档的系统栏让位由原生做**：原生按状态栏 / 导航栏 / 挖孔收缩 WebView 自身 padding，官方布局拿到的是一个「本来就小一号」的视口，**页面本身零改动**（不写 DOM/CSS）。
   - **运行中折叠 ⇄ 展开切换**只改注入配置并调 hook 的幂等切换 API（`window.__dshrSetDevice`），**不重载 WebView、不中断隧道**，界面按新档位即时生效。平板档仍会定义该 API（幂等），只是不安装 hook。
   - 手机横屏的状态栏保持透明沉浸：侧栏灰底 / 主栏白底各自延伸到屏幕顶，控件再避开系统栏，并挡住该区域点击，避免误触。收起态用左上角悬浮鲸鱼打开侧栏。展开后采用 DeepSeek App 式布局：侧栏铺在底层，中间会话列可**跟手拖动**滑成圆角浮层。手机竖屏右侧只留细条。**主屏幕右划**＝打开左侧栏，**主屏幕左划**＝打开官方右侧栏（`<768px` 时官方为全屏态）；官方右栏已打开期间不再误开左侧栏。右划跟随手指，抽屉关闭时只有右划会被接管。左划开右栏是**本插件补的手势**——官方 `0.2.0-rc.2` 自身没有（bundle 内 swipe 零命中），故经官方开关 `button[data-sidebar-right-toggle]` 以 `dispatchNativeClick` 触发。在侧栏里点对应会话（或新建会话）后抽屉自动收起。官方「设置」以**全屏页**盖住侧栏与会话（带进入动画），不再先收起侧栏再弹窗。模型、权限、命令、模式等浮动选框会被钳在视口内。输入底栏里超长模型名会省略号截断，不得盖住左侧「+」和权限按钮。
@@ -405,6 +441,22 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
   - **「不做缩放」是产品决定**：全流程没有 `transform: scale`；鲸鱼的 transform 与尺寸**一字未改**
     （仍是 `translateX(var(--dshr-drawer-x))`）。证据：`scratch/t91/report.md` §1–§3。
 - 系统栏沉浸（手机档）：App 保持透明状态栏 edge-to-edge，并把真实的状态栏/导航栏 inset（CSS px）写入页面变量 `--dshr-inset-top` / `--dshr-inset-bottom`；页面内容下移让出状态栏，状态栏颜色与页面背景一致（`viewport-fit=cover` 与 `env(safe-area-inset-*)` 仅作兜底）。即使官方 frame 结构探测失败，body 兜底 padding 也保证内容不顶进时钟/挖孔区域。**虚拟键盘**弹出时，原生按焦点输入框位置平移，只抬到输入框露在键盘上方（空会话/设置页元素少时不会把输入框顶出屏幕）；页面侧再用 `interactive-widget=overlays-content` 与 `visualViewport` 把焦点矩形告诉原生。Android 返回键会优先关闭设置弹窗或收起已展开的 DSH 侧栏。
+- **系统栏「沉浸」配色：那两条跟着页面走（rc.2.8，T94）**：状态栏 / 导航栏那两条画的其实是
+  **`rootLayout` 的底**（T80 把让位落成 WebView 外边距后露出的父容器），而**改前是硬编码**——
+  `dark ? 0xFF141414 : WHITE`，`dark` 只能来自**系统主题**（平板档 hook 严格关闭，页面上没有
+  任何信号可读）⇒ **页面主题 ≠ 系统主题时那两条与页面反色**（用户症状）。
+  - **修法 = 只读探针**：采样「贴着系统栏那条边，页面真实画的颜色」（`elementFromPoint` +
+    逐层合成 `background-color`），把同一个值同步到 **rootLayout + 状态栏色 + 导航栏色** 三处；
+    **1.5s 只读轮询**跟随主题切换（回前台起、切后台停），页面内用官方设置面板改主题也能跟上。
+    **不注入任何 DOM / CSS / 属性 / 类名**。
+  - **像素真值（逐字节相等：R=G=B 三通道 0 差）**：平板 4 组（系统浅/深 × 页面浅/深）
+    **两条带 == 左栏色**；手机两组**三色相等**。与主列残差 **≤7/255**。
+  - ⚠️ **一个颜色无法同时贴合左栏与主列**——取舍是**贴边那列**（用户症状所在），如实写明。
+  - **`targetSdk=34` 在 API 35 上的行为**：两个着色 API **仍生效**（决定性实验：让 `rootLayout`
+    回到硬编码 `#141414`、导航栏色仍是采样色，底部那条读到的就是采样色 ⇒ 是系统按我们给的
+    颜色画的）；**但手势导航下导航栏由系统画成透明、着色不生效** ⇒ **必须自己画**（`rootLayout`）。
+  - 未回归真值：T80 内容避让四向重叠仍 **0 / 0 / 0 / 0**；平板档页面侧仍**只读**。
+  - 证据：`scratch/t94/report.md` §1.1–§1.3、§2.1–§2.5、§3.2–§3.6、§4.1–§4.3、§8。
 - **平板档系统栏避让（`sw ≥ 600` 会话页，rc.2.6 重做）**：让位算式改为**逐方向并集**
   `systemBars() | displayCutout() | tappableElement()`——`getInsets` 对掩码内各来源**逐边取 max**，
   **不求和**（求和会把两个来源的同一块区域算两次）；掩码**不含 `ime()`**，键盘仍然只走上面那条
@@ -423,7 +475,10 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
     任务栏在**三键**格被 `tappableElement` 独立上报 **112px** ⇒ 掩码里加它是**承重的**，
     不是保险性空转。
   - 证据：`scratch/t72/report.md` §1–§2（算式与实现）、§5（5 格重叠全 0）、§6（断言 106→140）、
-    §7.1（负控制）。**未取证项（如实）**：AVD 无挖孔 ⇒ `displayCutout` 分支与「状态栏/导航栏落左右」
+    §7.1（负控制）。**rc.2.8 补**：让位只解决「重叠」，「**那两条的颜色**」由 T94 的只读探针同步
+    （见上文「系统栏『沉浸』配色：那两条跟着页面走」）；两者互不影响——T94 复跑 T80 的四向
+    重叠仍 **0 / 0 / 0 / 0**。
+    **未取证项（如实）**：AVD 无挖孔 ⇒ `displayCutout` 分支与「状态栏/导航栏落左右」
     只由 javac 替身覆盖，**未在设备上跑过**；冷启动首帧**未做像素级取证**（进真实会话需建会话，
     本轮禁止），替代证据是时序格 + 负控制 + 6 条源码契约断言。次因（是否即算式）**无法判定**，
     只有强旁证。
@@ -561,6 +616,44 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
     「**服务端已经回来、页面还在睡退避**」这段等待压到 **<1s**。判据边界另见「已知取舍」。
   - 证据：`scratch/t86/report.md` §4–§5、`scratch/t88/report.md` §A–§C、`scratch/t90/report.md` §1–§6·§12、
     `scratch/t87/report.md` §1·§6.4（停泊证否的字节扫描原文）。
+- **半开检测与回前台探活（rc.2.8，T95）**：症状「切后台几分钟回来，界面停在**重新连接中**、
+  几分钟不恢复」。**第一因不在我们这层**——上游 mux 载体
+  （`dsh-api-gateway/lib/client.js`，全文件**唯一建连点** `new WebSocket()`）**没有握手超时**：
+  `maintain()` 首个 `return` 就把那次挂死的握手持有了，`failAll()` 只在 `close` / `error` 才调
+  ⇒ 握手挂死时 `open` / `error` / `close` **一个都不来**，客户端**永远停在 connecting**；
+  hook 的 nudge 作用在上层 generation，**够不到它**。
+  - **修法（只改 hook，未改 Java）**：回前台（后台 **≥20s**）**主动探活** = 同源绕缓存
+    `GET /__dsh_remote__/health?__dshr_probe=<ts>`（探**隧道 / 传输链路**，不是上游会话）
+    + `AbortController` **3s 硬超时** ⇒ 判「断」、结论并入 `isConnectionDown()`、
+    `reportUiDiag()` 喂原生自救层、**立刻推**一次；回前台 5s 窗口可**跳过 8s 最小间隔**，
+    另加 **1.5s 硬地板** `RESUME_HARD_MIN_GAP_MS`（任何两次推之间不得短于它）。
+  - **真值**：半开场景改前「判据说健康 / 0 推 / 无横幅」→ 改后「探活超时 ⇒ 横幅 + nudge」；
+    **回前台首次推 6763ms → 1307ms（5.2×）**（同装置同断言）；健康态探活 **0/0/1 次**
+    （A1/A2/A3，20s 闸拦住短后台），**观测块仍零 `setInterval`**。
+  - **三条实测硬约束**：① **断链上重载会把页面一次性打死**（`ERR_TIMED_OUT` + 错误页，
+    链路恢复后**仍不恢复**）⇒ 重载必须**原生做且先探活**；② **健康链路上重载能回到同一会话
+    （3s）**——此前「重载会掉到 chooser」被**证伪**，那是「重载时链路已断」的现象；
+    ③ **健康会话本来就完全静默**（75s **零帧**）⇒ **不能用「静默」当半开判据**。
+  - 平板档：探活只在「回前台 + 后台 ≥20s」触发，平板档 hook 不跑 ⇒ **一个字节都不跑**。
+  - 证据：`scratch/t95/report.md` §1.4–§1.5、§1.8、§2、§3.2–§3.5、§7。
+- **卡住自救 `StuckRescue`（rc.2.8，T96，原生 Java）**：症状「切后台几分钟回来卡住几分钟不恢复；
+  杀掉重开十几秒就好」。**第一因**：平板档 hook 的 **WS 观测没装**，只读 DOM 探针可用但
+  **没人消费**（`probeResumeRecovery` 只有三个入口，平板档缺 WS 那个；1s 巡检要等首次判「断」
+  才装 ⇒ 平板档永远等不到），且实测**温和层在平板档本来就无效**（派发 `offline`→`online` 后
+  40s 仍 `phase=[connecting]`），**只有受控重载有效**。
+  - **状态机**（纯逻辑，可 JVM 验证）：**温和层** `evaluateJavascript` 派发
+    `offline`→`online` 瞬态对，0s / +8s 各一次（`TIER1_AFTER_MS=1500`、间隔 `8000ms`、上限 **2 次**）
+    → **+12s 升级层**受控重载；**手机档让位**（hook 自己会做，阈值抬到 **25s**）；
+    防风暴：重载 **2 次 × 60s**，到顶后**只剩观测**（`StuckRescueTest` 用 200 拍 / 10 分钟钉死）。
+  - 🔴 **链路闸（这是被真机打出来的）**：**升级前先用 `PinnedFetch` 取 `/__dsh_remote__/health`，
+    不通就撤回**——v1（无链路闸）实测 `+12.2s` 重载把页面打成 `chrome-error` 错误页。
+  - **真值**：**平板后台 5 分钟回前台 → 恢复 ≈13.6s**（重载提交 → 恢复 0.8s，会话保持：
+    `sameSession=true`、`sessionId` 前后同一）；**改前同场景 ≥100s 仍卡**。健康态**零开销**
+    （不新增定时器 / 回调，只挂在既有 500ms 探针之后，健康时一次比较即返回 `NONE`）。
+  - **横幅不再滞留**：一直挂着**不是探针去抖失配**，而是「页面真的还卡着」的忠实反映
+    （探针持续匹配 ⇒ 永远凑不满 3 拍 OK）。治法 = 治掉卡住 + **升级动作时立即收起** +
+    **新文档提交清零**。
+  - 证据：`scratch/t96/report.md` §1.1–§1.3、§3.1–§3.4、§4.1–§4.4、§5、§7。
 - **手机档**下连接设置（配置组卡片页）可由**长按小鲸鱼**进入，也可在**会话根按系统返回键**进入
   （**rc.2.6 起两档一致**，此前手机档会话根是直接退到后台）。会话内先关官方弹层/侧栏再回上一页；
   **右栏打开态按返回键只关面板**，不多走一步到设置页。到会话根则回 App 连接设置页，
@@ -590,13 +683,25 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
 
 ## 平板档设置入口
 
-平板档（`sw ≥ 600`，含折叠屏展开）关闭了移动 hook，页面上也就没有长按鲸鱼那个入口。
-为了让 App 自有的「连接设置」仍然可达，原生补两个入口，**两者都不在页面上新增任何可见浮层**：
+平板档（`sw ≥ 600`，含折叠屏展开）下页面上没有长按鲸鱼那个入口。
+为了让 App 自有的「连接设置」仍然可达，由**原生 + 最小 hook** 共补**三个**入口，
+**三者都不在页面上新增任何可见浮层 / 节点 / 属性 / 类名 / 样式**：
 
 | 入口 | 行为 |
 |---|---|
 | 隧道常驻通知的「**连接设置**」动作 | 进程外直达连接设置页（`MainActivity.ACTION_OPEN_SETTINGS`）。只切界面，**不碰隧道**、不重载 WebView；冷启动与已在前台/后台两条路径行为一致。通知上原有的「断开」动作不受影响 |
-| **会话根**按系统返回键 | 打开连接设置页（会话内仍先关官方弹层、再收侧栏、再回上一页）。**rc.2.6 起手机档同样如此**（此前手机档在会话根是退到后台） |
+| **长按品牌区 600ms**（rc.2.8 新增，T97） | 锚点 `[data-slot="sidebar"] [data-window-drag="true"] > button`（会话页左上角「鲸鱼 + deepseek HARNESS」那块可拖拽按钮，**不依赖哈希类名 / aria**）→ 打开连接设置页。阈值 600ms；移动 >10px 取消；多指不立案；监听**全 passive、从不 preventDefault** |
+| **会话根**按系统返回键 | 打开连接设置页（会话内仍先关官方弹层、再收侧栏、再回上一页）。**rc.2.6 起手机档同样如此**；**rc.2.8 起平板档一次返回即进设置页**（此前先关官方左抽屉） |
+
+> **为什么平板档那条长按需要动 hook（契约变更的由来）**：该手势只能由页面侧监听，原生接不到。
+> 为此平板档契约由「**hook 严格 OFF / 零痕迹**」改为「**允许最小 hook，但不得新增 DOM 节点 /
+> 属性 / 类名 / 样式**」（rc.2.8，用户明确授权）。**痕迹实测**：常态只有 1 个
+> `touchstart` 监听器，DOM / 全局**零新增**（base 与最终 APK 的 `outerHTML` 逐字节相同）；
+> 手势进行中才临时挂 `touchmove` / `touchend` / `touchcancel`（全 passive）+ 捕获阶段 `click`，
+> 收手即拆。**长按后必须吞掉窗口内每一次 `click`**——该区域单击的语义是**新建会话**，不吞就会
+> 「开了设置页又顺手开了新会话」。真值 **18/18**（长按生效 / 单击仍开新会话 / 移动不触发 /
+> 多指不触发 / 切 phone 档立即失效）；**手机档不生效**（档位闸）。
+> 证据：`scratch/t97/report.md` §1–§3.5、§4–§6.3、§12。
 
 **返回键语义（会话页，rc.2.6 起两档一致）**：
 
@@ -605,7 +710,7 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
 | 官方弹层 / 侧栏展开 | 先收弹层、再收侧栏 |
 | **右栏打开态** | **只关面板**（不继续到设置页、不退后台） |
 | 会话根 | **回 App 连接设置页**（再按一次才退后台） |
-| 平板档会话根 | 第 1 次**关官方左抽屉**、第 2 次回设置页、第 3 次退后台 |
+| 平板档会话根 | **第 1 次直接回 App 连接设置页**、第 2 次退后台（**rc.2.8 起不再先关左抽屉**） |
 
 - **旧实现为什么「承诺与行为不一致」**：设置页那句「点上方「返回当前会话」或**系统返回键**继续」的
   判据是 `settingsViaBackKey && isTabletClass()`，而 `settingsViaBackKey` 的**唯一置位点就写在
@@ -614,6 +719,20 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
   现已去掉档位门，并让**设置页文案、会话根处理、文档三处同批改**。
 - **其它入口未变**：由通知动作（或长按鲸鱼）进设置页时标记仍为 false，返回键仍**回会话**。
 - 证据：`scratch/t65/report.md` §1.1–§1.2（源码两处 + 文案）、§4.1（三条路径的设备级真值）。
+
+**平板档一次返回直接进设置页（rc.2.8，T99）**：
+
+- 平板档会话根按**系统返回键**：**一次**返回即进 App 连接设置页（**不再先关官方左抽屉**）；
+  第 2 次退后台。手机档会话根行为**未变**；右栏打开态仍只关右栏；无活会话仍退后台。
+  注释与设置页文案同批改（避免「注释说先关抽屉、行为已换」这种不一致）。
+- **设备真值 6 场景**（真实 `adb shell input keyevent 4`，两档逐场景）：平板会话根 1 次返回 →
+  设置页（顶部出现「返回当前会话」）；官方弹层打开态只关弹层；右栏打开态只关面板；
+  无会话退后台；手机档三条路径不变。变异反证 3 处（含把 WEB 分支改回 T99 之前 → 断言红 + 设备红）。
+- ⚠️ **未决（如实）**：手机档「**右栏打开 + 返回**」在这套隔离装置里**点不出那个面板**
+  （绑定工作区要过 mux RPC）⇒ 本体**没有**设备真值。替代证据三条：
+  ① **代码路径逐字节相同**（手机档走的仍是 T99 之前那条 `closeOverlaysThenFinish()`）；
+  ② 官方弹层臂的设备真值；③ T47 验收台 44/44。
+- 证据：`scratch/t99/report.md` §2–§4、§6–§7、§9 未决①。
 
 **返回键语义（平板档）**：
 
@@ -856,3 +975,22 @@ sub_filter '<link rel="manifest" href="/manifest.webmanifest" />' '<link rel="ma
     只命中**部分场景**，本批次**未在其实机上复验**。平板档只在 phone 档设备上做「运行时切 tablet」，
     **没有**起第二台平板跑完整的平板端到端（平板档横幅走 DOM 探针这条已在真机上用官方同构节点验过）。
   - 证据：`scratch/t90/report.md` §12、`scratch/t86/report.md` §2.1·§5.2·§6、`scratch/t88/report.md` §F。
+- **rc.2.8 的取舍与未验（如实写，别当回归）**：
+  - **平板档「温和层派发」会让官方客户端自己重渲染一次**：实测 `nodes 475→480`、
+    `outerHTML` **+452B**（**不是我们写 DOM**，也没引入新的痕迹类别）。若要「DOM 逐字节相同」
+    的硬门槛，`runStuckRescue` 里对 `isTabletClass()` 跳过温和层**一行开关即可关掉**
+    （平板档只走 12s → 升级层）。**当前未改**，是明写的取舍。证据：`scratch/t96/report.md` §5、§7。
+  - **手机档「右栏打开 + 返回」没有设备真值**（隔离装置里点不出那个面板），替代证据 =
+    **代码路径逐字节相同 + 官方弹层臂 + T47 44/44**。证据：`scratch/t99/report.md` §9 未决①。
+  - **总台账里 `test:device` 曾出现一次 exit 1 却不是断言失败**：首轮 **158/158、0 跳过** 全绿，
+    红的是脚本的「清理义务」（它借用的**共享用户网关 18443** 的设备表在运行期被**别的并发任务**
+    改动：284 → 285）⇒ 隔离复跑即 `未吊销的新设备 0 个`、exit 0。**这是环境争用，不是回归。**
+    证据：`scratch/t99/report.md` §6。
+  - **取证环境**：rc.2.8 批次的量化真值仍全部来自 **AVD 模拟器**
+    （T94 `emulator-5682/5684`、T96 `emulator-5700/5702`、T97 `emulator-5730`、
+    T99 `emulator-5900/5902`）+ 真实页面 CDP。用户报障的**小米 15 / Xiaomi Pad 本批次未复验**
+    ——本批所说的「真机」= AVD。证据：`scratch/t94/report.md` §0.1、`scratch/t96/report.md` §0、
+    `scratch/t97/report.md` §11.2、`scratch/t99/report.md` §1。
+  - **一处未判红（如实）**：T94 的变异 M2（把 1.5s 轮询间隔改成 24h）**没有变红**——
+    跟随被别的触发点覆盖（平板档没有 hook 推送，纠正本应完全靠轮询；实测 8s 内仍跟随）。
+    该条的**主要**判据是设备像素与源码契约，不是这一处变异。证据：`scratch/t94/report.md` §5.1、§8。

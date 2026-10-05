@@ -23,10 +23,18 @@ Write-Host "== hook 单一源（断言 7 比对对象）：$hook"
 Write-Host "== MainActivity 源（T86 缺口② 判据来源）：$main"
 Write-Host "== jdk：$jdk"
 & "$jdk/bin/javac.exe" -encoding UTF-8 -nowarn -cp "$platform" -d "$out/classes" `
-    "$src/ReconnectBanner.java" "$PSScriptRoot/tests/ReconnectBannerTest.java"
+    "$src/ReconnectBanner.java" "$src/StuckRescue.java" `
+    "$PSScriptRoot/tests/ReconnectBannerTest.java" "$PSScriptRoot/tests/StuckRescueTest.java"
 if ($LASTEXITCODE -ne 0) { throw 'JVM test compile failed' }
 & "$jdk/bin/java.exe" "-Dstdout.encoding=UTF-8" "-Dstderr.encoding=UTF-8" -cp "$out/classes;$platform" top.d1studio.dshremote.ReconnectBannerTest $hook $main
 if ($LASTEXITCODE -ne 0) { throw 'ReconnectBanner tests failed' }
+
+# ── T96：原生「卡住自救」分级状态机的 JVM 行为臂 + MainActivity 接线源码契约 ──────
+# 参数：① MainActivity.java（接线契约）② StuckRescue.java（纯逻辑：不引 Android 运行时）
+Write-Host "== T96 卡住自救臂（StuckRescue，纯 Java，真跑时间线）=="
+& "$jdk/bin/java.exe" "-Dstdout.encoding=UTF-8" "-Dstderr.encoding=UTF-8" -cp "$out/classes;$platform" `
+    top.d1studio.dshremote.StuckRescueTest "$main" "$src/StuckRescue.java"
+if ($LASTEXITCODE -ne 0) { throw 'StuckRescue tests failed' }
 
 # ── 臂②：真实 PROBE_JS 的 DOM 桩行为臂 ─────────────────────────────────────
 $node = (Get-Command node -ErrorAction SilentlyContinue)

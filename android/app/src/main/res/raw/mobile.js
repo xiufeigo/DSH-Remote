@@ -25,6 +25,11 @@
  *     web/edge 路径逐字节不变。档位只由原生判定，JS 侧不看视口宽度（WEB-02）。
  *   - 运行时切换：window.__dshrSetDevice(mode) 幂等重算，hook 未装完时先落
  *     配置、装完后按最新值生效（不抛错），供原生 onConfigurationChanged 调用。
+ *   - 平板档唯一例外（T97，用户明确授权「平板允许有 hook 改动」）：平板档**只**
+ *     多挂一个事件监听器——左上角官方品牌区（鲸鱼 + 「deepseek HARNESS」）
+ *     **长按 600ms = 打开 App 连接设置页**，**单击仍是官方原本的「新建会话」**；
+ *     该特性不写任何 DOM（节点 / 属性 / 类名 / 样式规则零新增），其余平板档能力
+ *     仍全部关闭（含 window.WebSocket 包装）。详见 syncBrandLongPress 一段。
  *
  * 设计目标：不依赖服务器端是否安装 dsh-remote-plugin。手机连接任何官方 DSH Web
  * （装或不装插件）都由本脚本完成移动适配：
@@ -2147,6 +2152,42 @@
 	var RESUME_MAX_NUDGES = 6;
 	// T82：断开持续态的巡检步长。健康时这个 tick 只做一次判据读取就返回（零开销）。
 	var RESUME_DOWN_TICK_MS = 1000;
+	// ── T95：回前台"主动探活" + 回前台首次推不等间隔 ──
+	//
+	// 真值依据（`scratch/t95/report.md §1`，全部是我自己装置上的原始真值）：
+	//   ① 后台期间 JS 被**整体冻结**（250ms 采样器单拍空档 47755ms、rAF 105→106）；
+	//   ② 但冻结本身不会卡：后台 240s + 期间**干净断线**，回前台 **864ms 自愈、nudge 0 次**
+	//      （客户端每次重连都新建 socket，不依赖定时器）⇒ 候选①只是共因；
+	//   ③ 真正"几分钟不恢复"的是**握手挂死**：mux 载体（`dsh-api-gateway/lib/client.js:507,602-613`）
+	//      **没有握手超时**，一次挂死的 `new WebSocket()` 把 `keepAlive` 永久占住、上层 loop 停在
+	//      `await failed`，只在每次尝试发 `connecting` ⇒ 页面永远"重新连接中"，而我们的 nudge
+	//      作用在**上层 generation**、够不到它（装置复现 §1.6：横幅 25/25 可见、nudge 6 次后
+	//      `cap-reached`、190s 不恢复）；
+	//   ④ 断开态下客户端自己空转一轮约 **20s**（`generationReadyTimeoutMs=15000` + 退避），
+	//      而 nudge 能把"服务端已回来 → 第一次重连"压到 ~0.7s（T90 实测 5496ms→681ms）
+	//      ⇒ **断开态下越早推越好**；
+	//   ⑤ 可回前台的"首次推"会被 `RESUME_MIN_INTERVAL_MS=8000` 压住（离开前刚推过就最多干等 8s）；
+	//   ⑥ **半开**（socket 早死、`close` 事件永不到）时判据说"健康"、一次都不推；而实测
+	//      mux 健康空闲 75s 内**收 0 帧 / 发 0 帧**（§1.8）⇒ **不能**用"静默"当半开判据，
+	//      只能回前台**主动探活**一次。
+	//
+	// 风控边界一行未放宽：主动探活只在"回前台 + 后台待够 RESUME_VERIFY_MIN_HIDDEN_MS"时才发，
+	// 一次回前台最多 1 个请求、3s 硬超时；"跳过间隔"只给回前台这 5s 窗口（自到期，不长期放宽）；
+	// 上限 6 次 / 8s 间隔 / 二次确认三道具在。
+	var RESUME_VERIFY_MIN_HIDDEN_MS = 20000;   // 只有"后台待够久"才探活 ⇒ 健康前台零请求
+	var RESUME_VERIFY_TIMEOUT_MS = 3000;       // 探活硬超时：超过即认为传输层已死
+	var RESUME_VERIFY_TRUST_MS = 60000;        // 一次"传输层已死"判定的有效期（期间判据恒"断"）
+	var RESUME_BYPASS_WINDOW_MS = 5000;        // 回前台这条路径允许"跳过最小间隔"的时间窗
+	var RESUME_HARD_MIN_GAP_MS = 1500;         // 任何两次推之间的**硬地板**（回前台窗口也不能破）
+	var resumeHiddenSince = 0;                 // 进入 hidden 的时刻（0 = 已回前台/从未隐藏）
+	var resumeBypassUntil = 0;                 // >now 时，推 nudge 不受 RESUME_MIN_INTERVAL_MS 约束
+	var resumeVerifyDownAt = 0;                // 主动探活判定"传输层已死"的时刻（0 = 未判定）
+	var resumeVerifyResult = 'never';          // 'never'/'ok'/'timeout'/'error'
+	var resumeVerifyRunning = false;           // 探活进行中（防重入）
+	var resumeVerifyAt = 0;                    // 最近一次探活发起时刻
+	// "这一拍是回前台进来的"意图位。**不用形参**：`scripts/test-resume-recovery.mjs`
+	// 逐字匹配 `function probeResumeRecovery()`，形参会让那条契约变红（不许改那个脚本）。
+	var resumeFromResumeIntent = false;
 	// T38-2：断开闩锁。resumeDownSince = 第一次观测到"确实断开"的时刻（0 = 未断开）；
 	// resumeNudgeArmed = 是否允许推。推过一次后必须先观测到恢复才重新武装。
 	var resumeDownSince = 0;
@@ -2680,6 +2721,11 @@
 		// `window.WebSocket`（零痕迹不只 DOM），启用态安装（幂等）。必须放在下面那条
 		// strictOff 早退**之前**，否则切到平板档时构造器还原不掉。
 		syncWsStateWatch(on && !isStrictOff());
+		// T97：平板档「左上角品牌区（鲸鱼 + deepseek HARNESS）长按 = 打开 App 连接设置页」
+		// 也跟着档位走。**只平板档挂**；手机档 / auto 档一个监听器都不挂 ⇒ 既有鲸鱼、
+		// 抽屉拖动、右栏、焦点守卫等手势零影响。同样必须放在下面那条 strictOff 早退
+		// 之前，否则切到平板档时监听挂不上、切走时也摘不掉。
+		syncBrandLongPress(isStrictOff());
 		var root = document.documentElement;
 		if (!on && isStrictOff()) {
 			// 平板档：官方布局零改动，直接走拆除路径（不写 dshr-official-inset）。
@@ -4631,6 +4677,246 @@
 		}
 	}
 
+	// ── T97：平板档「左上角品牌区长按 = 打开 App 连接设置页」 ──────────────────
+	//
+	// 需求（用户原话）：平板档把左上角「鲸鱼图标 + deepseek HARNESS 文字」那片区域，
+	// 由「单击 = 新会话」**另加**一条「长按 = 呼出 App 连接设置页」；单击行为原样保留。
+	//
+	// 契约变更：此前「平板档 hook 严格 OFF、页面零痕迹」是硬契约；本次用户明确授权
+	// 平板档可以挂 hook。痕迹仍压到**最小**——
+	//   · **不新增任何 DOM 节点 / 属性 / 类名 / 样式规则**（本段代码一行 DOM 都不写）；
+	//   · 常态下**只挂一个事件监听器**（`document` 上的 touchstart，注册表里的一行，
+	//     不出现在 DOM 里，也不出现在 outerHTML / 节点数 / data-dshr-* 计数里）；
+	//   · 其余平板档能力（`window.WebSocket` 包装、悬浮鲸鱼、抽屉视觉、IM 标记、
+	//     主题标记…）**一律保持关闭**：本段不碰 `window`、不进 teardownHookTraces
+	//     的还原清单，T90 的「平板档可逆还原」逐条不变。
+	// 全部痕迹清单（本特性在平板档新增的一切）在交付报告里逐条列出：只有那**一个**
+	// 事件监听器（+ 手势进行中的临时守卫，手势结束即摘）。
+	//
+	// 目标元素锚定（**不依赖 CSS module 哈希类名**，只用官方结构/语义）：
+	//   `[data-slot="sidebar"] [data-window-drag="true"] > button` 里的**第一个**按钮。
+	// 实测（1280×800 官方布局，原始 DOM 见 scratch/t97/recon-brand.json）：
+	//   <button type="button" class="hHd-Xa_brand hHd-Xa_wide" aria-label="新建会话"
+	//           aria-keyshortcuts="Control+Alt+N"> rect=(16,24,216×24)，内含 2 个
+	//   <svg>（鲸鱼 + 「deepseek HARNESS」文字标记），innerText 为空。
+	// 同一行里的第二个按钮是「收起侧边栏」（Control+Alt+B），落到本判据就是 false；
+	// 工作区树顶部那个大「新会话」按钮的父节点没有 data-window-drag，同样 false。
+	// 单击它的既有行为实测 = **新建会话**（见 scratch/t97/recon-session.json：
+	// 点前会话列表只有已存在的 T97 probe session，点后新增一行「新会话」且主区切回
+	// 空会话落地页「探索未至之境」）。
+	//
+	// 阈值 600ms（BRAND_LONG_PRESS_MS）：Android 系统
+	// `ViewConfiguration.getLongPressTimeout()` 为 500ms，取 600ms 在系统长按判定之上
+	// 留一档余量（手慢一点的单击不会被吞成设置页），又落在 500–800ms 的通行长按区间内。
+	// **刻意不动**手机档悬浮鲸鱼的既有 650ms —— 那是本脚本自加按钮、没有单击语义，
+	// 强行统一会改到已验收的手机档行为。
+	//
+	// 误触防线（逐条对应实测，见 scratch/t97/report.md §3）：
+	//   ① 位移 > BRAND_MOVE_TOLERANCE_PX(10px) ⇒ 取消（与手机档鲸鱼同阈值）；
+	//   ② 滚动/拖动：touchmove 走取消路径，且三个 touch 监听全是 `{passive:true}`、
+	//      **从不调用 preventDefault** ⇒ 不参与、不阻断页面滚动与惯性；
+	//   ③ 多指：`touches.length !== 1` ⇒ 不立案，并取消在案手势；
+	//   ④ 长按触发后**吞掉随后那次 click**（见 brandOnClickCapture）：否则会同时
+	//      「打开新会话 + 打开设置页」——这是本任务最容易出错的一处；
+	//   ⑤ 目标找不到 / 桥缺失 ⇒ 静默降级（isBrandAreaButton 返回 false 即不立案；
+	//      openAppSettings 自带 typeof 判空与 try/catch），全程不抛错、不写页面。
+	/** T97：长按判定阈值（ms）。 */
+	var BRAND_LONG_PRESS_MS = 600;
+	/** T97：手指位移容差（px）。 */
+	var BRAND_MOVE_TOLERANCE_PX = 10;
+	/** T97：长按触发后吞 click 的窗口（ms）。 */
+	var BRAND_CLICK_SUPPRESS_MS = 1500;
+	/** T97：常态唯一监听器是否已挂。 */
+	var brandTouchStartBound = false;
+	/** T97：在案手势（null = 无）。 */
+	var brandPress = null;
+	/** T97：长按已触发 ⇒ 该时刻之前落到品牌区的那次 click 要吞掉。 */
+	var brandSuppressClickUntil = 0;
+	/** T97：手势进行中挂的临时守卫（entries=[[type,fn,opts],…]，手势结束即摘）。 */
+	var brandGuards = null;
+
+	/** T97：只在平板档（严格 OFF 档 = `device==='tablet'`）生效，其余档位一律不挂监听。 */
+	function brandLongPressWanted() {
+		return isStrictOff();
+	}
+
+	/**
+	 * T97：判一个元素是不是「左上角品牌区」那个官方按钮。
+	 * 只认官方结构：父行带 `data-window-drag="true"`（官方窗口拖动区），且自己是该行
+	 * **第一个** button —— 同一行里第二个是「收起侧边栏」，这里自然为 false。
+	 * 不读 aria-label 文本（会被 i18n 改），不读任何 CSS module 哈希类名。
+	 */
+	function isBrandAreaButton(el) {
+		if (!el || el.nodeType !== 1 || el.tagName !== 'BUTTON') return false;
+		var row = el.parentElement;
+		if (!row || row.getAttribute('data-window-drag') !== 'true') return false;
+		if (row.querySelector('button') !== el) return false;
+		var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+		return !!(r && r.width > 0 && r.height > 0);
+	}
+
+	/** T97：从事件目标往上找品牌按钮（touch 可能落在里面的 <svg>/<span> 上）。 */
+	function brandAreaFromTarget(target) {
+		var node = target;
+		for (var i = 0; node && node.nodeType === 1 && i < 8; i++) {
+			if (isBrandAreaButton(node)) return node;
+			node = node.parentNode;
+		}
+		return null;
+	}
+
+	/** T97：取消在案手势（有定时器就清掉）。 */
+	function brandCancelPress() {
+		if (brandPress && brandPress.timer) window.clearTimeout(brandPress.timer);
+		brandPress = null;
+	}
+
+	/**
+	 * T97：摘掉临时守卫。
+	 * @param keepClickGuard true = 只摘 touch* 三个，click 守卫留到抑制窗口结束
+	 *        （长按路径必须留：那一次 click 正是要吞的对象）。
+	 */
+	function brandUnbindGuards(keepClickGuard) {
+		var g = brandGuards;
+		if (!g) return;
+		if (keepClickGuard) {
+			var kept = [];
+			for (var i = 0; i < g.entries.length; i++) {
+				var e = g.entries[i];
+				if (e[0] === 'touchmove' || e[0] === 'touchend' || e[0] === 'touchcancel') {
+					try { document.removeEventListener(e[0], e[1], e[2]); } catch (ignoredBrandUnbindA) {}
+				} else {
+					kept.push(e);
+				}
+			}
+			g.entries = kept;
+			if (!g.timer) {
+				g.timer = window.setTimeout(function () { brandUnbindGuards(false); }, BRAND_CLICK_SUPPRESS_MS + 200);
+			}
+			return;
+		}
+		brandGuards = null;
+		if (g.timer) window.clearTimeout(g.timer);
+		for (var j = 0; j < g.entries.length; j++) {
+			try { document.removeEventListener(g.entries[j][0], g.entries[j][1], g.entries[j][2]); } catch (ignoredBrandUnbindB) {}
+		}
+	}
+
+	/** T97：长按触发 —— 记账、开抑制窗口、调原生桥。任何一步都不写 DOM。 */
+	function brandFireLongPress() {
+		if (!brandPress) return;
+		brandPress.timer = 0;
+		brandPress.fired = true;
+		brandSuppressClickUntil = Date.now() + BRAND_CLICK_SUPPRESS_MS;
+		openAppSettings();
+	}
+
+	/** T97：本次手势的临时守卫（手势结束即摘，故常态只剩 touchstart 一个）。 */
+	function brandBindGuards() {
+		if (brandGuards) return;
+		var entries = [
+			['touchmove', brandOnMove, { passive: true }],
+			['touchend', brandOnEnd, { passive: true }],
+			['touchcancel', brandOnCancel, { passive: true }],
+			// click 用**捕获**：React 18 把合成事件挂在 root 容器上，document 捕获阶段
+			// 先于它，stopPropagation 才拦得住官方那记「新建会话」。
+			['click', brandOnClickCapture, { capture: true }],
+		];
+		brandGuards = { entries: entries, timer: 0 };
+		for (var i = 0; i < entries.length; i++) {
+			try { document.addEventListener(entries[i][0], entries[i][1], entries[i][2]); } catch (ignoredBrandBindGuard) {}
+		}
+	}
+
+	/** T97：手指移出容差 ⇒ 取消（滚动/拖动不得触发）。 */
+	function brandOnMove(event) {
+		if (!brandPress) return;
+		var touches = event.touches;
+		if (!touches || touches.length !== 1) { brandCancelPress(); return; }
+		var t = touches[0];
+		if (Math.abs(t.clientX - brandPress.x) > BRAND_MOVE_TOLERANCE_PX ||
+			Math.abs(t.clientY - brandPress.y) > BRAND_MOVE_TOLERANCE_PX) {
+			brandCancelPress();
+		}
+	}
+
+	/** T97：抬手。未触发长按 ⇒ 这是普通单击，守卫全摘，click 照常落到官方 handler。 */
+	function brandOnEnd() {
+		var pressed = brandPress;
+		if (!pressed) { brandUnbindGuards(false); return; }
+		var fired = pressed.fired;
+		brandCancelPress();
+		brandUnbindGuards(fired);
+	}
+
+	/** T97：touchcancel ⇒ 当作未触发处理（不吞 click 之外的一切都不做）。 */
+	function brandOnCancel() {
+		brandCancelPress();
+		brandUnbindGuards(false);
+	}
+
+	/**
+	 * T97：**click 抑制**。长按已经调过 openSettings，这一次 click 绝不能再落到官方
+	 * handler 上——否则「打开新会话」与「打开设置页」同时发生。
+	 * React 18 的合成事件挂在 root 容器（本页是 `#root`）上，document 捕获阶段的
+	 * stopPropagation 足以让事件到不了那里；<button type="button"> 没有默认动作，
+	 * preventDefault 只是保险，且与滚动无关（滚动在 touchmove 上，本函数不碰）。
+	 *
+	 * ⚠ 窗口内**吞掉每一次**落在品牌区的 click，而不是「吞一次就收工」：
+	 * 实测（scratch/t97/diag-suppress.mjs）一次长按之后可能跟着**两**次 click
+	 * （合成 click 与 touch-derived click 各一次），只吞第一次的话第二次照样会把
+	 * 新会话打开。所以匹配后**不清零**窗口、`brandUnbindGuards(true)` 只摘触摸类守卫、
+	 * 把 click 守卫留到窗口自然到期。
+	 */
+	function brandOnClickCapture(event) {
+		if (Date.now() >= brandSuppressClickUntil) return;
+		if (!brandAreaFromTarget(event.target)) return;
+		try { event.stopPropagation(); } catch (ignoredBrandStop) {}
+		try { event.preventDefault(); } catch (ignoredBrandPrevent) {}
+		brandUnbindGuards(true);
+	}
+
+	/** T97：常态唯一监听器的本体（任何一步出错都不得影响页面）。 */
+	function brandOnTouchStart(event) {
+		try {
+			if (!brandLongPressWanted()) return;
+			var touches = event.touches;
+			// 多指：不立案；在案的一并取消（多指不得触发长按）。
+			if (!touches || touches.length !== 1) { brandCancelPress(); brandUnbindGuards(false); return; }
+			if (brandPress) return;
+			if (!brandAreaFromTarget(event.target)) return;
+			var t = touches[0];
+			brandPress = { x: t.clientX, y: t.clientY, fired: false, timer: 0 };
+			brandBindGuards();
+			brandPress.timer = window.setTimeout(brandFireLongPress, BRAND_LONG_PRESS_MS);
+		} catch (ignoredBrandStart) {
+			brandCancelPress();
+		}
+	}
+
+	/**
+	 * T97：按档位同步（`applyWidthScope` 唯一的调用点，幂等）。
+	 * 平板档 ⇒ 挂上**唯一**那个 `touchstart` 监听（capture 阶段，保证官方若在
+	 * touchstart 上 stopPropagation 也拦不住我们）；其余档位 ⇒ 一个不留地摘掉。
+	 */
+	function syncBrandLongPress(enabled) {
+		if (enabled) {
+			if (brandTouchStartBound) return;
+			try {
+				document.addEventListener('touchstart', brandOnTouchStart, { passive: true, capture: true });
+				brandTouchStartBound = true;
+			} catch (ignoredBrandBindStart) {
+				brandTouchStartBound = false;
+			}
+			return;
+		}
+		if (!brandTouchStartBound) return;
+		try { document.removeEventListener('touchstart', brandOnTouchStart, { capture: true }); } catch (ignoredBrandUnbindStart) {}
+		brandTouchStartBound = false;
+		brandCancelPress();
+		brandUnbindGuards(false);
+	}
+
 	// ── DOM 同步：标记 frame / 侧栏列 / 设置 sheet ──
 	var marked = [];
 	function mark(node, attribute) {
@@ -5451,6 +5737,11 @@
 		var el = null;
 		try { el = findReconnectStatusElement(); } catch (ignoredConnDownText) { el = null; }
 		if (el) return true;
+		// T95：回前台探活判定"传输层已死"（半开：`open`/`close` 事件都不会来，
+		// wsWatchDown() 恒 false）⇒ 判据必须认它，否则页面把"表面连着、实际已死"当健康，
+		// 一次 nudge 都不推、原生自救层也看不到真相。有效期 RESUME_VERIFY_TRUST_MS，
+		// 新 socket 真打开时在 wsWatchEvent() 里当场撤销。
+		if (resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS) return true;
 		return wsWatchDown();
 	}
 
@@ -5462,6 +5753,9 @@
 			s.openNow += 1;
 			s.closeSeen = false;
 			s.connectSince = 0;
+			// T95：新 socket 真开了 ⇒ 撤销"传输层已死"的判定（探活的结论只活到链路自己给出证据）。
+			resumeVerifyDownAt = 0;
+			resumeVerifyResult = 'ok';
 		} else {
 			s.openNow = s.openNow > 0 ? s.openNow - 1 : 0;
 			s.closeSeen = true;
@@ -5794,9 +6088,17 @@
 			lastProbeAt: resumeLastProbeAt,
 			lastProbe: resumeLastProbeResult,
 			lastDisconnectAt: lastDisconnectAt,
-			reconnecting: detail.el !== null || wsDown,
+			// T95：与 isConnectionDown() **同口径**（补上"探活判定传输层已死"这一路）。
+			// 改前只写 `detail.el !== null || wsDown` ⇒ 半开场景下 collectUiDiag().wsState 说
+			// "reconnecting"（横幅出来了）而这里说 false，两边自相矛盾（我在装置上实测到，
+			// 见 scratch/t95/logs/resume-fix-after.log）。判据只能有一个。
+			reconnecting: detail.el !== null || wsDown
+				|| (resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS),
 			reconnectSrc: detail.src,
-			wsSrc: detail.src > 0 ? detail.src : (wsDown ? 3 : 0),
+			// wsSrc 语义不变（DOM 层优先，其次 WS 观测，再次探活）+ 语义仍为"哪一层认出来的"：
+			//   1 = 官方按钮 / 2 = 文案 / 3 = WS 观测 / **4 = 只有回前台探活命中** / 0 = 健康。
+			wsSrc: detail.src > 0 ? detail.src
+				: (wsDown ? 3 : ((resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS) ? 4 : 0)),
 			wsSeen: !!(ws && ws.installed),
 			wsDown: wsDown,
 			wsEvents: ws ? ws.eventCount : 0,
@@ -5809,16 +6111,100 @@
 			ticking: resumeDownTick !== 0,
 			nudgeEntry: resumeLastNudgeResult,
 			vis: document.visibilityState,
+			// T95：回前台主动探活的只读快照（业务判据读 isConnectionDown()，这里只为证据/排查）。
+			verifyDown: resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS,
+			verifyResult: resumeVerifyResult,
+			verifyAt: resumeVerifyAt,
+			hiddenSince: resumeHiddenSince,
+			bypassUntil: resumeBypassUntil,
 		};
+	}
+
+	/**
+	 * T95：回前台**主动探活** —— 用一次同源、绕缓存的 GET 判断"传输层还通不通"。
+	 *
+	 * 为什么要它：`wsWatchDown()` 只看 `open`/`close` 事件；**半开**（对端已死但 TCP 没发 FIN、
+	 * Chromium 也收不到 close）时它恒判健康，页面就把"表面连着、实际已死"当正常，
+	 * 一次 nudge 都不推、原生自救层也看不到真相（真值：`scratch/t95/report.md §1.8`：
+	 * 健康空闲期 mux 75s 内零帧 ⇒ 不能用"静默"当半开判据，只能主动发一次探活）。
+	 *
+	 * 探针选型的依据：
+	 *   · 打 `/__dsh_remote__/health`（网关**本地**端点，不依赖上游 DSH）⇒ 探的是"隧道/垫片
+	 *     这条传输链路"，而不是"上游 DSH 会话状态"，语义与"连接能不能重连"一致；
+	 *   · `cache:'no-store'` + 唯一 query ⇒ 绕开 App 自带 SW 的磁盘缓存，免得命中缓存得到假"活"；
+	 *   · 3s 硬超时（AbortController）：断链上请求会挂住，超时即判"传输层已死"。
+	 *
+	 * 成本边界：**只**在"回前台 + 后台待够 RESUME_VERIFY_MIN_HIDDEN_MS"时调用一次
+	 * （调用点见 probeResumeRecovery 的 fromResume 分支）⇒ 健康前台零请求、无定时器。
+	 * 判定为死时会立刻走断开分支（推一次 nudge 逼客户端新建 socket = 修半开），
+	 * 并把真相经既有 `reportUiDiag()` 通道喂给原生自救层。
+	 */
+	function verifyResumeTransport() {
+		if (resumeVerifyRunning) return false;
+		resumeVerifyRunning = true;
+		resumeVerifyAt = Date.now();
+		var settled = false;
+		var finish = function (alive, why) {
+			if (settled) return;
+			settled = true;
+			resumeVerifyRunning = false;
+			resumeVerifyResult = why;
+			if (alive) { resumeVerifyDownAt = 0; return; }
+			resumeVerifyDownAt = Date.now();
+			// 判定为死 = 刚知道断开 ⇒ 重开 5s 窗口，让紧跟的这一推也不被 8s 间隔压住。
+			resumeBypassUntil = Date.now() + RESUME_BYPASS_WINDOW_MS;
+			try { reportUiDiag(); } catch (ignoredVerifyDiag) { /* 上报失败不影响判据 */ }
+			// 立刻按"断开"走一遍既有入口：二次确认 → 推 nudge（掐断睡着的退避 + 新建 socket）。
+			try { probeResumeRecovery(); } catch (ignoredVerifyProbe) { /* 探活失败不影响判据 */ }
+		};
+		try {
+			var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+			var timer = window.setTimeout(function () {
+				try { if (ctl) ctl.abort(); } catch (ignoredVerifyAbort) { /* abort 失败也要落地结论 */ }
+				finish(false, 'timeout');
+			}, RESUME_VERIFY_TIMEOUT_MS);
+			var url = location.origin + '/__dsh_remote__/health?__dshr_probe=' + String(Date.now());
+			window.fetch(url, {
+				method: 'GET',
+				cache: 'no-store',
+				credentials: 'same-origin',
+				signal: ctl ? ctl.signal : undefined,
+			}).then(function () {
+				window.clearTimeout(timer);
+				finish(true, 'ok');
+			}, function () {
+				window.clearTimeout(timer);
+				finish(false, 'error');
+			});
+		} catch (ignoredVerifyFetch) {
+			finish(false, 'error');
+		}
+		return true;
 	}
 
 	/**
 	 * 探测并（必要时）推一把。返回是否真的推了。测试与原生都可直接调。
 	 *
 	 * 健康 ⇒ 立刻返回 false，是本函数的第一件事（"不误触发"的结构性保证）。
+	 *
+	 * @param 无 —— T95 用意图位 `resumeFromResumeIntent` 区分"回前台进来的那一拍"
+	 *   （visibilitychange / pageshow 先置位再调用），原因是 `scripts/test-resume-recovery.mjs`
+	 *   逐字匹配 `function probeResumeRecovery()`，加形参会让那条既有契约变红。
+	 *   为真时做两件**只对回前台**的事：①后台待够久就主动探活一次（半开被判出来）；
+	 *   ②开一个 5s 自到期窗口，让这一趟的首次推不受 RESUME_MIN_INTERVAL_MS 约束
+	 *   （离开前刚推过时，否则首次推最多干等 8s）。健康态开销仍为零。
 	 */
 	function probeResumeRecovery() {
 		resumeLastProbeAt = Date.now();
+		var fromResume = resumeFromResumeIntent === true;
+		resumeFromResumeIntent = false;   // 一次性：读走即清，后续 tick/通知都不会误当回前台
+		if (fromResume) {
+			resumeBypassUntil = resumeLastProbeAt + RESUME_BYPASS_WINDOW_MS;
+			var hiddenMs = resumeHiddenSince > 0 ? (resumeLastProbeAt - resumeHiddenSince) : 0;
+			resumeHiddenSince = 0;
+			// 只在"后台待够久"时探活：短切换（键盘/权限弹窗）不产生任何请求。
+			if (hiddenMs >= RESUME_VERIFY_MIN_HIDDEN_MS) verifyResumeTransport();
+		}
 		// T90：判据升级为 isConnectionDown() = 层 1/层 2 的 DOM 文案 **或** WS 观测。
 		// 为什么必须升级：rail（左栏收起，用户平时的状态）下官方那条指示器不渲染
 		// （T88 §E.4 实测 45s 断线窗口 0 帧）⇒ 只认文案时这里恒 false、直接走健康分支，
@@ -5853,6 +6239,16 @@
 		}
 		// 走到这里 = 二次确认通过，确实处于断开态。逐道闸检查，任何一道不过都不推。
 		if (lastDisconnectAt === 0) lastDisconnectAt = Date.now();
+		// T95：回前台这条路径那 5s 窗口内允许跳过"最小间隔"这一道闸。
+		// **没有**放宽任何硬边界：`RESUME_MIN_INTERVAL_MS`/`RESUME_MAX_NUDGES` 取值一字未改、
+		// 二次确认仍在上面、窗口推过一次即关（见下面的 `resumeBypassUntil = 0`），
+		// 并且另加一道 `RESUME_HARD_MIN_GAP_MS` **硬地板** —— 任何两次推之间不得短于它。
+		// （DOM 真值台实测到过漏洞：一次"迟到/重复的回前台意图"会把窗口重新打开，于是第二次推
+		//   只隔 450ms 就出去了。硬地板把这条堵死，同时不影响"回前台首次不等 8s"。）
+		// 依据（§1.5/§1.6）：回前台"首次推"否则会被 8s 间隔压住，而断开态下越早推越好。
+		var sinceLastNudge = resumeLastNudgeAt > 0 ? (Date.now() - resumeLastNudgeAt) : Number.POSITIVE_INFINITY;
+		var bypassInterval = resumeBypassUntil > 0 && Date.now() <= resumeBypassUntil
+			&& sinceLastNudge >= RESUME_HARD_MIN_GAP_MS;
 		if (resumeNudgeCount >= RESUME_MAX_NUDGES) {
 			resumeLastProbeResult = 'cap-reached';
 			stopResumeDownTick();
@@ -5869,14 +6265,14 @@
 		// 防风暴边界不变（上限 6 次 + 间隔 8s 的硬闸仍在下面逐条检查）；
 		// 健康时仍然由上面的 `!reconnecting` 分支复位。
 		if (!resumeNudgeArmed) {
-			if (resumeLastNudgeAt > 0 && Date.now() - resumeLastNudgeAt >= RESUME_MIN_INTERVAL_MS) {
-				resumeNudgeArmed = true;   // 断开持续 + 间隔已到 ⇒ 重武装，下一拍可再推
+			if (bypassInterval || (resumeLastNudgeAt > 0 && Date.now() - resumeLastNudgeAt >= RESUME_MIN_INTERVAL_MS)) {
+				resumeNudgeArmed = true;   // 断开持续 + 间隔已到（或回前台窗口内）⇒ 重武装，下一拍可再推
 			} else {
 				resumeLastProbeResult = 'down-confirmed-disarmed';
 				return false;
 			}
 		}
-		if (resumeLastNudgeAt > 0 && Date.now() - resumeLastNudgeAt < RESUME_MIN_INTERVAL_MS) {
+		if (!bypassInterval && resumeLastNudgeAt > 0 && Date.now() - resumeLastNudgeAt < RESUME_MIN_INTERVAL_MS) {
 			resumeLastProbeResult = 'rate-limited';
 			return false;
 		}
@@ -5884,6 +6280,8 @@
 			resumeLastNudgeResult = requestUpstreamReconnect();
 			resumeNudgeCount += 1;
 			resumeLastNudgeAt = Date.now();
+			// T95：窗口用掉即关（推过一次就回到 8s 硬间隔，防风暴语义与改前逐字相同）。
+			resumeBypassUntil = 0;
 			// 重新起算：若仍断开，下一次要走完二次确认（保留二次确认这道闸）。
 			resumeDownSince = Date.now();
 			resumeNudgeArmed = false;
@@ -5898,13 +6296,15 @@
 
 	if (document.addEventListener) {
 		document.addEventListener('visibilitychange', function () {
-			if (document.visibilityState !== 'visible') return;
-			window.setTimeout(probeResumeRecovery, RESUME_PROBE_DELAY_MS);
+			// T95：记下"进入后台"的时刻 —— 回前台时用它决定要不要主动探活
+			// （后台待够 RESUME_VERIFY_MIN_HIDDEN_MS 才发那一次探活请求）。
+			if (document.visibilityState !== 'visible') { resumeHiddenSince = Date.now(); return; }
+			window.setTimeout(function () { resumeFromResumeIntent = true; probeResumeRecovery(); }, RESUME_PROBE_DELAY_MS);
 		}, { passive: true });
 		window.addEventListener('pageshow', function (ev) {
 			// bfcache 恢复：从后台标签页回前台同样走一次
 			if (!ev || !ev.persisted) return;
-			window.setTimeout(probeResumeRecovery, RESUME_PROBE_DELAY_MS);
+			window.setTimeout(function () { resumeFromResumeIntent = true; probeResumeRecovery(); }, RESUME_PROBE_DELAY_MS);
 		}, { passive: true });
 	}
 

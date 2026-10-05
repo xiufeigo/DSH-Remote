@@ -695,6 +695,78 @@ function assertSourceContracts() {
 			throw new Error("源码契约：T90 新文档必须重置 hook 上报的连接态（页面级数据源，不许跨页带）");
 		}
 	}
+	// ── T95：回前台"主动探活"（半开）+ 回前台首次推不等间隔 ──
+	//
+	// 真值依据（scratch/t95/report.md §1）：后台期 JS 整体冻结（单拍空档 47755ms）但冻结本身不会卡
+	// （干净断线回前台 864ms 自愈、nudge 0 次）；真正会卡住的是**半开**（`close` 永不到 ⇒
+	// wsWatchDown() 恒健康 ⇒ 一次都不推），而 mux 健康空闲期本来就零帧（75s 收 0 帧）
+	// ⇒ 不能用"静默"当判据，只能回前台主动发一次探活。这块把"探活必须存在、必须只在回前台
+	// 且后台待够久时发、必须绕缓存、必须认到判据里、且不得放宽任何硬边界"逐条钉死。
+	{
+		// ① 探活本体必须在 WS 观测块**之外**（观测块只许被动监听，上面 T90 那条断言管着）。
+		const watchStartAt = src.indexOf("function installWsStateWatch() {");
+		const watchEndAt = src.indexOf("function syncWsStateWatch(enabled) {");
+		const watchBlockT95 = src.slice(watchStartAt, watchEndAt);
+		const verifyAt = src.indexOf("function verifyResumeTransport() {");
+		if (!(verifyAt > watchEndAt)) {
+			throw new Error("源码契约：T95 主动探活必须定义在 WS 观测块之外（观测块只能被动监听）");
+		}
+		if (watchBlockT95.includes("verifyResumeTransport")) {
+			throw new Error("源码契约：T95 探活不得出现在 WS 观测块内（观测块零网络请求）");
+		}
+		// ② 只在"回前台 + 后台待够久"时才发 ⇒ 健康前台零请求。
+		for (const [needle, why] of [
+			["var RESUME_VERIFY_MIN_HIDDEN_MS = 20000;", "后台待够多久才允许探活（健康前台零请求的闸）"],
+			["var RESUME_VERIFY_TIMEOUT_MS = 3000;", "探活硬超时"],
+			["function verifyResumeTransport() {", "探活本体"],
+			["if (hiddenMs >= RESUME_VERIFY_MIN_HIDDEN_MS) verifyResumeTransport();", "探活必须被后台时长闸住"],
+			["resumeHiddenSince = Date.now(); return;", "隐藏时必须记录进入后台的时刻"],
+			["'/__dsh_remote__/health?__dshr_probe='", "探活必须打网关**本地**端点（探传输链路，不探上游会话）"],
+			["cache: 'no-store',", "探活必须绕缓存（否则命中 SW 磁盘缓存会得到假“活”）"],
+			["resumeFromResumeIntent = true;", "回前台意图位（不用形参，理由见下）"],
+			["var fromResume = resumeFromResumeIntent === true;", "意图位必须在 probeResumeRecovery 里读走"],
+			["if (resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS) return true;", "探活结论必须并进 isConnectionDown()（否则半开仍判健康）"],
+			["resumeVerifyDownAt = 0;", "新 socket 打开必须撤销探活结论"],
+			["var bypassInterval = resumeBypassUntil > 0 && Date.now() <= resumeBypassUntil", "回前台跳过间隔必须走**自到期窗口**"],
+			["resumeBypassUntil = resumeBypassUntil + 0;", "占位（不会命中）"],
+		]) {
+			if (why.startsWith("占位")) continue;
+			if (!src.includes(needle)) throw new Error(`源码契约：T95 ${why}（缺 ${needle}）`);
+		}
+		// ③ 不得用形参：`scripts/test-resume-recovery.mjs` 逐字匹配 `function probeResumeRecovery()`。
+		if (!src.includes("function probeResumeRecovery() {")) {
+			throw new Error("源码契约：T95 不得给 probeResumeRecovery 加形参（test-resume-recovery.mjs 逐字匹配零参签名）");
+		}
+		if (src.includes("probeResumeRecovery(true)")) {
+			throw new Error("源码契约：T95 回前台必须通过意图位进入（不得出现 probeResumeRecovery(true)）");
+		}
+		// ④ 硬边界逐字不动 + 窗口推过一次即关（防风暴语义与改前相同）。
+		for (const keep of ["RESUME_MIN_INTERVAL_MS = 8000", "RESUME_MAX_NUDGES = 6", "RESUME_CONFIRM_DELAY_MS = 400",
+			"if (bypassInterval || (resumeLastNudgeAt > 0 && Date.now() - resumeLastNudgeAt >= RESUME_MIN_INTERVAL_MS)) {",
+			"resumeBypassUntil = 0;",
+			// T95：跳过间隔的窗口还额外被"硬地板"压着 —— DOM 真值台实测到过"迟到/重复的回前台意图
+			// 把窗口重新打开 ⇒ 第二次推只隔 450ms"的漏洞，地板把它堵死（且不影响首次不等 8s）。
+			"var RESUME_HARD_MIN_GAP_MS = 1500;",
+			"&& sinceLastNudge >= RESUME_HARD_MIN_GAP_MS;"]) {
+			if (!src.includes(keep)) throw new Error(`源码契约：T95 不得放宽既有风暴边界（缺 ${keep}）`);
+		}
+		const nudgeAt = src.indexOf("resumeLastNudgeResult = requestUpstreamReconnect();");
+		if (!(nudgeAt > 0 && src.slice(nudgeAt, nudgeAt + 400).includes("resumeBypassUntil = 0;"))) {
+			throw new Error("源码契约：T95 跳过间隔的窗口必须在推过一次后立刻关闭");
+		}
+		// ⑤ 探活结论必须是只读诊断可见的（真机自证用），且 `reconnecting` 必须与
+		// `isConnectionDown()` **同口径** —— 我在装置上实测到过"collectUiDiag 说 reconnecting
+		// 而 resumeRecoveryState 说 false"的自相矛盾（横幅出来了、诊断字段说没事）。
+		for (const field of ["verifyDown:", "verifyResult:", "verifyAt:", "hiddenSince:", "bypassUntil:"]) {
+			if (!src.includes(field)) throw new Error(`源码契约：T95 resumeRecoveryState 缺少只读诊断字段 ${field}`);
+		}
+		if (!src.includes("|| (resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS),")) {
+			throw new Error("源码契约：T95 resumeRecoveryState().reconnecting 必须与 isConnectionDown() 同口径（含探活那一路）");
+		}
+		if (!src.includes(": (wsDown ? 3 : ((resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS) ? 4 : 0)),")) {
+			throw new Error("源码契约：T95 wsSrc 必须报出「只有探活命中」这一层（4）");
+		}
+	}
 	// ── WEB-05：抽屉接管接入横向滚动容器豁免 ──
 	if (!src.includes("if (isInHorizontallyScrollableContainer(target)) return false;")) {
 		throw new Error("源码契约：WEB-05 canStartDrawerTrack 必须接入横向可滚容器豁免");

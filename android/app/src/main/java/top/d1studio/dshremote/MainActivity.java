@@ -176,6 +176,32 @@ public class MainActivity extends Activity {
 	 * **只允许经 {@link #hideReconnectBannerNow()} 清零**，避免上一页的累计带到新页面。
 	 */
 	private final ReconnectBanner.Debouncer reconnectDebounce = new ReconnectBanner.Debouncer();
+	/**
+	 * T96：原生侧**卡住自救**判定器（分级：温和 nudge → 受控重载）。
+	 *
+	 * <p>为什么必须有它：平板档 hook 严格 OFF ⇒ 包装 WebSocket 观测**根本没装**，
+	 * 全套自愈（400ms 二次确认 + 1s 断开巡检 + nudge）在 hook 里、平板档一次都不跑；
+	 * 原生探针虽然**看得见**官方的「重新连接中」（实测 {@code probe=OK SUPPRESS|src=1 …}
+	 * 与页面 {@code data-phase="connecting"} 同刻在场），但没有任何东西消费它。
+	 * 实测（emulator-5700 平板档）：网关硬杀再拉起后页面卡在官方 Reconnecting **100s+**，
+	 * 同刻页面内 {@code fetch('/__dsh_remote__/health')} = **200 / 64ms** ⇒ 卡的不是网络，是没人踹。
+	 *
+	 * <p>判据来源是**同一个** 500ms 只读探针（不新增第二套判据、不新增定时器），
+	 * 只是吃的必须是**原始真相**（{@code re=1}）而不是"官方那条已可见 ⇒ 抑制横幅"之后的映射值。
+	 */
+	private final StuckRescue.Decider stuckRescue = new StuckRescue.Decider();
+	/** T96：升级层（受控重载）**必须先过链路闸**——网关 HTTP 侧通不通。 */
+	private volatile boolean rescueLinkOk = false;
+	/** T96：链路探针是否在飞（一次只发一条，绝不叠加）。 */
+	private volatile boolean rescueLinkProbeInFlight = false;
+	/** T96：判定器已要求重载、正在等链路探针回话。 */
+	private boolean rescueReloadArmed = false;
+	/** T96：升级意图发起的时刻（看门狗用）。 */
+	private long rescueReloadArmedAt = 0;
+	/** T96：链路探针发起时刻（探针自己也要有超时，否则一次卡住会把后续升级全挡掉）。 */
+	private volatile long rescueLinkProbeAt = 0;
+	/** T96：等链路回话的最长时间；超时即撤回本次升级（配额回滚），绝不留"静默挡死"这条路。 */
+	private static final long RELOAD_ARM_TIMEOUT_MS = 15000L;
 	/** T78：轮询是否在推进（onResume 起、onPause 停）。 */
 	private boolean reconnectPolling = false;
 	/**
@@ -254,6 +280,26 @@ public class MainActivity extends Activity {
 	private long lastBackAt = 0;
 	/** DSH 页面是否处于深色（body[data-ds-dark-theme]），用于状态栏图标和 WebView 底色。 */
 	private boolean pageDark = false;
+	/**
+	 * T94：系统栏让位后露出的那两条（状态栏带 / 底部手势条带）**实际用的颜色**。
+	 *
+	 * <p>背景（用户报的"白条"）：T80 把让位落成 WebView 的**外边距**之后，那两条画的是
+	 * 父容器 {@code rootLayout} 的底色，而它的取值一直是**硬编码**的
+	 * {@code dark ? 0xFF141414 : Color.WHITE}。手机档有 hook 经
+	 * {@code setPageDark} 把真实深浅推上来，所以碰巧对；**平板档 hook 严格 OFF**
+	 * （契约 3.5），没人推 ⇒ {@code pageDark} 永远停在 {@code isSystemDark()} 上。
+	 * 页面主题与系统主题不一致时（DSH 侧手选深色/浅色、系统却是另一套），
+	 * 那两条就与页面**反色**：实测页面 #1B1B1C 而两条 #FFFFFF（见 scratch/t94/report.md §1）。
+	 *
+	 * <p>所以这里存**页面自己画出来的颜色**（只读探针 {@link #PAGE_BG_PROBE_JS} 采样，
+	 * 见 {@link #requestPageBackground()}），{@link #PAGE_BG_NONE} 表示"还没取到"——
+	 * 取不到时**逐值退回**改动前的硬编码取值，绝不因为探针失败而改变行为。
+	 */
+	private static final int PAGE_BG_NONE = 0;
+	private int pageBgTop = PAGE_BG_NONE;
+	private int pageBgBottom = PAGE_BG_NONE;
+	/** T94：探针轮询是否在推进（onResume 起、onPause 停）。 */
+	private boolean pageBgPolling = false;
 	/** 直连重试不得误用当前选中的 FRP 配置组。 */
 	private String directTarget = "";
 	/**
@@ -377,6 +423,8 @@ public class MainActivity extends Activity {
 		// T78：退后台即停轮询并立即收起横幅——后台不该留一条"重新连接中"，
 		// 也不该继续每 500ms 往页面里跑只读探针。
 		stopReconnectPolling();
+		// T94：退后台即停页面背景轮询（后台不读页面；回前台 onResume 重启并立即补读一次）。
+		stopPageBgPolling();
 		hideReconnectBannerNow();
 		CookieManager.getInstance().flush();
 		// PERF-03：退后台即挂起 WebView 渲染与全 WebView JS 定时器（含 DSH 的
@@ -414,10 +462,18 @@ public class MainActivity extends Activity {
 		if (rootLayout != null) rootLayout.post(this::applyReconnectBannerInsets);
 		// T78：回前台重启重连状态轮询（onPause 停掉的那条）。
 		startReconnectPolling();
+		// T96：回前台是**新起点**——退后台期间连接可能已经死了（页面侧 JS 被 pauseTimers 冻住），
+		// 所以回前台后第一次读到「正在重连」就允许温和层**立刻**动作，不等 TIER1_AFTER_MS，
+		// 更不等 hook 那条（平板档根本没有 hook 自愈）。判据合并在 stuckRescue 里。
+		stuckRescue.onForeground();
 		// T90：顺便**补读一次** hook 的连接态（只读、一次性）：后台期间 pauseTimers 冻住了
 		// 页面侧 JS，翻转事件未必推得过来（见 refreshHookConnState 注释）。放在
 		// startReconnectPolling 之后：先让轮询恢复，再补这一读，横幅下一拍就能用上新值。
 		refreshHookConnState();
+		// T94：回前台重启页面背景轮询，并**立即补读一次**——退后台期间用户可能在
+		// 页面里改了主题（或系统深浅色变了），首帧就得是新的页面色。
+		startPageBgPolling();
+		requestPageBackground();
 		// PERF-03：与 onPause 成对恢复；在 WEB 态补一次 inset/注入（暂停期间
 		// 键盘/旋转事件可能漏掉），已有 resumeLiveSession 保证不断整页重载。
 		if (webView != null) {
@@ -1018,6 +1074,8 @@ public class MainActivity extends Activity {
 	private void showHome() {
 		connectionGeneration += 1;
 		sessionHistoryRooted = false;
+		// T94：回首页（离开会话）⇒ 作废页面采样色，重新用壳底色（applySystemBars 会读会话态）。
+		resetPageBackground();
 		awaitingCertificateDecision = false;
 		dismissPendingHttpAuth();
 		clearResumeSession();
@@ -2272,6 +2330,9 @@ public class MainActivity extends Activity {
 				// T90：**页面级**数据源随文档一起重置 —— 上一页 hook 推来的连接态一律不许
 				// 带到新文档（新文档的 hook 装好后会经 reportUiDiag 推一次当前状态）。
 				hookConnState = null;
+				// T94：同理作废上一页采样到的页面底色——新文档首帧不该沿用旧页的颜色
+				//（新文档就绪后由轮询/enterSessionPage 重采）。
+				resetPageBackground();
 				// 这里【不】清 failedMainFrameUrl：主框架错误可能与 onPageStarted 同一
 				// 毫秒到达（如 ERR_UNSAFE_PORT 实测两者同为 t+348ms），在这里清会把
 				// 紧随其后的 onPageFinished 放行，错误页又会被当成会话页。
@@ -2302,6 +2363,9 @@ public class MainActivity extends Activity {
 				// T78：新文档这一刻立即收起横幅并把防抖清零——上一页的"重新连接中"
 				// 一律不许带到新页面（也不许把上一页累计的"连续为真"带过来）。
 				hideReconnectBannerNow();
+				// T96：新文档也是自救判定的新起点（断开 episode 重开；**重载配额跨文档保留**，
+				// 所以受控重载本身不会被自己的新文档洗掉计数 ⇒ 不会变成无限重载）。
+				stuckRescue.onDocumentChanged();
 				if (Build.VERSION.SDK_INT >= 23) enterSessionPage(view, url);
 			}
 
@@ -2568,6 +2632,208 @@ public class MainActivity extends Activity {
 	}
 
 	/**
+	 * T96：hook 的自愈这一侧是不是**真的在跑**（决定原生让不让位）。
+	 *
+	 * <p>两个条件同时成立才算"在场"：① 非平板档（平板档 hook 严格 OFF，
+	 * {@code installWsStateWatch()} 第一行就 return false，观测没装）；
+	 * ② hook 至少经既有 JS 桥推过一次诊断（{@code hookConnState != null}）——
+	 * 只用档位判会让"桥/脚本其实没装"的手机档白等 {@link StuckRescue#TIER2_AFTER_HOOK_MS}。
+	 */
+	private boolean hookSelfHealLive() {
+		return !isTabletClass() && hookConnState != null;
+	}
+
+	/**
+	 * T96：喂一次观测给自救判定器并执行动作（分级）。
+	 *
+	 * @param pageReconnecting 页面/ hook 的**原始真相**：此刻确实处于「正在重连」
+	 * @param observed         横幅那套语义下的观测值（可能因为"官方那条已可见"被抑制成 OK）
+	 */
+	private void runStuckRescue(boolean pageReconnecting, ReconnectBanner.Observed observed) {
+		StuckRescue.Observed o;
+		if (pageReconnecting) {
+			o = StuckRescue.Observed.RECONNECTING;
+		} else if (observed == ReconnectBanner.Observed.OK) {
+			o = StuckRescue.Observed.OK;
+		} else {
+			o = StuckRescue.Observed.UNKNOWN;
+		}
+		StuckRescue.Action action = stuckRescue.observe(o, System.currentTimeMillis(), hookSelfHealLive());
+		// T96：**升级层全程必须留痕**——实测踩过"一声不响"的坑：链路探针线程若因闸门/回调丢失
+		// 迟迟不回来，`rescueLinkProbeInFlight` 一直为 true，后面每次升级都被静默挡掉，
+		// 现场只有"什么都没发生"（见 report §3.4 的真机时间线）。加看门狗 + 逐条日志后，
+		// 这条路要么动手、要么在 logcat 里说清楚为什么不动手。
+		if (rescueReloadArmed && System.currentTimeMillis() - rescueReloadArmedAt > RELOAD_ARM_TIMEOUT_MS) {
+			rescueReloadArmed = false;
+			rescueLinkProbeInFlight = false;
+			stuckRescue.abortReload();
+			Log.w("dshr-rescue", "tier2 看门狗：链路探针 " + RELOAD_ARM_TIMEOUT_MS
+				+ "ms 未回话 ⇒ 放弃本次升级（撤回配额，等下一轮）");
+		}
+		if (action == StuckRescue.Action.NUDGE) {
+			runStuckNudge();
+		} else if (action == StuckRescue.Action.RELOAD) {
+			// 先查链路：通了才重载（断链上重载会把页面打成浏览器错误页，实测见 report §3）。
+			rescueReloadArmed = true;
+			rescueReloadArmedAt = System.currentTimeMillis();
+			rescueLinkOk = false;
+			Log.i("dshr-rescue", "tier2 升级意图（stuckFor=" + stuckRescue.stuckForMs(rescueReloadArmedAt)
+				+ "ms reloads=" + stuckRescue.reloads() + "/" + StuckRescue.MAX_RELOADS + "）⇒ 先查链路");
+			startRescueLinkProbe();
+		}
+	}
+
+	/**
+	 * T96 温和层：派发 {@code offline}→{@code online} 瞬态对。
+	 *
+	 * <p>**零痕迹**：只派事件，不写 DOM / 不换全局 / 不导航（真机逐字节 DOM 对照见
+	 * scratch/t96/report.md §5）。作用是把上游正在睡的那一跳退避当场掐断并把 attempt 归零。
+	 */
+	private void runStuckNudge() {
+		if (destroyed || webView == null) return;
+		long stuck = stuckRescue.stuckForMs(System.currentTimeMillis());
+		Log.i("dshr-rescue", "tier1 nudge 派发 offline→online（nudges=" + stuckRescue.nudges()
+			+ " stuckFor=" + stuck + "ms hookLive=" + hookSelfHealLive() + "）");
+		try {
+			webView.evaluateJavascript(StuckRescue.NUDGE_JS, value -> {
+				if (destroyed) return;
+				Log.i("dshr-rescue", "tier1 nudge 结果=" + normaliseJsonString(value));
+			});
+		} catch (Exception e) {
+			Log.w("dshr-rescue", "tier1 nudge 派发失败 " + e);
+		}
+	}
+
+	/**
+	 * T96 升级层：**受控重载**当前会话文档（等价用户手动重开 App，但不动进程、不掉会话）。
+	 *
+	 * <p>真值依据（scratch/t96/tablet-reload.json）：卡住态下 {@code Page.reload}
+	 * （== {@code WebView.reload()}）**1.6s** 恢复，且
+	 * {@code localStorage["dsh.sessions.current"]} 原样保留 ⇒ **回到同一会话**、
+	 * 不落 workspace chooser（重载前后 sessionId 逐字相同）。
+	 *
+	 * <p><b>链路闸（必须先过）</b>：网关还断着就重载，主框架直接
+	 * {@code net::ERR_CONNECTION_CLOSED} ⇒ 页面被打成浏览器错误页（实测见
+	 * scratch/t96/tablet-rescue-fg-v1.json）。所以重载前由 {@link #startRescueLinkProbe()}
+	 * 先问一次"网关的 HTTP 还在吗"，**只有通了才重载**。
+	 *
+	 * <p>四道门（任一不成立就不动）：① 会话页（非本地壳/配对页/网关错误页）；
+	 * ② 主框架没有处于失败态（失败反馈由既有 {@code showGatewayFailure} 负责，不自救）；
+	 * ③ {@code uiState == WEB}（用户在原生设置页时绝不抢）；④ 判定器的配额与间隔 + 链路探针已通。
+	 */
+	private void runStuckReload() {
+		if (destroyed || webView == null) return;
+		if (uiState != UiState.WEB) return;
+		String url = webView.getUrl();
+		if (!isSessionUrl(url) || isLocalShellUrl(url)) return;
+		if (!failedMainFrameUrl.isEmpty()) return;
+		if (!rescueLinkOk) {
+			Log.i("dshr-rescue", "tier2 受控重载被链路闸拦下（链路不通，宁可不重载）");
+			return;
+		}
+		long stuck = stuckRescue.stuckForMs(System.currentTimeMillis());
+		Log.i("dshr-rescue", "tier2 受控重载 url=" + url + " stuckFor=" + stuck
+			+ "ms reloads=" + stuckRescue.reloads() + "/" + StuckRescue.MAX_RELOADS);
+		// 重载后旧观测一律作废：横幅不许活过这次动作（新文档 onPageCommitVisible 还会再清一次）。
+		hideReconnectBannerNow();
+		stuckRescue.onDocumentChanged();
+		try {
+			webView.reload();
+		} catch (Exception e) {
+			Log.w("dshr-rescue", "tier2 受控重载失败 " + e);
+		}
+	}
+
+	/**
+	 * T96：链路探针 —— 网关的 HTTP 侧现在通不通（**纯原生、零页面痕迹**）。
+	 *
+	 * <p>为什么不能靠页面：平板档 hook 严格 OFF、页面侧没有任何可写的地方（零痕迹契约），
+	 * 而"能不能重载"必须由原生自己判断。这里用 {@link PinnedFetch}（既有可信链 + pin 语义 +
+	 * 并发闸门）在**后台线程**取一次 {@code /__dsh_remote__/health}：
+	 * 只判"服务器有没有回话"，任何状态码（含 404/405）都算通 —— 我们要证明的是
+	 * HTTP 链路活着，不是这个端点存在。
+	 *
+	 * <p>开销：只在**升级层已被判定器要求重载**的那一刻发一次（卡住态下最多每 12s 一次），
+	 * 健康态一次都不发。
+	 */
+	private void startRescueLinkProbe() {
+		long now = System.currentTimeMillis();
+		if (rescueLinkProbeInFlight) {
+			// 看门狗（第二次防线）：只在探针**确实在飞**时挡；超时的一律当死掉重发。
+			if (now - rescueLinkProbeAt > RELOAD_ARM_TIMEOUT_MS) {
+				rescueLinkProbeInFlight = false;
+				Log.w("dshr-rescue", "链路探针超时 " + RELOAD_ARM_TIMEOUT_MS + "ms ⇒ 重发一次");
+			} else {
+				return;
+			}
+		}
+		if (destroyed || webView == null) {
+			Log.w("dshr-rescue", "链路探针跳过：destroyed 或 webView 为空");
+			return;
+		}
+		String pageUrl = webView.getUrl();
+		if (!isSessionUrl(pageUrl) || isLocalShellUrl(pageUrl)) {
+			Log.w("dshr-rescue", "链路探针跳过：当前不是会话页 url=" + pageUrl);
+			return;
+		}
+		final Uri uri;
+		try {
+			uri = Uri.parse(pageUrl);
+		} catch (Exception e) {
+			Log.w("dshr-rescue", "链路探针跳过：URL 解析失败 " + pageUrl);
+			return;
+		}
+		final String scheme = uri.getScheme();
+		final String host = uri.getHost();
+		final int port = uri.getPort();
+		if (scheme == null || host == null) {
+			Log.w("dshr-rescue", "链路探针跳过：URL 缺少 scheme/host " + pageUrl);
+			return;
+		}
+		final String healthUrl = scheme + "://" + host + (port > 0 ? ":" + port : "") + "/__dsh_remote__/health";
+		rescueLinkProbeInFlight = true;
+		rescueLinkProbeAt = now;
+		final String profileId = activeProfileId;
+		Log.i("dshr-rescue", "链路探针发起 " + healthUrl);
+		Thread t = new Thread(() -> {
+			boolean ok = false;
+			int status = 0;
+			try {
+				PinnedFetch.Result r = PinnedFetch.get(healthUrl, host, port > 0 ? port : 443,
+					profileId, certPinStore(), "rescue");
+				if (r != null && r.status > 0) {
+					ok = true;
+					status = r.status;
+				}
+			} catch (Throwable ignored) {
+				ok = false;
+			}
+			final boolean okF = ok;
+			final int statusF = status;
+			if (rootLayout != null) rootLayout.post(() -> onRescueLinkProbe(okF, statusF));
+		}, "dshr-rescue-link");
+		t.setDaemon(true);
+		t.start();
+	}
+
+	/** 链路探针回话（主线程）：通了才真重载，不通就撤回这次重载意图。 */
+	private void onRescueLinkProbe(boolean ok, int status) {
+		rescueLinkProbeInFlight = false;
+		rescueLinkOk = ok;
+		Log.i("dshr-rescue", "链路探针 " + (ok ? "通" : "不通") + " status=" + status
+			+ " armed=" + rescueReloadArmed);
+		if (!rescueReloadArmed) return;
+		rescueReloadArmed = false;
+		if (ok) {
+			runStuckReload();
+		} else {
+			// 撤回：不消耗配额、episode 归零 ⇒ 链路一回来第一拍就能重新动手。
+			stuckRescue.abortReload();
+			Log.i("dshr-rescue", "tier2 撤回（链路不通期间绝不重载：会把页面打成浏览器错误页）");
+		}
+	}
+
+	/**
 	 * T78：消费一次探针结果。
 	 *
 	 * <p>{@code ok=0} / 空串 / {@code null} / 解析失败 ⇒ {@code UNKNOWN}（导航期静默，不累计）。
@@ -2582,6 +2848,12 @@ public class MainActivity extends Activity {
 		if (destroyed || reconnectBanner == null) return;
 		ReconnectBanner.Observed observed = ReconnectBanner.Observed.UNKNOWN;
 		String detail = "";
+		// T96：**原始真相**（探针 re=1）单独留一份。它跟 observed 的差别只有一处、
+		// 但那一处正是平板档实测里踩到的坑：官方那条**已可见且不重叠 ⇒ 抑制横幅**时
+		// observed 被映射成 OK，可页面的真相仍然是"正在重连"（实测 logcat 同刻：
+		// `probe=OK SUPPRESS|src=1 …` + 页面 `data-phase="connecting"`）。
+		// 自救判定必须吃原始真相，否则平板档永远不动（这正是本轮要修的"没人踹"）。
+		boolean pageReconnecting = false;
 		if (value != null && !value.isEmpty() && !"null".equals(value)) {
 			try {
 				JSONObject o = new JSONObject(value);
@@ -2589,6 +2861,7 @@ public class MainActivity extends Activity {
 					if (o.optInt("re", 0) != 1) {
 						observed = ReconnectBanner.Observed.OK;
 					} else {
+						pageReconnecting = true;
 						detail = officialStatusDetail(o);
 						observed = detail.startsWith("SUPPRESS|")
 							? ReconnectBanner.Observed.OK
@@ -2606,11 +2879,16 @@ public class MainActivity extends Activity {
 		//   ③ hook 说 ok / ok-recovered ⇒ **不覆盖**探针的结论（wide 下探针能用元素级几何
 		//      做抑制，比 hook 粗粒度状态更精确），也**不把 UNKNOWN 抬成 OK**
 		//      （导航期静默不累计是既有语义，抬了就会把"连续为真/连续为假"跨页面累加）。
-		if (hookConnState != null && "reconnecting".equals(hookConnState)
-			&& observed != ReconnectBanner.Observed.RECONNECTING) {
-			observed = ReconnectBanner.Observed.RECONNECTING;
-			detail = (detail.isEmpty() ? "" : detail + " ") + "hook=reconnecting";
+		if (hookConnState != null && "reconnecting".equals(hookConnState)) {
+			pageReconnecting = true;
+			if (observed != ReconnectBanner.Observed.RECONNECTING) {
+				observed = ReconnectBanner.Observed.RECONNECTING;
+				detail = (detail.isEmpty() ? "" : detail + " ") + "hook=reconnecting";
+			}
 		}
+		// T96：自救判定。吃**原始真相**；横幅的抑制语义一个字没动（observed 照旧走上面那套）。
+		// 放在防抖的早退**之前**：横幅该不该显示与"要不要踹一脚"是两件事。
+		runStuckRescue(pageReconnecting, observed);
 		// 只在**日志去重键**变化时打一行，避免每 500ms 刷屏；这一行是设备侧"原生看到了什么"的唯一原始证据。
 		// T86：键里除了观测值，还含**抑制判定**与**匹配层** —— 否则「官方那条可见且不重叠 ⇒ 抑制」
 		// 这一步（observed 从 UNKNOWN/OK 到 OK 不变）在 logcat 里完全看不见，
@@ -3235,6 +3513,8 @@ public class MainActivity extends Activity {
 			// 折叠/展开、旋转后按新档位即时生效（契约 3.1/3.3）：
 			// 只改注入配置 + 调 hook 的幂等切换 API，绝不重载 WebView、绝不碰隧道。
 			applyDeviceClassInsets();
+			// T94：系统深浅色变化 ⇒ 页面（跟随系统时）底色跟着变 ⇒ 立刻只读重采一次。
+			requestPageBackground();
 			if (!isTabletClass()) {
 				// 折回手机档时补一次注入：hook 在平板档可能整体早退，
 				// 只靠 __dshrSetDevice 不保证脚本已装上（契约 3.3 的保守解读）。
@@ -3263,6 +3543,137 @@ public class MainActivity extends Activity {
 		applySystemBars();
 	}
 
+	// ---------- T94：让位后露出的那两条，跟页面同色（沉浸） ----------
+
+	/**
+	 * T94：**只读**页面背景探针。取「贴着系统栏那条边、页面实际画出来的颜色」。
+	 *
+	 * <p>为什么不能读 {@code body} 的背景色：DSH 的 {@code html} 背景是透明的、
+	 * {@code body} 是 #FFFFFF/#151517，而用户看到的那条"灰底"其实是**左栏容器**自己的底色
+	 * （浅色 #F9FAFB / 深色 #1B1B1C，实测见 scratch/t94/report.md §1）——
+	 * 读 body 只会拿回改动前就已经硬编码的那个值，等于没读。
+	 * 所以这里从 {@code elementFromPoint} 命中的元素**逐层向上合成**
+	 * {@code background-color}（含 alpha 混色），得到的就是该点**真实的可见底色**。
+	 *
+	 * <p>采样点：(2,2) 与 (2, h-3)，即内容盒的左上/左下角——正是两条带**正下方**那一列。
+	 * 两条带整宽只有一种颜色，而页面在平板上是「左栏 + 主列」两段底色，
+	 * 取左栏那一列是**刻意**的：用户的症状就是"左侧栏灰底、上下却白"。
+	 * 主列那侧的残差在实测里 ≤7/255（≈2.7%），肉眼不可辨；选择理由与残差数字见报告 §3.4。
+	 *
+	 * <p>只读：本探针不 setAttribute / 不写 style / 不建节点，平板档零痕迹（契约 3.5）不受影响。
+	 * 返回**对象**而不是 JSON 字符串——evaluateJavascript 会把字符串结果再编码一层，
+	 * 那样 {@code new JSONObject(value)} 直接抛异常（同 officialStatusDetail 的注释）。
+	 */
+	private static final String PAGE_BG_PROBE_JS = "(function(){try{"
+		+ "var p=function(c){var m=/^rgba?\\(\\s*([\\d.]+)[,\\s]+([\\d.]+)[,\\s]+([\\d.]+)(?:\\s*[,/]\\s*([\\d.%]+))?\\s*\\)$/.exec(String(c||''));"
+		+ "if(!m)return null;var r=m[4];var a=r===undefined?1:(r.indexOf('%')>=0?parseFloat(r)/100:parseFloat(r));return[+m[1],+m[2],+m[3],a];};"
+		+ "var b=function(t,o){var a=t[3];return[t[0]*a+o[0]*(1-a),t[1]*a+o[1]*(1-a),t[2]*a+o[2]*(1-a),1];};"
+		+ "var bg=function(el){return el?p(getComputedStyle(el).backgroundColor):null;};"
+		+ "var e=function(x,y){var el=document.elementFromPoint(x,y);var s=[];"
+		+ "while(el){var c=bg(el);if(c&&c[3]>0)s.push(c);el=el.parentElement;}"
+		+ "if(!s.length){var ht=bg(document.documentElement);if(ht&&ht[3]>0)s.push(ht);"
+		+ "var bd=bg(document.body);if(bd&&bd[3]>0)s.push(bd);}"
+		+ "if(!s.length)return null;var o=s[s.length-1];for(var i=s.length-2;i>=0;i--)o=b(s[i],o);"
+		+ "return[Math.round(o[0]),Math.round(o[1]),Math.round(o[2])];};"
+		+ "var h=innerHeight|0;"
+		+ "var k=function(ys){for(var i=0;i<ys.length;i++){var v=e(2,ys[i]);if(v)return v;}return null;};"
+		+ "var t=k([2,h>>4,h>>2,h>>1]);var bo=k([Math.max(0,h-3),h-(h>>4),h>>1]);"
+		+ "return {t:t,b:bo,d:!!(document.body&&document.body.hasAttribute('data-ds-dark-theme'))};"
+		+ "}catch(x){return {};}})()";
+
+	/** T94：轮询间隔。主题可能在页面里随时被改（官方设置面板手选浅色/深色）⇒ 只能定期只读重采。 */
+	private static final long PAGE_BG_POLL_INTERVAL_MS = 1500L;
+
+	/** T94：读一次页面背景色。只读、幂等、失败静默。 */
+	private void requestPageBackground() {
+		if (webView == null || destroyed) return;
+		if (uiState != UiState.WEB || webView.getVisibility() != View.VISIBLE) return;
+		try {
+			webView.evaluateJavascript(PAGE_BG_PROBE_JS, this::handlePageBackgroundResult);
+		} catch (Exception ignored) { /* 取不到 ⇒ 保留上一次的值 */ }
+	}
+
+	/**
+	 * T94：消费一次探针结果。空 / {@code null} / 缺 {@code t} ⇒ **什么都不做**
+	 * （保留上一次取到的颜色，避免主题切换瞬间闪回白条）。
+	 */
+	private void handlePageBackgroundResult(String value) {
+		if (destroyed || value == null || value.isEmpty() || "null".equals(value)) return;
+		int top;
+		int bottom;
+		boolean dark;
+		try {
+			JSONObject o = new JSONObject(value);
+			top = packRgb(o.optJSONArray("t"));
+			if (top == PAGE_BG_NONE) return;
+			bottom = packRgb(o.optJSONArray("b"));
+			dark = o.optBoolean("d", pageDark);
+		} catch (Exception e) {
+			return;
+		}
+		if (bottom == PAGE_BG_NONE) bottom = top;
+		if (top == pageBgTop && bottom == pageBgBottom && dark == pageDark) return;
+		Log.i("dshr-immersive", "page-bg top=" + hexOf(top) + " bottom=" + hexOf(bottom)
+			+ " dark=" + dark + " tablet=" + isTabletClass() + " uiState=" + uiState);
+		pageBgTop = top;
+		pageBgBottom = bottom;
+		pageDark = dark;
+		applySystemBars();
+	}
+
+	/** T94：`[r,g,b]` → {@code 0xFFRRGGBB}；缺失/越界各通道夹到 0..255，缺数组返回 NONE。 */
+	private static int packRgb(org.json.JSONArray a) {
+		if (a == null || a.length() < 3) return PAGE_BG_NONE;
+		int r = Math.max(0, Math.min(255, a.optInt(0, 0)));
+		int g = Math.max(0, Math.min(255, a.optInt(1, 0)));
+		int b = Math.max(0, Math.min(255, a.optInt(2, 0)));
+		return 0xFF000000 | (r << 16) | (g << 8) | b;
+	}
+
+	/** T94：日志用 {@code #RRGGBB}（不回落到 float 格式，避免默认 Locale 插逗号）。 */
+	private static String hexOf(int color) {
+		return String.format(java.util.Locale.US, "#%06X", color & 0xFFFFFF);
+	}
+
+	/**
+	 * T94：会话档那两条要画成的颜色。探针没取到 ⇒ **逐值退回**改动前的硬编码取值
+	 * （{@code dark ? 0xFF141414 : Color.WHITE}），保证探针失败时的行为与改动前一致。
+	 */
+	private int sessionBarColor(boolean dark) {
+		if (uiState == UiState.WEB && pageBgTop != PAGE_BG_NONE) return pageBgTop;
+		return dark ? 0xFF141414 : Color.WHITE;
+	}
+
+	/** T94：启动页面背景轮询（幂等）。与重连轮询同一套生命周期（onResume 起 / onPause 停）。 */
+	private void startPageBgPolling() {
+		if (rootLayout == null || destroyed || pageBgPolling) return;
+		pageBgPolling = true;
+		rootLayout.removeCallbacks(pageBgPollTick);
+		rootLayout.postDelayed(pageBgPollTick, PAGE_BG_POLL_INTERVAL_MS);
+	}
+
+	/** T94：停止页面背景轮询（幂等）。 */
+	private void stopPageBgPolling() {
+		pageBgPolling = false;
+		if (rootLayout != null) rootLayout.removeCallbacks(pageBgPollTick);
+	}
+
+	/** T94：轮询节拍。守卫与重连轮询一致（WEB 且 WebView 可见），否则静默不读。 */
+	private final Runnable pageBgPollTick = new Runnable() {
+		@Override
+		public void run() {
+			if (destroyed) return;
+			requestPageBackground();
+			if (pageBgPolling && rootLayout != null) rootLayout.postDelayed(this, PAGE_BG_POLL_INTERVAL_MS);
+		}
+	};
+
+	/** T94：换了文档就作废上一页取到的颜色（一次导航的首帧不该沿用旧页底色）。 */
+	private void resetPageBackground() {
+		pageBgTop = PAGE_BG_NONE;
+		pageBgBottom = PAGE_BG_NONE;
+	}
+
 	private void applySystemBars() {
 		boolean session = uiState == UiState.WEB;
 		boolean dark = session ? pageDark : isSystemDark();
@@ -3270,20 +3681,30 @@ public class MainActivity extends Activity {
 		// 状态栏必须透明 + 让位，不能沿用手机档「注入失败退实色」的判定。
 		boolean tabletSession = session && isTabletClass();
 		boolean edge = !session || tabletSession || edgeToEdgeChrome;
+		// T94：三条都取**同一个**值 ⇒ 系统栏区域与页面连成一片。
+		//   ① rootLayout 是那两条真正的底（T80 把让位落成 WebView 外边距之后，露出的就是它）；
+		//   ② 窗口状态栏/导航栏色也钉成它（三者一致）——有些形态系统**忽略**着色
+		//      （API 35 + targetSdk 34 实测：手势导航下 navigationBarColor 本就不生效，
+		//      见 scratch/t94/report.md §1.3），那时就靠 ① 兜住，像素一样是对的。
+		// 探针没取到颜色时 sessionBarColor() 逐值退回改动前的硬编码取值。
+		int strip = sessionBarColor(dark);
+		boolean sampled = session && pageBgTop != PAGE_BG_NONE;
 		if (rootLayout != null) rootLayout.setBackgroundColor(session
-			? (dark ? 0xFF141414 : Color.WHITE) : shellColor(R.color.shell_background));
+			? strip : shellColor(R.color.shell_background));
 		if (!session) {
 			tintShell(homeScroll);
 			tintShell(setupScroll);
 		}
 		// T80：平板档下状态栏/导航栏露出的是「让位外边距」那圈**父容器底色**（rootLayout 已钉成
-		// 页面深浅色，见上），不再指望 WebView 自己的 padding 区；WebView 底色仍钉到页面深浅色，
+		// 页面底色，见上），不再指望 WebView 自己的 padding 区；WebView 底色仍钉到页面底色，
 		// 用来盖住页面首帧前的空白。
 		if (tabletSession && webView != null) {
-			webView.setBackgroundColor(dark ? 0xFF141414 : Color.WHITE);
+			webView.setBackgroundColor(strip);
 		}
 		// 只在适配已启用的会话中透明：各列 CSS inset 留空间，背景画到手势条下。
-		int nav = edge ? Color.TRANSPARENT : (dark ? 0xFF141414 : Color.WHITE);
+		// T94：取到页面真实底色后，底部这条也用页面色（= 页面自己画在那里的颜色）；
+		// 取不到时逐值退回改动前的「沉浸则透明 / 否则实色」。
+		int nav = sampled ? pageBgBottom : (edge ? Color.TRANSPARENT : (dark ? 0xFF141414 : Color.WHITE));
 		WindowManager.LayoutParams attrs = getWindow().getAttributes();
 		View decor = getWindow().getDecorView();
 		int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
@@ -3295,14 +3716,14 @@ public class MainActivity extends Activity {
 			getWindow().setNavigationBarContrastEnforced(false);
 		}
 		if (edge) {
-			getWindow().setStatusBarColor(Color.TRANSPARENT);
+			getWindow().setStatusBarColor(sampled ? strip : Color.TRANSPARENT);
 			flags |= View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
 			if (Build.VERSION.SDK_INT >= 28) {
 				attrs.layoutInDisplayCutoutMode =
 					WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
 			}
 		} else {
-			getWindow().setStatusBarColor(dark ? 0xFF141414 : Color.WHITE);
+			getWindow().setStatusBarColor(sampled ? strip : (dark ? 0xFF141414 : Color.WHITE));
 			if (Build.VERSION.SDK_INT >= 28) {
 				attrs.layoutInDisplayCutoutMode =
 					WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT;
@@ -3383,6 +3804,8 @@ public class MainActivity extends Activity {
 		hideSettings();
 		setUiState(UiState.WEB);
 		applySystemBars();
+		// T94：进会话立刻只读采一次页面底色（否则首帧会先用退回色，等下一次轮询才纠正）。
+		requestPageBackground();
 		if (webView != null && webView.getVisibility() != View.VISIBLE) {
 			webView.setVisibility(View.VISIBLE);
 		}
@@ -3417,6 +3840,8 @@ public class MainActivity extends Activity {
 		activeUrl = target;
 		setUiState(UiState.WEB);
 		applySystemBars();
+		// T94：回到仍存活的会话文档：底色沿用文档现值（不重置），补读一次即可。
+		requestPageBackground();
 		webView.setVisibility(View.VISIBLE);
 		injectMobileAdaptation(webView);
 		applyInsetsToPage(webView);
@@ -4375,12 +4800,29 @@ public class MainActivity extends Activity {
 			return;
 		}
 		if (uiState == UiState.WEB && webView != null && webView.getVisibility() == View.VISIBLE) {
-			webView.evaluateJavascript(
-				"(function(){var bridge=window.__dshRemoteAndroidMobile;return !!(bridge&&bridge.closeSidebarIfExpanded&&bridge.closeSidebarIfExpanded());})()",
-				value -> {
-					if (value == null || !value.contains("true")) finishWebBack();
-				}
-			);
+			// T99：**平板档一次返回直接进 App 连接设置页**（不再先关官方左抽屉）。
+			//
+			// 判据只问一件事：**除左抽屉之外**还有没有要收的东西（弹层 / 官方右栏）？
+			//   有 → 走既有桥（与手机档同一条通道，T43/T47「右栏打开态只关右栏」逐字保留）；
+			//   无 → 直接 finishWebBack()，**连桥都不调**，左抽屉一动不动。
+			//
+			// 为什么不改桥本身：桥在 hook 里（mobile-web.js，T97 正在改，本次一个字节都不能碰），
+			// 且桥的「关左抽屉」是**最后一个**分支（前面依次是 sheet / explorer / dialog / 右栏）。
+			// 所以"先确认前几个分支都没东西可关 ⇒ 跳过整次调用"与"调用后恰好只走到最后一个分支
+			// 再把它当作什么都没关"在语义上等价，而跳过的代价是**左抽屉保持展开**——正是本任务要的。
+			if (isTabletClass()) {
+				webView.evaluateJavascript(TABLET_BACK_OVERLAY_PROBE_JS, value -> {
+					if (value != null && value.contains("none")) {
+						finishWebBack();
+						return;
+					}
+					// 'overlay'（有弹层/右栏）与任何异常、空回话都退回**既有语义**（fail-safe：
+					// 宁可多收一次弹层，也不把"该关的弹层"漏过去）。
+					closeOverlaysThenFinish();
+				});
+				return;
+			}
+			closeOverlaysThenFinish();
 			return;
 		}
 		super.onBackPressed();
@@ -4390,9 +4832,15 @@ public class MainActivity extends Activity {
 	 * 会话内返回：先关官方弹层/侧栏（由 JS 处理）；再仅在同一网关内 goBack。
 	 * 在会话根改为打开 App 连接设置（D6 ①，<b>两档一致</b>）；设置页再按一次才退到后台。
 	 *
-	 * <p>T65：改前 {@code if (isTabletClass())} 把「打开连接设置」限死在平板档，
+	 * <p>T99 起，平板档的「先关侧栏」只剩**官方右栏**：左抽屉不再被返回键收起
+	 * （手机档左抽屉的既有行为未动，见 {@link #handleAppBack()}）。
+	 *	 * <p>T65：改前 {@code if (isTabletClass())} 把「打开连接设置」限死在平板档，
 	 * 手机档直接落到 {@code moveTaskToBack(true)} 退到桌面，与设置页文案承诺的
 	 * 「系统返回键继续」不一致（T48/T58/T59 三轮复现）。平板档判据本身一字未改。
+	 *
+	 * <p><b>T99</b>：本方法的职责边界收窄了一句 —— 平板档到达这里之前**不再**收官方左抽屉
+	 * （见 {@link #handleAppBack()} 的平板分支）。也就是说"到达本方法"在平板档现在是
+	 * **一次返回键**（左抽屉展开时也一样），手机档语义逐字不变。
 	 */
 	private void finishWebBack() {
 		if (uiState != UiState.WEB || webView == null || webView.getVisibility() != View.VISIBLE) {
@@ -4430,6 +4878,57 @@ public class MainActivity extends Activity {
 		settingsViaBackKey = true;
 		showConnectionSettings();
 	}
+
+	/**
+	 * T99：会话页返回键的「收弹层」通道 —— 就是 T43/T47 起就有的那条 hook 返回键桥。
+	 *
+	 * <p>抽成方法**只为复用**（手机档 / 平板档+有弹层两条路径同一条），JS 字面量**逐字节未改**
+	 * （`!value.contains("true")` 才继续走 {@link #finishWebBack()} 的判据也没动）。
+	 * 桥的收拢顺序：sheet → Explorer 详情 → 模态弹框 → 官方右栏 → **最后才**官方左抽屉；
+	 * 因此"桥返回 true"既可能是收了右栏（要留在会话页），也可能是收了左抽屉（T99 起平板档
+	 * 不该发生——平板档只在探针确认有非左抽屉弹层时才会调到这里）。
+	 */
+	private void closeOverlaysThenFinish() {
+		if (webView == null) return;
+		webView.evaluateJavascript(
+			"(function(){var bridge=window.__dshRemoteAndroidMobile;return !!(bridge&&bridge.closeSidebarIfExpanded&&bridge.closeSidebarIfExpanded());})()",
+			value -> {
+				if (value == null || !value.contains("true")) finishWebBack();
+			}
+		);
+	}
+
+	/**
+	 * T99：平板档返回键的**只读**前置探针 —— 「除左抽屉外还有东西要收吗」。
+	 *
+	 * <p>返回三个取值（`evaluateJavascript` 回话是 JSON 字符串，故原生侧用 {@code contains} 判）：
+	 * <ul>
+	 *   <li>{@code none}：没有任何弹层/右栏要收 ⇒ 原生**不调桥**，直接进连接设置页
+	 *       （左抽屉保持展开，绝不会被当作"要收的东西"）。</li>
+	 *   <li>{@code overlay}：有 sheet / Explorer 详情 / 模态弹框 / 官方右栏 ⇒ 调既有桥收它，
+	 *       仍在会话页（T43/T47 右栏语义原样保留）。</li>
+	 *   <li>{@code error}：探针自身异常 ⇒ 原生按"非 none"处理，退回既有桥（fail-safe）。</li>
+	 * </ul>
+	 *
+	 * <p>四个判据与 hook 桥的前四个分支**同源同序**（`[data-dshr-sheet-panel]` 可见、
+	 * `data-dshr-explorer-details=1`、可见的 `[role="dialog"][aria-modal="true"]`、
+	 * `[data-sidebar-right-panel][data-sidebar-right-open]` 且 `aria-hidden!=true`），
+	 * 可见性口径与 hook 的 {@code isVisible()} 一致（{@code getClientRects().length>0}）。
+	 * 顺序在这里**不影响正确性**（只要"有任意一个"就返回 overlay），但保持一致便于对账。
+	 *
+	 * <p>纯只读：不写 DOM/CSS/存储、不派发事件、不注册监听、不起定时器
+	 * （由 {@code android/tests/T99BackKeyTest.java} 的只读性断言钉住）。
+	 */
+	private static final String TABLET_BACK_OVERLAY_PROBE_JS = "(function(){try{"
+		+ "var vis=function(n){return !!(n&&n.getClientRects&&n.getClientRects().length>0);};"
+		+ "var sheet=document.querySelector('[data-dshr-sheet-panel]');"
+		+ "if(sheet&&vis(sheet))return 'overlay';"
+		+ "if(document.documentElement.getAttribute('data-dshr-explorer-details')==='1')return 'overlay';"
+		+ "var ds=document.querySelectorAll('[role=\"dialog\"][aria-modal=\"true\"]');"
+		+ "for(var i=0;i<ds.length;i++){if(vis(ds[i]))return 'overlay';}"
+		+ "var rp=document.querySelector('[data-sidebar-right-panel][data-sidebar-right-open]');"
+		+ "if(rp&&rp.getAttribute('aria-hidden')!=='true')return 'overlay';"
+		+ "return 'none';}catch(e){return 'error';}})()";
 
 	private final class AppBridge {
 		@JavascriptInterface
