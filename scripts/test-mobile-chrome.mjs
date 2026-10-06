@@ -838,8 +838,15 @@ function assertSourceContracts() {
 		for (const field of ["verifyDown:", "verifyResult:", "verifyAt:", "hiddenSince:", "bypassUntil:"]) {
 			if (!src.includes(field)) throw new Error(`源码契约：T95 resumeRecoveryState 缺少只读诊断字段 ${field}`);
 		}
-		if (!src.includes("|| (resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS),")) {
-			throw new Error("源码契约：T95 resumeRecoveryState().reconnecting 必须与 isConnectionDown() 同口径（含探活那一路）");
+		// T116：上一行的内联 trust 改为 trustDown 门控变量 —— 有活口（openNow>0）时
+		// trust 不计，与 isConnectionDown() 的新口径一致（活口是事实、探活只是推测）。
+		// 钉两件事：① reconnecting 仍含 trust 这一路（换了载体，不许丢）；② trustDown
+		// 的计算里必须有活口门控（否则与 isConnectionDown() 漂移，诊断快照说谎）。
+		if (!src.includes("reconnecting: detail.el !== null || wsDown || trustDown,")) {
+			throw new Error("源码契约：T95 resumeRecoveryState().reconnecting 必须与 isConnectionDown() 同口径（含探活那一路，T116 起走 trustDown 门控变量）");
+		}
+		if (!src.includes("trustDown = !(ws && ws.installed && ws.openNow > 0);")) {
+			throw new Error("源码契约：T116 trustDown 必须含活口门控（有活口时 trust 不计，否则诊断快照与 isConnectionDown() 漂移）");
 		}
 		// T112b：这一条的老落点是 resumeRecoveryState 里那串内联三元式；本任务把"哪一层认出来的"
 		// 抽成 connectionDownSource()（**同一个**取值同时被 nudge 的分流闸读，两处必须同口径），

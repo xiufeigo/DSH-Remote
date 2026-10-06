@@ -6123,10 +6123,16 @@
 		var s = wsWatchState;
 		if (!s || !s.installed) return false;
 		if (s.openNow > 0) return false;
+		var now = Date.now();
+		// T116（P0·用着用着显示重连）：交接窗抑制 —— 新 socket 正在 8s 宽限内建链时，
+		// 不许用“老 socket 已关 1.5s”报断。改前 close 分支优先，老 socket 关后 1.5s
+		// 即报断（即使新 socket 还在正常握手），随后 nudge 掐断这次握手 = 自造一次真重连。
+		// 中转链路上一次 TCP+WSS 握手超 1.5s 并不稀奇，8s 才是双方承认的建链宽限。
+		if (s.pendingSince > 0 && now - s.pendingSince < WS_CONNECT_GRACE_MS) return false;
 		// ② 曾经 OPEN 过的同类 socket 关了、且没有别的活口：给一个宽限期（S3）。
-		if (s.closeAt > 0 && Date.now() - s.closeAt >= WS_CLOSE_GRACE_MS) return true;
+		if (s.closeAt > 0 && now - s.closeAt >= WS_CLOSE_GRACE_MS) return true;
 		// ③ 有同类 socket 构造出来了却迟迟没 open：超过 CONNECTING 宽限即断（S4）。
-		if (s.pendingSince > 0 && Date.now() - s.pendingSince >= WS_CONNECT_GRACE_MS) return true;
+		if (s.pendingSince > 0 && now - s.pendingSince >= WS_CONNECT_GRACE_MS) return true;
 		return false;
 	}
 
@@ -6144,6 +6150,15 @@
 		// wsWatchDown() 恒 false）⇒ 判据必须认它，否则页面把"表面连着、实际已死"当健康，
 		// 一次 nudge 都不推、原生自救层也看不到真相。有效期 RESUME_VERIFY_TRUST_MS，
 		// 新 socket 真打开时在 wsWatchEvent() 里当场撤销。
+		// T116（P0·误判自证）：有活口（openNow>0）时忽略 trust —— 双探失败时那条
+		// 健康 socket 还开着，没有新 open 事件来撤销 trust，trust 会压住活链 20s；
+		// 其间 hook 按电平每秒重推、原生 OR 进判据，随后 nudge 掐断这条活链 =
+		// “探活误判 → 自造一次真重连”。活口是事实，探活只是推测，事实优先。
+		// 门控前置、老字面量原样保留（源码契约逐字匹配下面那一行）。
+		try {
+			var live = wsWatchState;
+			if (live && live.installed && live.openNow > 0) return wsWatchDown();
+		} catch (ignoredTrustLive) { /* 取不到活口信息就按旧语义走 trust 那一行 */ }
 		if (resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS) return true;
 		return wsWatchDown();
 	}
@@ -6164,6 +6179,13 @@
 		var wsDown = false;
 		try { wsDown = wsWatchDown(); } catch (ignoredSrcWs) { wsDown = false; }
 		if (wsDown) return 3;
+		// T116：与 isConnectionDown() 同口径 —— 有活口时 trust 不计入来源（见上），
+		// 否则 nudge 分流会把“活链 + 误判 trust”当成来源 4 去 online-only，
+		// 而判据侧却报断，两边口径漂移。门控前置、老字面量原样保留。
+		try {
+			var liveSrc = wsWatchState;
+			if (liveSrc && liveSrc.installed && liveSrc.openNow > 0) return 0;
+		} catch (ignoredSrcLive) { /* 取不到就按旧语义走 trust 那一行 */ }
 		if (resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS) return 4;
 		return 0;
 	}
@@ -6253,7 +6275,11 @@
 			return;
 		}
 		s.sockets += 1;
-		if (s.openNow === 0 && s.pendingSince === 0) s.pendingSince = Date.now();
+		// T116（P0·重叠交接）：新 socket 在老 socket 还没关时就建出来是常态
+		// （页面主动重建），此时 openNow>0。改前只在 openNow===0 时记 pending，
+		// 于是这条新链没有宽限 —— 老链一关、1.5s 后即报断（即使新链还在正常握手）。
+		// 改后同类新链一律记 pending（open 分支会清零，健康稳态零影响）。
+		if (s.pendingSince === 0) s.pendingSince = Date.now();
 		wsWatchRecheck();
 		try {
 			socket.addEventListener('open', function () { wsWatchEvent(rec, true); wsWatchRecheck(); wsWatchNotifyEdge(); });
@@ -6672,6 +6698,15 @@
 		var wsDown = false;
 		var ws = wsWatchState;
 		try { wsDown = wsWatchDown(); } catch (ignoredWsStateDown) { wsDown = false; }
+		// T116：与 isConnectionDown() 同口径 —— trust 在有活口时不计（见上）。
+		// 这里不能直接调 isConnectionDown()（那会重算 DOM，两次 DOM 求值可能不一致），
+		// 所以把同一段门控 inline 一份。
+		var trustDown = false;
+		try {
+			if (resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS) {
+				trustDown = !(ws && ws.installed && ws.openNow > 0);
+			}
+		} catch (ignoredStateTrust) { trustDown = false; }
 		return {
 			installed: true,
 			nudges: resumeNudgeCount,
@@ -6683,8 +6718,8 @@
 			// 改前只写 `detail.el !== null || wsDown` ⇒ 半开场景下 collectUiDiag().wsState 说
 			// "reconnecting"（横幅出来了）而这里说 false，两边自相矛盾（我在装置上实测到，
 			// 见 scratch/t95/logs/resume-fix-after.log）。判据只能有一个。
-			reconnecting: detail.el !== null || wsDown
-				|| (resumeVerifyDownAt > 0 && Date.now() - resumeVerifyDownAt <= RESUME_VERIFY_TRUST_MS),
+			// T116：trustDown 已含“有活口则忽略”门控（见上），与 isConnectionDown() 同口径。
+			reconnecting: detail.el !== null || wsDown || trustDown,
 			reconnectSrc: detail.src,
 			// wsSrc 语义不变（DOM 层优先，其次 WS 观测，再次探活）+ 语义仍为"哪一层认出来的"：
 			//   1 = 官方按钮 / 2 = 文案 / 3 = WS 观测 / **4 = 只有回前台探活命中** / 0 = 健康。

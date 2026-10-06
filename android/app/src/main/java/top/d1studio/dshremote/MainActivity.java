@@ -3124,6 +3124,18 @@ public class MainActivity extends Activity {
 		} else {
 			o = StuckRescue.Observed.UNKNOWN;
 		}
+		// T116（P0·重连完整页刷新）：健康/读不到页时先撤掉已武装的重载意图，
+		// 且必须在 observe() 之前撤 —— observe(OK) 会把 reloadedSinceDown 清掉，
+		// 之后再调 abortReload() 就是空操作，配额白白扣掉一次、武装还留着，
+		// 等链路探针回来就在健康页上打出一发 WebView.reload()。
+		if (o != StuckRescue.Observed.RECONNECTING && rescueReloadArmed) {
+			rescueReloadArmed = false;
+			rescueLinkProbeInFlight = false;
+			stuckRescue.abortReload();
+			Log.i("dshr-rescue", "tier2 取消武装（页面已"
+				+ (o == StuckRescue.Observed.OK ? "恢复" : "不可读")
+				+ "，链路探针回来也不重载）");
+		}
 		StuckRescue.Action action = stuckRescue.observe(o, System.currentTimeMillis(), hookSelfHealLive());
 		// T96：**升级层全程必须留痕**——实测踩过"一声不响"的坑：链路探针线程若因闸门/回调丢失
 		// 迟迟不回来，`rescueLinkProbeInFlight` 一直为 true，后面每次升级都被静默挡掉，
@@ -3291,6 +3303,22 @@ public class MainActivity extends Activity {
 		if (!rescueReloadArmed) return;
 		rescueReloadArmed = false;
 		if (ok) {
+			// T116（P0·重连完整页刷新）：探针在飞的这段时间页面可能已经恢复
+			// （runStuckRescue 的提前撤 arm 正常会拦住，但切页/轮询暂停等路径
+			// 下那一拍可能没跑到）。动手前再看一眼“此刻还断着吗”，不看就动手
+			// 正是“重连完有概率整页刷新一遍”的来源。已恢复 ⇒ 回滚配额、不重载。
+			if (!stuckRescue.reloadedSinceDown()) {
+				Log.i("dshr-rescue", "tier2 取消：等待链路期间判定器已复位（页面已恢复），不重载");
+				return;
+			}
+			boolean stillDown = lastProbeObserved == ReconnectBanner.Observed.RECONNECTING
+				|| "reconnecting".equals(freshHookConnState());
+			if (!stillDown) {
+				stuckRescue.abortReload();
+				Log.i("dshr-rescue", "tier2 取消：链路通时页面已恢复（lastProbe="
+					+ lastProbeObserved + "），回滚配额、不重载");
+				return;
+			}
 			runStuckReload();
 		} else {
 			// 撤回：不消耗配额、episode 归零 ⇒ 链路一回来第一拍就能重新动手。
