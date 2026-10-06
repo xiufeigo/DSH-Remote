@@ -30,12 +30,12 @@
  *     **长按 600ms = 打开 App 连接设置页**，**单击仍是官方原本的「新建会话」**；
  *     该特性不写任何 DOM（节点 / 属性 / 类名 / 样式规则零新增），其余平板档能力
  *     仍全部关闭（含 window.WebSocket 包装）。详见 syncBrandLongPress 一段。
- *   - 平板档第二处例外（T101，用户明确授权「允许最小 hook」）：平板档**多 2 条 CSS 规则**
- *     ——把官方会话主区画成圆角面板、把官方 frame 铺成左侧栏底色（圆角露出的就是这个底色，
- *     与 T94 的系统栏带取色同源 ⇒ 无新异色缝）。规则写进**既有的**
- *     <style data-dshr-mobile-css>，**不新增 DOM 节点 / 类名 / data-dshr-* 属性**。
- *     注意：这使 teardownHookTraces 文档里「平板档 style 里无一条规则命中官方 DOM」
- *     这句话**不再成立**（那 2 条规则正是要在平板档命中官方 frame 与 main 列）。
+ *   - 平板档第二处例外（T101，用户明确授权「允许最小 hook」）**已删除**：
+ *     原来多 2 条 CSS 规则（官方会话主区 28px 圆角面板 + 官方 frame 铺左侧栏底色）。
+ *     用户实测否决：「主 session 左上/左下那个圆角跟左侧栏直线对不上」——官方桌面布局
+ *     的主区列本来就是直角，圆角是我们自己加的装饰，不是原生。两条规则整段删除，
+ *     平板档绘制回到官方原生（见 MOBILE_CSS 里「T101 平板档圆角已删除」一段）。
+ *     剩下那组让位规则与四个 inset 变量是 T115 的，不动。
  *   - 平板档第三处例外（T115，用户口径「系统栏走安卓原生透明 + 页面自己让位」）：
  *     平板档的系统栏让位从「原生给 WebView 留外边距」改为「**页面自己让位**」。
  *     轨迹增量仍然只有两样，且都在既有载体里：
@@ -49,7 +49,8 @@
  *     布局贴边那一行本来就是**两色**（左栏 --dsw-specific-sidebar-fill / 面板
  *     --dsw-alias-bg-base）⇒ 单色带必然在面板那一侧留一道硬缝（T115 实测 2560 宽里
  *     1919 px = 75.0% 与页面差 ΔRGB=(6,5,4)）。让页面自己画这两条带，ΔRGB=0 是构造性的。
- *     T97 的事件监听器、T101 的 2 条规则、T115 的四个变量与一组规则就是平板档的**全部** hook 痕迹。
+ *     T97 的事件监听器、T115 的四个变量与一组规则就是平板档的**全部** hook 痕迹
+ *     （T101 的 2 条圆角规则已删，见下）。
  *   - 手机档「长按 = 进 App 连接设置页」的两处入口（T103，用户口径「进连接设置只保留
  *     长按这一条路」，取消返回键入口由 T102 完成）：
  *     ① **悬浮鲸鱼长按**（既有 650ms 行为，T103 补两处防误触：长按触发后那次
@@ -307,61 +308,16 @@
 		'  box-sizing: border-box !important;',
 		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
 		'}',
-		// ── T101：平板档（官方三栏 / 桌面布局）圆角 ──────────────────────────────
-		// 契约变更（用户授权）：平板档由「hook 严格 OFF / 零痕迹」放宽为「**允许最小 hook**」。
-		// 本段的**全部**痕迹就是下面 2 条规则，它们住在**既有的**
-		// <style data-dshr-mobile-css> 里 ⇒ 不新增 DOM 节点、不加类名、不加任何
-		// data-dshr-* 属性（`scripts/test-device-class.mjs` 的零痕迹判定逐条仍绿）。
-		//
-		// 作用域 = `html:not(.dshr-mobile):not(.dshr-official-inset)`，它**恰好**等于
-		// `deviceMode === 'tablet'`：严格 OFF 时 teardownHookTraces() 把这两个类都摘掉；
-		// 手机竖屏有 .dshr-mobile、手机横屏与 auto-OFF 有 .dshr-official-inset ⇒ 一条都不命中。
-		//
-		// 元素锚点全部走官方**结构属性**，不碰 CSS module 哈希类名（同 T97 的约定）：
-		//   官方 frame            = `:has(> [data-shell-overlay])`
-		//                           （overlayLayer `[data-shell-overlay]` 是 frame 的直接子节点）
-		//   官方会话主区列 centerCol = `:has(> [data-slot="main"])`
-		//                           （`[data-slot="main"]` 是 centerCol 的直接子节点）
-		// 两条都是**单层 :has()**：不支持 :has 的旧 WebView 只会整条丢弃 ⇒ 退回改动前观感，
-		// 不会坏版面（`:has()` Chrome 105+，Android 15 WebView / headless Chrome 均满足）。
-		//
-		// 为什么是「frame 铺左侧栏底色 + 主区列画成圆角」而不是反过来：
-		// 状态栏带 / 手势条带的取色是原生 T94 探针按 `elementFromPoint(2, y)` 采页面底色
-		// （MainActivity.PAGE_BG_PROBE_JS，x=2 落在**左侧栏**上）。所以「圆角露出来的颜色」
-		// 必须恒等于 x=2 处的颜色，否则圆角外会多出一条**异色缝**。
-		// 让 frame 与左侧栏取**同一个官方 token** 之后：
-		//   · x=2 无论命中左侧栏还是 frame，探针读到的都是同一个颜色 ⇒ 系统栏带**不变色**；
-		//     侧栏收起（列宽变 0）时探针落到 frame 上，读到的仍是同一个值 ⇒ 两种状态都成立；
-		//   · 圆角缺口露出的就是这个颜色 ⇒ 与上/下带**同色**，交界由直角变成圆弧。
-		// 深色档不另写规则：这两个 token 都由官方主题定义在 body 上并随深浅切换
-		// （真机实测 --dsw-specific-sidebar-fill=#f9fafb、--dsw-alias-bg-base=#fff）。
-		//
-		// 半径取官方**面板级**圆角 token `--dsw-radius-panel`（官方前端实测 28px）：
-		// 官方用它画 dialog 面板、浮层面板、可调整面板的右下抓手，也用它画本页的输入卡
-		// （uV2eYG_card 712×114 = 28px）⇒ 与「官方桌面端最大块表面的圆角」同值。
-		// 兜底写同一个 28px，避免旧构建上退化成 0。
-		//
-		// 只改绘制：不写 margin / padding / width / grid-template-columns / transform，
-		// 因此不重排、不破坏滚动与输入区可点性、不动 WebView 四向让位（仍 0/0/0/0）。
-		// centerCol 上的 `overflow: hidden` 是**官方本来就有的值**（真机实测 computed
-		// overflow=hidden），这里只是加 !important 钉住它，让「圆角裁剪子节点」这件事
-		// 不随官方构建变化而失效（子节点里的真实白底不重排、只被裁到圆角内）。
-		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-shell-overlay]) {',
-		'  background: var(--dsw-specific-sidebar-fill, #f9fafb) !important;',
-		'}',
-		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="main"]) {',
-		'  border-radius: var(--dsw-radius-panel, 28px) !important;',
-		// corner-shape 是官方自己也在用的声明（官方前端样式表里 `corner-shape:round`
-		// 出现 8 次），这里显式写 `round` 是**对齐官方既有取值**、并把「圆角 = 正圆弧」
-		// 钉住：新版 Chromium 对 border-radius 默认渲染成**超椭圆（squircle）**，
-		// 与旧版/Android WebView 的正圆弧不是同一条曲线（实测：1280×800 headless Chrome
-		// 上 R=28 的角在 devY=1 处边界 x=297.0，正圆弧理论值 302.73，偏差 5.73px；
-		// Android 15 WebView 不支持 corner-shape ⇒ 恒为正圆弧）。
-		// 写 round 后两个引擎都是正圆弧，像素判据（圆弧拟合 ≤1–2 CSS px）才有意义；
-		// 不支持的引擎直接忽略这条声明，行为不变。
-		'  corner-shape: round;',
-		'  overflow: hidden !important;',
-		'}',
+		// ── T101 平板档圆角**已删除**（用户口径：「主 session 左上/左下那个圆角跟左侧栏
+		// 直线对不上」）──
+		// 删掉的是 T101 加的那 2 条规则：
+		//   ① `div:has(> [data-shell-overlay])` 铺左侧栏底色；
+		//   ② `div:has(> [data-slot="main"])` 的 28px 圆角 + corner-shape + overflow 钉死。
+		// 两条是设计上的一对（① 负责给 ② 的圆角缺口垫同色），② 没了 ① 就没有留下的理由，
+		// 一起删 = 平板档绘制彻底回到官方原生（官方桌面布局的主区列本来就是直角，圆角是
+		// 我们借官方面板 token 装饰出来的，不是原生做法）。
+		// 探针侧无影响：T94 的 x=2 取色读的是列本身的颜色，frame 底色只在列盖不住的缝里才可见，
+		// 稳态三列铺满时 frame 根本不露面；T115 的让位 padding 与列底色规则一字未动。
 		// ── T115：平板档系统栏让位（用户口径「系统栏走安卓原生透明 + 页面自己让位」）──────
 		// 契约变更（与 T101 同源授权）：平板档由「原生给 WebView 让位」改为「**页面自己让位**」。
 		// 原生侧 T115 起把 WebView 四向外边距恒写 0（覆盖全窗）、把系统栏四向 inset（CSS px）
@@ -2868,11 +2824,9 @@
 	 *      规则外，全部规则都以 html.dshr-mobile / html.dshr-official-inset 开头，
 	 *      这两个类已被移除，故无一条规则命中官方 DOM；那四个裸 ID 规则的宿主
 	 *      节点本函数已从 DOM 删除，规则同样无宿主。
-	 *      ⚠ T101 起有**一处例外**：那 2 条平板档圆角规则（见 MOBILE_CSS 里
-	 *      「T101：平板档圆角」一段）以 `html:not(.dshr-mobile):not(.dshr-official-inset)`
-	 *      开头，**正是要在平板档命中官方 frame / main 列**——它们改的只是绘制
-	 *      （frame 底色与主区列的圆角/裁剪），不写节点、不写属性、不写类名，
-	 *      因此仍是「最小痕迹」；代价是上面这句话在平板档不再逐字成立。
+	 *      ⚠ T101 的那 2 条平板档圆角规则**已删除**（用户否决圆角装饰，见 MOBILE_CSS 里
+	 *      「T101 平板档圆角已删除」一段）——上面「无一条规则命中官方 DOM」这句话在平板档
+	 *      重新逐字成立，唯一的例外只剩下面 T115 这一组。
 	 *      ⚠ T115 起再有**一组例外**：以同一作用域开头的平板档让位规则（三列 padding 四向
 	 *      + 会话面板列的底色）。它同样是「改绘制/布局、不写节点/属性/类名」。
 	 *      另外 <html> 上的四个 --dshr-inset-* 变量本函数**刻意不摘**——平板档正靠它们让位，
