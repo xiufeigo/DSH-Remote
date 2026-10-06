@@ -407,8 +407,12 @@
 		// frame 的 padding），面板标题行会直接顶到状态栏上、底部压住导航栏。
 		// 面板自己垫出两侧系统栏高度：背景画进 padding，状态栏后面颜色一致。
 		// push（停靠）态不垫——那一列在 frame 的 padding 之内，垫了反而多一条空白。
+		// 平板档同样要垫：syncDom 在严格 OFF 下直接返回（无 data-dshr-* 标记），
+		// 所以平板这条走纯结构选择器（官方自己的 =fullscreen 值，不依赖任何 hook 标记）；
+		// 背景走同一个官方 token，深浅色由 token 自己跟随（平板不挂 data-dshr-dark）。
 		'html.dshr-official-inset [data-sidebar-right-panel="fullscreen"],',
 		'html.' + ROOT_CLASS + ' [data-sidebar-right-panel="fullscreen"],',
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) [data-sidebar-right-panel="fullscreen"],',
 		'html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen="1"] [data-sidebar-right-panel] {',
 		'  box-sizing: border-box !important;',
 		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',

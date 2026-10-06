@@ -14,7 +14,7 @@ import { pipeline } from "node:stream";
 import tls from "node:tls";
 import zlib from "node:zlib";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { encodePingFrame, findHttpHeadEnd, WsFrameBoundaryTracker } from "./wsframe.ts";
+import { encodeClientFrame, encodePingFrame, findHttpHeadEnd, WsFrameBoundaryTracker, OPCODE_PING } from "./wsframe.ts";
 
 export interface Upstream {
 	host: string;
@@ -559,7 +559,8 @@ export function proxyHttp(
 /** proxyUpgrade 的可选参数。 */
 export interface ProxyUpgradeOptions {
 	/**
-	 * T31-2：网关 → 浏览器侧周期性 WS PING 的间隔（毫秒）。≤0 或缺省视为调用方关闭。
+	 * T31-2：WS PING 保活间隔（毫秒），**双向**：往浏览器侧发服务端 PING、
+	 * 往上游侧发客户端 PING（掩码）。≤0 或缺省视为调用方关闭（两边一起关）。
 	 * 由 ws.ts 从 `config.ws.pingIntervalMs` 归一化后传入。
 	 */
 	wsPingIntervalMs?: number;
@@ -570,14 +571,20 @@ const MAX_WS_HANDSHAKE_HEAD_BYTES = 16 * 1024;
 
 /** 保活发生器的可观测计数；测试与排查用挂在这个 socket 上，不影响任何对外行为。 */
 export interface WsKeepaliveStats {
-	/** 真正写出的 PING 帧数 */
+	/** 真正写出的 PING 帧数（浏览器方向） */
 	sent: number;
-	/** 因"上游正在一帧中间"而跳过的拍数 */
+	/** 因"上游正在一帧中间"而跳过的拍数（浏览器方向） */
 	skipped: number;
 	/** 跟踪器判定字节流非法 / 握手非 101 而永久放弃的次数（正常应为 0） */
 	aborted: number;
 	/** 上游已完整确认的帧数 */
 	upstreamFrames: number;
+	/** 真正写出的 PING 帧数（上游方向，掩码） */
+	sentUpstream: number;
+	/** 因"浏览器正在一帧中间"而跳过的拍数（上游方向） */
+	skippedUpstream: number;
+	/** 上游方向跟踪器判非法后永久停发的标记（true = 上行保活已停，浏览器方向不受影响） */
+	upstreamHalted: boolean;
 }
 
 /** 取 socket 上的保活计数；未挂保活返回 undefined。 */
@@ -591,16 +598,24 @@ export function wsKeepaliveStatsOf(socket: unknown): WsKeepaliveStats | undefine
 /**
  * T31-2：给已握手的 WebSocket 连接挂一个"只在帧边界插 PING"的保活发生器。
  *
+ * T121：保活是**双向**的（同一节拍）——
+ * 往浏览器侧发服务端 PING（不掩码），往上游侧发客户端 PING（掩码，RFC6455 §5.1
+ * 要求客户端帧必须掩码）。原因是中继段（frp/运营商 NAT）掐的是**静默腿**：
+ * 此前只有浏览器腿有流量，网关→上游腿在 mux 空闲期几分钟零字节，掐的就是它
+ * （平板无 hook 自愈，每次微闪都可见；手机档 hook 几百毫秒就近自愈，用户无感）。
+ *
  * 关键设计（为什么这不会破坏 mux 数据流）：
- * - **只往浏览器侧写**，绝不改写任何透传字节；mux 载荷一个字节都不碰；
- * - 写入时机由 `WsFrameBoundaryTracker` 把关：只有确认"上游此刻不在一帧中间"才写，
- *   永远不会把 PING 插进某个 mux 帧的中间造成帧损坏；
- * - 握手不是 `HTTP/1.1 101`，或字节流无法按 RFC6455 解释（如上游不是 WS），
- *   就永久退回纯字节管道（`stop()` 后不再写任何东西）；
+ * - 绝不改写任何透传字节；mux 载荷一个字节都不碰；只**追加**空载荷控制帧；
+ * - 写入时机各自由一只 `WsFrameBoundaryTracker` 把关：浏览器方向看"上游→浏览器"
+ *   字节流的边界，上游方向看"浏览器→上游"字节流的边界，永远不会把 PING 插进
+ *   某个 mux 帧的中间造成帧损坏；
+ * - 握手不是 `HTTP/1.1 101`，或任一方向字节流无法按 RFC6455 解释（如上游不是 WS），
+ *   就永久退回纯字节管道（`stop()` 后不再写任何东西；上游方向非法只停上行，
+ *   浏览器方向不受影响）；
  * - 定时器 `unref` + 两侧 close 时清理：不会给进程留挂钟句柄。
  *
  * 对应用层完全不可见：PING/PONG 是控制帧，浏览器的 WebSocket API 在
- * `message` 事件里永远不会看到它们，浏览器自动回 PONG。
+ * `message` 事件里永远不会看到它们，浏览器自动回 PONG；上游（DSH）同样自动回 PONG。
  */
 function attachWsKeepalive(
 	browser: net.Socket,
@@ -609,10 +624,15 @@ function attachWsKeepalive(
 ): void {
 	if (intervalMs <= 0) return;
 	const tracker = new WsFrameBoundaryTracker();
+	// T121：浏览器→上游方向的边界跟踪器（网关自己是"客户端"，写上游必须看这条）。
+	const upTracker = new WsFrameBoundaryTracker();
 	let pendingHead: Buffer | null = null; // 101 响应头缓冲（握手前）
 	let handshaked = false;
 	let timer: NodeJS.Timeout | undefined;
-	const stats: WsKeepaliveStats = { sent: 0, skipped: 0, aborted: 0, upstreamFrames: 0 };
+	const stats: WsKeepaliveStats = {
+		sent: 0, skipped: 0, aborted: 0, upstreamFrames: 0,
+		sentUpstream: 0, skippedUpstream: 0, upstreamHalted: false,
+	};
 	Object.defineProperty(browser, WS_KEEPALIVE_STATS, { value: stats, enumerable: false, configurable: true });
 
 	const stop = () => {
@@ -625,6 +645,12 @@ function attachWsKeepalive(
 	upstreamSocket.on("close", stop);
 	browser.on("error", stop);
 	upstreamSocket.on("error", stop);
+	// T121：浏览器→上游方向只做被动观察（不消费、不改写，与 pipe 共存）。
+	// 握手完成前浏览器不会发 WS 帧，但门还是按 handshaked 守一道，与上游侧对称。
+	browser.on("data", (chunk: Buffer) => {
+		if (!handshaked) return;
+		upTracker.push(chunk);
+	});
 
 	upstreamSocket.on("data", (chunk: Buffer) => {
 		if (handshaked) {
@@ -658,17 +684,38 @@ function attachWsKeepalive(
 				stop();
 				return;
 			}
+			// —— 浏览器方向（T31-2 原样）——
 			// 上游正处在一帧中间 → 放弃这一拍，下一拍再试（mux 帧都是小 JSON，实践中几乎不会命中）
 			if (!tracker.atBoundary) {
 				stats.skipped += 1;
-				return;
+			} else {
+				try {
+					browser.write(encodePingFrame());
+					stats.sent += 1;
+				} catch {
+					stats.aborted += 1;
+					stop();
+					return;
+				}
 			}
-			try {
-				browser.write(encodePingFrame());
-				stats.sent += 1;
-			} catch {
-				stats.aborted += 1;
-				stop();
+			// —— 上游方向（T121 新增）——
+			// 网关自己是"客户端"：帧必须掩码（encodeClientFrame），载荷同样为空。
+			// 门控看的是**浏览器→上游**这条（别把 PING 插进浏览器正在发的帧中间）；
+			// 上游→浏览器方向的字节与这次写入不在同一个 socket 上，无需互锁。
+			// 上游方向一旦判非法就永久停发上行（浏览器方向不受影响，各停各的）。
+			if (!stats.upstreamHalted) {
+				if (upTracker.invalid) {
+					stats.upstreamHalted = true;
+				} else if (!upTracker.atBoundary) {
+					stats.skippedUpstream += 1;
+				} else {
+					try {
+						upstreamSocket.write(encodeClientFrame(OPCODE_PING, Buffer.alloc(0)));
+						stats.sentUpstream += 1;
+					} catch {
+						stats.upstreamHalted = true;
+					}
+				}
 			}
 		}, intervalMs);
 		// socket 本身就持有事件循环；定时器不需要额外挂着进程
@@ -688,6 +735,7 @@ function isWebSocketUpgrade(req: IncomingMessage): boolean {
  *
  * T31-2 起：WebSocket 升级且 `options.wsPingIntervalMs > 0` 时，会额外在
  * **帧边界**向浏览器侧发空载荷 PING 控制帧（见 attachWsKeepalive）；
+ * T121 起同时向**上游侧**发掩码 PING（同一节拍，各自看各自方向的帧边界）；
  * 非 WebSocket 的 upgrade 路径与全部载荷字节的行为与此前完全一致。
  */
 export function proxyUpgrade(

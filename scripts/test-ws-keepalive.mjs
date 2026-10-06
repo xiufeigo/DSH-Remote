@@ -376,14 +376,26 @@ test("T31-2/集成（负控制）：关掉 PING 后一条控制帧都没有，�
 	for (let i = 1; i < seqs.length; i++) assert.equal(seqs[i], seqs[i - 1] + 1, "关 PING 时数据帧也必须完整");
 });
 
-test("T31-2/集成：上游不会收到任何被改写的字节（PING 只去浏览器侧）", async () => {
+test("T121/集成：开 PING 时上游只收到掩码空 PING（除此之外无任何注入字节）", async () => {
 	const cookie = await pairCookie(pingGw);
 	const before = upstream.received.reduce((n, c) => n + c.length, 0);
-	await collectThroughGateway(pingGw.port, cookie, 1_200);
+	await collectThroughGateway(pingGw.port, cookie, 2_500);
 	await sleep(150);
 	const after = upstream.received.reduce((n, c) => n + c.length, 0);
-	// 本测试的裸客户端不会自动回 PONG，所以上游应当"什么都收不到"
-	assert.equal(after, before, "上游侧不应收到任何由网关注入的字节");
+	assert.ok(after > before, "上游侧应收到网关注入的上行 PING");
+	// 本测试的裸客户端不会自动回 PONG，浏览器侧也不会向上游发任何字节，
+	// 所以这段增量里只能是网关的上行 PING，逐帧验。
+	// 直接解码增量字节（它们全是完整帧：网关一次 write 一帧）。
+	const delta = Buffer.concat(upstream.received).subarray(before);
+	const decoded = decodeFrames(delta);
+	assert.equal(decoded.ok, true, `上行字节必须是合法 WS 流：${decoded.ok ? "" : decoded.error}`);
+	assert.equal(decoded.rest.length, 0, "不应残留半帧");
+	assert.ok(decoded.frames.length >= 2, `2.5s @1s 至少 2 个上行 PING，实得 ${String(decoded.frames.length)}`);
+	for (const f of decoded.frames) {
+		assert.equal(f.opcode, OPCODE_PING, "上游侧只应出现 PING");
+		assert.equal(f.masked, true, "网关发往上游的帧必须掩码（RFC6455 §5.1 客户端义务）");
+		assert.equal(f.payload.length, 0, "本实现只发空载荷 PING");
+	}
 });
 
 test("T31-2/集成：上游回非 101 时网关不注入任何控制帧（纯管道兜底）", async () => {
@@ -558,6 +570,70 @@ test("T31-2/空闲回收：静默链路上，开 PING 则连接不被回收、�
 		assert.equal(reaped.pings, 0, "关 PING：不应有任何 PING");
 		assert.equal(reaped.reaped, true, "关 PING：静默链路必须被空闲回收（否则这个对照没意义）");
 		assert.equal(reapProxy.state.reaped, 1, "关 PING：中继应恰好回收 1 次");
+	} finally {
+		await keepProxy.close();
+		await reapProxy.close();
+		await gwOn.destroy();
+		await gwOff.destroy();
+		await new Promise((r) => silent.close(r));
+	}
+});
+
+// ---------- T121：上游腿的空闲回收 ----------
+//
+// T31-2 只证明了浏览器腿（PING 只往浏览器发）。但中继段掐的是静默腿：
+// 网关→上游方向在 mux 空闲期几分钟零字节， frp/运营商 NAT 按空闲回收，
+// 平板无 hook 自愈，每次微闪都可见（手机档几百毫秒自愈，用户无感）。
+// 这里把掐线中继放在**网关与静默上游之间**：开 PING（上行掩码 PING 保温）
+// 则不被回收，关 PING 则被回收 —— 与浏览器腿镜像。
+test("T121/空闲回收：上游腿静默时，开上行 PING 则不被回收、关则被回收", async () => {
+	const IDLE_MS = 2_000;
+	const OBSERVE_MS = 7_000;
+
+	const silent = net.createServer((socket) => {
+		socket.on("error", () => {});
+		let buf = Buffer.alloc(0);
+		socket.on("data", (chunk) => {
+			if (buf.length > 0) return;
+			buf = Buffer.concat([buf, chunk]);
+			const text = buf.toString("latin1");
+			if (serveFingerprint(text, socket)) {
+				socket.end();
+				return;
+			}
+			const end = findHttpHeadEnd(buf);
+			if (end < 0) return;
+			const key = /sec-websocket-key:\s*(\S+)/i.exec(text)?.[1] ?? "";
+			const accept = crypto.createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-5AB0DC85B11F`).digest("base64");
+			socket.write(
+				"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n" +
+				`sec-websocket-accept: ${accept}\r\n\r\n`,
+			);
+			buf = Buffer.alloc(0);
+		});
+	});
+	await new Promise((r) => silent.listen(0, "127.0.0.1", r));
+
+	// 掐线中继放在网关与上游之间：网关的上游指向中继，中继指向静默上游。
+	// 网关的上行 PING 必须穿过中继才能保温；指纹探测的 GET / 同样穿过中继（透明 TCP）。
+	const keepProxy = await startIdleReapingProxy({ targetPort: silent.address().port, idleMs: IDLE_MS });
+	const reapProxy = await startIdleReapingProxy({ targetPort: silent.address().port, idleMs: IDLE_MS });
+	const gwOn = await createTestGateway({
+		label: "t121-idle-on",
+		config: { upstreamPort: keepProxy.port, listenPort: 0, ws: { pingIntervalMs: 1_000 } },
+	});
+	const gwOff = await createTestGateway({
+		label: "t121-idle-off",
+		config: { upstreamPort: reapProxy.port, listenPort: 0, ws: { pingIntervalMs: 0 } },
+	});
+
+	try {
+		// 客户端经网关建链（浏览器腿同样静默：裸客户端不回 PONG、不发数据）；
+		// 断言的是上游侧中继的回收计数。
+		await observeThroughIdleProxy(gwOn.port, gwOn.port, await pairCookie(gwOn), OBSERVE_MS);
+		await observeThroughIdleProxy(gwOff.port, gwOff.port, await pairCookie(gwOff), OBSERVE_MS);
+		assert.equal(keepProxy.state.reaped, 0, "开上行 PING：上游腿始终有流量，中继一次都不该回收");
+		assert.equal(reapProxy.state.reaped, 1, "关 PING：上游腿静默，中继应恰好回收 1 次");
 	} finally {
 		await keepProxy.close();
 		await reapProxy.close();

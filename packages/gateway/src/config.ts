@@ -105,10 +105,11 @@ export interface TlsConfig {
 	keyPath?: string;
 }
 
-/** WebSocket 直通通道的保活设置（T31-2）。 */
+/** WebSocket 直通通道的保活设置（T31-2，T121 起双向）。 */
 export interface WsConfig {
 	/**
-	 * 网关→浏览器侧 WS PING 的间隔（毫秒）。缺省 25_000。
+	 * WS PING 保活间隔（毫秒），**双向**：往浏览器侧发服务端 PING、
+	 * 往上游侧发客户端 PING（T121；此前只保浏览器腿）。缺省 25_000。
 	 * 写 0 / 负数 / `false` 即关闭（退回 T31 之前的纯字节管道）。
 	 */
 	pingIntervalMs?: number | false;

@@ -203,8 +203,9 @@ export function decodeFrames(buffer: Buffer): DecodeResult {
 }
 
 /**
- * 编码一个**客户端 → 服务端**方向的数据帧（测试用）：客户端帧必须掩码。
+ * 编码一个**客户端 → 服务端**方向的数据帧：客户端帧必须掩码。
  * 这是 RFC6455 §5.3 的标准客户端掩码算法。
+ * T121 起网关往上游发的保活 PING 也走这里（生产路径，不只是测试）。
  */
 export function encodeClientFrame(opcode: number, payload: Buffer, maskKey?: Buffer): Buffer {
 	const len = payload.length;
