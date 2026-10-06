@@ -447,8 +447,36 @@ public class ReconnectBannerTest {
 			check(interval.contains("freshHookConnState()"),
 				"T109 S1：快档节拍也走新鲜度（陈旧的 reconnecting 不许把 500ms 快档一直挂着）");
 			// ④ 诊断行：状态必须改由设置页体现（横幅的替代面）
-			check(main.contains("reconnectDiagLine()"),
-				"T109 去横幅：设置页只读诊断行必须接上（否则用户侧再没有任何状态可见面）");
+			//
+			// ⚠️ T117「谁钉住了谁」：T109 这条臂原来钉的是「**设置页只读诊断行**必须接上」
+			// （`main.contains("reconnectDiagLine()")` 那句的真实语义是"状态必须有一个**可见面**"）。
+			// T117 按用户要求把设置页那 9 行诊断整块删除（用户原话：「把你之前加的那些测试用的
+			// 内容删了吧…比如这串诊断字样」），因此**可见面这一层被移动**：同一份诊断改由
+			// logcat 标签 `dshr-diag` 输出（只在值变化时打），进设置页时**无条件**打一份全文快照。
+			// ——移动被钉代码的人（T117）在本批同批更新这条断言，并把它改写成对**新落点**的判据，
+			// 同时保留"不许只剩删除、必须仍有取回通道"的判别力（见下面四条 + 变异反证）。
+			check(main.contains("reconnectDiagLine()") && main.contains("diagSnapshotText()"),
+				"T117：诊断内容仍必须被**消费**（reconnectDiagLine → diagSnapshotText → logcat），"
+					+ "不许在删 UI 时把信息一起删掉（否则用户侧再没有任何取回通道）");
+			check(!code.contains("tvUiDiag") && !code.contains("setText(diagSnapshotText"),
+				"T117：设置页**不许**再有诊断控件/上屏（把 tvUiDiag 那行塞回来必红）");
+			check(main.contains("private void emitDiagLog(String trigger, boolean userTriggered)")
+				&& main.contains("Log.i(DIAG_TAG, "),
+				"T117：诊断必须落到 logcat（emitDiagLog + DIAG_TAG），这是删掉屏上那串之后的唯一落点");
+			check(main.contains("emitDiagLog(\"settings\", true)"),
+				"T117：进设置页必须**无条件**打一份完整快照（用户主动排查时刻，绕过去重与最小间隔闸）");
+			// T117 省电契约：无推送通道档的兜底从 1000ms 放宽，且**两档合并**。
+			// rc.2.10 按用户口径再放宽到 **60000ms（按分钟计）**：
+			// 「兜底探针改成按分钟计吧，然后在后台的时候不触发，只有在前台才会触发探针，这样才是真省电。」
+			// 变异反证：把 60000L 改回 5000L/1000L（或把 PROBE_IDLE_HOOK_MS 那套分档塞回来）⇒ 这两条立刻红。
+			check(main.contains("private static final long PROBE_IDLE_MS = 60000L"),
+				"rc.2.10：健康态兜底探针必须是一档 60000ms（按分钟；改回 1000L/5000L = 本任务要修的耗电点）");
+			check(!code.contains("PROBE_IDLE_HOOK_MS"),
+				"T117：有/无推送通道的两档必须**合并**（不许留一个没人用的旧档常量，"
+					+ "否则 probeIntervalMs 又会按 hookSelfHealLive() 分叉回去）——"
+					+ "判据打在剥注释后的代码上：{@code PROBE_IDLE_MS} 的 javadoc 里刻意留了这段说明");
+			check(main.contains("return PROBE_IDLE_MS;"),
+				"T117：probeIntervalMs 的健康态分支必须**只有**一个兜底周期");
 		} else {
 			System.out.println("skip MainActivity source comparison (no second path argument)");
 		}

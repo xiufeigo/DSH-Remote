@@ -168,8 +168,6 @@ public class MainActivity extends Activity {
 	/** T104：编辑中配置组的电脑端形态（导入链接带来的；空 = 未知）。 */
 	private String editingPcMode = "";
 	private TextView tvTunnelState;
-	/** T22-D：连接设置页的只读诊断行（无点击、无控件），显示 hook 最近一次上报。 */
-	private TextView tvUiDiag;
 	private Button resumeSessionBtn;
 	private String editingProfileId = "";
 	private WebView webView;
@@ -247,7 +245,8 @@ public class MainActivity extends Activity {
 	 * <p>取 20000 的账：
 	 * <ul>
 	 *   <li>**下界**要容得下"正常但没有翻转"的静默期：健康态兜底探针周期是 5s
-	 *       （{@link #PROBE_IDLE_HOOK_MS}），快档窗口 8s（{@link #PROBE_FAST_WINDOW_MS}）；
+	 *       （{@link #PROBE_IDLE_MS}，T117 起两档合并成这一个），快档窗口 8s
+	 *       （{@link #PROBE_FAST_WINDOW_MS}）；
 	 *       20s = 4 拍兜底 + 2.5 个快档窗口，不会在正常静默里误判为陈旧；</li>
 	 *   <li>**上界**要短到"一次假 reconnecting 不会把用户钉死"：T112 在 hook 侧对断开态
 	 *       每 1s 重推一次 ⇒ 真断开时推送**永远新鲜**，20s 陈旧等价于"连续 20 次重推都没到"，
@@ -391,7 +390,7 @@ public class MainActivity extends Activity {
 	/**
 	 * T39：最近一次 WebView 文件选择器的诊断行（原生侧，只读）。与 {@code uiDiagSummary}
 	 * 分开存：hook 那份是页面适配诊断且**载荷字段集合被 test:device 全等钉死**（9 字段 + ts），
-	 * 原生这份是文件选择器链路，混进去会破坏那条契约断言，故在 refreshUiDiagLine() 里拼接。
+	 * 原生这份是文件选择器链路，混进去会破坏那条契约断言，故在 diagSnapshotText() 里拼接。
 	 * 空串 = 本次 App 生命周期内还没选过文件（显示「未选择」而不是省略）。
 	 */
 	private volatile String chooserDiag = "";
@@ -751,13 +750,12 @@ public class MainActivity extends Activity {
 		tvTunnelState.setPadding(0, dp(10, d), 0, 0);
 		box.addView(tvTunnelState);
 
-		// T22-D：只读诊断行（纯文本、不可点、不新增任何控件），显示 hook 最近一次
-		// 上报的页面适配效果。给「手机界面到底有没有生效」一个当场可读的答案。
-		tvUiDiag = new TextView(this);
-		tvUiDiag.setTextSize(12);
-		tvUiDiag.setPadding(0, dp(4, d), 0, 0);
-		box.addView(tvUiDiag);
-		refreshUiDiagLine();
+		// T117：**设置页那行可见诊断块整块删除**（用户口径原话：「请你顺手把你之前加的那些测试用的
+		// 内容删了吧，免得徒增耗电。比如这串诊断字样」——指的就是下面这段 9 行计数器/键值对）。
+		// 采集与记账**一个字没删**（PinnedFetch 并发闸、StaticDiskCache 落盘缓存、TunnelPath 路径
+		// 记账、探针拍数全都照跑），只是不再往屏上画；同样的信息改由 logcat 标签 {@link #DIAG_TAG}
+		// 输出，且**只在值变化时打**（见 {@link #emitDiagLog}）。取回方式见 android/README.md。
+		// 保留的是**人话级提示**（tvTunnelState：「隧道仍在运行…」）与失败原因/重试入口。
 
 		LinearLayout direct = card(d);
 		direct.addView(cardTitle("直连入口或局域网", d));
@@ -1281,50 +1279,76 @@ public class MainActivity extends Activity {
 		}
 		if (homeScroll != null) homeScroll.setVisibility(View.VISIBLE);
 		if (setupScroll != null) setupScroll.setVisibility(View.GONE);
-		refreshUiDiagLine();
+		// T117：进设置页 = 用户主动排查时刻 ⇒ 无条件打一份完整诊断快照（绕过最小间隔闸）。
+		// 这就是"屏上那 9 行"的替代品：`adb logcat -s dshr-diag` 看得到同一份内容。
+		emitDiagLog("settings", true);
 		applySystemBars();
 	}
 
 	/**
-	 * 刷新连接设置页那行只读诊断。显示最近一次 hook 上报的关键字段
-	 * （device/on/rootClass/ready/whale/frame/strictOff），从未收到上报时显示「未上报」。
-	 * 必须在 UI 线程调用。
+	 * T117：**诊断输出的唯一落点 = logcat**（{@link #DIAG_TAG}），设置页不再画它。
 	 *
-	 * <p>T39：在 hook 那段后面接上**原生侧**的文件选择器诊断（同一行、仍然只读、无新增控件）。
-	 * 分两段而不是揉进 {@link #formatUiDiag}：那份载荷字段集合被 test:device 全等钉死
-	 * （9 字段 + ts），原生这段不属于 hook 契约，揉进去会破坏那条断言。
-	 * 这样用户远程复现一次后，回设置页看一眼就能告诉我们卡在选择器链路的哪一环。
+	 * <p>背景（用户口径原话）：「请你顺手把你之前加的那些测试用的内容删了吧，免得徒增耗电。
+	 * 比如这串诊断字样」——T22-D 加的那行只读诊断（页面适配诊断 / 文件选择 / 并发峰值 /
+	 * 落盘缓存 / 未拦 / 打洞策略 / 本次隧道 / 重连探针 共 9 行）整块从 UI 上删除。
 	 *
-	 * <p>T60：第三段接上 {@link PinnedFetch#statsSummary()}（并发峰值/排队/拒绝/累计字节），
-	 * 同样只读、无新增可点控件。刻意做成**独立一段**而不是揉进 {@link #formatUiDiag}：
-	 * 后者的载荷字段集合被 test:device 全等钉死。
+	 * <p>**注意**：那串字本身几乎不耗电（静态文本，只在设置页可见时绘制一次）；真正在耗电的是
+	 * 它最后一行暴露的**兜底探针节拍**（改前平板档 `节拍 1000ms`）。那次改动见
+	 * {@link #PROBE_IDLE_MS} 的账。这里做的是第二件事：把"信息"从屏上搬到 logcat，
+	 * 排查能力不降（原来只有设置页可见的用户能读到，现在 `adb logcat -s dshr-diag` 就够）。
+	 *
+	 * <p>三段内容与改前上屏的那份**逐字同源**（{@link #formatUiDiag} 的 9 字段 + 文件选择 +
+	 * {@link PinnedFetch#statsSummary()} + {@link StaticDiskCache#statsSummary()} +
+	 * {@link #staticPassthroughSummary()} + {@link #strategyDiagLine()} + {@link #reconnectDiagLine()}），
+	 * 采集与记账一处未改。
+	 *
+	 * <p><b>只在值变化时打</b>（避免刷屏，也不给"省电"这件事加回一条新开销）：
+	 * <ul>
+	 *   <li>判重键 = 整段文本，但把两个**时间类单调量**归一化掉——`拍数 N`（每拍 +1）与
+	 *       `陈旧 <N>s`（每秒 +1）。它们本身不携带新信息，却会让"值变化"变成"每拍必变"
+	 *       （改前是 1s 一拍 ⇒ 每秒一行）。归一化只影响**打不打**，打的永远是**完整原文**
+	 *       （含真实拍数与真实陈旧秒数）。</li>
+	 *   <li>被 throttled 掉的变化不会丢：文本是**全量快照**，下一次真变化（或任何
+	 *       {@code userTriggered} 打点，如打开设置页、文件选择出结果）打的仍是当时的完整值。</li>
+	 *   <li>{@code userTriggered=true} 的调用点绕过最小间隔闸：那是用户主动要看的时刻。</li>
+	 * </ul>
 	 */
-	private void refreshUiDiagLine() {
-		if (tvUiDiag == null) return;
-		String summary = uiDiagSummary;
-		String base = TextUtils.isEmpty(summary)
-			? "页面适配诊断：未上报（连上会话后由页面回报）"
-			: summary;
-		String chooser = TextUtils.isEmpty(chooserDiag)
-			? "文件选择：未选择过"
-			: "文件选择：" + chooserDiag;
-		// T60：PinnedFetch 那一行（只读纯文本，与上面两段同一 TextView、同样不新增控件）。
-		// 「并发峰值 / 排队 / 拒绝 / 本次累计字节」四项是并发闸门唯一能被用户
-		// 自证的证据——没它们就只能翻 logcat（远程场景下用户拿不到）。
-		// 计数器在后台线程变，这里只在刷新时读一次，不做主动推送。
-		//
-		// T65：追加两段——落盘缓存的命中/取回/淘汰，以及**未拦**计数。
-		// 后者是「/api 与主文档没被接管」的唯一用户自证：远程场景下用户拿不到 logcat，
-		// 而这恰恰是最该被怀疑的一处（拦错 = 白屏 / 登录态坏掉）。
-		// 同样只读纯文本、同样不新增可点控件，formatUiDiag 的载荷契约一个字没动。
-		tvUiDiag.setText(base + "\n" + chooser + "\n" + PinnedFetch.statsSummary()
-			+ "\n" + StaticDiskCache.statsSummary()
-			+ "\n" + staticPassthroughSummary()
-			+ "\n" + strategyDiagLine()
-			// T109：横幅删除后，连接态/探针节拍这一层的**唯一可见面**就是这一段。
-			// 同样只读纯文本、同样不新增可点控件。
-			+ "\n" + reconnectDiagLine());
+	private void emitDiagLog(String trigger, boolean userTriggered) {
+		String text = diagSnapshotText();
+		String key = text.replaceAll("陈旧 [0-9]+s", "陈旧 Ns").replaceAll("拍数 [0-9]+", "拍数 N");
+		long now = System.currentTimeMillis();
+		if (key.equals(lastDiagLogKey)) return;
+		if (!userTriggered && now - lastDiagLogAt < DIAG_LOG_MIN_INTERVAL_MS) return;
+		lastDiagLogKey = key;
+		lastDiagLogAt = now;
+		Log.i(DIAG_TAG, "trigger=" + trigger + " " + text);
 	}
+
+	/**
+	 * T117：诊断快照全文（**只读**，不产生任何副作用；设置页那行与 logcat 那行改前/改后同源）。
+	 * 各段之间的分隔符从改前的 `\n`（上屏）换成 `" | "`（logcat 单行），内容一字未改；
+	 * 段内自带的换行（`strategyDiagLine()` 是两行）也在末尾统一折成空格
+	 * ⇒ logcat 里恒为**一条**记录（实测抓到过被 `\n` 拆成两行）。
+	 */
+	private String diagSnapshotText() {
+		String summary = uiDiagSummary;
+		String base = TextUtils.isEmpty(summary) ? "页面适配诊断：未上报（连上会话后由页面回报）" : summary;
+		String chooser = TextUtils.isEmpty(chooserDiag) ? "文件选择：未选择过" : "文件选择：" + chooserDiag;
+		return (base + " | " + chooser + " | " + PinnedFetch.statsSummary()
+			+ " | " + StaticDiskCache.statsSummary()
+			+ " | " + staticPassthroughSummary()
+			+ " | " + strategyDiagLine()
+			+ " | " + reconnectDiagLine()).replace('\n', ' ');
+	}
+
+	/** T117：诊断 logcat 标签（`adb logcat -s dshr-diag:I`）。 */
+	private static final String DIAG_TAG = "dshr-diag";
+	/** T117：两次**非用户触发**诊断行之间的最小间隔（ms）——上限 60 行/分，杜绝刷屏。 */
+	private static final long DIAG_LOG_MIN_INTERVAL_MS = 1000L;
+	/** T117：上一次打出去的判重键（时间类单调量已归一化）。 */
+	private String lastDiagLogKey = "";
+	/** T117：上一次打出去的时刻（最小间隔闸用）。 */
+	private long lastDiagLogAt = 0L;
 
 	/**
 	 * T104：诊断里那两行「打洞策略 / 本次实际路径」——用户要"能看出这次到底走了哪条"。
@@ -1357,7 +1381,7 @@ public class MainActivity extends Activity {
 	/**
 	 * 把 hook 的诊断 JSON 折成一行文案。字段名与 hook 的 collectUiDiag() 同源，
 	 * 任何字段缺失都显示「未上报」而不是省略——缺字段本身就是要说出来的信息。
-	 * 解析失败返回空串，由 refreshUiDiagLine() 落回「未上报」。
+	 * 解析失败返回空串，由 diagSnapshotText() 落回「未上报」。
 	 */
 	private static String formatUiDiag(String json) {
 		if (TextUtils.isEmpty(json)) return "";
@@ -1654,6 +1678,9 @@ public class MainActivity extends Activity {
 		p.fingerprint = CertPin.normalizeFingerprint(c.fingerprint);
 		ProfileStore.upsert(prefs(), p);
 		ProfileStore.setActiveId(prefs(), p.id);
+		// T117：导入/扫码成功 = 一次**授权数据写入**，顺手把 cookie 存储刷盘
+		// （同一个洞口：写完就 force-stop 不该丢东西）。日志理由见 flushDeviceCookies。
+		flushDeviceCookies("importLink");
 		beginTunnel(p);
 		return true;
 	}
@@ -2855,19 +2882,33 @@ public class MainActivity extends Activity {
 	private static final long PROBE_FAST_WINDOW_MS = 8000L;
 
 	/**
-	 * T108：**健康态兜底周期（有推送通道）**。手机档 hook 在连接态翻转时经
-	 * {@code setUiDiag} 推给原生（T90），翻转的时延由推送决定、不由周期决定 ⇒
-	 * 兜底周期只负责兜「推送链路本身坏了」这一类，可以慢到 5s。
+	 * T108/T117/**Users**：**健康态兜底周期（1 分钟）**。
+	 *
+	 * <p>T108 的分档是「有推送通道 5s（{@code PROBE_IDLE_HOOK_MS}）/ 无推送通道 1s」；
+	 * T117 先把无通道那一档从 1000ms 放宽到 5000ms 并**合并成一个常量**；
+	 * 随后按用户口径进一步放宽到 **60s**：
+	 * <blockquote>"兜底探针改成按分钟计吧，然后在后台的时候不触发，只有在前台才会触发探针，这样才是真省电。"</blockquote>
+	 *
+	 * <p><b>三条账</b>：
+	 * <ol>
+	 *   <li><b>耗电账</b>：兜底探针 = 一次 {@code evaluateJavascript} + 页面侧 DOM 扫描
+	 *       （{@code PROBE_JS}，开销随 DOM 线性增长）。实测（T117 装置、长会话档 9000+ 节点）：
+	 *       <b>1s 档 60 拍/分 → 5s 档 12 拍/分，CPU 624.9 → ~210 ms/分</b>；
+	 *       60s 档按同口径推算 ≈ **1 拍/分**。
+	 *       ⚠️ 60s 这一档**没有单独的真机计时**（T117 实测的是 5s 档）——真机可用 logcat
+	 *       {@code dshr-diag} 行里的拍数对账。</li>
+	 *   <li><b>后台账</b>：后台**根本不跑**——{@code onPause()} 停轮询并 {@code pauseTimers()}，
+	 *       T108 实测后台 **0 拍/分**（这里不依赖 60s 这个值）。</li>
+	 *   <li><b>及时性账</b>：60s 只决定"**在页面里干等时**多久发现断开"；而
+	 *       "**切后台再回来**"这条主场景由 {@code onResume} → {@link #armProbeFastWindow}
+	 *       立刻开 **500ms** 快档 ⇒ 仍是 ~1s 级发现。{@link StuckRescue} 的阈值
+	 *       （温和 2×8s / 升级 12s / 链路闸）**一个字没改**。</li>
+	 * </ol>
+	 *
+	 * <p>刻意**没有**把快档窗口 {@link #PROBE_FAST_WINDOW_MS} 开大来"补偿"（那反而更耗电），
+	 * 也没有删掉"进会话/回前台立刻补一拍"（那是关键的及时性）。
 	 */
-	private static final long PROBE_IDLE_HOOK_MS = 5000L;
-
-	/**
-	 * T108：**健康态兜底周期（无推送通道）**。平板档 hook 严格 OFF、没有任何推送，
-	 * 真断线只能靠周期发现 ⇒ 这里**不能**降。取 1000ms 的账（与改前 500ms 对照）：
-	 * 断线到横幅的最坏时延 = 一拍发现（≤1000ms）+ 因为看到「正在重连」立刻切快档 ⇒
-	 * 第二拍 500ms 后凑满 SHOW_STREAK=2 ⇒ **≤1.5s**（改前 ≤1.0s，要求 ≤1.5–2s）。
-	 */
-	private static final long PROBE_IDLE_MS = 1000L;
+	private static final long PROBE_IDLE_MS = 60000L;
 
 	/** T108：快档窗口截止时刻（0 = 不在窗口内）。 */
 	private long probeFastUntil = 0L;
@@ -2883,17 +2924,18 @@ public class MainActivity extends Activity {
 	 * T108：当前节拍周期。三个"快档"条件（任一成立就是 500ms）：
 	 * <ol>
 	 *   <li>在快档窗口内（刚进页面 / 刚收到推送 / 刚看到重连）；</li>
-	 *   <li>hook 说正在重连（手机档的推送通道）；</li>
-	 *   <li>横幅已经显示（断开态，与改前一样保持 500ms）。</li>
+	 *   <li>hook 说正在重连（新鲜度上界内）；</li>
+	 *   <li>防抖器已判"仍在断开态"（与改前一样保持 500ms）。</li>
 	 * </ol>
-	 * 其余是健康态：有推送通道（手机档且 hook 至少上报过一次）走 5s 兜底，
-	 * 没有通道（平板档 / hook 没上报过）走 1s 兜底——见两个常量的账。
+	 * <p>T117：其余（健康态）**只有一档 5s**（{@link #PROBE_IDLE_MS}）——改前按
+	 * "有没有推送通道"分成 5s / 1s 两档，那条 1s 档是所有平板的常态、也是本任务要解决的耗电点。
+	 * 探针的**采样链、判据、防抖、自救喂数**一个字未改，改的只有"多久跑一拍"。
 	 */
 	private long probeIntervalMs() {
 		if (System.currentTimeMillis() < probeFastUntil) return ReconnectBanner.POLL_INTERVAL_MS;
 		if ("reconnecting".equals(freshHookConnState())) return ReconnectBanner.POLL_INTERVAL_MS;
 		if (reconnectDebounce.state() == ReconnectBanner.State.SHOWN) return ReconnectBanner.POLL_INTERVAL_MS;
-		return hookSelfHealLive() ? PROBE_IDLE_HOOK_MS : PROBE_IDLE_MS;
+		return PROBE_IDLE_MS;
 	}
 
 	/** T78：启动重连状态轮询（幂等）。T108：回前台是一次"进入"，开快档窗口。 */
@@ -2915,7 +2957,7 @@ public class MainActivity extends Activity {
 	 * T78：轮询节拍。守卫照抄既有会话页判据（{@code uiState == WEB && webView 可见}）：
 	 * 不满足即立即收起横幅并清零计数，不推进状态机。
 	 *
-	 * <p>T108：周期由 {@link #probeIntervalMs()} 动态给：健康态 1–5s 兜底，
+	 * <p>T108：周期由 {@link #probeIntervalMs()} 动态给：健康态 5s 兜底，
 	 * 快档（刚进页面 / 收到推送 / 已判重连）500ms。
 	 */
 	private final Runnable reconnectPollTick = new Runnable() {
@@ -3269,7 +3311,8 @@ public class MainActivity extends Activity {
 	 * <p><b>T109（去横幅）</b>：这里不再有任何 `show()/hide()` —— 横幅的显示层整层删除。
 	 * 保留的是"采样 + 判据 + 记账"：观测值仍喂 {@link ReconnectBanner.Debouncer}
 	 * （它现在只决定 T108 快档节拍与自救观测量），原始真相仍喂 {@link #runStuckRescue}。
-	 * 状态呈现改由设置页只读诊断行（{@link #reconnectDiagLine()}）负责。
+	 * <p>T117：状态呈现从"设置页那行只读诊断"改为 **logcat 一行**（{@link #emitDiagLog}，
+	 * 标签 {@link #DIAG_TAG}），且只在观测值真的变了时才打。
 	 */
 	private void handleReconnectProbe(String value) {
 		if (destroyed) return;
@@ -3321,10 +3364,11 @@ public class MainActivity extends Activity {
 				detail = (detail.isEmpty() ? "" : detail + " ") + "hook=reconnecting";
 			}
 		}
-		// T108：探针自己看到「正在重连」⇒ 立刻切快档。兜底周期（1s / 5s）只负责"发现"，
+		// T108：探针自己看到「正在重连」⇒ 立刻切快档。兜底周期（T117 起统一 5s）只负责"发现"，
 		// 一旦发现就回到 500ms，把 SHOW_STREAK=2 的第二拍缩短到 500ms ——
-		// 于是"发现并确认断开态"的时延 = 一拍兜底 + 一拍快档
-		// （平板档最坏 1.5s，见 PROBE_IDLE_MS 的账），而不是"两拍兜底"（2s 甚至 10s）。
+		// 于是"发现并确认断开态"的时延 = 一拍兜底 + 一拍快档（最坏 5.5s），
+		// 而不是"两拍兜底"（10s）。改前平板档是 1s 兜底 ⇒ 最坏 1.5s，
+		// 那 4s 的发现延迟就是 T117 用 12 拍/分换来的代价，见 {@link #PROBE_IDLE_MS} 的账。
 		if (pageReconnecting || observed == ReconnectBanner.Observed.RECONNECTING) {
 			armProbeFastWindow(PROBE_FAST_WINDOW_MS);
 		}
@@ -3339,6 +3383,8 @@ public class MainActivity extends Activity {
 		if (!key.equals(lastProbeKey)) {
 			lastProbeKey = key;
 			Log.i("dshr-reconnect", "probe=" + observed + " " + detail);
+			// T117：观测值**真的变了**才顺路打一份诊断快照（值变化时才打，零稳态开销）。
+			emitDiagLog("probe", false);
 		}
 		// T109：只推进防抖状态机（`state()` 供 probeIntervalMs 快档与诊断行使用），
 		// 不再有任何与显示相关的动作。
@@ -3350,6 +3396,7 @@ public class MainActivity extends Activity {
 
 	/** T109：探针累计拍数（设置页诊断行展示，替代横幅成为"原生在采样"的证据）。 */
 	private int reconnectProbeCount = 0;
+	/** T117 测量插桩（临时，最终字节里没有）：探针派发计数。 */
 	/** T109：最近一次探针观测值（设置页诊断行展示）。 */
 	private volatile ReconnectBanner.Observed lastProbeObserved = ReconnectBanner.Observed.UNKNOWN;
 
@@ -4277,6 +4324,30 @@ public class MainActivity extends Activity {
 	}
 
 	/**
+	 * T117：把 WebView 的 cookie 存储**立刻**刷到磁盘（带一行日志，便于事后对账）。
+	 *
+	 * <p>为什么必须有它：网关的设备凭据 {@code dr_device} 是**配对成功那一刻**由网关
+	 * Set-Cookie 下发的 HttpOnly cookie；WebView 默认把它先留在内存、随后批量落盘。
+	 * 改前唯一的落盘点在 {@code onPause}（退后台）⇒ <b>前台直接 force-stop 就整条丢掉</b>，
+	 * 下一次进来网关认不出设备、又跳回配对页（用户侧表现为"明明配对过还要再配一次"）。
+	 *
+	 * <p>落点选在两种"写入成功"之后：
+	 * <ul>
+	 *   <li>{@link #enterSessionPage}：配对成功后落到会话文档 = 配对成功的**可观测点**；</li>
+	 *   <li>{@link #handleImportIntent}：导入链接把配置组写进 SharedPreferences 之后。</li>
+	 * </ul>
+	 * 都是低频事件（一次会话一次），不是周期调用；{@code flush()} 本身是批量的、不阻塞调用线程。
+	 */
+	private void flushDeviceCookies(String reason) {
+		try {
+			CookieManager.getInstance().flush();
+			Log.i("dshr-perf", "cookie flush ok（" + reason + "）");
+		} catch (Exception e) {
+			Log.w("dshr-perf", "cookie flush 失败（" + reason + "）：" + e);
+		}
+	}
+
+	/**
 	 * 任意非本地壳的 http(s) 主文档都视为会话页：注入移动适配并标成 WEB。
 	 * 这样网关跳转/Host 改写后也不会落成官方桌面栏。
 	 * 用户正在看连接设置时只更新状态、不抢回前台。
@@ -4305,6 +4376,14 @@ public class MainActivity extends Activity {
 		}
 		hideSettings();
 		setUiState(UiState.WEB);
+		// T117：**配对成功的落点就是这里** —— 用户在配对页提交一次性码之后，网关用
+		// Set-Cookie 下发 dr_device（HttpOnly）并 302 到会话页，于是本方法在会话文档上被调用。
+		// 此刻立刻 flush 一次 WebView 的 cookie 存储：否则 cookie 只在内存里，
+		// "前台直接 force-stop（不经 onPause 那条 flush）"会让它整条丢掉 ⇒ 下次进来又落回配对页。
+		// 实测（本任务装置，2/2 复现）：改前强杀后点直连节点落 `__dsh_remote__/pair`；
+		// 加了这一句之后落会话页 `/`。flush() 是批量的、不阻塞调用线程，只在"进会话"这类
+		// 低频时刻调用，不做周期调用。
+		flushDeviceCookies("enterSession");
 		applySystemBars();
 		// T108：进会话是"一次进入"——开快档窗口（进会话后前 8s 按 500ms 跑，
 		// 保证「刚进页面就断」这一档与改前同速发现），并欠一次配色采样。
@@ -5052,7 +5131,7 @@ public class MainActivity extends Activity {
 				Log.e(TAG, "onReceiveValue threw", t);
 			}
 			if (toastIt && finalToast != null) toast(finalToast);
-			refreshUiDiagLine();
+			emitDiagLog("chooser", true);
 		});
 	}
 
@@ -5322,10 +5401,10 @@ public class MainActivity extends Activity {
 		Toast.makeText(this, message, Toast.LENGTH_LONG).show();
 	}
 
-	/** 写文件选择器诊断行并刷新连接设置页那行只读诊断。 */
+	/** 写文件选择器诊断（T117 起只进 logcat，不再上屏）。 */
 	private void setChooserDiag(String s) {
 		chooserDiag = s == null ? "" : s;
-		runOnUiThread(() -> refreshUiDiagLine());
+		runOnUiThread(() -> emitDiagLog("chooser", true));
 	}
 
 	@Override
@@ -5575,7 +5654,9 @@ public class MainActivity extends Activity {
 				Log.i("dshr-perf", "setUiDiag hook 诊断上报 " + uiDiagRaw);
 			}
 			uiDiagSummary = summary;
-			runOnUiThread(() -> refreshUiDiagLine());
+			// T117：诊断不再上屏 ⇒ 这里改成往 logcat 打一份（**非**用户触发，走最小间隔闸 +
+			// 值变化判重；hook 侧本来就去抖，所以这里通常什么都不打）。
+			runOnUiThread(() -> emitDiagLog("setUiDiag", false));
 		}
 
 		@JavascriptInterface

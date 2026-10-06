@@ -687,12 +687,16 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
   系统返回键同样回到已连接会话。点「连接」若隧道仍在，会直接恢复已注入移动适配的会话，
   不会重载成官方 DeepSeek Harness 桌面栏。
 - 连接设置为卡片式布局（安全隧道 / 直连入口或局域网 / 连接维护三张卡片，圆角 + 浅灰页面底），并让出状态栏/导航栏 inset。「隧道形态」选择器提供 xtcp（P2P 打洞，推荐）与 stcp（加密中转）两项，文案与电脑端插件面板一致；entry（公网入口）形态是电脑端服务侧配置，手机上用「直连入口或局域网」即可，无需访客隧道。手动填写时按电脑端面板逐项对照：VPS 地址、控制端口、隧道形态、隧道名（默认 `dsh-remote`）、访客密钥、frps 登录密钥。
-- **连接设置页有一行只读诊断行**（「页面适配诊断：档位 phone · 钩子 是 · 根类 dshr-mobile ·
+- **连接设置页曾有一整块只读诊断行**（第一行「页面适配诊断：档位 phone · 钩子 是 · 根类 dshr-mobile ·
   收敛 是 · 鲸鱼 是 · 三栏 是 · 严格关闭 否」，未连上会话时显示「未上报」），由页面经 JS 桥
   回报给原生。用途是在**真机上判断 hook 到底有没有生效**，不必再靠无障碍树反推。纯文本
   12sp、无点击、**不新增任何控件**；回调在 WebView 的 JS 线程，只做「解析 → 存 volatile 字段
   → UI 线程纯赋值」，解析失败静默 return；日志按摘要去重，繁忙页面上也不刷屏。
   已实测七个字段与 CDP `window.__dshrMobileDiag()` 逐个相等。证据：`scratch/t22/report.md` §4。
+  - ⚠️ **rc.2.9 → 下一版（T117）：这一整块（9 行）已从 UI 删除**（用户明确要求「把之前加的那些
+    测试用的内容删了吧…比如这串诊断字样」）。下面这 9 行的历史记录保留作证据链，**屏上已经没有它们**；
+    同一份内容改由 logcat 标签 `dshr-diag` 输出 —— 取回方式见本文件
+    「### 怎么把诊断信息拿回来」。
   - **rc.2.6 追加了三段**（原 7 个字段**不变**、`formatUiDiag()` 载荷契约**未动**——它被 `test:device`
     全等钉死，故新数据一律**独立成段**而不是揉进载荷）。仍是**纯文本、无点击、不新增控件**。
     真机 `uiautomator dump` 原文（fresh 进程故计数为 0）：
@@ -721,8 +725,10 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
    - 留（**一个字都没省**）：`ReconnectBanner.PROBE_JS` 与它的全部字面量、`Debouncer`、
      T108 的合并探针与自适应节拍、`runStuckRescue` 的接线。防抖器仍决定「确认仍在断开态时
      保持 500ms 快档」；探针照旧 `webView.evaluateJavascript(ReconnectBanner.PROBE_JS, this::handleReconnectProbe)`。
-   - 状态改由设置页只读诊断行体现：新增一段 `重连探针：hook=… · 上次断线 … · 拍数 … · 最近 … · 节拍 …ms`，
-     与既有几段同一块只读文本、**不新增任何可点控件**。
+   - 状态可见面（rc.2.9）：设置页只读诊断行里的一段 `重连探针：hook=… · 上次断线 … · 拍数 … ·
+     最近 … · 节拍 …ms`，与既有几段同一块只读文本、**不新增任何可点控件**。
+     > **rc.2.9 → 下一版（T117）**：那一段（连同整块 9 行）已删 ⇒ 改由 logcat `dshr-diag`
+     > 输出（只在值变化时打；进设置页无条件打一份全文快照）。见本文件「T117 原生侧收口」一节。
    - 回归钉在哪：`android/test-reconnect-banner.ps1` 的 `ReconnectBannerTest` 里加了「显示层不许回来」
      的**反射断言**（`Bar`/`TEXT`/`FADE_MS`/`isOnScreen`/`bandHeightPx`/`BAND_FALLBACK_DP`/`shouldSuppress`
      逐个查存在性，谁偷偷加回来立刻红）＋「采样链不许断」的正向断言。
@@ -793,6 +799,49 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
 > 处理方式 = 按「谁移动了被钉代码，谁负责更新断言」的口径**同批改写该块**，
 > **断言总数仍 158**、四向取值仍被逐格钉死（变异 M1 反证：改回布局盒 ⇒ 通过数 158→145）。
 > 这条**不在 T115 的写域白名单里**，已在其实报告 §0.3 明确披露。
+
+## 下一版原生侧收口（T117：诊断块下线 / 兜底探针 5s / 配对 flush）
+
+三条都只动 `MainActivity.java`（`android/tests/ReconnectBannerTest.java` 同批更新被钉断言）。
+逐条「为什么」、改前/改后真值、截图与原始 logcat 见 `scratch/t117/report.md`。
+
+1. **设置页那 9 行可见诊断块删除**（用户原话：「把你之前加的那些测试用的内容删了吧，免得徒增耗电。
+   **比如这串诊断字样**」）。删的是 UI 这一层：`tvUiDiag` 那个 `TextView` 与
+   `refreshUiDiagLine()` 的上屏逻辑；**采集与记账一个字没删**（`PinnedFetch` 并发闸、
+   `StaticDiskCache` 落盘缓存、`staticPassthroughSummary()` 未拦计数、`TunnelPath` 路径记账、
+   探针拍数全部照跑）。保留的是**人话级提示**（`隧道仍在运行。点上方「返回当前会话」继续，
+   无需重新连接。`）与失败原因/重试入口。
+2. **兜底探针 1000ms → 5000ms**：无推送通道档（平板档常态，或手机档被动页 hook 不上报）
+   `PROBE_IDLE_MS` 放宽到 5000ms，与有通道档一致 ⇒ **两档合并成同一个常量**，
+   `probeIntervalMs()` 健康态分支只剩 `return PROBE_IDLE_MS;`。`StuckRescue` 的
+   温和 2×8s / 12s 升级 / 链路闸**语义与阈值一个字未改**；快档窗口 8s 没动（不拿它"补偿"），
+   「进会话 / 回前台立刻补一拍」也没删。
+3. **配对成功后 `CookieManager.flush()`**：新增 `flushDeviceCookies(reason)`，落点 =
+   `enterSessionPage()`（配对成功落的会话文档）与 `handleImportIntent()`（导入链接写入配置组之后）。
+   病灶：`dr_device` 是配对那一刻由网关 Set-Cookie 下发的 HttpOnly cookie，WebView 先留内存、
+   改前只在 `onPause` 落盘 ⇒ **前台直接 force-stop 会整条丢**、下次回配对页。
+
+### 怎么把诊断信息拿回来（替代原来"回设置页看一眼"）
+
+```bash
+# 实时看（只在值变化时打，稳态实测 0 行/分，不会刷屏）
+adb logcat -s dshr-diag:I
+# 取最近一份（进设置页会无条件打一份完整快照：trigger=settings）
+adb logcat -d -s dshr-diag:I | tail -1
+```
+
+- 一行一段，`trigger=` 后面是打点来源：`settings`（打开设置页，无条件）/ `probe`（探针观测值变化）/
+  `setUiDiag`（hook 推送）/ `chooser`（文件选择出结果）。
+- 内容与改前屏上那份**逐字同源**：`页面适配诊断` 9 字段 + `文件选择` + `并发峰值/排队/拒绝/累计字节` +
+  `落盘缓存` + `未拦` + `打洞策略（配置）/本次隧道` + `重连探针（hook/拍数/节拍）`，段间分隔符
+  由 `\n` 换成 ` | `（logcat 单行）。
+- **判重口径（为什么稳态 0 行）**：整段文本作判重键，但把两个**时间类单调量**归一化掉
+  （`拍数 N`、`陈旧 Ns`）；再叠一道「非用户触发时两次打点间隔 ≥1000ms」的闸。
+  打的永远是**完整原文**（含真实拍数与真实陈旧秒数）；被闸掉的中间态不会丢——文本是全量快照，
+  下一次真变化或任何用户触发打点打的都是当时的最新值。
+- 其它仍然有用的标签：`dshr-reconnect`（探针观测原始真相）、`dshr-rescue`
+  （卡住自救：nudge / tier2 升级意图 / 链路闸撤回）、`dshr-perf`（进入会话时延、
+  `cookie flush ok（enterSession）`）、`dshr-ssl`、`dshr-inset`。
 
 ## 平板档让位：从「原生外边距」改为「页面 CSS padding」（rc.2.9，T115）
 
