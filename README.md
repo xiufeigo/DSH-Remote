@@ -1247,14 +1247,35 @@ test:session / test:fixes，见 `.github/workflows/ci.yml`）；
 ### 版本与发布
 
 版本号 = `<deepseek-harness 基线版本>.<发版号>`，发版号每次发布 +1，详见
-[docs/versioning.md](docs/versioning.md)。当前基线 `0.2.0-rc.2`、版本 **`0.2.0-rc.2.9`**
-（tag `v0.2.0-rc.2.9`）。
+[docs/versioning.md](docs/versioning.md)。当前基线 `0.2.0-rc.2`、版本 **`0.2.0-rc.2.12`**
+（tag `v0.2.0-rc.2.12`）。
 
 > **填表纪律**：下表**只写实测值**，Release 创建前不填任何预期值（文件名/字节数/时间/digest
 > 全部由 `gh release view` + 下载后本机重算得出）。rc.2.8 起本表由一次 `docs:` 提交回填
 > （rc.2.8 原始记录见 `scratch/t100/report.md` §3.5；rc.2.9 见 `scratch/t116/report.md` §6）。
+> `0.2.0-rc.2.10` / `0.2.0-rc.2.11` 发布时未补表（本轮起恢复逐版回填）。
 
-**本版 `0.2.0-rc.2.9`**：
+**本版 `0.2.0-rc.2.12`**：
+
+| Release 资产 / 核验项 | 实测值 |
+|---|---|
+| 资产文件名 | `dsh-remote-0.2.0-rc.2.12.apk` |
+| 字节数 | **5,776,598 B**（下载后本机 `Get-Item.Length`） |
+| 发布时间 | **2026-10-06T11:42:30Z**（UTC；北京时间 2026-10-06 19:42:30，资产 `Last-Modified`） |
+| APK SHA-256 | `523156DAE5ADE88EF4C09C4FB6D409DF52BC3AEC9121CEC9EB2F31BA30DE3F85`（下载后**本机重算**） |
+| 包内 `res/raw/mobile.js` | `60566C6BBB69399D72E5FE13513FB9BEB1C4739F7ACC7E0715935E648280DCCA`（**362,597 B**、CR=0 纯 LF），与源 `packages/gateway/assets/mobile-web.js` **逐字节相同**（两处 `Get-FileHash` 逐字一致） |
+| 签名证书 | DN `CN=DSH Remote`，SHA-256 `1E217FA66C3C68F6E031ED28B8B1C12B675DB01F01B87BF7426A4F94D8E4000D`（包内 `META-INF/DSHREMOT.RSA` 提取，与 rc.2.5 起各发布**同一条签名链**，可直接覆盖升级） |
+| APK `versionName` / `versionCode` | `0.2.0-rc.2.12` / `2000212`（包内二进制 manifest 含该 versionName 字符串；versionCode 按 `build.ps1` 百进制折叠公式推导 `[0,2,0,2,12]→2000212`，本机无 SDK 未跑 `aapt2 dump badging`） |
+| 本轮工作流结论 | `ci`(main) ✅ · `android-apk`(main) ✅ · `android-apk`(tag) ✅ · `release`(tag) ✅（Actions API 实测四条全部 completed+success） |
+
+> Release 页：https://github.com/xiufeigo/DSH-Remote/releases/tag/v0.2.0-rc.2.12
+>
+> **发布前**已实测（与 CI 资产无关的那部分）：`test-mobile-chrome` 全过、
+> `test-resume-recovery` 12/12、`test-device-class` 158/158；单一源
+> `mobile-web.js == res/raw/mobile.js`（`sync-equal true`）。本轮**未跑本地
+> `build.ps1`**（本机无 SDK，构建由 CI 执行）；T101 删圆角后平板绘制回到官方原生。
+
+**上一版 `0.2.0-rc.2.9`（已发布，下表全部为实测值，非预期值）**：
 
 | Release 资产 / 核验项 | 实测值 |
 |---|---|
@@ -1274,7 +1295,7 @@ test:session / test:fixes，见 `.github/workflows/ci.yml`）；
 > 源 = `res/raw` 副本 = **两个 APK 的内嵌** 三处同为 `FD0F4434…20C0`（**363829 B、CR=0**）。
 > 台账 `scratch/t116/regression.log`（17 项全部 exit 0）与 `scratch/t116/report.md`。
 
-**上一版 `0.2.0-rc.2.8`（已发布，下表全部为实测值，非预期值）**：
+**再上一版 `0.2.0-rc.2.8`（已发布，下表全部为实测值，非预期值）**：
 
 | Release 资产 / 核验项 | 实测值 |
 |---|---|
@@ -1289,24 +1310,9 @@ test:session / test:fixes，见 `.github/workflows/ci.yml`）；
 
 > Release 页：https://github.com/xiufeigo/DSH-Remote/releases/tag/v0.2.0-rc.2.8
 
-**再上一版 `0.2.0-rc.2.7`（已发布，下表全部为实测值，非预期值）**：
-
-| Release 资产 / 核验项 | 实测值 |
-|---|---|
-| 资产文件名 | `dsh-remote-0.2.0-rc.2.7.apk` |
-| 字节数 | **5,739,737 B** |
-| 发布时间 | **2026-10-05T07:33:48Z**（UTC；北京时间 15:33:48） |
-| APK SHA-256 | `1e48b334153ece8953a1d286b651c61d1bad85cc211ea00ec4756d4b7be59ff2`（与 `gh release view` 的资产 digest 逐字一致） |
-| 包内 `res/raw/mobile.js` | `656CEE2E66D77404C0923F333AACAA77ECEF49CBF00E4E6187DD2F1B65BCE32E`（294305 B），与源 `packages/gateway/assets/mobile-web.js` **逐字节相同** |
-| 签名证书 | DN `CN=DSH Remote`，SHA-256 `1e217fa66c3c68f6e031ed28b8b1c12b675db01f01b87bf7426a4f94d8e4000d`（与 rc.2.5 / rc.2.6 及更早发布**同一条签名链**，可直接覆盖升级） |
-| APK `versionName` / `versionCode` | `0.2.0-rc.2.7` / `2000207`（`aapt2 dump badging`） |
-| 本轮工作流结论 | `ci`(main) ✅ · `android-apk`(main) ✅ · `android-apk`(tag) ✅ · `release`(tag) ✅ |
-
-> Release 页：https://github.com/xiufeigo/DSH-Remote/releases/tag/v0.2.0-rc.2.7
-
 ```powershell
 pnpm ver:bump     # 发版号 +1 并同步 package.json（+ docs/versioning.md）；harness 升级用 --base <新版本>
-git tag v0.2.0-rc.2.9 && git push origin v0.2.0-rc.2.9   # 推 tag 即自动打包发布
+git tag v0.2.0-rc.2.12 && git push origin v0.2.0-rc.2.12   # 推 tag 即自动打包发布
 ```
 
 > ⚠️ **只有推 tag 会重新发布**：`release.yml` 的触发条件是 `on.push.tags: ["v*"]`，
