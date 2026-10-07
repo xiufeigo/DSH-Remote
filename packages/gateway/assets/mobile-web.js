@@ -334,9 +334,14 @@
 		// 规则住在**既有的** <style data-dshr-mobile-css> 里 ⇒ 不新增 DOM 节点 / 类名 /
 		// data-dshr-* 属性；元素锚点全部走官方结构属性（单层 :has()），不碰 CSS module 哈希类名。
 		// 值语义与手机档逐字同源：var(--dshr-inset-*, env(safe-area-inset-*, 0px))。
+		// T126：右栏列加第二锚点 `div:has(> [data-sidebar-right-panel])` —— 官方 docked
+		// 右栏的列直接子节点不一定带 `data-slot="rightbar"`（以面板自身属性为准才是稳定的；
+		// 左栏/主列沿用 data-slot 锚点，那两列经用户实测让位正常，不动）。
+		// 两条候选命中同一 div 时声明逐字相同 ⇒ 幂等，不存在双重 padding。
 		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="sidebar"]),',
 		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="main"]),',
-		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="rightbar"]) {',
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="rightbar"]),',
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-sidebar-right-panel]) {',
 		'  box-sizing: border-box !important;',
 		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
 		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
@@ -347,8 +352,10 @@
 		// 会把 frame 的侧栏底色透出来，形成一条新的异色带。这里显式给列铺上和「面板同源」的
 		// 官方 token（与手机档 [data-dshr-main-col] 用的是同一个），padding 区因此也是面板色。
 		// 右侧栏列同源（手机档 [data-sidebar-right-panel] 用的也是这个 token）。
+		// T126：与上一组 padding 规则同理，右栏列背景补第二锚点。
 		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="main"]),',
-		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="rightbar"]) {',
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="rightbar"]),',
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-sidebar-right-panel]) {',
 		'  background: var(--dsw-alias-bg-base, var(--dsw-specific-background, #ffffff)) !important;',
 		'}',
 		// 深色档不另写规则（与 T101 同口径）：--dsw-alias-bg-base / --dsw-specific-sidebar-fill
