@@ -755,25 +755,37 @@ try {
 			sideW: (function(){var s=document.querySelector('[data-dshr-sidebar-col]');return s?Math.round(s.getBoundingClientRect().width):-1;})() };
 	})()`);
 
-	// A-left-swipe：主栏左滑 → 左侧抽屉必须完全不动，且事件不被钩子吃掉
+	// A-left-swipe：主栏左滑 → 左抽屉必须完全不动；T130 起这笔手势定向到**右抽屉**
+	// （跟手打开官方右栏卡片），所以跟手接管后 touchmove 被 preventDefault、右栏卡片
+	// 打开后遮罩换到左缘细条且拖柄可见，都是新语义的**正确**表现（旧世界这里是 no-op）。
 	const leftProbe = await dispatchSwipe(380, 130, lane.y);
 	const leftAfter = await evaluate(`(function(){
 		var r = document.documentElement;
 		var vis = function(id){ var e=document.getElementById(id); if(!e) return 'absent';
 			var c=getComputedStyle(e), b=e.getBoundingClientRect();
 			return (c.display==='none'||c.visibility==='hidden'||b.width===0)?'hidden':'VISIBLE'; };
+		var p = document.querySelector('[data-sidebar-right-panel]');
+		var m = document.getElementById('dshr-mobile-drawer-mask');
+		var mb = m ? m.getBoundingClientRect() : null;
 		return { expanded: r.getAttribute('data-dshr-expanded'), dragging: r.getAttribute('data-dshr-dragging'),
+			rdrag: r.getAttribute('data-dshr-rdrag'), ropen: r.getAttribute('data-dshr-ropen'),
 			collapsed: !!document.querySelector('[data-sidebar-collapsed]'),
-			rightCollapsed: !!document.querySelector('[data-rightbar-collapsed]'),
+			rightOpen: !!(p && p.hasAttribute('data-sidebar-right-open') && p.getAttribute('aria-hidden') !== 'true'),
 			sideW: (function(){var s=document.querySelector('[data-dshr-sidebar-col]');return s?Math.round(s.getBoundingClientRect().width):-1;})(),
-			mask: vis('dshr-mobile-drawer-mask'), handle: vis('dshr-drawer-handle') };
+			mask: vis('dshr-mobile-drawer-mask'), maskLeft: mb ? Math.round(mb.left) : -1, maskW: mb ? Math.round(mb.width) : -1,
+			handle: vis('dshr-drawer-handle'), whale: vis('dshr-mobile-whale') };
 	})()`);
 	record("A", "A-left-swipe 主栏左滑后 data-dshr-expanded 仍为 0", leftAfter.expanded === "0", `expanded=${leftAfter.expanded}（修复前会翻成 1）`);
 	record("A", "A-left-swipe 官方侧栏仍收起且列宽为 0", leftAfter.collapsed === true && leftAfter.sideW === 0, `data-sidebar-collapsed=${leftAfter.collapsed} 侧栏列宽=${leftAfter.sideW}px（修复前第 1 帧就变 360px）`);
-	record("A", "A-left-swipe 遮罩/拖柄全程不可见", leftAfter.mask !== "VISIBLE" && leftAfter.handle !== "VISIBLE", `mask=${leftAfter.mask} handle=${leftAfter.handle}`);
-	record("A", "A-left-swipe 无 data-dshr-dragging 残留", leftAfter.dragging === null, `data-dshr-dragging=${leftAfter.dragging}`);
-	record("A", "A-left-swipe 该 touchmove 未被 preventDefault", leftProbe.moves > 0 && leftProbe.prevented === 0, `touchmove=${leftProbe.moves} 个 被 preventDefault=${leftProbe.prevented} 个（修复前 6/6 被吃掉）`);
-	record("A", "A-left-swipe 官方右栏保持收起（官方本无左滑开右栏手势）", leftAfter.rightCollapsed === true, `data-rightbar-collapsed=${leftAfter.rightCollapsed}`);
+	record("A", "A-left-swipe 右抽屉开后遮罩在左缘细条且拖柄可见（T130 新语义）",
+		leftAfter.mask === "VISIBLE" && leftAfter.handle === "VISIBLE" && leftAfter.maskLeft <= 1 && leftAfter.maskW >= 40 && leftAfter.maskW <= 72 && leftAfter.ropen === "1",
+		`mask=${leftAfter.mask}@(${leftAfter.maskLeft},${leftAfter.maskW}) handle=${leftAfter.handle} ropen=${leftAfter.ropen}（右栏卡片打开时遮罩换边是设计行为）`);
+	record("A", "A-left-swipe 右抽屉开后鲸鱼收起（不压左缘细条）", leftAfter.whale === "hidden" || leftAfter.whale === "absent",
+		`whale=${leftAfter.whale}（ropen 规则收起，官方 frame 属性缺失时也能兜住）`);
+	record("A", "A-left-swipe 无 data-dshr-dragging / data-dshr-rdrag 残留", leftAfter.dragging === null && leftAfter.rdrag === null, `data-dshr-dragging=${leftAfter.dragging} data-dshr-rdrag=${leftAfter.rdrag}`);
+	record("A", "A-left-swipe 右抽屉跟手接管后 touchmove 被 preventDefault（拖动卡片必须吃掉横向）",
+		leftProbe.moves > 0 && leftProbe.prevented > 0, `touchmove=${leftProbe.moves} 个 被 preventDefault=${leftProbe.prevented} 个（旧 no-op 世界是 0；跟手拖动必须为真）`);
+	record("A", "A-left-swipe 官方右栏已被这笔左滑打开（T130 右抽屉）", leftAfter.rightOpen === true, `data-sidebar-right-open=${leftAfter.rightOpen}`);
 
 	// ── WEB-09 左滑 → 打开官方右侧栏（文件树/预览面板）──
 	// 承接上面那条左滑：手指已经抬起，hook 在 touchend 兑现了候选，右栏应已打开。
@@ -785,16 +797,17 @@ try {
 		var b = p ? p.getBoundingClientRect() : null;
 		return { open: !!(p && p.hasAttribute('data-sidebar-right-open') && p.getAttribute('aria-hidden') !== 'true'),
 			ariaHidden: p ? p.getAttribute('aria-hidden') : null,
-			box: b ? { x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height) } : null,
-			full: !!(b && b.x === 0 && b.y === 0 && b.width >= innerWidth - 1 && b.height >= innerHeight - 1),
+			box: b ? { x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height), r: Math.round(b.right) } : null,
+			card: !!(b && Math.abs(b.right - innerWidth) <= 1 && Math.abs(b.width - (innerWidth - 52)) <= 2
+				&& b.y === 0 && b.height >= innerHeight - 1 && b.x >= 40 && b.x <= 64),
 			expanded: r.getAttribute('data-dshr-expanded'),
 			sideW: (function(){var s=document.querySelector('[data-dshr-sidebar-col]');return s?Math.round(s.getBoundingClientRect().width):-1;})(),
 			panelText: p ? (p.innerText||'').replace(/\\s+/g,' ').trim().slice(0,40) : '' };
 	})()`);
 	record("A", "A-left-swipe-opens-rightbar 主栏左滑打开官方右栏", rbAfterLeft.open === true,
 		`data-sidebar-right-open=${rbAfterLeft.open} aria-hidden=${rbAfterLeft.ariaHidden} 面板内容="${rbAfterLeft.panelText}"（官方自身无此手势，故本条只可能由 hook 打开）`);
-	record("A", "A-left-swipe-opens-rightbar 手机上右栏为全屏", rbAfterLeft.full === true,
-		`panel=${JSON.stringify(rbAfterLeft.box)} 视口=412x915（<768px 官方把右栏铺成 inset:0 全屏）`);
+	record("A", "A-left-swipe-opens-rightbar 手机上右栏为右锚圆角卡片（T130：宽 100%-52px，不再是 inset:0 全屏）", rbAfterLeft.card === true,
+		`panel=${JSON.stringify(rbAfterLeft.box)} 视口=412x915（T130 Kimi 式卡片：右缘贴屏、左缘让出 52px 细条）`);
 	record("A", "A-left-swipe-opens-rightbar 打开右栏时左抽屉仍关闭", rbAfterLeft.expanded === "0" && rbAfterLeft.sideW === 0,
 		`expanded=${rbAfterLeft.expanded} 侧栏列宽=${rbAfterLeft.sideW}px`);
 
@@ -846,87 +859,86 @@ try {
 			`expanded=${rbSwipeAfter.expanded} 侧栏列宽=${rbSwipeAfter.sideW}px（修复前右滑会变 expanded=1 / 360px）`);
 		record("A", "A-left-swipe-rightbar-open-no-drawer 右栏开着时左滑不 toggle 关右栏", rbSwipeAfter.stillOpen === true,
 			`data-sidebar-right-open=${rbSwipeAfter.stillOpen}（开着时再点会误关，故此处必须不动作）`);
-		// 右滑也一并验：守卫生效时右栏全屏上右滑不得开左抽屉。
-		// 起点必须 ≥200：x0≤150 会触发 Chrome 边缘返回手势把页面导航到 about:blank
-		// （与本改动无关——注入/不注入两臂都会触发，见 scratch/t12/diag-nav.log）。
-		await dispatchSwipe(250, 400, rbLane.y);
+		// T130：右开态右滑 = 跟手关闭右抽屉（新语义；旧世界这里是带外 no-op）。
+		// 顺带必须不开左抽屉（两抽屉互斥）。起点仍 ≥200 避开 Chrome 边缘返回雷区；
+		// segments=3 让每段位移 50px、松手速度必然越过 0.45px/ms 的速度门（位置门
+		// 在本台子够不到：x0≥200 时最大位移 212px < 65% 关阀值，速度门才是主路径）。
+		await dispatchSwipe(250, 400, rbLane.y, 3);
 		const rbRightAfter = await evaluate(`(function(){
 			var r = document.documentElement;
 			var s = document.querySelector('[data-dshr-sidebar-col]');
+			var p = document.querySelector('[data-sidebar-right-panel]');
 			return { href: location.href, expanded: r.getAttribute('data-dshr-expanded'),
+				stillOpen: !!(p && p.hasAttribute('data-sidebar-right-open') && p.getAttribute('aria-hidden') !== 'true'),
 				sideW: s ? Math.round(s.getBoundingClientRect().width) : -1 };
 		})()`);
-		record("A", "A-left-swipe-rightbar-open-no-drawer 右栏全屏时右滑不开左抽屉（守卫生效）",
-			rbRightAfter.href.includes("18443") && rbRightAfter.expanded === "0" && rbRightAfter.sideW === 0,
-			`expanded=${rbRightAfter.expanded} 侧栏列宽=${rbRightAfter.sideW}px href=${rbRightAfter.href}（修复前 expanded=1 / 360px）`);
+		record("A", "A-left-swipe-rightbar-open-no-drawer 右开态右滑跟手关闭右抽屉且不开左抽屉（T130 新语义）",
+			rbRightAfter.href.includes("18443") && rbRightAfter.expanded === "0" && rbRightAfter.sideW === 0 && rbRightAfter.stillOpen === false,
+			`expanded=${rbRightAfter.expanded} 侧栏列宽=${rbRightAfter.sideW}px 右栏仍开=${rbRightAfter.stillOpen} href=${rbRightAfter.href}（修复前 expanded=1 / 360px）`);
 	}
 
-	// ── T66：右栏关闭手势的触发区（真机矩阵见 scratch/t66/report.md）──
-	// 改的是「起手带宽」这一个门：clamp(round(w×0.11),24,48) → clamp(round(w×0.15),48,96)，
-	// 并把起手窗整体右移 24px 让开系统返回手势区（rightbarCloseEdgeInsetPx）。
-	//
-	// 为什么这里只锁「源码契约 + 误伤」、不锁「带内能关掉」：
-	// 本台子视口 412px 下新窗是 [24, 24+62=86]，而**带内所有起点都落在本台子已知的
-	// 边缘返回雷区里**（:837 记着 x0≤150 会把页面导航到 about:blank），带内起点在这里
-	// 一发就丢读数，测不了。带内关闭的真值由真机矩阵承担
-	// （scratch/t66/out/{A-before,B-after}.json，真实 adb input swipe）。
-	// 能在这里测、且最该测的是**反向**：加宽之后**面板中部右滑必须仍是 no-op**。
+	// ── T130：右抽屉关闭手势（Kimi 式「面板任意位置右滑跟手关闭」，不再是左缘带触发）──
+	// T66 的左缘带/下沉让量/带内门整套已随旧引擎删除（rightbarCloseBandPx /
+	// rightbarCloseEdgeInsetPx / isRightbarCloseTrackTarget / considerRightbarCloseSwipe），
+	// 新语义由统一手势引擎承担：右开态右滑（面板或左缘细条任意位置）跟手关闭，
+	// 左滑保持 no-op（E5 基线）；关闭落位走「补间滑出右缘 → 官方收起」两段式。
 	{
-		// 1) 源码契约：带宽公式与左下沉让量都锁死，防止被静默改回窄带。
-		// ⚠️ T76：以下四条**全部**改成结构化提取（锚点定位 + 花括号配平）。
-		// 旧写法是 `/function rightbarCloseBandPx\(\)\s*\{[\s\S]{0,240}?\n\t\}/` 这种
-		// 「按字符预算截取」——函数体一改长就 match 不中 ⇒ 退化成空串 ⇒ 恒红；
-		// 改短则悄悄腰斩 ⇒ 假绿。理由见文件顶部「结构化源码提取」一节。
-		const bandFn = extractDecl(HOOK_SOURCE, /function rightbarCloseBandPx\b/, "rightbarCloseBandPx");
-		record("A/T66", "T66-契约 带宽公式为 clamp(round(w*0.15), 48, 96)",
-			!!bandFn && /w \* 0\.15/.test(bandFn) && /Math\.max\(48,\s*Math\.min\(96,/.test(bandFn),
-			bandFn ? bandFn.replace(/\s+/g, " ").slice(0, 150) : "提取失败：rightbarCloseBandPx");
-		const insetFn = extractDecl(HOOK_SOURCE, /function rightbarCloseEdgeInsetPx\b/, "rightbarCloseEdgeInsetPx");
-		// 逐字比对整个函数体：只 grep "return 24;" 会被"前面补一句 return 0"骗过去
-		// （负控制实测：在 if 之后插 `return 0;` 旧断言照样绿）。形状变了就该红。
-		const insetBody = insetFn
-			? insetFn.replace(/\s+/g, " ").replace(/^function rightbarCloseEdgeInsetPx\([^)]*\) \{/, "").replace(/\}$/, "").trim()
-			: null;
-		record("A/T66", "T66-契约 左下沉让量：面板贴视口左缘时让 24px，否则不扣（逐字）",
-			insetBody === "if (!rect || rect.left > 1) return 0; return 24;",
-			`函数体=${JSON.stringify(insetBody)}`);
-		const gate = extractDecl(HOOK_SOURCE, /function isRightbarCloseTrackTarget\b/, "isRightbarCloseTrackTarget");
-		record("A/T66", "T66-契约 起手门用「左缘+inset」起算（下沉+加宽都生效）",
-			!!gate && /x0 < rect\.left \+ inset\) return false;/.test(gate)
-			&& /x0 > rect\.left \+ inset \+ rightbarCloseBandPx\(\)\) return false;/.test(gate),
-			gate ? gate.replace(/\s+/g, " ").slice(0, 200) : "提取失败：isRightbarCloseTrackTarget");
-		// 2) 方向门一个字没动：加宽不等于放宽方向/距离/纵向，仍是 48 / 1.4 / 96。
-		// T76：旧写法靠 `[\s\S]{0,900}?\n\t+\}` 猜收尾，而 considerRightbarCloseSwipe 嵌在
-		// ensureGestures() 里（缩进两个 tab），当时只**侥幸**没中（真实 707 vs 预算 900）。
-		// 现在改成配平，嵌几层、缩进几格都不影响。
-		const closeGate = extractDecl(HOOK_SOURCE, /function considerRightbarCloseSwipe\b/, "considerRightbarCloseSwipe");
-		record("A/T66", "T66-契约 方向门未被放宽（dx>0、|dx|≥48、横向占优 1.4、|dy|≤96）",
-			!!closeGate && /if \(dx <= 0\) return false;/.test(closeGate)
-			&& /Math\.abs\(dx\) < 48/.test(closeGate)
-			&& /Math\.abs\(dx\) < Math\.abs\(dy\) \* 1\.4/.test(closeGate)
-			&& /Math\.abs\(dy\) > 96/.test(closeGate),
-			closeGate ? "48/1.4/96 三道门在位" : "提取失败：considerRightbarCloseSwipe");
+		// 1) 源码契约：新语义的四个承重点。
+		// ① 官方状态唯一收口 setRightbarOpen：意图队列（rightToggleBusy / pendingRightbarOpen）
+		//    治 T82 那类「close 撞上 disabled → 右栏永远留在打开态」的失同步。
+		const setFn = extractDecl(HOOK_SOURCE, /function setRightbarOpen\b/, "setRightbarOpen");
+		record("A/T130", "T130-契约 右栏开合唯一收口 setRightbarOpen（意图队列治失同步）",
+			!!setFn && /rightToggleBusy/.test(setFn) && /pendingRightbarOpen = open;/.test(setFn)
+			&& /dispatchNativeClick\(toggle\)/.test(setFn) && /button\[data-sidebar-right-toggle\]/.test(setFn),
+			setFn ? setFn.replace(/\s+/g, " ").slice(0, 150) : "提取失败：setRightbarOpen");
+		// ② 卡片态闸：宽屏（≥768px，官方 push/docked）不做右抽屉卡片。
+		const cardFn = extractDecl(HOOK_SOURCE, /function canOpenRightCard\b/, "canOpenRightCard");
+		record("A/T130", "T130-契约 右抽屉卡片态闸：<768px + 官方折叠按钮存在",
+			!!cardFn && /\(window\.innerWidth \|\| 0\) >= 768\) return false;/.test(cardFn)
+			&& /button\[data-sidebar-right-toggle\]/.test(cardFn),
+			cardFn ? cardFn.replace(/\s+/g, " ").slice(0, 150) : "提取失败：canOpenRightCard");
+		// ③ 右开态左滑 no-op（E5 基线）：方向门 dx<=0 → resetTrack()+return 整笔放弃。
+		const moveFn = extractDecl(HOOK_SOURCE, /function onDragMove\b/, "onDragMove");
+		record("A/T130", "T130-契约 右开态左滑 no-op（dx<=0 整笔放弃接管）",
+			!!moveFn && /if \(dx <= 0\) \{\s*\n\s*resetTrack\(\);\s*\n\s*return;/.test(moveFn),
+			moveFn ? "no-op 门在位" : "提取失败：onDragMove");
+		// ④ considerSwipe 轻扫门未放宽（48 / 1.4 / 96 三道门逐字在位），
+		//    且右开态右划走 settleRight(false)（卡片补间滑出）。
+		const swipeFn = extractDecl(HOOK_SOURCE, /function considerSwipe\b/, "considerSwipe");
+		record("A/T130", "T130-契约 轻扫门未放宽（48/1.4/96）且右开态右划走 settleRight(false)",
+			!!swipeFn && /Math\.abs\(dx\) < 48/.test(swipeFn)
+			&& /Math\.abs\(dx\) < Math\.abs\(dy\) \* 1\.4/.test(swipeFn)
+			&& /Math\.abs\(dy\) > 96/.test(swipeFn)
+			&& /if \(dx > 0\) return settleRight\(false\);/.test(swipeFn),
+			swipeFn ? "48/1.4/96 + settleRight(false) 在位" : "提取失败：considerSwipe");
 
-		// 3) 误伤（真跑）：带内起点在本台子测不了，但**带外必须仍然不关**是能测的。
-		//    412px 视口下新窗右边界 = 24 + round(412*0.15)=86；起点 250 远在窗外。
+		// 2) 真跑：右开态面板中部（x0=250）右滑——新语义下**也要**跟手关闭
+		//    （不再限左缘带），且不开左抽屉。segments=3 ⇒ 松手速度必过 0.45px/ms 速度门
+		//    （位置门在本台子够不到：x0≥200 避 Chrome 边缘返回雷区，最大位移 212px < 65% 关阀值）。
+		await ensureRightbarOpen();
 		const rbOpenForT66 = await isRightbarOpen();
-		record("A/T66", "T66-误伤 已把右栏打开（前提）", rbOpenForT66 === true,
+		record("A/T130", "T130-真跑 已把右栏打开（前提）", rbOpenForT66 === true,
 			`data-sidebar-right-open=${rbOpenForT66}`);
 		if (rbOpenForT66) {
 			const midY = rbLane ? rbLane.y : 300;
-			await dispatchSwipe(250, 400, midY);
-			const t66Mid = await evaluate(`(function(){
+			await dispatchSwipe(250, 400, midY, 3);
+			const t130Mid = await evaluate(`(function(){
 				var p = document.querySelector('[data-sidebar-right-panel]');
 				return { href: location.href,
 					stillOpen: !!(p && p.hasAttribute('data-sidebar-right-open') && p.getAttribute('aria-hidden') !== 'true'),
-					expanded: document.documentElement.getAttribute('data-dshr-expanded') };
+					expanded: document.documentElement.getAttribute('data-dshr-expanded'),
+					rdrag: document.documentElement.getAttribute('data-dshr-rdrag'),
+					rx: document.documentElement.style.getPropertyValue('--dshr-rx') };
 			})()`);
-			record("A/T66", "T66-误伤 面板中部(x0=250)右滑仍是 no-op：右栏不被误关",
-				t66Mid.href.includes("18443") && t66Mid.stillOpen === true,
-				`新窗右边界=86px，起点 250 在窗外；stillOpen=${t66Mid.stillOpen} href=${t66Mid.href}（加宽后若变 false 即为误伤）`);
-			record("A/T66", "T66-误伤 面板中部右滑顺带不开左抽屉",
-				t66Mid.expanded === "0",
-				`data-dshr-expanded=${t66Mid.expanded}（必须 0）`);
+			record("A/T130", "T130-真跑 面板中部(x0=250)右滑跟手关闭右抽屉（新语义：不限左缘带）",
+				t130Mid.href.includes("18443") && t130Mid.stillOpen === false,
+				`stillOpen=${t130Mid.stillOpen} href=${t130Mid.href}（旧世界带外 no-op；T130 起面板任意位置右滑关闭）`);
+			record("A/T130", "T130-真跑 面板中部右滑顺带不开左抽屉",
+				t130Mid.expanded === "0",
+				`data-dshr-expanded=${t130Mid.expanded}（必须 0）`);
+			record("A/T130", "T130-真跑 关闭落位后无跟手痕迹残留（rdrag/rx 全清）",
+				t130Mid.rdrag === null && !t130Mid.rx,
+				`data-dshr-rdrag=${t130Mid.rdrag} --dshr-rx="${t130Mid.rx}"`);
 		}
 	}
 	await ensureRightbarClosed();

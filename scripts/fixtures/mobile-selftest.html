@@ -733,20 +733,18 @@ function run() {
     // 拖动中官方侧栏必须已是 wide 内容（完整会话列表），不能还是图标 rail。
     add(checks, 'drag-shows-wide-sidebar', !frame.hasAttribute('data-sidebar-collapsed'),
       'collapsed=' + frame.hasAttribute('data-sidebar-collapsed'));
-    // T125-fix 回归：拖动时抽屉自己的 transform 必须生效（跟手滑入），不能被稳态
-    // `transform: none` 以特异度压住。frame 在拖动起手即展开（生产行为），此处断言
-    // 抽屉位移量为负（藏入左侧途中）；若稳态规则赢了，这里就是 none，直接变红。
+    // T130（Kimi 双抽屉）：拖动期抽屉**静止垫底**（transform:none），由主卡向右平移
+    // 把它揭示出来；此前 T125 的「抽屉 1:1 跟手滑入」（tx<-40）已废弃。
+    // 这里断言抽屉没有任何位移（tx=0 或 transform:none），且与稳态展开规则一致。
     var dragSide = document.querySelector('[data-dshr-sidebar-col]');
-    var dragSideTx = null;
-    if (dragSide) {
-      var dragSideTf = getComputedStyle(dragSide).transform;
-      if (dragSideTf && dragSideTf !== 'none') {
-        var dragSideM = dragSideTf.match(/matrix\(([^)]+)\)/);
-        if (dragSideM) dragSideTx = parseFloat(dragSideM[1].split(',')[4]) || 0;
-      }
+    var dragSideTx = 0;
+    var dragSideTf = dragSide ? getComputedStyle(dragSide).transform : 'none';
+    if (dragSideTf && dragSideTf !== 'none') {
+      var dragSideM = dragSideTf.match(/matrix\(([^)]+)\)/);
+      if (dragSideM) dragSideTx = parseFloat(dragSideM[1].split(',')[4]) || 0;
     }
-    add(checks, 'drag-drawer-follows', dragSideTx !== null && dragSideTx < -40,
-      'tx=' + (dragSideTx === null ? 'none' : Math.round(dragSideTx)));
+    add(checks, 'drag-drawer-follows', dragSide !== null && Math.abs(dragSideTx) < 1,
+      'tx=' + Math.round(dragSideTx) + '（静止垫底，主卡平移揭示）');
     var dragHeight = dragMain.offsetHeight;
     var dragShadow = getComputedStyle(dragMain).boxShadow;
     bridge.setDrawerDrag(0.7);
@@ -922,7 +920,68 @@ function run() {
             if (noticeApi && noticeApi.syncNow) noticeApi.syncNow();
             var idleAgain = noticeApi && noticeApi.readSessionNotice ? noticeApi.readSessionNotice() : null;
             add(checks, 'notice-idle-after-stop', idleAgain && idleAgain.running === false, idleAgain ? JSON.stringify(idleAgain) : 'missing');
-            finish(checks);
+            // ── T130：右抽屉卡片（Kimi 式镜像：左滑开 / 右滑关，盖在主卡上的圆角卡）──
+            var rdPanel = document.getElementById('rightbar-panel');
+            var rdFrame = document.querySelector('.frame');
+            var rdToggle = rdPanel ? rdPanel.querySelector('[data-sidebar-right-toggle]') : null;
+            if (rdPanel && rdFrame && rdToggle) {
+              // mock 官方折叠按钮的 React 提交：点击即翻转 open/fullscreen 属性。
+              rdToggle.onclick = function () {
+                if (rdPanel.hasAttribute('data-sidebar-right-open')) {
+                  rdPanel.removeAttribute('data-sidebar-right-open');
+                  rdFrame.removeAttribute('data-rightbar-fullscreen');
+                } else {
+                  rdPanel.setAttribute('data-sidebar-right-open', '');
+                  rdFrame.setAttribute('data-rightbar-fullscreen', '');
+                }
+              };
+              // ① 左滑 → 右抽屉从右缘滑入打开。
+              fireSwipe(column, 360, 400, 40, 400);
+              window.setTimeout(function () {
+                var rdOpen = rdPanel.hasAttribute('data-sidebar-right-open');
+                add(checks, 'rdrawer-opens-on-left-swipe', rdOpen, 'open=' + rdOpen);
+                var rs = getComputedStyle(rdPanel);
+                var rr = rdPanel.getBoundingClientRect();
+                add(checks, 'rdrawer-card-anchored-right', rs.position === 'fixed' && Math.abs(rr.right - window.innerWidth) < 2,
+                  'pos=' + rs.position + ' right=' + Math.round(rr.right) + ' vw=' + window.innerWidth);
+                add(checks, 'rdrawer-card-width', Math.abs(rr.width - (window.innerWidth - 52)) < 3,
+                  'w=' + Math.round(rr.width) + ' 期望=' + (window.innerWidth - 52));
+                add(checks, 'rdrawer-card-radius-left', parseFloat(rs.borderTopLeftRadius) >= 12 && parseFloat(rs.borderTopRightRadius) < 1,
+                  'tl=' + rs.borderTopLeftRadius + ' tr=' + rs.borderTopRightRadius);
+                add(checks, 'rdrawer-ropen-flag', document.documentElement.getAttribute('data-dshr-ropen') === '1',
+                  'ropen=' + document.documentElement.getAttribute('data-dshr-ropen'));
+                var rdMask = document.getElementById('dshr-mobile-drawer-mask');
+                var rdMaskR = rdMask ? rdMask.getBoundingClientRect() : { left: -1, width: 0 };
+                add(checks, 'rdrawer-mask-left-sliver', !!rdMask && getComputedStyle(rdMask).display !== 'none' && rdMaskR.left <= 1 && rdMaskR.width >= 40,
+                  'd=' + (rdMask ? getComputedStyle(rdMask).display : 'missing') + ' l=' + Math.round(rdMaskR.left) + ' w=' + Math.round(rdMaskR.width));
+                var rdWhale = document.getElementById('dshr-mobile-whale');
+                add(checks, 'rdrawer-hides-whale', !!rdWhale && getComputedStyle(rdWhale).display === 'none',
+                  'd=' + (rdWhale ? getComputedStyle(rdWhale).display : 'missing'));
+                // ② 右开态左滑 = no-op（E5 基线：不关右栏、不开左抽屉）。
+                fireSwipe(rdPanel, 300, 400, 100, 400);
+                window.setTimeout(function () {
+                  add(checks, 'rdrawer-left-swipe-noop', rdPanel.hasAttribute('data-sidebar-right-open') && rdFrame.hasAttribute('data-sidebar-collapsed'),
+                    'open=' + rdPanel.hasAttribute('data-sidebar-right-open') + ' collapsed=' + rdFrame.hasAttribute('data-sidebar-collapsed'));
+                  // ③ 右滑 → 补间滑出右缘后官方收起，跟手痕迹全清。
+                  fireSwipe(rdPanel, 100, 400, 320, 400);
+                  window.setTimeout(function () {
+                    add(checks, 'rdrawer-closes-on-right-swipe', !rdPanel.hasAttribute('data-sidebar-right-open'),
+                      'open=' + rdPanel.hasAttribute('data-sidebar-right-open'));
+                    add(checks, 'rdrawer-flags-cleared', document.documentElement.getAttribute('data-dshr-ropen') !== '1'
+                      && !document.documentElement.style.getPropertyValue('--dshr-rx')
+                      && document.documentElement.getAttribute('data-dshr-rdrag') !== '1',
+                      'ropen=' + document.documentElement.getAttribute('data-dshr-ropen')
+                      + ' rx=' + document.documentElement.style.getPropertyValue('--dshr-rx')
+                      + ' rdrag=' + document.documentElement.getAttribute('data-dshr-rdrag'));
+                    rdToggle.onclick = null;
+                    finish(checks);
+                  }, 700);
+                }, 450);
+              }, 700);
+            } else {
+              add(checks, 'rdrawer-opens-on-left-swipe', false, 'rightbar fixture missing');
+              finish(checks);
+            }
           }, 200);
         }, 80);
       }, 80);

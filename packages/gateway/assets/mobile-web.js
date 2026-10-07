@@ -68,8 +68,9 @@
  *      桌面布局
  *   2. 桌面端收起后的 56px rail 压到 0，用左上角悬浮鲸鱼打开侧栏
  *      （不把官方按钮拖到顶栏，避免官方 Harness 布局在窄屏错位）；
- *   3. 用户直接点击官方按钮产生可信事件；展开侧栏时采用 DeepSeek App 式
- *      「侧栏在下、会话栏圆角浮层滑开」：中间列可跟手拖动，松手后吸附开/关；
+ *   3. 用户直接点击官方按钮产生可信事件；展开侧栏时采用 Kimi App 式
+ *      「侧栏静止垫底、会话栏圆角浮层滑开」：主会话卡高度不变、只向右平移，
+ *      圆角/阴影随位移全程渐变；中间列可跟手拖动，松手后吸附开/关；
  *      点浮层右侧细条/主会话窗口/遮罩关闭；长按鲸鱼 = 打开 App 连接设置
  *      （优先 DshRemoteApp.openSettings，避免写入 WebView 历史）；
  *      平板竖屏侧栏只划出约 1/3 宽，主会话窗口仍大块可见，不得铺满全屏；
@@ -87,8 +88,9 @@
  *      （文字剪裁保留给读屏）；
  *   7. 窄屏会话条：只收缩已标记的回复操作行、输入底栏和底部统计；
  *      耗时与统计保持单行。误标父节点时不得裁掉消息正文；
- *   8. 手机宽度下主屏幕右划打开侧栏（会话栏滑成圆角浮层）；点侧栏里的
- *      会话后自动收起，直接露出对话，不必再点遮罩或鲸鱼；
+ *   8. 手机宽度下主屏幕右划打开左侧栏（会话卡高度不变、圆角平移滑出，
+ *      静止垫底的侧栏被揭示）；左划打开右抽屉（官方文件栏卡片从右缘滑入）；
+ *      点侧栏里的会话后自动收起，直接露出对话，不必再点遮罩或鲸鱼；
  *   9. 模型 / 权限 / 命令 / 模式等浮动选框（menu、listbox）钳在视口内，
  *      不再向左或向右超出屏幕，过高时内部滚动。
  *  10. 与 dsh-explorer 共存：检测到 frame[data-dshx-overlay] 时让出第三列，
@@ -103,10 +105,12 @@
  *  14. 键盘抬起按整块输入区：焦点在官方输入卡内时报 [data-composer-seat]
  *      （文本框 + 四键底栏 + 统计）的矩形，而不是只报文本框——否则原生
  *      恰好抬到「文本框底边高于键盘」，底栏与统计仍被键盘盖住。
- *  15. 官方右侧栏（0.1.3+ 文件树/文档预览，[data-sidebar-right-panel]）全屏态
- *      是 position:fixed;inset:0，绝对定位不吃 frame 的 padding：由面板自己
- *      垫出 --dshr-inset-top/-bottom，标题行不再顶进状态栏、底部不压导航栏；
- *      全屏时同时收起悬浮鲸鱼/遮罩/拖动手柄。
+ *  15. 官方右侧栏（0.1.3+ 文件树/文档预览，[data-sidebar-right-panel]）在手机档
+ *      （<768px 官方 fullscreen 态）重构为「右抽屉卡片」：与左抽屉镜像的 Kimi 式
+ *      交互——面板 = 盖在主会话卡**上方**的圆角卡片（右锚、宽 100%-52px、左缘
+ *      圆角），左滑从右缘跟手滑入、右滑跟手关闭，左缘 52px 遮罩点按关闭；
+ *      面板自己垫出 --dshr-inset-top/-bottom，标题行不顶状态栏、底部不压导航栏；
+ *      卡片态期间收起悬浮鲸鱼。宽屏（≥768px push/docked）不吃卡片态，官方原样。
  *  16. 会话头部收敛：官方 Agent Team 动作（[data-team-action]）只加标记，
  *      用 CSS 定位到页签行右侧（不搬 React 节点）；后台任务触发器
  *      （aria-label =「N 个后台任务运行中」）只保留状态点 + 数量，数量写进
@@ -429,13 +433,12 @@
 		'html.' + ROOT_CLASS + '[data-dshr-dark="1"] [data-sidebar-right-panel] {',
 		'  background: var(--dsw-alias-bg-base, #111318) !important;',
 		'}',
-		// 右侧栏全屏时收起悬浮鲸鱼 / 抽屉遮罩 / 拖动手柄，别压在面板上。
-		'html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen="1"] #dshr-mobile-whale,',
-		'html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen="1"] #dshr-mobile-drawer-mask,',
-		'html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen="1"] #dshr-drawer-handle {',
+		// 右侧栏卡片态时收起悬浮鲸鱼（它在左上角，会压在左缘细条上）。
+		// 遮罩与拖动手柄**不再**一起藏：T130 起它们是右抽屉的关闭细条与交界指示
+		// （见下方 data-dshr-ropen 两条规则）。
+		'html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen="1"] #dshr-mobile-whale {',
 		'  display: none !important;',
-		'}',
-		// 兜底：结构探测暂时失败（frame 未标记）时，body 自身让出状态栏，
+		'}',		// 兜底：结构探测暂时失败（frame 未标记）时，body 自身让出状态栏，
 		// 保证任何官方构建下内容都不会顶进时钟/挖孔区域。
 		'html.' + ROOT_CLASS + ':not([data-dshr-ready="1"]) body {',
 		'  box-sizing: border-box !important;',
@@ -624,10 +627,12 @@
 		'  opacity: 1 !important;',
 		'  overflow: hidden !important;',
 		'  pointer-events: none !important;',
-		// T125（Kimi 化）：抽屉本身跟手滑入（此前 transform:none = 静止揭开）。
-		// x=0 时藏到左侧（-width），x=max 时归零；与主卡同读 --dshr-drawer-x，同帧 1:1。
-		// 稳态展开仍走下面的非 dragging 规则（transform:none = 完全滑入），交接零台阶。
-		'  transform: translateX(calc(var(--dshr-drawer-x, 0px) - var(--dshr-drawer-width))) !important;',
+		// Kimi 式（T130 重写）：抽屉**静止垫底**——侧栏从拖动第一帧起就完整铺在
+		// 底层（拖动起手即官方展开，见 setDrawerVisual），主卡向右平移把它**揭示**出来。
+		// 此前 T125 的「抽屉 1:1 跟手滑入」（translateX(x - width)）已废弃：
+		// 用户口径是「主页像一块盖在侧栏上的圆角卡片向右滑出，露出被盖住的侧栏」，
+		// 侧栏自己不动。稳态展开规则同样是 transform:none，交接零台阶。
+		'  transform: none !important;',
 		'  z-index: 10 !important;',
 		'  border-right: 0 !important;',
 		'  box-shadow: none !important;',
@@ -819,76 +824,69 @@
 		'html.' + ROOT_CLASS + '[data-dshr-explorer-details="1"] #dshr-drawer-handle {',
 		'  display: none !important;',
 		'}',
-		// ── T82：右栏跟手层（关闭方向的跟手 + 打开方向的补间） ──
+		// ── T130：右抽屉卡片（Kimi 式镜像）──
 		//
-		// 为什么要给「承载面板的容器」单独抬 z-index，而不是只给面板加 transform：
-		// 实测（report §A）单独给面板**或**单独给主列加 transform 都是**零视觉反馈**——
-		// 位移确实写了，但面板被官方层叠上下文压住，合成出来的画面一帧都不动。
-		// 唯一有效的做法是把面板所在的那一层容器整体抬到官方之上。
-		//
-		// 为什么是「官方现有最大 z-index + 1」而不是硬编码 40：
-		// 硬编码在官方改版（新增更高层的浮层/弹窗）时会静默失效，表现是"跟手又不动了"，
-		// 而这正是本轮要修的症状，不能让它以另一种形式回来。运行时由
-		// applyRightbarLayer() 扫描 frame 子树算出实际最大值再 +1，写进 --dshr-rightbar-z。
-		'html.' + ROOT_CLASS + '[data-dshr-rightbar-drag="1"] [data-dshr-rightbar-col] {',
-		'  z-index: var(--dshr-rightbar-z, 40) !important;',
-		'  transform: translateX(var(--dshr-rightbar-x, 0px)) !important;',
-		'  transition: none !important;',
-		'  will-change: transform;',
-		// 拖动期容器盖在页面上，但它只是承载面板的壳，不能吃掉内容点击。
-		'  pointer-events: none !important;',
-		'}',
-		// 提交/回弹阶段：改走 CSS transition（合成线程），与官方主列同款曲线。
-		// 回弹**不用**这条——回弹走 rAF，避免"摘掉属性那一帧"出现空窗（见 settleRightbarVisual）。
-		'html.' + ROOT_CLASS + '[data-dshr-rightbar-settle="1"] [data-dshr-rightbar-col] {',
-		'  z-index: var(--dshr-rightbar-z, 40) !important;',
-		'  transform: translateX(var(--dshr-rightbar-x, 0px)) !important;',
+		// 官方右栏在手机档（<768px）打开即 fullscreen（position:fixed;inset:0 盖住一切），
+		// 用户口径「右栏太僵硬」。这里把它重构为与左抽屉镜像的 Kimi 式卡片交互：
+		//   面板 = 盖在主会话卡**上方**的圆角卡片——右锚定、宽 = var(--dshr-drawer-width)
+		//   （手机 = 100% − 52px，与左抽屉同一个变量）、左缘圆角 + 左缘投影；
+		//   主会话卡原地不动，左缘露出 52px 细条（遮罩点按关闭）。
+		// 卡片形态完全锚在**官方属性**上（[data-sidebar-right-panel="fullscreen"]
+		//   + [data-sidebar-right-open]），无 JS 参与也在位；JS 只经 --dshr-rx 驱动位移：
+		//   0 = 全开、W（= 100vw − peek）= 全藏。缺省 0px ⇒ 官方按钮打开时面板即在终态，
+		//   transition 负责从上次位置（或屏外）滑入。
+		// 宽屏（≥768px）官方 push/docked 态面板属性值不是 fullscreen，天然不命中本规则。
+		// 面板 fixed 定位 + 自带 z-index:850 ⇒ 不再需要 T82 那套「抬承载列 z-index/transform」
+		//   （data-dshr-rightbar-col 与 --dshr-rightbar-z 一并删除）；
+		//   T85 的 width 裁剪窗打开动画也删除（打开方向现在是从右缘跟手滑入）。
+		// touch-action:pan-y：文件树竖滚走原生（touchcancel 自然解除手势），横滑留给我们。
+		'html.' + ROOT_CLASS + ' [data-sidebar-right-panel="fullscreen"][data-sidebar-right-open] {',
+		'  position: fixed !important;',
+		'  top: 0 !important;',
+		'  right: 0 !important;',
+		'  bottom: 0 !important;',
+		'  left: auto !important;',
+		'  width: var(--dshr-drawer-width) !important;',
+		'  min-width: 0 !important;',
+		'  max-width: 100vw !important;',
+		'  box-sizing: border-box !important;',
+		'  border-radius: var(--dshr-card-r, 20px) 0 0 var(--dshr-card-r, 20px) !important;',
+		'  box-shadow: -14px 0 36px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(0, 0, 0, 0.04) !important;',
+		'  transform: translateX(var(--dshr-rx, 0px)) !important;',
 		'  transition: transform 0.34s cubic-bezier(0.32, 0.72, 0, 1) !important;',
 		'  will-change: transform;',
-		'  pointer-events: none !important;',
+		'  visibility: visible !important;',
+		'  opacity: 1 !important;',
+		'  pointer-events: auto !important;',
+		'  touch-action: pan-y !important;',
+		'  overflow: hidden !important;',
+		'  z-index: 850 !important;',
 		'}',
-		// ── T85：右栏**打开方向**——把承载容器当裁剪窗，用 `width` 过渡让面板"从左边长出来" ──
-		//
-		// 为什么不能用 transform 补间（T82 的降级结论在这里被实测推翻了一半）：
-		// 真机上开/关两态**除面板上两个属性外零差异**（recon/diff2：面板 + 全祖先链 +
-		// 三个兄弟节点的 computed style 与 rect 逐位相同，frame 的 grid-template-columns
-		// 也相同），承载容器 BynINW_rightbarCol 两态恒为 width:0。也就是说官方**没有**把
-		// 容器拉宽——所以"只加一条 transition: width"不会有任何像素可动，必须由本层
-		// 自己把容器的 width 当成裁剪窗的窗宽来驱动。
-		//
-		// 几何依据（真机实测，scratch/t85/exp-clip.mjs）：
-		//   面板是 absolute，官方锚在承载容器的**右缘**（panel.x = col.right - 100vw）。
-		//   col 一旦被搬走，面板跟着搬；补偿量又依赖正在动的 width ⇒ 单靠 CSS 过渡没法两全。
-		//   把面板改锚到容器**左缘**（left:-100vw）后，col 搬到 x=0、窗宽=width，
-		//   面板恒在 x=0 ⇒ 窗 [0,width] 从左往右变宽 = 面板从左长出来。
-		//   实测 W=150/300/412 三档 panelRect.left 全部 = 0，colRect = [0,46,W,869]。
-		//
-		// 为什么 overflow 用 clip 而不是 hidden：hidden 会把容器变成**滚动容器**，
-		// 面板在容器左侧造成的负溢出会被按"负向滚动区"补偿，面板位置随 width 漂移。
-		// clip 不建滚动容器，纯裁剪。
-		'html.' + ROOT_CLASS + '[data-dshr-rightbar-open="1"] [data-dshr-rightbar-col] {',
-		'  z-index: var(--dshr-rightbar-z, 40) !important;',
-		'  overflow: clip !important;',
-		'  width: 0px !important;',
-		'  transform: translateX(-100vw) !important;',
+		// 跟手期：位移必须与手指 1:1，关掉过渡（与左抽屉 data-dshr-dragging 同义）。
+		'html.' + ROOT_CLASS + '[data-dshr-rdrag="1"] [data-sidebar-right-panel="fullscreen"][data-sidebar-right-open] {',
 		'  transition: none !important;',
-		'  pointer-events: none !important;',
 		'}',
-		// "2" 才带上 width 过渡：属性从 1 翻到 2 时，after-change style 里的 transition
-		// 与新的 width 同时生效 ⇒ 过渡从 0 起来（CSS Transitions 用 after-change style 判定）。
-		'html.' + ROOT_CLASS + '[data-dshr-rightbar-open="2"] [data-dshr-rightbar-col] {',
-		'  z-index: var(--dshr-rightbar-z, 40) !important;',
-		'  overflow: clip !important;',
-		'  width: var(--dshr-rightbar-open-w, 100vw) !important;',
-		'  transform: translateX(-100vw) !important;',
-		'  transition: width 0.3s cubic-bezier(0.32, 0.72, 0, 1) !important;',
-		'  will-change: width;',
-		'  pointer-events: none !important;',
+		// 右抽屉卡片态期间：遮罩换到左缘细条（点按关闭），层级压过面板；
+		// drag handle 镜像到左缘交界（x = peek）；悬浮鲸鱼收起（它会压在细条上，
+		// 双保险：data-dshr-rightbar-fullscreen 那条依赖官方 frame 属性，
+		// 这条只依赖 hook 自己的 ropen 镜像）。data-dshr-ropen 由 syncDom 按
+		// 「官方 open 且面板为 fullscreen 卡片态」镜像，push/docked 态不置位。
+		'html.' + ROOT_CLASS + '[data-dshr-ropen="1"] #dshr-mobile-whale {',
+		'  display: none !important;',
 		'}',
-		'html.' + ROOT_CLASS + '[data-dshr-rightbar-open] [data-dshr-rightbar-col] [data-sidebar-right-panel] {',
-		'  left: -100vw !important;',
+		'html.' + ROOT_CLASS + '[data-dshr-ropen="1"] #dshr-mobile-drawer-mask {',
+		'  display: block;',
+		'  left: 0 !important;',
 		'  right: auto !important;',
-		'  transform: translateX(100vw) !important;',
+		'  width: var(--dshr-drawer-peek) !important;',
+		'  z-index: 860 !important;',
+		'}',
+		'html.' + ROOT_CLASS + '[data-dshr-ropen="1"] #dshr-drawer-handle {',
+		'  display: block;',
+		'  left: var(--dshr-drawer-peek) !important;',
+		'}',
+		'html.' + ROOT_CLASS + '[data-dshr-rdrag="1"] #dshr-drawer-handle {',
+		'  display: none !important;',
 		'}',
 		// ── 设置弹窗 → 全屏页（盖住侧栏与会话，带进入动画） ──
 		'@keyframes dshr-settings-fade {',
@@ -2947,6 +2945,7 @@
 		root.style.removeProperty('--dshr-drawer-width');
 		root.style.removeProperty('--dshr-drawer-peek');
 		root.style.removeProperty('--dshr-drawer-shift');
+		root.style.removeProperty('--dshr-rx');
 		root.style.removeProperty('--dshr-ime');
 		root.style.removeProperty('--dshr-vv-height');
 		// 2) hook 创建的节点：悬浮鲸鱼、抽屉遮罩、状态栏挡板、drag handle。
@@ -2957,6 +2956,7 @@
 		// 3) 打在官方节点上的标记与行内样式（全部由本脚本写入，可安全还原）。
 		resetFloatHosts();
 		clearDrawerVisual();
+		clearRightVisual(false);
 		unmarkAll();
 		// 4) 丢弃深浅色缓存：否则切回 phone 档时 syncPageTheme 会因「值没变」
 		//    早退，data-dshr-dark 补不回来，状态就与首次装上不一致了。
@@ -3499,392 +3499,181 @@
 		return true;
 	}
 
-	/**
-	 * T66：右栏「右滑关闭」的起手带宽。视口的 15%，夹到 [48,96]。
-	 *
-	 * 为什么从 11% 放宽到 15%、下限从 24 抬到 48（T47 真机矩阵，见 scratch/t66/report.md §2）：
-	 * 旧公式 clamp(round(w×0.11),24,48) 在 540px 视口上正好顶到上限 48px —— 也就是
-	 * **只有最左 8.9% 的屏幕能触发**，探针 8 档起点里有 3 档（+64/+96/+128）是死路。
-	 * 216 格真机矩阵同时证明：门是**起点 x 的纯阶跃**（带内 135/135 关、带外 81/81 不关），
-	 * 距离 150/250/400、时长 200/350/500、纵向 25%/50%/75% 的关闭率**全都是 62.5%**，
-	 * 即"滑远一点/放慢一点/往上滑一点"三条调优路线全部无效——唯一的杠杆就是这个带宽。
-	 * 15% 在 393px 上给 59px、540px 上给 81px，上限 96 兜住超宽视口。
-	 */
-	function rightbarCloseBandPx() {
-		var w = window.innerWidth || 0;
-		if (!w) return 48;
-		return Math.max(48, Math.min(96, Math.round(w * 0.15)));
+	// ── T130：右抽屉桥 —— 官方状态机 + 意图队列 ─────────────────────────
+	//
+	// setRightbarOpen 是「右栏状态真的要被改写」的唯一收口（手势 settle / considerSwipe
+	// 轻扫 / 遮罩点按都汇到这里），与左侧 setSidebarOpen 完全同构：
+	//   - rightToggleBusy（官方折叠提交中）时意图入队 pendingRightbarOpen，落地后重放；
+	//   - 按钮 disabled（官方还在提交上一次翻转）⇒ 意图入队 + 300ms 后重放——
+	//     杜绝 T82 那类失同步（close 撞上 disabled 返回 false，右栏永远留在打开态）；
+	//   - 280ms 状态未翻转补一次 dispatchTap，+220ms 释放并 flush（节奏与 toggleSidebar 一致）。
+	// 兑现仍然只有 dispatchNativeClick/click() 这一条官方通道，绝不自己改写官方 open 状态。
+	var rightToggleBusy = false;
+	var pendingRightbarOpen = null;
+
+	function flushPendingRightbar() {
+		if (pendingRightbarOpen === null) return;
+		var want = pendingRightbarOpen;
+		pendingRightbarOpen = null;
+		if (isRightbarOpen() !== want) setRightbarOpen(want);
 	}
 
-	/**
-	 * T66：起手窗的**左下沉让量**——面板贴到视口左缘时，把最外这一段让给系统返回手势。
-	 *
-	 * 为什么必须让：Android 手势导航的返回手势占屏幕最外约 24dp。页面在
-	 * `<meta viewport width=device-width>` 下 1 CSS px == 1dp，所以 24dp 就是 24 CSS px。
-	 * 这一格**JS 抢不过、preventDefault 也挡不住**——它发生在系统输入管线里、早于 WebView。
-	 * 旧门把整条带子从 x=panelRect.left 起算，于是最左 24px 是"声明了但永远收不到"的位置：
-	 * 带子看起来有 48px，实际只有 [24,48] 这 24px 是活的。把起手窗整体右移 24px，
-	 * 换来的是同样宽度下**两倍**的可用起点，而不是白白浪费掉一半带宽。
-	 *
-	 * 只在面板**贴住视口左缘**（全屏态，rect.left≈0）时让：非全屏的侧栏式右栏
-	 * （push/Split）左缘在屏幕中间，附近没有系统返回手势，此时不该扣这 24px。
-	 */
-	function rightbarCloseEdgeInsetPx(rect) {
-		if (!rect || rect.left > 1) return 0;
-		return 24;
-	}
-
-	/**
-	 * T47：右栏**打开**态下「右滑关闭」手势的**起手门**（全部满足才接管这一笔）。
-	 * 放在 onDragStart 里、canStartDrawerTrack 之前调用——既有 WEB-09 守卫
-	 * （canStartDrawerTrack 的 `isRightbarOpen() → false`）语义一个字没变，
-	 * 只是原本被整笔丢弃的手势多了一个兑现点。
-	 *   1) 右栏确实打开（读 data-sidebar-right-open + aria-hidden，与 isRightbarOpen 逐字一致）；
-	 *   2) 起点落在面板**水平范围内**（面板非全屏的 push/Split 态也正确）；
-	 *   3) 起点落在面板**左缘带**内：rect.left + inset <= x0 <= rect.left + inset + band
-	 *      （inset 见 rightbarCloseEdgeInsetPx、band 见上；T66 起这条窗整体右移出系统返回手势区）；
-	 *   4) 不在横向可滚容器内（WEB-05 同款豁免，保护 pre/code/表格与横向溢出区）；
-	 *   5) 不是 isIgnoredSwipeTarget（输入框/输入卡/鲸鱼/状态栏/统计行）。
-	 * 门 3 是"不劫持面板内横向内容"的关键：面板**中部**右滑（x0 > left+inset+band）
-	 * 拿不到候选 ⇒ 维持 no-op（scratch/t43/diagnosis.md §7 T3）。
-	 */
-	function isRightbarCloseTrackTarget(target, x0) {
-		if (!isElement(target)) return false;
-		if (!isRightbarOpen()) return false;
+	function setRightbarOpen(open) {
+		open = !!open;
+		if (rightToggleBusy) { pendingRightbarOpen = open; return true; }
+		if (isRightbarOpen() === open) { pendingRightbarOpen = null; return true; }
 		var panel = findRightbarPanel();
-		if (!panel) return false;
-		var rect = panel.getBoundingClientRect();
-		if (!rect || !rect.width) return false;
-		if (x0 < rect.left || x0 > rect.right) return false;
-		var inset = rightbarCloseEdgeInsetPx(rect);
-		if (x0 < rect.left + inset) return false;
-		if (x0 > rect.left + inset + rightbarCloseBandPx()) return false;
-		if (isIgnoredSwipeTarget(target)) return false;
-		if (isInHorizontallyScrollableContainer(target)) return false;
+		var toggle = panel ? panel.querySelector('button[data-sidebar-right-toggle]') : null;
+		if (!toggle) return false;
+		if (toggle.disabled) {
+			pendingRightbarOpen = open;
+			window.setTimeout(flushPendingRightbar, 300);
+			return true;
+		}
+		rightToggleBusy = true;
+		var before = isRightbarOpen();
+		if (!dispatchNativeClick(toggle)) toggle.click();
+		window.setTimeout(function () {
+			if (isRightbarOpen() !== before) {
+				rightToggleBusy = false;
+				flushPendingRightbar();
+				return;
+			}
+			var panel2 = findRightbarPanel();
+			var toggle2 = panel2 ? panel2.querySelector('button[data-sidebar-right-toggle]') : null;
+			if (toggle2 && !toggle2.disabled) dispatchTap(toggle2);
+			window.setTimeout(function () {
+				rightToggleBusy = false;
+				flushPendingRightbar();
+			}, 220);
+		}, 280);
 		return true;
 	}
 
-	// ── T82：右栏跟手层 ──────────────────────────────────────────────
-	//
-	// 背景（实测真值，见 scratch/t82/report.md §A）：改前右栏开/关都只是
-	// dispatchNativeClick() 点官方那颗折叠按钮 ⇒ 官方面板自身**完全没有过渡**
-	// （面板及 8 层祖先 transition-duration 全 0s、animation-name 全 none）。
-	// 手指在屏 1147ms（开）/ 981ms（关）期间面板位移变化 0 帧，松手后 1 帧内到位。
-	//
-	// 本层与既有左抽屉 setDrawerVisual 同构：拖动期只写一个自定义属性驱动
-	// transform（只走合成器、不触发布局），用 rAF 节流；兑现仍然走
-	// dispatchNativeClick()（复用官方状态机，**绝不自己改写官方 open 状态**）。
-	var rightbarVisual = null;
-	var rightbarRaf = 0;
-	var rightbarNextX = 0;
-	var rightbarSettleTimer = 0;
-	var rightbarTrack = null;
-
 	/**
-	 * 承载右栏面板的那一层容器（= panel 在 frame 下的那一层祖先）。
-	 * 官方只有一个 [data-sidebar-right-panel] 标记，没有给"列"标记，所以这里自己找。
+	 * 右抽屉卡片态闸：只有手机档窄视口（<768px，官方 fullscreen 态）才把右栏当卡片抽屉；
+	 * 宽屏官方 push/docked 态不做卡片（CSS 侧由面板属性值天然闸掉，这里是手势侧闸）。
+	 * 同时要求官方折叠按钮存在（兑现通道存在），否则左滑整笔 no-op、事件原样放行。
 	 */
-	function findRightbarColumn() {
+	function canOpenRightCard() {
+		if ((window.innerWidth || 0) >= 768) return false;
 		var panel = findRightbarPanel();
-		if (!panel) return null;
-		var frame = findFrame();
-		var el = panel;
-		while (el && el.parentElement && el.parentElement !== frame && el.parentElement !== document.body) {
-			el = el.parentElement;
-		}
-		if (el && el.parentElement === frame) return el;
-		// 没有 frame（结构探测未收敛）时退一级：面板的直接父级就是容器。
-		return panel.parentElement && panel.parentElement !== document.body ? panel.parentElement : null;
+		if (!panel) return false;
+		return !!panel.querySelector('button[data-sidebar-right-toggle]');
 	}
 
 	/**
-	 * 把承载面板的容器抬到官方层叠之上，z-index = **官方现有最大 z-index + 1**。
-	 *
-	 * 为什么不硬编码 40：硬编码在官方改版（新增更高层浮层）时会静默失效，
-	 * 表现恰好就是本轮要修的"跟手又不动了"。运行时算出来的值不会随官方改版漂移。
-	 *
-	 * 采样集合刻意做小（frame/body/documentElement 的直接子元素 + 面板祖先链），
-	 * 因为：层级对抗只发生在**同一层叠上下文里的兄弟**之间；主列自己带
-	 * z-index:20 + transform ⇒ 它自成层叠上下文，其后代 z-index 逃不出来，不必逐个扫。
-	 * 全子树扫描会在这个每笔手势都要走的入口上强制几千次样式解析。
+	 * 右栏当前是否处于「卡片抽屉开」态：官方 open 且面板为 fullscreen 卡片态。
+	 * push/docked（宽屏停靠）不算——手势引擎的右开态分支只认这一条，
+	 * 与 syncDom 的 data-dshr-ropen 镜像同口径。
 	 */
-	function applyRightbarLayer() {
-		var col = findRightbarColumn();
-		if (!col) return null;
-		col.setAttribute('data-dshr-rightbar-col', '');
-		var max = 0;
-		var consider = function (node) {
-			if (!isElement(node) || node === col) return;
-			var z = 0;
-			try { z = parseInt(window.getComputedStyle(node).zIndex, 10); } catch (ignoredZ) { z = 0; }
-			if (isFinite(z) && z > max) max = z;
-		};
-		var roots = [findFrame(), document.body, document.documentElement];
-		for (var r = 0; r < roots.length; r++) {
-			var host = roots[r];
-			if (!host) continue;
-			var kids = host.children || [];
-			for (var i = 0; i < kids.length; i++) consider(kids[i]);
-		}
-		var p = findRightbarPanel();
-		while (p) { consider(p); p = p.parentElement; }
-		col.style.setProperty('--dshr-rightbar-z', String(max + 1));
-		return col;
-	}
-
-	/** 面板位移上限 = 面板自身宽度（全屏态就是视口宽度）。 */
-	function rightbarShiftMax() {
+	function isRightCardOpen() {
 		var panel = findRightbarPanel();
-		var w = 0;
-		if (panel) {
-			try { w = panel.getBoundingClientRect().width; } catch (ignoredW) { w = 0; }
-		}
-		if (!(w > 0)) w = window.innerWidth || 390;
-		return w;
+		if (!panel || panel.getAttribute('data-sidebar-right-panel') !== 'fullscreen') return false;
+		return isRightbarOpen();
 	}
 
-	function setRightbarVisual(x) {
-		if (!rightbarVisual) return 0;
-		x = Math.max(0, Math.min(rightbarVisual.max, x));
-		rightbarVisual.x = x;
-		document.documentElement.style.setProperty('--dshr-rightbar-x', Math.round(x) + 'px');
-		return x;
+	// ── T130：右抽屉跟手视觉层 ─────────────────────────────────────────
+	//
+	// 与左抽屉 setDrawerVisual 同构：拖动期只写一个自定义属性 --dshr-rx 驱动 transform
+	// （只走合成器、不触发布局），rAF 节流；官方状态兑现走 setRightbarOpen。
+	// rx ∈ [0, max]：0 = 全开（卡片贴右缘），max = 全藏（卡片退到右屏外）。
+	var rightVisual = null;
+	var rightRaf = 0;
+	var rightNextX = 0;
+	var rightSettleAnim = 0;
+
+	/** 右卡位移上限 = 卡片宽度（= 视口宽 − 左缘细条 peek）。 */
+	function rightCardMax() {
+		return Math.max(80, (window.innerWidth || 390) - drawerPeekPx());
+	}
+
+	function setRightVisual(x) {
+		if (!rightVisual) {
+			rightVisual = { max: rightCardMax(), x: 0 };
+			document.documentElement.setAttribute('data-dshr-rdrag', '1');
+		}
+		var max = rightVisual.max;
+		x = Math.max(0, Math.min(max, x));
+		rightVisual.x = x;
+		document.documentElement.style.setProperty('--dshr-rx', Math.round(x) + 'px');
+		return { x: x, p: max > 0 ? 1 - x / max : 0, max: max };
 	}
 
 	/** rAF 节流：一帧最多写一次属性（touchmove 可以每帧来好几次）。 */
-	function queueRightbarVisual(x) {
-		rightbarNextX = x;
-		if (rightbarRaf) return;
-		rightbarRaf = window.requestAnimationFrame(function () {
-			rightbarRaf = 0;
-			if (rightbarVisual) setRightbarVisual(rightbarNextX);
+	function queueRightVisual(x) {
+		rightNextX = x;
+		if (rightRaf) return;
+		rightRaf = window.requestAnimationFrame(function () {
+			rightRaf = 0;
+			if (rightVisual) setRightVisual(rightNextX);
 		});
 	}
 
-	function clearRightbarVisualAttrs() {
-		var root = document.documentElement;
-		// T85：打开方向的裁剪窗与关闭方向的拖动态互斥，收尾时一并清掉，别留残窗。
-		cancelRightbarOpenVisual();
-		root.removeAttribute('data-dshr-rightbar-drag');
-		root.removeAttribute('data-dshr-rightbar-settle');
-		root.style.removeProperty('--dshr-rightbar-x');
-		if (rightbarRaf) { window.cancelAnimationFrame(rightbarRaf); rightbarRaf = 0; }
-		if (rightbarSettleTimer) { window.clearTimeout(rightbarSettleTimer); rightbarSettleTimer = 0; }
-		if (rightbarSettleAnim) { window.cancelAnimationFrame(rightbarSettleAnim); rightbarSettleAnim = 0; }
-	}
-
-	/** 起手：关闭方向。面板已在屏上，直接跟手。 */
-	function startRightbarCloseVisual() {
-		// T85：打开方向的 width 过渡若还在跑，先把它收干净——两条规则都会写容器的
-		// transform/transition，同帧共存会互相压制（关闭方向是跟手，优先级更高）。
-		cancelRightbarOpenVisual();
-		var col = applyRightbarLayer();
-		if (!col) return false;
-		rightbarVisual = { col: col, max: rightbarShiftMax(), x: 0, opening: false };
-		document.documentElement.setAttribute('data-dshr-rightbar-drag', '1');
-		setRightbarVisual(0);
-		return true;
-	}
-
-	// ── T85：打开方向「面板从左边长出来」──────────────────────────────
-	//
-	// 只管**视觉**，一行都不碰官方状态机：
-	//   - 兑现仍然是原来那一刻、原来那一句 `openOfficialRightbar()`（dispatchNativeClick 通道逐字未改）；
-	//   - 遮罩/鲸鱼/composer 的可点性、`data-sidebar-right-*` 属性翻转全由官方照旧发生；
-	//   - 本层只在容器上临时挂 `data-dshr-rightbar-open` 抢走 `width`，过渡一结束就摘干净，
-	//     终态回到"官方 open"的几何（两者 panel.x 都是 0，摘的那一帧没有跳变）。
-	// 只有**手势路径**走它：官方那颗折叠按钮的点击路径保持瞬时展开（避免把一条没验过的
-	// 交互面也拖进本轮的回归范围）。
-	var RIGHTBAR_OPEN_MS = 300;
-	var rightbarOpenTimer = 0;
-
 	/**
-	 * 把容器架成"窗宽 0"的裁剪窗并抬到官方之上。返回容器供过渡用（拿不到就返回 null，
-	 * 此时调用方照旧只做官方打开，退化成改动前的瞬时行为）。
+	 * 摘掉跟手痕迹。keepShift=true 时保留 --dshr-rx 的当前值：
+	 * 关闭落位后官方收起是异步提交的，滞留的 rx=max 让面板停在屏外；等 syncDom 见到
+	 * 官方 closed 后统一清理（否则属性一摘 transform 回落 0，面板会往回跳一帧）。
 	 */
-	function primeRightbarOpenVisual() {
-		var col = applyRightbarLayer();
-		if (!col) return null;
-		// 窗宽目标 = 面板自身宽度（全屏态就是视口宽度）；用变量喂给 CSS，避免在 JS 里猜单位。
-		col.style.setProperty('--dshr-rightbar-open-w', Math.round(rightbarShiftMax()) + 'px');
-		document.documentElement.setAttribute('data-dshr-rightbar-open', '1');
-		// 强制落定一次样式：保证"1"这一帧的 width:0 真的被算过，过渡才有起点。
-		// （同一个任务里连续改两个值，浏览器只做一次 style recalc，不加这句过渡不会启动。）
-		void col.offsetWidth;
-		return col;
+	function clearRightVisual(keepShift) {
+		if (rightSettleAnim) { window.cancelAnimationFrame(rightSettleAnim); rightSettleAnim = 0; }
+		if (rightRaf) { window.cancelAnimationFrame(rightRaf); rightRaf = 0; }
+		rightVisual = null;
+		document.documentElement.removeAttribute('data-dshr-rdrag');
+		if (!keepShift) document.documentElement.style.removeProperty('--dshr-rx');
 	}
 
-	/** 起过渡（0 → 窗宽）。必须在官方打开那句**之后**调用，理由见 considerRightbarSwipe。 */
-	function playRightbarOpenVisual(col) {
-		if (!col) return;
-		var root = document.documentElement;
-		if (root.getAttribute('data-dshr-rightbar-open') !== '1') return;
-		root.setAttribute('data-dshr-rightbar-open', '2');
-		var onEnd = function (ev) {
-			if (ev && ev.propertyName !== 'width') return;
-			clearRightbarOpenVisual(col, onEnd);
-		};
-		col.addEventListener('transitionend', onEnd);
-		// 兜底：宿主切后台会冻结合成/动画，transitionend 可能永远不来，别把裁剪窗留在页面上。
-		if (rightbarOpenTimer) window.clearTimeout(rightbarOpenTimer);
-		rightbarOpenTimer = window.setTimeout(function () {
-			rightbarOpenTimer = 0;
-			clearRightbarOpenVisual(col, onEnd);
-		}, RIGHTBAR_OPEN_MS + 120);
-	}
-
-	/** 摘掉裁剪窗（= 让官方 open 的几何接管）。可重入，重复调用无副作用。 */
-	function clearRightbarOpenVisual(col, onEnd) {
-		var root = document.documentElement;
-		root.removeAttribute('data-dshr-rightbar-open');
-		if (col) {
-			if (onEnd) col.removeEventListener('transitionend', onEnd);
-			col.style.removeProperty('--dshr-rightbar-open-w');
-		}
-		if (rightbarOpenTimer) { window.clearTimeout(rightbarOpenTimer); rightbarOpenTimer = 0; }
-	}
-
-	/** 取消：把裁剪窗当场收掉。官方此刻已经是 open，收掉 = 面板立刻完整显示（不是跳回关闭）。 */
-	function cancelRightbarOpenVisual() {
-		clearRightbarOpenVisual(null, null);
-	}
-
-	/**
-	 * T82：打开方向 —— **不做视觉层**（官方瞬时展开，与改动前逐字一致）。
-	 *
-	 * 父任务原本建议"起手时先兑现官方打开，再施加反向 transform 把它拉回手指位置并跟手"，
-	 * 并允许在产生跳变/失同步时降级为"只做 340ms 补间"。实测**两级都走不通**：
-	 *
-	 * ① 提前兑现（方向门命中处 10px 就开官方右栏）与官方状态机失同步：
-	 *    兑现有阈值（T47 的 |dx|≥48），而跟手起手点是 10px。10–47px 的左滑于是变成
-	 *    "开官方右栏 → 松手未过阈值 → 回弹 → 再关"，而 React 提交是异步的，
-	 *    closeOfficialRightbar() 会在提交落地前撞上 toggleBusy/按钮 disabled 而返回 false，
-	 *    右栏**留在打开态**。后果不止"右栏开着"：右栏全屏会给 <html> 打上
-	 *    data-dshr-rightbar-fullscreen="1"，该规则带 !important 一次性藏掉
-	 *    **鲸鱼 + 遮罩 + 拖动手柄**。device-class 回归据此从 158/158/0跳过 掉到
-	 *    152总/3失败/8跳过（失败点：遮罩 display:none、__dshrMobileDiag().whale=false、
-	 *    以及级联的 composer 不可点）。降级掉这条路之后 158/158/0跳过 复现。
-	 *
-	 * ② 只在兑现点做 340ms 补间同样没有视觉：关闭态下承载容器实测
-	 *      pI_x6G_rightbarCol { width: 0, overflow: visible }，其上级 overflow: hidden
-	 *    ⇒ 面板（412px 宽）被整块裁掉，加任何 translateX 都没有像素可动。
-	 *    实测"位移变化帧数=1"（与改前的 0 帧在观感上无从区分）。
-	 *    要真做出滑入必须逐帧动画容器 width 0→412（布局动画），
-	 *    与本轮"只走合成器、不触发布局"的硬约束冲突 ⇒ 不做。
-	 *
-	 * 因此：打开方向 = 官方瞬时展开；关闭方向才是本轮补齐的跟手层
-	 * （实测跟手 33 帧同向位移、提交/回弹 35 帧补间，见 report §A）。
-	 * 两条不变量（面板中部右滑 no-op、打开态左滑 no-op）在两种方向下都逐字保留。
-	 */
-	function rightbarOpenMove() {
-		// 起手期不碰任何官方状态、不写任何位移属性：兑现点仍是原来的 touchend + T47 阈值。
-		// 保留这个空实现是刻意的——调用方统一按 rightbarVisualMove 派发，方向门语义一个字不改。
-	}
-
-	/**
-	 * 提交：走 CSS transition（0.34s cubic-bezier(0.32,0.72,0,1)，与官方主列同款、
-	 * 在合成线程上跑），到位后再兑现官方状态。
-	 */
-	function commitRightbarVisual(targetX, done) {
-		var state = rightbarVisual;
+	/** 与 animateMainTo 同款 rAF 补间（340ms ease-out，reduced-motion 直落）。 */
+	function animateRightTo(x, done) {
+		if (rightSettleAnim) window.cancelAnimationFrame(rightSettleAnim);
+		rightSettleAnim = 0;
+		if (rightRaf) { window.cancelAnimationFrame(rightRaf); rightRaf = 0; }
+		var state = rightVisual;
 		if (!state) { done(); return; }
-		var root = document.documentElement;
-		if (rightbarRaf) { window.cancelAnimationFrame(rightbarRaf); rightbarRaf = 0; }
-		root.removeAttribute('data-dshr-rightbar-drag');
-		root.setAttribute('data-dshr-rightbar-settle', '1');
-		// 先强制一次样式落定，保证 transition 的起点是"当前手指位置"而不是属性默认值。
-		void state.col.offsetWidth;
-		setRightbarVisual(targetX);
-		var finish = function () {
-			if (rightbarVisual !== state) return;
-			rightbarVisual = null;
-			root.removeAttribute('data-dshr-rightbar-settle');
-			root.style.removeProperty('--dshr-rightbar-x');
-			if (rightbarSettleTimer) { window.clearTimeout(rightbarSettleTimer); rightbarSettleTimer = 0; }
-			done();
-		};
-		var onEnd = function (ev) {
-			if (ev && ev.propertyName !== 'transform') return;
-			state.col.removeEventListener('transitionend', onEnd);
-			finish();
-		};
-		state.col.addEventListener('transitionend', onEnd);
-		// transitionend 兜底：宿主在后台标签页会冻结合成线程，回调可能永远不来。
-		rightbarSettleTimer = window.setTimeout(function () {
-			state.col.removeEventListener('transitionend', onEnd);
-			finish();
-		}, 340 + 80);
-	}
-
-	/**
-	 * 回弹：走 rAF 补间，**不用** CSS transition。
-	 * 理由：回弹的目标态就是"没有位移"，用 transition 就得先摘 [data-dshr-rightbar-settle]、
-	 * 再摘 --dshr-rightbar-x，而属性一摘位移立刻归零 —— 官方 transform 那帧直接跳回去，
-	 * 会看到一帧空窗。rAF 逐帧写到位再摘属性，摘的时候本来就已经在 0，没有回跳。
-	 */
-	function reboundRightbarVisual(done) {
-		var state = rightbarVisual;
-		if (!state) { done(); return; }
-		if (rightbarRaf) { window.cancelAnimationFrame(rightbarRaf); rightbarRaf = 0; }
 		var from = state.x;
-		if (Math.abs(from) < 2 || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-			setRightbarVisual(0);
-			finish();
+		if (Math.abs(x - from) < 2 || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+			setRightVisual(x);
+			done();
 			return;
 		}
 		var start = 0;
-		var duration = 220;
-		rightbarSettleAnim = window.requestAnimationFrame(function step(ts) {
-			if (rightbarVisual !== state) { rightbarSettleAnim = 0; return; }
+		var duration = 340;
+		rightSettleAnim = window.requestAnimationFrame(function step(ts) {
+			if (rightVisual !== state) { rightSettleAnim = 0; return; }
 			if (!start) start = ts;
 			var t = Math.min(1, (ts - start) / duration);
+			// 与官方 0.34s cubic-bezier(0.32,0.72,0,1) 近似的 ease-out。
 			var eased = 1 - Math.pow(1 - t, 3);
-			setRightbarVisual(from * (1 - eased));
-			if (t < 1) {
-				rightbarSettleAnim = window.requestAnimationFrame(step);
-			} else {
-				rightbarSettleAnim = 0;
-				finish();
-			}
+			setRightVisual(from + (x - from) * eased);
+			if (t < 1) rightSettleAnim = window.requestAnimationFrame(step);
+			else { rightSettleAnim = 0; done(); }
 		});
-		function finish() {
-			if (rightbarVisual !== state) return;
-			rightbarVisual = null;
-			clearRightbarVisualAttrs();
-			done();
-		}
 	}
 
 	/**
-	 * T47 阈值**逐字复用**：|dx|≥48 && |dx|≥1.4|dy| && |dy|≤96。
-	 * 与 considerRightbarSwipe / considerRightbarCloseSwipe 三处完全一致。
+	 * 右抽屉落位（与 settleDrawer 镜像）：
+	 *   开：补间 rx→0，到位摘跟手痕迹（CSS 缺省 0px 接管，交接零台阶）；
+	 *   关：补间 rx→max，到位才兑现官方收起（面板全程可见地滑出右缘）；
+	 *       --dshr-rx 与 data-dshr-rdrag 留到 syncDom 见官方 closed 后清理，防回跳帧。
 	 */
-	function rightbarSwipeCommits(dx, dy) {
-		if (Math.abs(dx) < 48) return false;
-		if (Math.abs(dx) < Math.abs(dy) * 1.4) return false;
-		if (Math.abs(dy) > 96) return false;
-		return true;
-	}
-
-	/** 右栏打开态：右滑关闭的跟手 + 松手判定。 */
-	function rightbarCloseMove(clientX, clientY) {
-		if (!rightbarTrack || rightbarTrack.mode !== 'close') return;
-		var dx = clientX - rightbarTrack.x0;
-		var dy = clientY - rightbarTrack.y0;
-		if (dx <= 0) return;   // 打开态左滑：保持 no-op，一帧都不动
-		if (!rightbarVisual) {
-			// 方向确认后才起手（与左抽屉"越过 10px 才接管"同款节奏）。
-			if (Math.abs(dx) < 10) return;
-			if (Math.abs(dx) < Math.abs(dy) * 1.15) { rightbarTrack = null; return; }
-			if (!startRightbarCloseVisual()) { rightbarTrack = null; return; }
+	function settleRight(wantOpen) {
+		if (!rightVisual && !wantOpen && isRightbarOpen()) setRightVisual(0);
+		var state = rightVisual;
+		if (!state) return setRightbarOpen(!!wantOpen);
+		if (wantOpen) {
+			if (!isRightbarOpen()) setRightbarOpen(true);
+			animateRightTo(0, function () {
+				clearRightVisual(false);
+				setRightbarOpen(true);
+			});
+			return true;
 		}
-		queueRightbarVisual(dx);
-	}
-
-	function rightbarOpenMove() {
-		// T82：打开方向已降级为"只做 340ms 补间"（见 stageRightbarOpenTween 的注释），
-		// 起手期间**不碰任何官方状态、不写任何位移属性**。这里保留空实现是刻意的：
-		// 调用方（rightbarVisualMove）仍然按统一路径派发，方向门的既有语义一个字不改。
+		animateRightTo(state.max, function () {
+			rightVisual = null;
+			document.documentElement.removeAttribute('data-dshr-rdrag');
+			setRightbarOpen(false);
+		});
+		return true;
 	}
 
 	function isDialogOpen() {
@@ -4160,7 +3949,8 @@
 	}
 
 	/**
-	 * 主屏幕右划打开左侧栏；展开后在侧栏或右侧浮层细条上左划关闭。
+	 * 主屏幕右划打开左侧栏；展开后在侧栏或右侧浮层细条上左划关闭；
+	 * 关闭态左划打开右抽屉（官方文件栏卡片）；右开态右划关闭、左划 no-op（E5 基线）。
 	 * 跟手拖动走 touchmove；本函数保留给测试桥与瞬时轻扫兜底。
 	 */
 	function considerSwipe(x0, y0, x1, y1, target) {
@@ -4176,11 +3966,21 @@
 		var inSidebar = !!(sidebar && isElement(target) && sidebar.contains(target));
 		var inMain = !!(main && isElement(target) && main.contains(target));
 		var onMask = isElement(target) && target.id === 'dshr-mobile-drawer-mask';
+		if (isRightbarOpen()) {
+			if (dx > 0) return settleRight(false);
+			return false;
+		}
 		if (dx > 0 && !isSidebarOpen() && !inSidebar && !onMask && !isIgnoredSwipeTarget(target)) {
 			return settleDrawer(true);
 		}
 		if (dx < 0 && isSidebarOpen() && (inSidebar || onMask || inMain || x0 < window.innerWidth * 0.92)) {
 			return settleDrawer(false);
+		}
+		if (dx < 0 && !isSidebarOpen() && !inSidebar && !onMask && !isIgnoredSwipeTarget(target)) {
+			// 左划开右抽屉：与手势路径同一条卡片通道（从右缘滑入）。
+			if (!canOpenRightCard()) return false;
+			setRightVisual(rightCardMax());
+			return settleRight(true);
 		}
 		return false;
 	}
@@ -4291,64 +4091,65 @@
 		var startX = 0;
 		var startY = 0;
 		var baseX = 0;
+		var baseRx = 0;
 		var lastX = 0;
 		var lastT = 0;
 		var velocity = 0;
 		var startTarget = null;
-		// WEB-09：抽屉关闭时的左滑候选。方向门命中时**只记不动**，
-		// 真正的开关动作留到 touchend 再兑现（原因见 considerRightbarSwipe 的注释）。
-		var rightbarCandidate = null;
-		// T47：右栏**打开**态下「右滑关闭」的候选。方向与 rightbarCandidate 相反
-		// （那条 dx<0 开右栏、这条 dx>0 关右栏），两笔手势互斥且状态互斥，
-		// 所以用**独立变量**，绝不复用同一个槽位。
-		var rightbarCloseCandidate = null;
+		// T130（Kimi 双抽屉）：方向门确认后，本笔手势服务哪一侧抽屉。
+		// 'left' = 主卡跟手（开/关左抽屉）；'right' = 右栏卡片跟手（开/关右抽屉）；
+		// null = 未定向（还在 10px 死区里）。
+		var axis = null;
 
 		function resetTrack() {
 			tracking = false;
 			dragging = false;
+			axis = null;
 			startTarget = null;
 			velocity = 0;
 			activePointer = null;
-			// 注意：这里**不**清 rightbarCandidate。方向门正是「记下候选 → resetTrack() →
-			// return」，候选必须活过这次 resetTrack 才能等到 touchend 兑现。
-			// 它的清理点在 touchstart（防上一次残留）与 touchend/touchcancel（用完即清）。
 		}
 
 		var activePointer = null;
 
 		function onDragStart(clientX, clientY, target, pointerId) {
-			if (!isMobileMode() || isDrawerLocked()) {
+			if (!isMobileMode() || isDrawerLocked() || toggleBusy || rightToggleBusy) {
 				resetTrack();
 				return false;
 			}
-			// T47：右栏打开态——把这一笔手势**转交**给「右滑关闭」，但仍然**不武装**左抽屉。
-			// 语义与既有守卫完全一致（canStartDrawerTrack 的 `isRightbarOpen() → false`
-			// 在此之后依然成立，右栏打开期间左抽屉手势仍然彻底不武装）；
-			// 区别只是原本被整笔丢弃的手势现在多了一个 touchend 兑现点。
-			// toggleBusy（官方折叠正在提交）时不接管：避免连点两次把状态又翻回去。
-			if (isRightbarOpen()) {
-				if (!toggleBusy && isRightbarCloseTrackTarget(target, clientX)) {
-					rightbarCloseCandidate = { x0: clientX, y0: clientY, target: target };
-					// T82：同一笔手势武装跟手层。这里**只记**，不动任何样式——
-					// 起手窗（band/inset）与"面板中部右滑 no-op"由上面那道门保证；
-					// 视觉位移要等 onDragMove 确认方向（dx>0）才起手。
-					rightbarTrack = { x0: clientX, y0: clientY, mode: 'close' };
-				} else {
-					rightbarCloseCandidate = null;
-					rightbarTrack = null;
-				}
+			if (!isElement(target)) {
 				resetTrack();
 				return false;
 			}
-			if (!canStartDrawerTrack(target, clientX)) {
-				resetTrack();
-				return false;
-			}
-			// 接管当前回位位置；旧补间不能继续覆盖新手势。
+			// 接管进行中的落位补间：旧补间不能继续覆盖新手势。
 			if (settleAnim) window.cancelAnimationFrame(settleAnim);
 			settleAnim = 0;
+			if (rightSettleAnim) window.cancelAnimationFrame(rightSettleAnim);
+			rightSettleAnim = 0;
+			if (isRightCardOpen()) {
+				// 右抽屉开着：只武装「关右栏」——起点在面板上或左缘细条遮罩上，
+				// 输入类目标与横向可滚容器豁免（与左抽屉同规则）。
+				// 两抽屉互斥：左抽屉手势在此期间彻底不武装（WEB-09 守卫语义不变）。
+				// push/docked 态（宽屏）不走这里：isRightCardOpen 只认 fullscreen 卡片态，
+				// push 开态落到下面 canStartDrawerTrack 的 isRightbarOpen 守卫（照旧不武装）。
+				var panel = findRightbarPanel();
+				var onPanel = !!(panel && panel.contains(target));
+				var onMaskNow = target.id === 'dshr-mobile-drawer-mask';
+				if (!onPanel && !onMaskNow) {
+					resetTrack();
+					return false;
+				}
+				if (isIgnoredSwipeTarget(target) || isInHorizontallyScrollableContainer(target)) {
+					resetTrack();
+					return false;
+				}
+			} else if (!canStartDrawerTrack(target, clientX)) {
+				resetTrack();
+				return false;
+			}
 			tracking = true;
 			dragging = false;
+			axis = null;
 			startX = clientX;
 			startY = clientY;
 			lastX = startX;
@@ -4359,59 +4160,8 @@
 			baseX = drawerVisual && drawerVisual.main
 				? parseFloat(document.documentElement.style.getPropertyValue('--dshr-drawer-x')) || 0
 				: isSidebarOpen() ? drawerMaxShift() : 0;
-			// T82：抽屉路径也可能是"左滑开右栏"的起手。这里**只记起点**，
-			// 真正起手要等 onDragMove 里右栏跟手层确认方向（见 rightbarVisualMove）。
-			rightbarTrack = { x0: clientX, y0: clientY, mode: 'open' };
+			baseRx = rightVisual ? rightVisual.x : (isRightbarOpen() ? 0 : rightCardMax());
 			return true;
-		}
-
-		// ── T82：右栏跟手层的移动/兑现桥 ──
-		//
-		// 为什么不把这些逻辑直接塞进 onDragMove：右栏**打开态**那笔手势在 onDragStart
-		// 就 resetTrack() 了（tracking=false），onDragMove 首行即 return；而
-		// rightbarCandidate / rightbarCloseCandidate 这两个候选槽位是**本层作用域**的，
-		// 视觉层一旦接管就必须在这里把它们清掉，否则 touchend 的候选路径会再兑现一次，
-		// 把官方状态二次翻转（开完又被关回去）。
-		function rightbarVisualMove(clientX, clientY) {
-			if (!rightbarTrack) return;
-			if (rightbarTrack.mode === 'close') rightbarCloseMove(clientX, clientY);
-			else rightbarOpenMove();
-			if (rightbarVisual) {
-				rightbarCandidate = null;
-				rightbarCloseCandidate = null;
-			}
-		}
-
-		/** 松手兑现。返回 true 表示这笔手势已由跟手层处理（调用方不要再走候选路径）。 */
-		function settleRightbarGesture(endX, endY) {
-			var track = rightbarTrack;
-			rightbarTrack = null;
-			var visual = rightbarVisual;
-			if (!track || !visual) return false;
-			var dx = endX - track.x0;
-			var dy = endY - track.y0;
-			var commits = rightbarSwipeCommits(dx, dy);
-			if (track.mode === 'close') {
-				if (commits) {
-					// 提交：合成线程上补间到 +max（滑出右缘），到位后再兑现官方关闭。
-					commitRightbarVisual(visual.max, function () { closeOfficialRightbar(); });
-				} else {
-					// 回弹：面板本来就开着，只把视觉打回 0，不碰官方状态。
-					reboundRightbarVisual(function () {});
-				}
-				return true;
-			}
-			// T82：打开方向已降级——起手期不产生任何 visual，走到这里必然是 close 方向。
-			return true;
-		}
-
-		/** touchcancel：触摸被系统/滚动接管，一律回到"官方当前状态"的原样，不做兑现。 */
-		function cancelRightbarGesture() {
-			rightbarTrack = null;
-			var visual = rightbarVisual;
-			if (!visual) return;
-			if (visual.opening) return;               // 打开方向没有视觉层，无需还原
-			reboundRightbarVisual(function () {});    // 关闭方向：官方还开着，视觉必须回到 0
 		}
 
 		function onDragMove(clientX, clientY, event) {
@@ -4424,120 +4174,47 @@
 					resetTrack();
 					return;
 				}
-				// WEB-08 方向门：抽屉关闭时（手势起手时未展开，baseX<=0）只认右滑（dx>0）。
-				// 左滑必须在这里就放弃接管并把事件原样还给官方/浏览器：
-				//   1) 判定必须早于下面的 dragging=true / setDrawerVisual(baseX)。setDrawerVisual
-				//      首次调用会**无条件**置上 data-dshr-dragging 并 setSidebarOpen(true)，随后才把
-				//      x 夹到 [0,max]——左滑的负位移被夹成 0，于是「左侧栏被点亮 + 主栏回弹」，
-				//      而末尾的 event.preventDefault() 又把官方手势吃掉。判定挪到 setDrawerVisual
-				//      之后就已经晚了：那时 setSidebarOpen(true) 早已执行。
-				//   2) 抽屉展开时（baseX>0）不放行，保留既有行为：左滑关闭、右滑按既有逻辑跟手。
-				if (baseX <= 0 && dx < 0) {
-					// WEB-09：左滑记成「打开官方右栏」的候选，然后**原样**放弃抽屉接管。
-					// 候选只存起点，松手前不做任何动作；兑现点在下面的 touchend 监听里
-					// （见 considerRightbarSwipe 的注释）。dragging 始终为 false，
-					// 因此不会点亮左抽屉、不会写 --dshr-drawer-x、也到不了下面的 preventDefault。
-					rightbarCandidate = { x0: startX, y0: startY, target: startTarget };
-					resetTrack();
-					return;
+				// T130 方向门（Kimi 双抽屉）：按当前抽屉态 + 位移方向给本笔手势定向。
+				// 定向失败 = 整笔 no-op——resetTrack 原样归还事件：不 preventDefault、
+				// 不写任何抽屉样式、不碰官方状态。WEB-08「关闭态左滑不点亮左抽屉」
+				// 由这里的分支结构保证：左滑只会走向右抽屉，永远碰不到 setDrawerVisual；
+				// 右开态左滑（E5 基线）与「右栏不可用时左滑」同样是 no-op。
+				if (isRightCardOpen()) {
+					if (dx <= 0) {
+						resetTrack();
+						return;
+					}
+					axis = 'right';
+				} else if (isSidebarOpen()) {
+					axis = 'left';
+				} else if (dx > 0) {
+					axis = 'left';
+				} else {
+					// 左滑开右抽屉：先确认官方卡片通道可用，不可用整笔 no-op。
+					// 方向确认这一刻就兑现官方打开（与左抽屉起手即 setSidebarOpen(true)
+					// 同节奏）：面板随即以卡片形态出现在右缘，--dshr-rx 跟手驱动。
+					if (!canOpenRightCard()) {
+						resetTrack();
+						return;
+					}
+					if (!setRightbarOpen(true)) {
+						resetTrack();
+						return;
+					}
+					axis = 'right';
 				}
 				dragging = true;
-				setDrawerVisual(baseX);
+				if (axis === 'left') setDrawerVisual(baseX);
+				else setRightVisual(baseRx);
 			}
 			var now = Date.now();
 			var dt = Math.max(1, now - lastT);
 			velocity = (clientX - lastX) / dt;
 			lastX = clientX;
 			lastT = now;
-			queueDrawerVisual(baseX + dx);
+			if (axis === 'left') queueDrawerVisual(baseX + dx);
+			else queueRightVisual(baseRx + dx);
 			if (event && event.cancelable) event.preventDefault();
-		}
-
-		/**
-		 * WEB-09：左滑 → 打开官方右侧栏。
-		 *
-		 * 为什么必须在 **touchend** 才兑现，而不是在方向门里就点开：
-		 *   1) 方向门命中时手指才移动了 10px，距离还很短。此时开右栏等于把一次
-		 *      「手指划过」的起手动作变成状态翻转，用户中途反悔（滑回去）就来不及收回。
-		 *   2) 阈值判定需要**终点**坐标（总位移 |dx|≥48、横向占优、|dy|≤96），
-		 *      起点坐标记在 rightbarCandidate 里，只有松手时才知道终点。
-		 *   3) 全程不 preventDefault、不写任何抽屉样式，官方/浏览器的事件原样放行，
-		 *      与 WEB-08 方向门「还手给官方」的结论一致。
-		 *
-		 * 豁免为什么天然成立：候选只在方向门命中后存在，而方向门在 tracking 期间，
-		 * tracking 又只在 canStartDrawerTrack 通过后才开始 —— 横向可滚容器
-		 * （isInHorizontallyScrollableContainer）、isIgnoredSwipeTarget（输入框/输入卡/鲸鱼/
-		 * 状态栏/统计行）、侧栏内、遮罩上在起点就被全部挡掉；右栏已打开时
-		 * canStartDrawerTrack 直接 false（不再武装）。抽屉展开时方向门（baseX>0）根本不产生
-		 * 候选，左滑仍是关抽屉，行为不变。
-		 */
-		function considerRightbarSwipe(candidate, endX, endY) {
-			if (!candidate) return false;
-			if (!isMobileMode() || isDrawerLocked()) return false;
-			if (isSidebarOpen()) return false;   // 抽屉展开中不碰右栏
-			if (isRightbarOpen()) return false;  // 已经开着就不 toggle，避免左滑把右栏关掉
-			var dx = endX - candidate.x0;
-			var dy = endY - candidate.y0;
-			if (dx >= 0) return false;
-			// 阈值沿用 considerSwipe 的既有风格：位移 48px、横向占优 1.4 倍、纵向不超过 96px。
-			if (Math.abs(dx) < 48) return false;
-			if (Math.abs(dx) < Math.abs(dy) * 1.4) return false;
-			if (Math.abs(dy) > 96) return false;
-			// T82：打开方向**保持官方原样（瞬时）**，不做视觉层。这是有证据的降级，不是遗漏：
-			//
-			// 父任务原本建议「起手时先兑现官方打开 → 施加反向 transform 拉回手指位置 → 跟手」，
-			// 并允许在产生跳变/失同步时降级为「只做 340ms 补间」。实测两级都走不通：
-			//   ① 提前兑现（方向门处 10px 就开）会与官方状态机失同步 —— device-class 从
-			//      158/158/0跳过 掉到 152总/3失败/8跳过（详见 report §A3）；
-			//   ② 只在兑现点做 340ms 补间也没有视觉：关闭态下承载容器实测
-			//        pI_x6G_rightbarCol { width: 0, overflow: visible } 且其上级 overflow: hidden
-			//      ⇒ 面板（412px 宽）被**整块裁掉**，此时给它加任何 translateX 都没有像素可动
-			//      （实测位移变化帧数=1，与改前的 0 帧在观感上无从区分，report §A2）。
-			//      要真正做出"滑入"就必须逐帧动画容器 width 0→412 —— 那是布局动画，
-			//      与本轮"只走合成器、不触发布局"的硬约束直接冲突，因此不做。
-			// 结论：打开方向 = 官方瞬时展开（与改动前逐字一致）；关闭方向才是本轮补齐的跟手。
-			//
-			// ── T85 修订 ──
-			// 父任务 T85 明确接受"布局动画 / 可能掉帧"，于是上面 ② 的禁令被解除：
-			// 现在**由本层自己**驱动承载容器的 width（当裁剪窗），做出"面板从左边长出来"。
-			// 兑现时机与调用方式一个字没改——下面仍然只有一次 openOfficialRightbar()，
-			// 仍然走它内部那条 dispatchNativeClick/click() 通道；本层只在其前后贴
-			// 裁剪窗的架/起/摘三步（见 prime/play/clearRightbarOpenVisual 的注释）。
-			// 起手期（方向门那 10px 到松手）依然**不碰**官方状态、不写任何位移属性。
-			var openCol = primeRightbarOpenVisual();
-			var opened = openOfficialRightbar();
-			if (opened) playRightbarOpenVisual(openCol);
-			else cancelRightbarOpenVisual();
-			return opened;
-		}
-
-		/**
-		 * T47：右栏**打开**态的右滑 → 关闭官方右栏（与 considerRightbarSwipe 镜像）。
-		 *
-		 * 为什么也在 **touchend** 兑现，而不是在 onDragMove 的方向门里就点：
-		 * 与 considerRightbarSwipe 同理由——阈值要**终点**坐标，且不该把「手指划过」
-		 * 的起手动作变成状态翻转。候选只存起点，全程不 preventDefault、不写
-		 * --dshr-drawer-x、不 setDrawerVisual、不 setSidebarOpen ⇒ 右栏打开态的右滑
-		 * 既不会点亮左抽屉（守住 WEB-09 的 expanded=0 断言），也不会吃掉事件。
-		 *
-		 * 方向门 `dx <= 0 一律不处理` 是**故意的**：右栏打开态的左滑必须仍是 no-op
-		 * （守住 scratch/t43/E5-leftswipe-while-open.json 的 72 条基线），
-		 * 绝不能顺手让左滑变成别的动作。
-		 */
-		function considerRightbarCloseSwipe(candidate, endX, endY) {
-			if (!candidate) return false;
-			if (!isMobileMode() || isDrawerLocked() || toggleBusy) return false;
-			if (isSidebarOpen()) return false;    // 抽屉展开中不碰右栏（与 :2510 同款）
-			if (!isRightbarOpen()) return false;  // 只关不开：二次校验，防抖动双触
-			var dx = endX - candidate.x0;
-			var dy = endY - candidate.y0;
-			if (dx <= 0) return false;           // 只认右滑；dx<=0 保持 no-op
-			// 阈值与 considerSwipe（:2278-2280）、considerRightbarSwipe（:2516-2518）逐字一致：
-			// 位移 48px、横向占优 1.4 倍、纵向不超过 96px。
-			if (Math.abs(dx) < 48) return false;
-			if (Math.abs(dx) < Math.abs(dy) * 1.4) return false;
-			if (Math.abs(dy) > 96) return false;
-			return closeOfficialRightbar();
 		}
 
 		function onDragEnd(clientX, clientY) {
@@ -4545,11 +4222,13 @@
 			var endX = clientX;
 			var endY = clientY;
 			var wasDragging = dragging;
+			var axisUsed = axis;
 			var start = startTarget;
-			var opened = isSidebarOpen();
+			var leftOpen = isSidebarOpen();
+			var rightOpen = isRightbarOpen();
 			var releaseVelocity = Date.now() - lastT < 100 ? velocity : 0;
 			resetTrack();
-			if (wasDragging) {
+			if (wasDragging && axisUsed === 'left') {
 				var shift = baseX + (endX - startX);
 				var visual = setDrawerVisual(shift);
 				var wantOpen = visual.p >= 0.35;
@@ -4557,7 +4236,17 @@
 				settleDrawer(wantOpen);
 				return;
 			}
-			if (opened && isElement(start)) {
+			if (wasDragging && axisUsed === 'right') {
+				var rx = baseRx + (endX - startX);
+				var rvisual = setRightVisual(rx);
+				var wantRight = rvisual.p >= 0.35;
+				// 右抽屉镜像：向左的速度 = 打开方向。
+				if (Math.abs(releaseVelocity) > 0.45) wantRight = releaseVelocity < 0;
+				settleRight(wantRight);
+				return;
+			}
+			// 非拖动点按：左开点主卡/右缘细条关左抽屉；右开点左缘细条关右抽屉（补间滑出）。
+			if (leftOpen && isElement(start)) {
 				var frame = findFrame();
 				var main = frame ? findMainCol(frame) : null;
 				var inMain = !!(main && main.contains(start));
@@ -4567,26 +4256,31 @@
 					return;
 				}
 			}
+			if (rightOpen && isElement(start) && start.id === 'dshr-mobile-drawer-mask') {
+				settleRight(false);
+				return;
+			}
 			considerSwipe(startX, startY, endX, endY, start);
 		}
 
 		function onDragCancel() {
 			if (!tracking) return;
-			var opened = drawerVisual ? drawerVisual.wasOpen : isSidebarOpen();
 			var wasDragging = dragging;
+			var axisUsed = axis;
 			resetTrack();
-			if (wasDragging) settleDrawer(opened);
-			else clearDrawerVisual();
+			if (!wasDragging) {
+				clearDrawerVisual();
+				clearRightVisual(false);
+				return;
+			}
+			// 触摸被系统/滚动接管：回到「官方当前状态」，不做兑现。
+			if (axisUsed === 'left') settleDrawer(drawerVisual ? drawerVisual.wasOpen : isSidebarOpen());
+			else if (axisUsed === 'right') settleRight(isRightbarOpen());
 		}
 
 		// Android WebView 的 PointerEvent 会在页面滚动时 pointercancel，右滑打开侧栏被吞掉。
 		// 抽屉手势始终走 touch；一旦判定为横向拖动就 preventDefault。
 		document.addEventListener('touchstart', function (event) {
-			// WEB-09：新一次触摸先清掉上一次没走完流程的候选（防残留误触发）。
-			rightbarCandidate = null;
-			rightbarCloseCandidate = null;
-			// T82：跟手层的起手记录同样每笔清零（上一次可能被 touchcancel 打断）。
-			rightbarTrack = null;
 			if (event.touches && event.touches.length !== 1) {
 				onDragCancel();
 				return;
@@ -4598,40 +4292,15 @@
 		document.addEventListener('touchmove', function (event) {
 			var touch = event.touches && event.touches[0];
 			if (!touch) return;
-			// T82：右栏跟手层先跑。它只在自己接管后清候选；没接管时不碰任何状态，
-			// 于是"面板中部右滑 no-op""打开态左滑 no-op"两条不变量原样保留。
-			rightbarVisualMove(touch.clientX, touch.clientY);
 			onDragMove(touch.clientX, touch.clientY, event);
 		}, { capture: true, passive: false });
 		document.addEventListener('touchend', function (event) {
 			var touch = event.changedTouches && event.changedTouches[0];
 			var endX = touch ? touch.clientX : lastX;
 			var endY = touch ? touch.clientY : startY;
-			// T82：跟手层接管过的这一笔在这里兑现（提交/回弹），并且**不再**走下面的
-			// 候选路径——否则官方状态会被翻转两次。
-			var handledByVisual = settleRightbarGesture(endX, endY);
-			// WEB-09：方向门记下的左滑候选在这里兑现（为什么是 touchend 而不是方向门，
-			// 见 considerRightbarSwipe 的注释）。候选存在时方向门已经 resetTrack()，
-			// tracking 为 false，所以下面的 onDragEnd 会首行 return——两条路径不会互相干扰。
-			var candidate = rightbarCandidate;
-			rightbarCandidate = null;
-			if (!handledByVisual && candidate) considerRightbarSwipe(candidate, endX, endY);
-			// T47：右栏打开态的「右滑关闭」候选在同一处兑现。两条路径互斥——
-			// 开右栏的候选要求右栏**关**、关右栏的候选要求右栏**开**，
-			// 而且本函数入口已判断 isRightbarOpen()，所以同一笔手势最多命中一条。
-			var closeCandidate = rightbarCloseCandidate;
-			rightbarCloseCandidate = null;
-			if (!handledByVisual && closeCandidate) considerRightbarCloseSwipe(closeCandidate, endX, endY);
 			onDragEnd(endX, endY);
 		}, { capture: true, passive: true });
 		document.addEventListener('touchcancel', function () {
-			// touchcancel 一律不兑现候选：它意味着滚动/系统已经把这次触摸接管走，
-			// 且这条路径的坐标是 lastX 而不是真实终点，拿它开右栏是假阳性。
-			rightbarCandidate = null;
-			// T47：关右栏的候选同样不兑现（理由相同）。
-			rightbarCloseCandidate = null;
-			// T82：跟手层也一样——不提交，只回弹并把官方状态还原到"这笔手势开始前"。
-			cancelRightbarGesture();
 			if (!tracking) return;
 			var dx = lastX - startX;
 			if (dragging || Math.abs(dx) >= 48) onDragEnd(lastX, startY);
@@ -5916,7 +5585,7 @@
 			} else {
 				root.removeAttribute('data-dshr-explorer-details');
 			}
-			// 官方右侧栏全屏（0.1.3+ 的文件树/文档预览）时收起本脚本的悬浮控件。
+			// 官方右侧栏全屏（0.1.3+ 的文件树/文档预览）时收起本脚本的悬浮鲸鱼。
 			if (frame.hasAttribute('data-rightbar-fullscreen')) {
 				root.setAttribute('data-dshr-rightbar-fullscreen', '1');
 			} else {
@@ -5929,6 +5598,23 @@
 			root.setAttribute('data-dshr-has-official-toggle', '0');
 			root.removeAttribute('data-dshr-explorer-details');
 			root.removeAttribute('data-dshr-rightbar-fullscreen');
+		}
+
+		// ── T130：右抽屉卡片态镜像 + 跟手痕迹卫生 ──
+		// data-dshr-ropen = 「官方 open 且面板为 fullscreen 卡片态」（push/docked 不置位），
+		// 供遮罩换边 / drag handle 镜像两条 CSS 规则用。
+		var rPanelNow = findRightbarPanel();
+		var rOpenNow = isRightbarOpen();
+		var rCardNow = !!(rPanelNow && rPanelNow.getAttribute('data-sidebar-right-panel') === 'fullscreen');
+		root.setAttribute('data-dshr-ropen', rOpenNow && rCardNow ? '1' : '0');
+		if (!rOpenNow) {
+			// 官方已收起（含 settleRight 关闭落位后的异步收敛、官方按钮直收）：
+			// 清掉右抽屉全部跟手痕迹。此时面板已被官方隐藏，清 --dshr-rx 无可见跳变。
+			clearRightVisual(false);
+		} else if (!rightVisual && !rightSettleAnim && !root.style.getPropertyValue('--dshr-rx')) {
+			// 非手势路径打开（官方按钮 / 返回桥外）：确保停在全开设定位
+			// （--dshr-rx 缺省即 0px，这里显式写一次只是让语义自解释）。
+			root.style.setProperty('--dshr-rx', '0px');
 		}
 
 		if (typeof document.querySelectorAll !== 'function') return;
@@ -7125,6 +6811,13 @@
 		},
 		clearDrawerDrag: clearDrawerVisual,
 		settleDrawer: settleDrawer,
+		// T130：右抽屉测试桥（与左抽屉三个桥镜像）。
+		setRightDrag: function (progress) {
+			var p = Math.max(0, Math.min(1, Number(progress) || 0));
+			return setRightVisual((1 - p) * rightCardMax());
+		},
+		clearRightDrag: function () { clearRightVisual(false); },
+		settleRight: settleRight,
 		syncNow: syncDom,
 		syncViewport: function () {
 			applyWidthScope();
@@ -7146,16 +6839,16 @@
 		},
 		// T82：重连入口分层自检（测试用；返回值就是实际用的那一层）
 		requestUpstreamReconnect: requestUpstreamReconnect,
-		// T82：右栏跟手层的只读快照（测试采样用，不做任何动作）
+		// T130：右抽屉跟手层的只读快照（测试采样用，不做任何动作）
 		rightbarVisualState: function () {
 			return {
-				tracking: rightbarTrack !== null,
-				mode: rightbarTrack ? rightbarTrack.mode : null,
-				active: rightbarVisual !== null,
-				opening: rightbarVisual ? rightbarVisual.opening : null,
-				x: rightbarVisual ? rightbarVisual.x : null,
-				max: rightbarVisual ? rightbarVisual.max : null,
-				col: rightbarVisual && rightbarVisual.col ? rightbarVisual.col.getAttribute('data-dshr-rightbar-col') !== null : false,
+				tracking: rightVisual !== null,
+				mode: rightVisual ? (isRightbarOpen() ? 'close' : 'open') : null,
+				active: rightVisual !== null,
+				opening: rightVisual ? !isRightbarOpen() : null,
+				x: rightVisual ? rightVisual.x : null,
+				max: rightVisual ? rightVisual.max : null,
+				col: !!findRightbarPanel(),
 			};
 		},
 	};

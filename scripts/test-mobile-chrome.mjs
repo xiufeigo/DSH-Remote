@@ -862,17 +862,11 @@ function assertSourceContracts() {
 	}
 	// ── WEB-08：手势方向门，且必须早于 setDrawerVisual 接管 ──
 	// 用户报告：手机主页面「从右往左滑」会点亮左侧抽屉而不是走官方右栏。
-	// 根因是 onDragMove 越过 10px 阈值就 dragging=true + setDrawerVisual(baseX)，
-	// 而 setDrawerVisual 首次调用无条件 setSidebarOpen(true) 才夹 x，左滑的负位移被夹成 0。
+	// T130（Kimi 双抽屉）把方向门重写为「按抽屉态 + 位移方向定向」：
+	//   右开态 dx<=0 → 整笔 no-op（E5 基线）；左开态任意横向 → 左抽屉跟手；
+	//   双闭 dx>0 → 左抽屉；双闭 dx<0 → 右抽屉（canOpenRightCard 不可用则整笔 no-op）。
+	// 左滑从分支结构上永远碰不到 setDrawerVisual ⇒ 点亮左抽屉在原理上不可能。
 	{
-		const GATE = "if (baseX <= 0 && dx < 0) {";
-		if (!src.includes(GATE)) {
-			throw new Error("源码契约：WEB-08 缺手势方向门（抽屉关闭时左滑必须放弃接管）");
-		}
-		// 取 onDragMove 的函数体：到下一个同缩进的 function 声明为止（不做花括号计数，
-		// 免得被函数体里的对象/数组字面量带偏），并**剔掉 // 注释行**——
-		// 方向门自己的注释里就出现过 "setDrawerVisual(baseX)" 这几个字，
-		// 按原文取下标会指向注释而不是真正的接管点，判定会假绿/假红。
 		const fnStart = src.indexOf("function onDragMove(clientX, clientY, event) {");
 		if (fnStart < 0) throw new Error("源码契约：找不到 onDragMove 函数");
 		const fnEnd = src.indexOf("\n\t\tfunction ", fnStart);
@@ -882,30 +876,42 @@ function assertSourceContracts() {
 			.split("\n")
 			.filter((line) => !line.trim().startsWith("//"))
 			.join("\n");
-		const gateAt = body.indexOf(GATE);
-		if (gateAt < 0) throw new Error("源码契约：WEB-08 方向门不在 onDragMove 函数体内");
+		// ① 定向序列必须都在「未 dragging」分支内，按
+		//    「右开态 → 左开态 → 双闭右滑 → 双闭左滑」序，且全部早于 dragging = true。
+		const notDragging = body.indexOf("if (!dragging) {");
+		const rightNoop = body.indexOf("if (dx <= 0) {");
+		const leftOpenArm = body.indexOf("} else if (isSidebarOpen()) {");
+		const rightSwipeOpen = body.indexOf("} else if (dx > 0) {");
+		const cardGate = body.indexOf("if (!canOpenRightCard()) {");
+		const commitOpen = body.indexOf("if (!setRightbarOpen(true)) {");
 		const dragStart = body.indexOf("dragging = true;");
-		const takeOver = body.indexOf("setDrawerVisual(baseX);");
+		const takeOver = body.indexOf("if (axis === 'left') setDrawerVisual(baseX);");
+		const rightTakeOver = body.indexOf("else setRightVisual(baseRx);");
 		const pd = body.indexOf("event.preventDefault()");
-		if (dragStart < 0 || takeOver < 0) {
-			throw new Error("源码契约：WEB-08 校验失败——onDragMove 里找不到 dragging = true; / setDrawerVisual(baseX); 接管点");
+		const links = [["if (!dragging)", notDragging], ["右开态左滑 no-op 门", rightNoop],
+			["左开态武装", leftOpenArm], ["双闭右滑开左", rightSwipeOpen], ["右卡闸", cardGate],
+			["右开兑现", commitOpen], ["dragging = true", dragStart], ["左抽屉接管", takeOver],
+			["右抽屉接管", rightTakeOver], ["preventDefault", pd]];
+		for (const [name, at] of links) {
+			if (at < 0) throw new Error(`源码契约：T130 方向门缺环节（${name}）`);
 		}
-		// 方向门必须在 dragging=true / setDrawerVisual(baseX) **之前**：
-		// 挪到 setDrawerVisual 之后就已经晚了——那时 setSidebarOpen(true) 早已执行，
-		// 左侧栏被点亮且末尾的 preventDefault() 已把官方手势吃掉。
-		if (gateAt > dragStart) {
-			throw new Error("源码契约：WEB-08 方向门必须早于 dragging = true（否则已进入跟手路径）");
+		if (!(notDragging < rightNoop && rightNoop < leftOpenArm && leftOpenArm < rightSwipeOpen
+			&& rightSwipeOpen < cardGate && cardGate < commitOpen && commitOpen < dragStart)) {
+			throw new Error("源码契约：T130 方向门必须按「右开态 → 左开态 → 双闭右滑 → 双闭左滑」序定向，且全部早于 dragging = true");
 		}
-		if (gateAt > takeOver) {
-			throw new Error("源码契约：WEB-08 方向门必须早于 setDrawerVisual(baseX)（setSidebarOpen(true) 已执行就来不及了）");
+		if (dragStart > takeOver || takeOver > pd) {
+			throw new Error("源码契约：T130 接管顺序必须是 dragging = true → setDrawerVisual(baseX) → preventDefault（方向门之后才有任何接管与事件吞没）");
 		}
-		// 方向门要早于 preventDefault，否则事件仍被吃掉（等于没还手给官方）。
-		if (pd < 0 || gateAt > pd) {
-			throw new Error("源码契约：WEB-08 方向门必须早于 event.preventDefault()（左滑要把事件还给官方/浏览器）");
+		// ② 每个 no-op 出口都必须 resetTrack() 后立即 return（事件原样还给官方/浏览器）：
+		//    纵向占优 / 右开态左滑 / 右卡不可用 / 右开兑现失败，共 4 处。
+		const gateRegion = body.slice(notDragging, dragStart);
+		const noopCount = (gateRegion.match(/resetTrack\(\);\s*\n\s*return;/g) || []).length;
+		if (noopCount < 4) {
+			throw new Error(`源码契约：T130 方向门 no-op 出口必须 resetTrack() 后立即 return（仅见 ${noopCount}/4）`);
 		}
-		// 方向门必须真的放弃接管：走 resetTrack() 并 return，不能继续跟手。
-		if (!/resetTrack\(\);\s*\n\s*return;/.test(body.slice(gateAt, gateAt + 200))) {
-			throw new Error("源码契约：WEB-08 方向门必须 resetTrack() 后立即 return（放弃接管）");
+		// ③ 左滑在源码结构上不可能点亮左抽屉：方向门区域内不得出现 setDrawerVisual。
+		if (gateRegion.includes("setDrawerVisual")) {
+			throw new Error("源码契约：T130 方向门区域内不得出现 setDrawerVisual（左滑点亮左抽屉的根因）");
 		}
 	}
 	// ── WEB-07：hook 幂等——脚本自带重复执行护栏，注入端按标记幂等 ──
