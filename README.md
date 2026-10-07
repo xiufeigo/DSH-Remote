@@ -408,6 +408,62 @@ xtcp 打洞成功时数据手机 ⇄ PC 直连不过 VPS；失败自动回退 st
 - **只作用于"投票"，不作用于"桥装没装过"**：`hookSelfHealLive()` 仍看未加时间戳的原值——
   否则健康态静默 20s 后会被误判成"hook 不在场"，兜底探针从 5s 掉到 1s，与省电目标相反。
 
+## rc.2.21 本批的用户可感知变化（两个手机档交互缺陷，T135）
+
+用户口径原话：「右侧边栏手动滑动关闭的时候，在关闭后会自动再弹一遍动画，也就是自动打开侧边栏
+又给关上」；另一条：「我手机版改不了这个模型。模型面板是在输入框顶部向上弹出，然后点击模型这个框
+会自己消失。」两条都已定位到根因并修复（唯一产品改动 `packages/gateway/assets/mobile-web.js`，
+与 `android/app/src/main/res/raw/mobile.js` 字节同步）。结单报告：`scratch/t135/report.md`。
+
+### ① 右栏「关完又自己弹回来再关上」＝**两套位移载体共用同一个闸**
+
+- hook 的卡片位移加在**面板本体**上（`transform: translateX(var(--dshr-rx))`），闸是官方属性
+  `data-sidebar-right-open`；而**官方真正的收起/展开过渡在面板内层**
+  （`[data-dockkit-host=dock]`/`[data-dockkit-empty]`/`[data-dockkit-divider]`：
+  `transform: translateX(var(--dsh-sidebar-width)); visibility: hidden;
+  transition: transform var(--ds-transition-duration-slow) …, visibility 0s linear …`）。
+- 手势关闭补间到 `rx=max` 后再兑现官方收起 ⇒ 属性消失使面板那条规则**整条失效**
+  （面板 `transform` 回落 `none`、rect 412→**0** 瞬回屏内），官方内层随即起跑它自己的 0.3s
+  过渡（`visibility` 延迟 0.3s 才隐藏、**全程可见**）⇒ 用户看到的第二次动画。
+  逐帧实测：官方提交帧 `t=1109`，内层可见窗口 `1109→1376ms`（屏内 17 帧）。
+  **不是状态机问题**：每次关闭官方 toggle 精确派发 **1 次**、属性只翻转 1 次（rc.2.18/2.19/2.20
+  三次「补拍」类修复治不好，原因就在这里）。
+- 修法：新手势关闭**交接窗** `data-dshr-rclosing`——交接窗内面板继续停在屏外（同一条卡片规则
+  用第二个选择器命中），并**压掉官方内层过渡**（收起一步到位 `translate+hidden`）；
+  官方状态一落地（`syncDom`）**先撤窗、再清 `--dshr-rx`**。打开意图 / 看门狗放弃 /
+  `setRightbarOpen` 早退 / 拆卸痕迹都要撤窗。
+- 附带：`startObserver` 的 `attributeFilter` 补 `data-sidebar-right-open` + `aria-hidden`
+  ——原先右栏属性翻转能否及时同步，全靠官方那次提交**恰好**带了 childList 变更；若只有属性变化，
+  `rightToggleBusy` 迟迟不解，1200ms 看门狗会按「派发丢失」补发第二颗 toggle（另一条
+  「关完又自己打开」的链路）。
+- 真值：独立复现脚本修前 **5/5 复现**、修后 **0/5**；提交帧面板 `left` 由 **0 → 412**（停在屏外）；
+  官方按钮直关的 0.3s 正常动画**未被误杀**。回归：`pnpm test:mobile`（fixture 逐帧断言
+  `rdrawer-official-close-no-replay` 等 + 源码契约）。
+
+### ② 手机端改不了模型 ＝**守卫 blur 掉了官方子面板自己弹出的搜索框**
+
+- 点「模型 …」行 ⇒ 官方打开模型子面板（18 条模型 + 搜索框
+  `input[role="searchbox"][aria-label="搜索模型…"]`）并**自动聚焦**该搜索框；
+  hook 的 `focusin` capture 守卫把它判成「非用户手势造成的偷焦点」⇒ `revokeStealthFocus` ⇒
+  `el.blur()` ⇒ 官方浮层以「焦点离开浮层」为准 dismiss ⇒ **blur 后 1.6ms** 菜单 + 刚渲染的
+  模型列表 + 外点遮罩整块卸载，列表一帧都没画。四臂对照（注入 hook ❌ / 无 hook ✅ /
+  tablet 严格 OFF ✅ / 只中和那一句 blur ✅ 且真能换模型）钉死因果；`click` 实测送达
+  （`defaultPrevented=false`、目标仍在文档里）⇒ 与「吞 click」无关。
+- 修法：**浮层内手势通行证 + 压 IME 而不是 blur**——手势起点落在已打开浮层内 ⇒ 开一张
+  **只对「浮层内元素」生效**的窗口；窗口内落在浮层里的可编辑元素被聚焦时**不 blur**，
+  只打 `inputmode="none"` + `data-dshr-imemute`（**记住原值**）⇒ 菜单活着、Chromium 不请求
+  `showSoftInput`（不把 T48 §5 的键盘病换回来）；用户之后真去点输入框 ⇒ 撤压制并还原原值。
+  判据**不靠 role**（官方容器 role 会在 `menu`/`group` 间切换），也不只认 hook 自己的标记
+  （标记由 50ms 合并的 `syncDom` 写，而官方这次聚焦发生在子面板挂载后 ~10ms）。
+- 范围严格性：点 composer 上的「+」/模型触发器**不开**窗口 ⇒ T48 §5 的防护不变（实测「+」路径
+  `data-dshr-imemute` 计数 = 0）；放行对象必须是**浮层内**的可编辑元素 ⇒ 官方浮层关闭把焦点
+  还给 composer 那种「偷焦点」仍被正常收回（T42 语义不变）。
+- 真值：真页面端到端**真的换了一次模型并逐字复原**（`DeepSeek V4.1 Flash/Max` →
+  `DeepSeek-V41-Flash/High` → 复原；切模型会同时重置推理等级，回滚分两步）。
+- ⚠️ **未决（如实）**：软键盘真机行为未实测（headless Chrome 量不到 `showSoftInput`）；
+  本修法取「放行焦点 + 压 IME」是**保守方向**；`inputmode` 撤销路径已实测
+  （点搜索框后还原、能输入并过滤 18→3 条）。
+
 ## rc.2.10 本批的用户可感知变化（省电清理）
 
 用户口径原话：「**兜底探针改成按分钟计吧，然后在后台的时候不触发，只有在前台才会触发探针，这样才是真省电。**」

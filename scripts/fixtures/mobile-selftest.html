@@ -79,18 +79,54 @@ header { padding: 8px 12px 0 20px; }
 .job { min-height: 28px; border: 0; background: none; display: inline-flex; align-items: center; gap: 3px; padding: 3px 2px; font: inherit; font-size: 12px; white-space: nowrap; color: #5c5c66; }
 .job-dot { flex: none; }
 .job-count { margin: 0 5px; }
-/* 官方右侧栏（0.1.3+ 文件树/文档预览）：全屏态 position:fixed;inset:0 */
+/* 官方右侧栏（0.1.3+ 文件树/文档预览）：全屏态 position:fixed;inset:0。
+   T135：真页面实测（scratch/t135/verify-A/ancestors.mjs，412×915 真 DSH 页面）——
+   关闭态**面板自己不隐藏**：`visibility:visible` + `pointer-events:none`，白底由 hook 的
+   `background:…!important` 提供，靠官方祖先的 0 宽右栏列/层叠在观感上「不存在」；
+   内容显隐与收起/展开动画落在**内层 dock**：
+   官方 CSS 原文 `transform: translateX(var(--dsh-sidebar-width)); visibility: hidden;
+   transition: transform var(--ds-transition-duration-slow) …, visibility 0s linear …`，
+   open 态反过来 `transform:none; visibility:visible; transition: transform …`。
+   夹具必须照官方建模：旧写法（关闭时面板自身 visibility:hidden）会让内层动画**永不入镜**，
+   于是 T135「关闭后重播一次可见位移」的断言无论修与不修都是绿的（没有牙齿）。 */
 .rightbar-panel {
-  position: fixed;
+  position: absolute;
   inset: 0;
   z-index: 40;
   display: flex;
   flex-direction: column;
-  background: #fff;
-  visibility: hidden;
-  transform: translateX(100%);
+  pointer-events: none;
+  /* 真页面里这条 overflow:hidden 在官方祖先容器上（BynINW_frame，实测 overflow:hidden）：
+     内层 dock 收起态被 translateX(100%) 推到屏外，若无人裁剪，移动视口会为了「装下」
+     这个越界盒子把 innerWidth 从 390 撑到 780（夹具实测），hook 因此判成平板档 ⇒
+     整套 phone 断言假红。官方用祖先裁剪，夹具就在面板上裁剪（面板是全屏容器，语义等价）。 */
+  overflow: hidden;
 }
-.rightbar-panel[data-sidebar-right-open] { visibility: visible; transform: none; }
+.rightbar-panel[data-sidebar-right-open] { pointer-events: auto; }
+/* 关闭态面板本身不铺底：hook 有一条 `html.dshr-mobile [data-sidebar-right-panel="fullscreen"]
+   { background: …#fff !important }`（真页面同样如此），而真页面上关闭态面板被官方祖先的
+   0 宽右栏列/层叠挡住，应用始终可见（见 scratch/t135/shots/lead-official-closed.png）。
+   夹具没有那棵祖先树，若不显式透明，关闭态会把整页刷白（截图产物变白板、也不再是那个
+   「聊天界面」自测页）。白底交给内层 dock：T135 要观测的可见位移本来就是它。 */
+html.dshr-mobile [data-sidebar-right-panel="fullscreen"]:not([data-sidebar-right-open]) {
+  background: transparent !important;
+}
+/* 内层 dock：官方收起/展开的真实过渡层（面板只是承载容器）。 */
+.rightbar-dock {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  transform: translateX(100%);
+  visibility: hidden;
+  transition: transform 0.3s ease-in-out, visibility 0s linear 0.3s;
+}
+.rightbar-panel[data-sidebar-right-open] .rightbar-dock {
+  transform: none;
+  visibility: visible;
+  transition: transform 0.3s ease-in-out;
+}
 .rightbar-head { flex: none; height: 44px; display: flex; align-items: center; padding: 0 12px; font-size: 14px; border-bottom: 1px solid #ececee; }
 .rightbar-body { flex: 1; overflow: auto; padding: 12px; }
 .handle { width: 8px; background: #d9dbe0; }
@@ -264,12 +300,15 @@ html.dshr-mobile [data-dshr-main-col] { transition: none !important; }
     <div class="dshx-root" id="explorer-panel">审查面板必须可见，不能被 Remote 壳藏成白屏。</div>
   </div>
   <div class="rightbar-panel" id="rightbar-panel" data-sidebar-right-panel="fullscreen">
-    <div class="rightbar-head" id="rightbar-head">
-      <button type="button" class="icon-button" aria-label="退出全屏" data-sidebar-right-mode="push"><svg width="15" height="15" viewBox="0 0 16 16"><path d="M2 8h12" stroke="currentColor" fill="none"/></svg></button>
-      <span>文件树</span>
-      <button type="button" class="icon-button" aria-label="收起右侧栏" data-sidebar-right-toggle="true"><svg width="15" height="15" viewBox="0 0 16 16"><path d="M2 8h12" stroke="currentColor" fill="none"/></svg></button>
+    <!-- T135：官方内层 dock（收起/展开的 transform+visibility 过渡在**这一层**，不在面板上） -->
+    <div class="rightbar-dock" id="rightbar-dock" data-dockkit-host="dock" data-dockkit-column>
+      <div class="rightbar-head" id="rightbar-head">
+        <button type="button" class="icon-button" aria-label="退出全屏" data-sidebar-right-mode="push"><svg width="15" height="15" viewBox="0 0 16 16"><path d="M2 8h12" stroke="currentColor" fill="none"/></svg></button>
+        <span>文件树</span>
+        <button type="button" class="icon-button" aria-label="收起右侧栏" data-sidebar-right-toggle="true"><svg width="15" height="15" viewBox="0 0 16 16"><path d="M2 8h12" stroke="currentColor" fill="none"/></svg></button>
+      </div>
+      <div class="rightbar-body" id="rightbar-body">工作区文件树：手机端全屏态顶部不得顶进状态栏。</div>
     </div>
-    <div class="rightbar-body" id="rightbar-body">工作区文件树：手机端全屏态顶部不得顶进状态栏。</div>
   </div>
 </div>
 <div id="float-model-wrap" style="position:fixed;left:0;top:0;transform:translate(-48px,420px);min-width:max-content;z-index:50;background:#fff;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.12);">
@@ -302,6 +341,19 @@ html.dshr-mobile [data-dshr-main-col] { transition: none !important; }
     <div role="menuitem">计划模式</div>
   </div>
 </div>
+<!-- T135-B 自测替身：官方「模型」子面板形态——浮层（fixed + 不满视口）里有一个会被官方
+     自动聚焦的搜索框，初始 inputmode 故意设为**非空**（search），用来证明守卫撤销时是
+     「逐字还原」而不是「删属性」。默认 display:none，只有 T135-B 断言块会打开它。 -->
+<div id="float-autofocus-wrap" style="position:fixed;left:16px;top:120px;width:280px;height:170px;z-index:60;background:#fff;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.16);display:none;">
+  <div role="dialog" aria-label="模型子面板（自测替身）" style="padding:10px;">
+    <div>模型列表（替身）</div>
+    <input id="float-autofocus-input" role="searchbox" aria-label="搜索模型" inputmode="search" style="width:100%;height:32px;margin-top:8px;" />
+  </div>
+</div>
+<!-- T135-B 负例（T48 语义）：浮层**外**的普通输入框，落点在非浮层时守卫必须照常收回聚焦。
+     零尺寸 + 静态定位：既能被 focus()，又不算浮层宿主（isFloatingHost 要求 fixed/absolute
+     且 rect>1px），也不会在截图产物里留下任何像素。 -->
+<input id="guard-plain-input" aria-label="浮层外的普通输入框" style="position:static;width:0;height:0;opacity:0;border:0;padding:0;margin:0;" />
 <div id="empty-home" class="empty-home">
   <h1 id="empty-title">探索未至之境</h1>
   <div class="empty-card" id="empty-composer">描述你想要构建的内容</div>
@@ -778,17 +830,45 @@ function run() {
     } else {
       add(checks, 'drag-close-follow', false, 'missing setDrawerDrag');
     }
+    // T135 附带（夹具稳健性）：原先这三条断言用 setTimeout(300ms) **单点**采样，机器负载高时
+    // 定时器被推迟 ⇒ 采到的是补间尾段，实测同一份代码 r=3/7（红）与 10/12/15（绿）随机出现、
+    // close-anim-glide-back left=45/119 对 210。改为 rAF 逐帧记录、判定时取「补间开始后
+    // 最接近 300ms 的那一帧」——判定时机再晚也不改变采到的动画进度，语义逐字不变。
+    var closeFrames = [];
+    var closeT0 = performance.now();
+    var closeSampling = true;
+    (function sampleClose() {
+      var el = document.querySelector('[data-dshr-main-col]');
+      if (el) {
+        var elCs = getComputedStyle(el);
+        var elR = el.getBoundingClientRect();
+        closeFrames.push({
+          t: performance.now() - closeT0,
+          left: elR.left,
+          radius: Math.round(parseFloat(elCs.borderTopLeftRadius) || 0),
+          height: Math.round(elR.height),
+          collapsed: frame.hasAttribute('data-sidebar-collapsed'),
+          tf: elCs.transform,
+        });
+      }
+      if (closeSampling) window.requestAnimationFrame(sampleClose);
+    })();
     fireSwipe(mainEl, 360, 420, 40, 420);
     window.setTimeout(function () {
       // 松手关闭现在是两段式：先补间回位（官方仍 wide），落位后才切收起。
+      closeSampling = false;
+      var midFrame = closeFrames[0] || { t: 0, left: -1, radius: 0, height: 0, collapsed: true, tf: 'none' };
+      for (var ci = 1; ci < closeFrames.length; ci++) {
+        if (Math.abs(closeFrames[ci].t - 300) < Math.abs(midFrame.t - 300)) midFrame = closeFrames[ci];
+      }
       var midMain = document.querySelector('[data-dshr-main-col]');
-      var midLeft = midMain ? midMain.getBoundingClientRect().left : -1;
-      var midRounded = midMain ? Math.round(parseFloat(getComputedStyle(midMain).borderTopLeftRadius) || 0) : 0;
-      add(checks, 'close-anim-glide-back', midLeft >= 0 && midLeft < 338 && getComputedStyle(midMain).transform !== 'none',
-        'left=' + Math.round(midLeft));
-      add(checks, 'close-anim-sidebar-still-wide', !frame.hasAttribute('data-sidebar-collapsed'),
-        'collapsed=' + frame.hasAttribute('data-sidebar-collapsed'));
-      add(checks, 'close-anim-keeps-card-geometry', midRounded >= 8 && Math.round(midMain.getBoundingClientRect().height) > 0,
+      var midLeft = midFrame.left;
+      var midRounded = midFrame.radius;
+      add(checks, 'close-anim-glide-back', midLeft >= 0 && midLeft < 338 && midFrame.tf !== 'none',
+        'left=' + Math.round(midLeft) + ' t=' + Math.round(midFrame.t) + 'ms 帧=' + closeFrames.length);
+      add(checks, 'close-anim-sidebar-still-wide', midFrame.collapsed === false,
+        'collapsed=' + midFrame.collapsed);
+      add(checks, 'close-anim-keeps-card-geometry', midRounded >= 8 && midFrame.height > 0,
         'r=' + midRounded);
       window.setTimeout(function () {
         add(checks, 'close-anim-settles-collapsed', frame.hasAttribute('data-sidebar-collapsed'),
@@ -933,6 +1013,10 @@ function run() {
                 return document.documentElement.getAttribute('data-dshr-rdrag') !== '1' && (!rx || rx === '0px');
               }
               function rdOpenState() { return rdPanel.hasAttribute('data-sidebar-right-open'); }
+              // T135：官方提交在夹具里是**异步**的（60ms 模拟 React），而 hook 的镜像属性
+              // data-dshr-ropen 要等 syncDom（50ms 合并）才落地 ⇒ 「开态就绪」必须把镜像
+              // 也算进去，否则会抢在镜像前采样，rdrawer-ropen-flag 假红。
+              function rdMirrored() { return document.documentElement.getAttribute('data-dshr-ropen') === '1'; }
               // 面板全开且设定位（右缘贴屏）：官方滑入过渡与 rAF 落位都收敛于这条。
               function rdSettledRight() {
                 var b = rdPanel.getBoundingClientRect();
@@ -961,22 +1045,75 @@ function run() {
                 bridge.settleRight(false);
                 rdWaitFor(function () { return !rdOpenState() && rdClean(); }, rdSettleCap, function () {
                   // mock 官方折叠按钮的 React 提交：点击即翻转 open/fullscreen 属性。
+                  // T135：官方提交是**异步**的（真页面实测 ~90–800ms；hook 的 syncDom 还会
+                  // 50ms 合并），同步翻转会把「手势落位 → 官方 closed 落地」这段**交接窗**
+                  // 压进同一个任务里，修法与 bug 都无处可观察 ⇒ 用 60ms 模拟异步提交。
                   rdToggle.onclick = function () {
-                    if (rdOpenState()) {
-                      rdPanel.removeAttribute('data-sidebar-right-open');
-                      rdFrame.removeAttribute('data-rightbar-fullscreen');
-                    } else {
-                      rdPanel.setAttribute('data-sidebar-right-open', '');
-                      rdFrame.setAttribute('data-rightbar-fullscreen', '');
-                    }
+                    window.setTimeout(function () {
+                      if (rdOpenState()) {
+                        rdPanel.removeAttribute('data-sidebar-right-open');
+                        rdFrame.removeAttribute('data-rightbar-fullscreen');
+                      } else {
+                        rdPanel.setAttribute('data-sidebar-right-open', '');
+                        rdFrame.setAttribute('data-rightbar-fullscreen', '');
+                      }
+                    }, 60);
                   };
-                  // ② 左滑 → 右抽屉从右缘滑入打开；等「开 + 设定位 + 痕迹收敛」再量几何。
+                  // ② 左滑 → 右抽屉从右缘滑入打开；等「开 + 设定位 + 镜像就绪 + 痕迹收敛」再量几何。
                   fireSwipe(column, 360, 400, 40, 400);
-                  rdWaitFor(function () { return rdSettledRight() && rdClean(); }, rdSettleCap, function () {
+                  rdWaitFor(function () { return rdSettledRight() && rdMirrored() && rdClean(); }, rdSettleCap, function () {
                     rdOpenAssert();
                   });
                 });
               });
+              /**
+               * T135：手势关闭的**逐帧**取证（rAF，真帧）。判据是「入镜可见」：
+               * 内层 dock 的 visibility:visible 且其视口矩形与视口相交（父级 transform 一并计入）。
+               *
+               * 为什么必须测内层而不是面板：官方收起/展开过渡在**内层 dock** 上；面板关闭态
+               * 仍是 412×915 的透明覆盖层（真页面实测），量面板 rect 永远「在屏内」。
+               * 为什么必须逐帧：bug 是**时间维度**的（官方 closed 之后又多滑了 0.3s），
+               * 只看终态（rdrawer-flags-cleared）永远测不到。
+               */
+              function rdDockFrames(panel) {
+                var frames = [];
+                var running = true;
+                function txOf(cs) {
+                  if (!cs || !cs.transform || cs.transform === 'none') return 0;
+                  var m = cs.transform.match(/matrix\(([^)]+)\)/);
+                  if (!m) return 0;
+                  var v = parseFloat(m[1].split(',')[4]);
+                  return isNaN(v) ? 0 : v;
+                }
+                function snap() {
+                  var nodes = panel.querySelectorAll('[data-dockkit-host],[data-dockkit-empty],[data-dockkit-divider]');
+                  var onScreen = false;
+                  var moving = false;
+                  for (var i = 0; i < nodes.length; i++) {
+                    var cs = getComputedStyle(nodes[i]);
+                    var r = nodes[i].getBoundingClientRect();
+                    var tx = txOf(cs);
+                    var hit = cs.visibility === 'visible' && cs.display !== 'none'
+                      && r.width > 0 && r.height > 0
+                      && r.left < window.innerWidth && r.right > 0
+                      && r.top < window.innerHeight && r.bottom > 0;
+                    if (hit) onScreen = true;
+                    if (hit && Math.abs(tx) > 4 && Math.abs(tx) < window.innerWidth - 4) moving = true;
+                  }
+                  return {
+                    open: panel.hasAttribute('data-sidebar-right-open'),
+                    rclosing: document.documentElement.getAttribute('data-dshr-rclosing'),
+                    rx: document.documentElement.style.getPropertyValue('--dshr-rx') || '',
+                    panelLeft: Math.round(panel.getBoundingClientRect().left),
+                    innerOnScreen: onScreen, innerMoving: moving, innerCount: nodes.length
+                  };
+                }
+                (function tick() {
+                  frames.push(snap());
+                  if (running) window.requestAnimationFrame(tick);
+                })();
+                return { stop: function () { running = false; return frames; } };
+              }
               function rdOpenAssert() {
                 var rdOpen = rdPanel.hasAttribute('data-sidebar-right-open');
                 add(checks, 'rdrawer-opens-on-left-swipe', rdOpen, 'open=' + rdOpen);
@@ -1007,16 +1144,136 @@ function run() {
                   add(checks, 'rdrawer-left-swipe-noop', rdOpenState() && rdFrame.hasAttribute('data-sidebar-collapsed'),
                     'open=' + rdOpenState() + ' collapsed=' + rdFrame.hasAttribute('data-sidebar-collapsed'));
                   // ④ 右滑 → 补间滑出右缘后官方收起，跟手痕迹全清。
+                  // T135：同一笔手势开始逐帧取证（放在 fireSwipe 之前，覆盖补间全程）。
+                  var rdTail = rdDockFrames(rdPanel);
                   fireSwipe(rdPanel, 100, 400, 320, 400);
                   rdWaitFor(function () { return !rdOpenState() && rdClean(); }, rdSettleCap, function () {
-                    add(checks, 'rdrawer-closes-on-right-swipe', !rdOpenState(),
-                      'open=' + rdOpenState());
-                    add(checks, 'rdrawer-flags-cleared', document.documentElement.getAttribute('data-dshr-ropen') !== '1' && rdClean(),
-                      'ropen=' + document.documentElement.getAttribute('data-dshr-ropen')
-                      + ' rx=' + document.documentElement.style.getPropertyValue('--dshr-rx')
-                      + ' rdrag=' + document.documentElement.getAttribute('data-dshr-rdrag'));
-                    rdToggle.onclick = null;
-                    finish(checks);
+                    // T135：官方内层收起过渡是 0.3s —— 采样窗必须**整段包住**它。条件（closed +
+                    // 痕迹收敛）命中就停会把重播截断成 1~4 帧，变异反证时红帧数被时序噪声吃掉
+                    // （实测同一变异 1~4 帧波动）⇒ 多采 360ms 再判定。
+                    window.setTimeout(function () {
+                      var tail = rdTail.stop();
+                      add(checks, 'rdrawer-closes-on-right-swipe', !rdOpenState(),
+                        'open=' + rdOpenState());
+                      add(checks, 'rdrawer-flags-cleared', document.documentElement.getAttribute('data-dshr-ropen') !== '1' && rdClean(),
+                        'ropen=' + document.documentElement.getAttribute('data-dshr-ropen')
+                        + ' rx=' + document.documentElement.style.getPropertyValue('--dshr-rx')
+                        + ' rdrag=' + document.documentElement.getAttribute('data-dshr-rdrag'));
+                      // ⑤ T135：官方 closed 之后，内层 dock 不得再出现**入镜可见**的帧——
+                      // 这正是用户看到的「关闭落位后又自己弹回来再关上」（官方内层从 tx=0
+                      // 可见地滑到屏外 0.3s 才 hidden）。修法缺席时这里必然 > 0 帧。
+                      var closedAt = -1;
+                      for (var ti = 0; ti < tail.length; ti++) {
+                        if (!tail[ti].open) { closedAt = ti; break; }
+                      }
+                      var visibleAfter = 0;
+                      var movingAfter = 0;
+                      for (var tj = Math.max(0, closedAt); closedAt >= 0 && tj < tail.length; tj++) {
+                        if (tail[tj].innerOnScreen) visibleAfter++;
+                        if (tail[tj].innerMoving) movingAfter++;
+                      }
+                      add(checks, 'rdrawer-official-close-no-replay',
+                        closedAt >= 0 && visibleAfter === 0,
+                        'closedAtFrame=' + closedAt + ' 可见帧=' + visibleAfter + '/' + (closedAt >= 0 ? tail.length - closedAt : tail.length)
+                        + ' 帧数=' + tail.length + '（官方 closed 后内层入镜可见即视为重播）');
+                      add(checks, 'rdrawer-official-close-no-slide',
+                        closedAt >= 0 && movingAfter === 0,
+                        '内层可见中间位移帧=' + movingAfter);
+                      // 交接窗几何契约（机制①）：官方收起已落地、hook 的 data-dshr-rclosing 仍在的
+                      // 那几帧（syncDom 有 50ms 合并窗），面板必须继续停在屏外。删掉卡片规则里的
+                      // [data-dshr-rclosing="1"] 选择器 ⇒ 面板在这几帧瞬回屏内 left=0 ⇒ 本条红。
+                      var windowFrames = 0;
+                      var leakedFrames = 0;
+                      for (var tk = 0; tk < tail.length; tk++) {
+                        if (tail[tk].rclosing !== '1') continue;
+                        windowFrames++;
+                        if (tail[tk].panelLeft < window.innerWidth - 8) leakedFrames++;
+                      }
+                      add(checks, 'rdrawer-handoff-window-parks-panel',
+                        windowFrames >= 1 && leakedFrames === 0,
+                        '交接窗帧=' + windowFrames + ' 泄漏帧=' + leakedFrames
+                        + (windowFrames ? '' : '（未观测到交接窗：mock 提交是否又变回同步了？）'));
+                      // ── T135-B：浮层内「自动聚焦」不得被守卫收回（只压 IME），主动点击才撤压制 ──
+                      // 官方「模型」子面板打开时会自动聚焦它自己的搜索框；守卫若照常收回（blur），
+                      // 官方按「焦点离开浮层」dismiss ⇒ 菜单 + 刚渲染的模型列表整块卸载（真机 1.6ms）。
+                      // 这里用替身浮层把那条链路搬进夹具（真页面口径的等价物见
+                      // scratch/t135/verify-B/model-guard.mjs 的 MA-04/05/08/09）。
+                      var mbLayer = document.getElementById('float-autofocus-wrap');
+                      var mbInput = document.getElementById('float-autofocus-input');
+                      var mbPlain = document.getElementById('guard-plain-input');
+                      // 一次真实落指 = pointerdown + touchstart + mousedown（守卫三条 capture 监听都要喂）
+                      function mbDown(el) {
+                        var r = el.getBoundingClientRect();
+                        var init = { bubbles: true, cancelable: true, clientX: r.left + 2, clientY: r.top + 2 };
+                        try { el.dispatchEvent(new PointerEvent('pointerdown', init)); } catch (e1) { el.dispatchEvent(new Event('pointerdown', { bubbles: true })); }
+                        try { el.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, cancelable: true })); } catch (e2) { el.dispatchEvent(new Event('touchstart', { bubbles: true })); }
+                        el.dispatchEvent(new MouseEvent('mousedown', init));
+                      }
+                      // 官方那次「自己聚焦」：真 focus() + 显式 focusin（headless 无焦点仿真时 focus()
+                      // 可能不派发 focusin，显式补一颗才不依赖宿主焦点状态）。
+                      // preventScroll：不给焦点顺带把页面滚走（零尺寸替身位于文档末尾，会污染截图产物）。
+                      function mbFocus(el) {
+                        try { el.focus({ preventScroll: true }); } catch (eFocus) { try { el.focus(); } catch (eFocus2) { /* 忽略 */ } }
+                        el.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+                      }
+                      function mbGestureEnd() {
+                        try { document.body.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); } catch (eEnd) { /* 忽略 */ }
+                      }
+                      if (mbLayer && mbInput && mbPlain) {
+                        mbLayer.style.display = 'block';
+                        mbInput.setAttribute('inputmode', 'search');
+                        // ① 落指在浮层内（非可编辑点）⇒ 开「浮层内手势」窗口
+                        mbDown(mbLayer);
+                        // ② 官方自动聚焦它自己的搜索框 ⇒ 守卫必须**不 blur**、只压 IME
+                        mbFocus(mbInput);
+                        var mbAfterFocus = {
+                          focused: document.activeElement === mbInput,
+                          display: getComputedStyle(mbLayer).display,
+                          inputmode: mbInput.getAttribute('inputmode'),
+                          marker: mbInput.getAttribute('data-dshr-imemute'),
+                          muted: document.querySelectorAll('[data-dshr-imemute]').length,
+                        };
+                        add(checks, 't135b-no-blur-in-float',
+                          mbAfterFocus.focused === true && mbAfterFocus.display !== 'none',
+                          JSON.stringify(mbAfterFocus));
+                        add(checks, 't135b-ime-muted-in-float',
+                          mbAfterFocus.inputmode === 'none' && mbAfterFocus.marker === 'search',
+                          'inputmode=' + mbAfterFocus.inputmode + ' marker=' + mbAfterFocus.marker);
+                        // ③ 用户**主动**点这个输入框 ⇒ 撤压制并把原值逐字还原（'search'，不是删属性）
+                        mbDown(mbInput);
+                        var mbAfterTouch = {
+                          inputmode: mbInput.getAttribute('inputmode'),
+                          marker: mbInput.getAttribute('data-dshr-imemute'),
+                          muted: document.querySelectorAll('[data-dshr-imemute]').length,
+                        };
+                        add(checks, 't135b-release-restores-original',
+                          mbAfterTouch.inputmode === 'search' && mbAfterTouch.marker === null && mbAfterTouch.muted === 0,
+                          JSON.stringify(mbAfterTouch));
+                        // ④ T48 负例：落点在**非浮层**（composer 模型触发器）⇒ 不开浮层窗口；
+                        //    浮层外的输入框被程序化聚焦时仍被守卫收回（老防护不变）。
+                        mbGestureEnd();
+                        mbLayer.style.display = 'none';
+                        mbDown(document.getElementById('model-btn'));
+                        mbFocus(mbPlain);
+                        var mbAfterNegative = {
+                          plainFocused: document.activeElement === mbPlain,
+                          plainMarker: mbPlain.getAttribute('data-dshr-imemute'),
+                          muted: document.querySelectorAll('[data-dshr-imemute]').length,
+                        };
+                        add(checks, 't135b-outside-landing-not-passed',
+                          mbAfterNegative.plainFocused === false && mbAfterNegative.plainMarker === null && mbAfterNegative.muted === 0,
+                          JSON.stringify(mbAfterNegative));
+                        mbGestureEnd();
+                        try { window.scrollTo(0, 0); } catch (eScroll) { /* 忽略 */ }
+                      } else {
+                        add(checks, 't135b-no-blur-in-float', false, 'T135-B 替身缺失');
+                        add(checks, 't135b-ime-muted-in-float', false, 'T135-B 替身缺失');
+                        add(checks, 't135b-release-restores-original', false, 'T135-B 替身缺失');
+                        add(checks, 't135b-outside-landing-not-passed', false, 'T135-B 替身缺失');
+                      }
+                      rdToggle.onclick = null;
+                      finish(checks);
+                    }, 360);
                   });
                 }, 450);
               }

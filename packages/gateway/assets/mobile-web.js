@@ -843,6 +843,19 @@
 		//   （data-dshr-rightbar-col 与 --dshr-rightbar-z 一并删除）；
 		//   T85 的 width 裁剪窗打开动画也删除（打开方向现在是从右缘跟手滑入）。
 		// touch-action:pan-y：文件树竖滚走原生（touchcancel 自然解除手势），横滑留给我们。
+		// T135：手势关闭的「交接窗」（data-dshr-rclosing）也要命中同一条卡片规则。
+		// 官方真正的收起动画**不在面板上**，而在内层 [data-dockkit-host=dock] /
+		// [data-dockkit-empty] / [data-dockkit-divider]（官方 CSS 原文：
+		//   transform: translateX(var(--dsh-sidebar-width)); visibility: hidden;
+		//   transition: transform var(--ds-transition-duration-slow) var(--ds-ease-in-out),
+		//               visibility 0s linear var(--ds-transition-duration-slow)
+		// open 态反过来：transform:none; visibility:visible; transition: transform …）。
+		// 而 hook 的卡片位移加在**面板**上、以官方 open 属性为闸 ⇒ 手势补间到 rx=max
+		// 后兑现官方收起时，属性一消失这条规则整条失效（面板从屏外右瞬回屏内 x=0），
+		// 官方内层随即从 tx=0 **可见地**滑到 tx=100vw、0.3s 后才 visibility:hidden
+		// ⇒ 用户看到「关闭落位后又自己弹回来再关上」（逐帧实测可见窗口 1109→1376ms，
+		// 见 scratch/t135/lead-replay-timeline.mjs）。交接窗期间让面板继续停在屏外。
+		'html.' + ROOT_CLASS + '[data-dshr-rclosing="1"] [data-sidebar-right-panel="fullscreen"],',
 		'html.' + ROOT_CLASS + ' [data-sidebar-right-panel="fullscreen"][data-sidebar-right-open] {',
 		'  position: fixed !important;',
 		'  top: 0 !important;',
@@ -867,6 +880,14 @@
 		'}',
 		// 跟手期：位移必须与手指 1:1，关掉过渡（与左抽屉 data-dshr-dragging 同义）。
 		'html.' + ROOT_CLASS + '[data-dshr-rdrag="1"] [data-sidebar-right-panel="fullscreen"][data-sidebar-right-open] {',
+		'  transition: none !important;',
+		'}',
+		// T135：交接窗内压掉官方内层的收起过渡 —— 官方收起一步到位（内容直接 translate+hidden），
+		// 不再产生第二次可见位移。只作用于面板内层三个 dockkit 节点，窗口极短
+		// （官方状态一落地即撤窗，见 syncDom），面板此刻已在屏外。
+		'html.' + ROOT_CLASS + '[data-dshr-rclosing="1"] [data-sidebar-right-panel="fullscreen"] [data-dockkit-host],',
+		'html.' + ROOT_CLASS + '[data-dshr-rclosing="1"] [data-sidebar-right-panel="fullscreen"] [data-dockkit-empty],',
+		'html.' + ROOT_CLASS + '[data-dshr-rclosing="1"] [data-sidebar-right-panel="fullscreen"] [data-dockkit-divider] {',
 		'  transition: none !important;',
 		'}',
 		// 右抽屉卡片态期间收起悬浮鲸鱼（全宽面板会盖到左上角；双保险：
@@ -1528,7 +1549,7 @@
 	var focusRevokeEl = null;
 	var focusRevokeCount = 0;
 	var focusRevokeSince = 0;
-	var focusGuardStats = { revoked: 0, capped: 0, sticky: 0, armed: 0, disarmed: 0, residualSwept: 0, sendExcluded: 0, armSkippedHeldFocus: 0, armRepeatSameGesture: 0, armNewGesture: 0, disarmSkippedSameGesture: 0 };
+	var focusGuardStats = { revoked: 0, capped: 0, sticky: 0, armed: 0, disarmed: 0, residualSwept: 0, sendExcluded: 0, armSkippedHeldFocus: 0, armRepeatSameGesture: 0, armNewGesture: 0, disarmSkippedSameGesture: 0, imeMuted: 0, imeReleased: 0 };
 	// ── T76：手势身份与「同手势幂等」（阻断②的真凶就在这四个状态变量上）──────
 	//
 	// 一次真实点按会触发**三个**「落指」事件，而 bindFocusGuard 的 onDown 同时绑在
@@ -1652,10 +1673,117 @@
 	/**
 	 * T51（R1）：关掉放行窗口。生命周期必须收干净 —— 见 disarmComposerFocus /
 	 * onDown / visibilitychange / pageshow 的调用点。
+	 *
+	 * T135：浮层手势窗口同生共死（它是同一张「这次落指是用户意图」的通行证）。
 	 */
 	function clearUserFocusWindow() {
 		userFocusWindowUntil = 0;
 		userFocusIntentEls = null;
+		panelFocusUntil = 0;
+	}
+
+	// ── T135：浮层内手势的聚焦通行证 + IME 压制 ─────────────────────────────
+	//
+	// 现象（真机 + 真页面实测）：点「模型」行 ⇒ 官方子面板（模型列表 + 搜索框）
+	// **立刻整个消失**，模型永远选不到。根因不在 click（实测 click 送达、目标仍在文档里、
+	// `defaultPrevented=false`），而在官方子面板打开时会**自动聚焦它自己的搜索框**
+	// （input[role="searchbox"][aria-label="搜索模型…"]），而本守卫把这次聚焦判成
+	// 「非用户手势造成的偷焦点」并 `el.blur()`；官方浮层以「焦点离开浮层」为准判定 dismiss
+	// ⇒ 实测 blur 后 **1.6ms** 菜单 + 刚渲染的模型列表 + 外点遮罩整块卸载，列表一帧都没画。
+	//
+	// 为什么不能只是「给浮层开窗口放行」：那样搜索框会拿到真焦点 ⇒ Android 按用户手势
+	// 请求 showSoftInput ⇒ 键盘盖住刚打开的模型列表（T48 §5 的原始诉求，A 病换 B 病）。
+	// 所以这里**放行焦点、但压住 IME**：
+	//   1. 手势起点落在浮层里 ⇒ 开一张**只对「浮层内元素」生效**的窗口；
+	//   2. 窗口内、落在浮层内的可编辑元素被聚焦 ⇒ 不 blur，只打 inputmode="none"
+	//      （复用 T46/T48 已验证的机制：Chromium 因此不向 IME 请求 showSoftInput）；
+	//   3. 用户之后真去点输入框（onDown 的可编辑分支）⇒ 撤掉压制并**还原原值**。
+	//
+	// 范围严格性（别把它读成「整页放行」）：
+	//   - 窗口只在「落点本身在浮层/已打开浮层内」时开；点 composer 上的「+」/模型触发器
+	//     **不开** ⇒ T48 §5「命令面板子面板搜索框抢焦点弹键盘」的防护原样保留；
+	//   - 放行的对象必须是**浮层内**的可编辑元素（floatingLayerOf 判真）；浮层关闭时
+	//     官方把焦点还回 composer 那种「偷焦点」仍会被正常收回（T42 语义不变）。
+	var IME_MUTE_ATTR = 'data-dshr-imemute';
+	var panelFocusUntil = 0;
+
+	/**
+	 * 落点/焦点所在的最近「浮层宿主」。
+	 * 复用既有 isFloatingHost 判据（fixed/absolute + 可见 + 非布局壳 + 不吃满视口），
+	 * **不靠 role**：官方浮层容器的 role 会在 menu / group 之间切换，靠 role 会漏；
+	 * 也不能只认 hook 自己的标记 —— 标记由 syncDom 写，而官方这次自动聚焦发生在
+	 * 子面板挂载后 ~10ms 内，syncDom（50ms 合并）可能还没跑。
+	 */
+	function floatingLayerOf(node) {
+		var el = node;
+		var depth = 0;
+		while (isElement(el) && el !== document.body && el !== document.documentElement && depth < FOCUS_ARM_HOST_MAX_DEPTH) {
+			if (isFloatingHost(el)) return el;
+			el = el.parentElement;
+			depth += 1;
+		}
+		return null;
+	}
+
+	/** 落点是否在**已经打开的官方浮层**里（role 名单 + 浮层宿主兜底，两条互补）。 */
+	function isInsideOpenPanel(node) {
+		if (!isElement(node) || !node.closest) return false;
+		try {
+			if (node.closest(OPEN_PANEL_SELECTOR)) return true;
+		} catch (ignoredPanelSel) { /* 选择器异常则走浮层兜底 */ }
+		return !!floatingLayerOf(node);
+	}
+
+	/** 用户在浮层内落指 ⇒ 开窗口（只对「浮层内元素」生效）。 */
+	function markPanelFocusIntent() {
+		panelFocusUntil = Date.now() + USER_FOCUS_WINDOW_MS;
+		return true;
+	}
+
+	/** 窗口内、且焦点落在浮层里的可编辑元素 ⇒ 放行（不 blur）。 */
+	function inPanelFocusWindow(el) {
+		if (!panelFocusUntil || Date.now() > panelFocusUntil) return false;
+		if (!isElement(el) || !isEditableFocus(el)) return false;
+		return !!floatingLayerOf(el);
+	}
+
+	/**
+	 * 压住 IME：打 inputmode="none"，并把**原值**记在 data-dshr-imemute 上（还原用）。
+	 * 只写自己那两个属性，结构上不可能吞事件。
+	 */
+	function mutePanelIme(el) {
+		if (!isElement(el)) return false;
+		try {
+			if (el.getAttribute(IME_MUTE_ATTR) === null) {
+				var prev = el.getAttribute('inputmode');
+				el.setAttribute(IME_MUTE_ATTR, prev === null ? '' : prev);
+			}
+			el.setAttribute('inputmode', 'none');
+			focusGuardStats.imeMuted += 1;
+			return true;
+		} catch (ignoredMute) { return false; }
+	}
+
+	/**
+	 * 撤掉全部 IME 压制并**还原原值**（不吞掉官方自己写的 inputmode）。
+	 * 调用点：用户主动点输入框（onDown 可编辑分支）、拆卸痕迹（teardownHookTraces）。
+	 */
+	function releasePanelIme() {
+		var list = null;
+		try { list = document.querySelectorAll('[' + IME_MUTE_ATTR + ']'); } catch (ignoredMuteList) { return 0; }
+		var n = 0;
+		for (var i = 0; i < list.length; i++) {
+			var el = list[i];
+			try {
+				var prev = el.getAttribute(IME_MUTE_ATTR);
+				if (prev === '') el.removeAttribute('inputmode');
+				else el.setAttribute('inputmode', prev);
+				el.removeAttribute(IME_MUTE_ATTR);
+				n += 1;
+			} catch (ignoredRelease) { /* 节点已卸载 */ }
+		}
+		if (n) focusGuardStats.imeReleased += n;
+		return n;
 	}
 
 	/** 目标元素是否落在这一次意图的亲缘范围内（自身 / 后代 / 祖先链）。 */
@@ -2202,6 +2330,10 @@
 			// 或摘除被节流），在浏览器按节点决定 showSoftInput 之前先摘掉。
 			sweepResidualInputMode();
 			if (!isEditablePoint(target)) {
+				// T135：落点在**已经打开的官方浮层**里（模型菜单/命令面板及其子面板）⇒
+				// 开「浮层内手势」窗口（只对浮层内元素生效）。官方会在这类浮层内部自行
+				// 搬焦点（点「模型」行 ⇒ 子面板搜索框自动聚焦），收回就会让浮层 dismiss。
+				if (isInsideOpenPanel(target)) markPanelFocusIntent();
 				// T48：落指在「会打开命令面板/弹层」的非可编辑触发器上（「+」这类）
 				//   => 走布防形态：打 inputmode="none" + 我们自己抢焦点。
 				// 这样官方随后打开面板时那次抢焦点是**空操作**（焦点没变），
@@ -2238,6 +2370,9 @@
 			var composerNow = focusComposerEl();
 			if (isElement(composerNow)) intentEls.push(composerNow);
 			markUserFocusIntent(intentEls);
+			// T135：用户**主动点了输入框** ⇒ 之前为浮层压住的 IME 要撤掉（并还原原值），
+			// 否则会退化成 T50 §5.2 那种「属性留在节点上、点了也弹不出键盘」的残留态。
+			releasePanelIme();
 			// 用户真的落指在这个输入区上 => 解除它的粘性抑制，这次聚焦与后续键盘照常。
 			// 落点可能是可编辑元素本身，也可能是它内部的子节点，两处都要清。
 			if (isElement(target)) clearFocusSticky(target);
@@ -2271,6 +2406,13 @@
 			if (!isEditableFocus(el)) return;
 			// T51（R1）：窗口只对「这次意图的目标元素及其亲缘」放行，不再对整篇文档放行。
 			if (inUserFocusWindow(el)) return;
+			// T135：用户手指正在浮层里 ⇒ 官方在浮层内部自己搬焦点（模型子面板自动聚焦
+			// 搜索框）不是「偷焦点」，收回去会让官方浮层 dismiss（模型改不了的根因）。
+			// 放行焦点但压住 IME：菜单活着、键盘不弹。
+			if (inPanelFocusWindow(el)) {
+				mutePanelIme(el);
+				return;
+			}
 			revokeStealthFocus(el);
 		}, { capture: true });
 		// T51（R1）：可见性/导航也是窗口生命周期的一部分。
@@ -2945,6 +3087,8 @@
 		resetFloatHosts();
 		clearDrawerVisual();
 		clearRightVisual(false);
+		// T135：IME 压制痕迹（inputmode=none + data-dshr-imemute）一并还原。
+		releasePanelIme();
 		unmarkAll();
 		// 4) 丢弃深浅色缓存：否则切回 phone 档时 syncPageTheme 会因「值没变」
 		//    早退，data-dshr-dark 补不回来，状态就与首次装上不一致了。
@@ -3512,8 +3656,16 @@
 
 	function setRightbarOpen(open) {
 		open = !!open;
+		// T135：意图是「打开」时立刻撤交接窗——否则面板会一直停在屏外右不动。
+		if (open) document.documentElement.removeAttribute('data-dshr-rclosing');
 		if (rightToggleBusy) { pendingRightbarOpen = open; return true; }
-		if (isRightbarOpen() === open) { pendingRightbarOpen = null; return true; }
+		if (isRightbarOpen() === open) {
+			pendingRightbarOpen = null;
+			// T135：官方已是关闭态 ⇒ 交接窗无事可等（它等的就是这一刻），当场撤掉。
+			// 不撤的话，若这一轮之后再没有 DOM 变更触发 syncDom，面板会一直停在屏外。
+			if (!open) document.documentElement.removeAttribute('data-dshr-rclosing');
+			return true;
+		}
 		var panel = findRightbarPanel();
 		var toggle = panel ? panel.querySelector('button[data-sidebar-right-toggle]') : null;
 		if (!toggle) return false;
@@ -3541,6 +3693,8 @@
 				// 观察者漏网时的兜底收口（语义与观察者路径逐字一致）。
 				rightToggleBusy = false;
 				rightIntentState = null;
+				// T135：状态已落地 ⇒ 交接窗的关门条件满足（与 syncDom 同一判据）。
+				if (!isRightbarOpen()) document.documentElement.removeAttribute('data-dshr-rclosing');
 				flushPendingRightbar();
 				return;
 			}
@@ -3556,6 +3710,8 @@
 			// 面板如实停在官方状态对应的位置（不留「官方开着但视觉上被拖走」的假态）。
 			rightToggleBusy = false;
 			rightIntentState = null;
+			// T135：放弃这次意图 ⇒ 交接窗必须一并撤掉，否则面板会停在屏外右不动。
+			document.documentElement.removeAttribute('data-dshr-rclosing');
 			clearRightVisual(false);
 			flushPendingRightbar();
 		};
@@ -3684,7 +3840,11 @@
 		animateRightTo(state.max, function () {
 			rightVisual = null;
 			document.documentElement.removeAttribute('data-dshr-rdrag');
-			setRightbarOpen(false);
+			// T135：本笔是**手势**关闭——此刻 rx 已补间到 max（面板停在屏外右），
+			// 从这里到「官方 closed 落地」之间的整段就是交接窗：期间面板必须继续停在
+			// 屏外、官方内层的收起过渡必须被压掉，否则会重播一次可见的「弹回来再关上」。
+			document.documentElement.setAttribute('data-dshr-rclosing', '1');
+			if (!setRightbarOpen(false)) document.documentElement.removeAttribute('data-dshr-rclosing');
 		});
 		return true;
 	}
@@ -5639,6 +5799,9 @@
 		if (!rOpenNow) {
 			// 官方已收起（含 settleRight 关闭落位后的异步收敛、官方按钮直收）：
 			// 清掉右抽屉全部跟手痕迹。此时面板已被官方隐藏，清 --dshr-rx 无可见跳变。
+			// T135：**先撤交接窗、再清 --dshr-rx**。撤窗这一刻卡片规则不再命中 ⇒ 面板
+			// 回到官方关闭几何（屏外）；随后清 rx 不会带着 .34s 过渡把面板从屏外拉回来。
+			root.removeAttribute('data-dshr-rclosing');
 			clearRightVisual(false);
 		} else if (!rightVisual && !rightSettleAnim && !root.style.getPropertyValue('--dshr-rx')) {
 			// 非手势路径打开（官方按钮 / 返回桥外）：确保停在全开设定位
@@ -5753,12 +5916,21 @@
 		if (isStrictOff()) return false;
 		if (typeof MutationObserver === 'undefined' || !document.body) return false;
 		observer = new MutationObserver(scheduleSyncDom);
+		// T135：右栏开合落到 `data-sidebar-right-open`（+ `aria-hidden`）上。两者原先**不在**
+		// 过滤名单里，右栏属性翻转能否被及时同步，全靠官方那次提交**恰好**带了 childList
+		// 变更 —— 一旦某次提交只有属性变化，syncDom 就要等下一次任意 DOM 变更才跑：
+		//   · rightToggleBusy 迟迟不解 ⇒ 1200ms 看门狗按「派发丢失」补发第二颗 toggle
+		//     （右栏被开两遍 / 动画两次的另一条独立链路）；
+		//   · 交接窗（data-dshr-rclosing）迟迟不撤。
+		// 这两条属性都只在面板开合时翻转，加进名单的代价可忽略。
 		observer.observe(document.body, {
 			attributes: true,
 			attributeFilter: [
 				'data-sidebar-collapsed',
 				'data-dshx-overlay',
 				'data-rightbar-fullscreen',
+				'data-sidebar-right-open',
+				'aria-hidden',
 				'data-ds-dark-theme',
 				'role',
 				'aria-modal',

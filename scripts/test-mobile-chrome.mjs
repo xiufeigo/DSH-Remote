@@ -1235,6 +1235,214 @@ function assertSourceContracts() {
 	if (!tunnel.includes("CHANNEL_SESSION")) {
 		throw new Error("源码契约：正在运行的会话必须走会话进度渠道");
 	}
+	// ── T135-A：手势关闭右栏的「交接窗」（data-dshr-rclosing）五条机制 ──
+	//
+	// 背景（真机 + 真页面逐帧实测）：官方右栏的收起/展开过渡在**面板内层**
+	// `[data-dockkit-host|empty|divider]` 上（`transform: translateX(--dsh-sidebar-width)`
+	// + `visibility: hidden` + `transition: transform .3s …, visibility 0s linear .3s`），
+	// 而 hook 的卡片位移加在**面板**上且以官方 `data-sidebar-right-open` 为闸。
+	// 手势关闭补间到 `--dshr-rx=max` 后兑现官方收起，官方属性一消失，卡片规则整条失效
+	// ⇒ 面板瞬回屏内 x=0，官方内层随即从 tx=0 **可见地**滑到屏外 0.3s 才 hidden
+	// ⇒ 用户看到「关完又弹回来再关上」。
+	//
+	// 下面每条契约都对应一个**行为断言**（scripts/fixtures/mobile-selftest.html 的
+	// rdrawer-official-close-no-replay / -no-slide / rdrawer-handoff-window-parks-panel）；
+	// 其中③（同一同步块内两条语句的顺序）没有行为判别力——浏览器不会在两条语句之间重算样式
+	// ——只能靠源码契约钉住，所以这里必须在场。
+	const windowCardSelector =
+		"'html.' + ROOT_CLASS + '[data-dshr-rclosing=\"1\"] [data-sidebar-right-panel=\"fullscreen\"],'";
+	const openCardSelector =
+		"'html.' + ROOT_CLASS + ' [data-sidebar-right-panel=\"fullscreen\"][data-sidebar-right-open] {'";
+	const windowCardAt = src.indexOf(windowCardSelector);
+	const openCardAt = src.indexOf(openCardSelector);
+	if (windowCardAt < 0 || openCardAt < 0 || windowCardAt > openCardAt || openCardAt - windowCardAt > 200) {
+		throw new Error(
+			"源码契约：右栏卡片规则必须同时命中 [data-dshr-rclosing=\"1\"]（交接窗内面板继续停在屏外），" +
+				"否则官方收起落地后到 syncDom 撤窗之间面板会瞬回屏内",
+		);
+	}
+	// ② 交接窗内压掉官方内层的收起过渡：三个 dockkit 节点 + transition:none 必须在同一条规则里。
+	const dockHostSel =
+		"'html.' + ROOT_CLASS + '[data-dshr-rclosing=\"1\"] [data-sidebar-right-panel=\"fullscreen\"] [data-dockkit-host],'";
+	const dockHostAt = src.indexOf(dockHostSel);
+	if (dockHostAt < 0) {
+		throw new Error("源码契约：交接窗内缺少 dockkit 过渡压制规则（官方内层会可见地滑出 0.3s ⇒ 二次动画）");
+	}
+	const dockRule = src.slice(dockHostAt, dockHostAt + 600);
+	if (
+		!dockRule.includes("[data-dockkit-empty],") ||
+		!dockRule.includes("[data-dockkit-divider] {") ||
+		!/transition:\s*none\s*!important/.test(dockRule)
+	) {
+		throw new Error("源码契约：dockkit 过渡压制必须覆盖 host/empty/divider 三个节点且落到 transition:none !important");
+	}
+	// ③ syncDom 见到官方 closed：**先撤交接窗、再清 --dshr-rx**（顺序反了 ⇒ 面板带着 .34s
+	// 过渡从屏外滑回；两条语句在同一同步块，行为断言测不到，只有源码契约能钉）。
+	const rclosedBranchAt = src.indexOf("if (!rOpenNow) {");
+	if (rclosedBranchAt < 0) {
+		throw new Error("源码契约：找不到 syncDom 的右栏 closed 分支（if (!rOpenNow)）");
+	}
+	const rclosedBranch = src.slice(rclosedBranchAt, rclosedBranchAt + 600);
+	const rcRemoveAt = rclosedBranch.indexOf("removeAttribute('data-dshr-rclosing')");
+	const rcClearAt = rclosedBranch.indexOf("clearRightVisual(false)");
+	if (rcRemoveAt < 0 || rcClearAt < 0 || rcRemoveAt > rcClearAt) {
+		throw new Error("源码契约：syncDom 见到官方 closed 时必须先撤交接窗、再清 --dshr-rx（顺序反了面板会被 .34s 过渡拉回屏内）");
+	}
+	// ④ 置位点在 setRightbarOpen(false) 之前：交接窗必须在兑现官方收起**之前**就位，
+	// 否则官方提交与撤窗会落在同一个样式重算之前，内层过渡照样跑。
+	const settleCloseAt = src.indexOf("animateRightTo(state.max, function () {");
+	if (settleCloseAt < 0) {
+		throw new Error("源码契约：找不到 settleRight 的关闭补间回调");
+	}
+	const settleCloseBody = src.slice(settleCloseAt, settleCloseAt + 500);
+	const settleWindowAt = settleCloseBody.indexOf("setAttribute('data-dshr-rclosing', '1')");
+	const settleOpenAt = settleCloseBody.indexOf("setRightbarOpen(false)");
+	if (settleWindowAt < 0 || settleOpenAt < 0 || settleWindowAt > settleOpenAt) {
+		throw new Error("源码契约：手势关闭补间到位后必须先置位 data-dshr-rclosing，再 setRightbarOpen(false)");
+	}
+	// ⑤ 打开意图 / 看门狗放弃路径都要撤窗，否则面板永远停在屏外右（点不开）。
+	const openIntentAt = src.indexOf("function setRightbarOpen(open) {");
+	const openIntentBody = openIntentAt < 0 ? "" : src.slice(openIntentAt, openIntentAt + 400);
+	if (!/if \(open\) document\.documentElement\.removeAttribute\('data-dshr-rclosing'\);/.test(openIntentBody)) {
+		throw new Error("源码契约：打开意图（setRightbarOpen(true)）必须先撤交接窗，否则面板会停在屏外右不动");
+	}
+	// ⑤-b 看门狗「放弃这次意图」路径：撤窗必须在 clearRightVisual(false) 之前，
+	// 否则面板会停在屏外右不动（用户手势关不掉也打不开）。
+	const giveUpAt = src.indexOf("// 放弃：停在官方当前态");
+	const giveUpEnd = giveUpAt < 0 ? -1 : src.indexOf("flushPendingRightbar();", giveUpAt);
+	const giveUpBody = giveUpAt < 0 || giveUpEnd < 0 ? "" : src.slice(giveUpAt, giveUpEnd);
+	const giveUpRemoveAt = giveUpBody.indexOf("removeAttribute('data-dshr-rclosing')");
+	const giveUpClearAt = giveUpBody.indexOf("clearRightVisual(false)");
+	if (giveUpRemoveAt < 0 || giveUpClearAt < 0 || giveUpRemoveAt > giveUpClearAt) {
+		throw new Error("源码契约：看门狗放弃这次意图时必须先撤交接窗、再 clearRightVisual(false)");
+	}
+	// ⑤-c MutationObserver：右栏开合属性必须在 attributeFilter 里（否则右栏属性翻转要靠官方提交
+	// 恰好带 childList 变更才能及时同步；漏一次 ⇒ busy 不解、看门狗补拍第二颗 toggle / 交接窗滞留）。
+	// 锚在 `observer.observe(document.body, {` 上：页面里还有别的 MutationObserver
+	//（inputModeWatcher 的 attributeFilter:['inputmode']），不能取第一个 attributeFilter。
+	const mainObserverAt = src.indexOf("observer.observe(document.body, {");
+	const filterAt = mainObserverAt < 0 ? -1 : src.indexOf("attributeFilter: [", mainObserverAt);
+	if (filterAt < 0) {
+		throw new Error("源码契约：找不到 MutationObserver 的 attributeFilter");
+	}
+	const filterBlock = src.slice(filterAt, src.indexOf("]", filterAt) + 1);
+	for (const attr of [
+		"data-sidebar-collapsed",
+		"data-dshx-overlay",
+		"data-rightbar-fullscreen",
+		"data-sidebar-right-open",
+		"aria-hidden",
+		"data-ds-dark-theme",
+		"role",
+		"aria-modal",
+		"aria-current",
+		"data-state",
+		"aria-expanded",
+		"aria-label",
+	]) {
+		if (!filterBlock.includes(`'${attr}'`)) {
+			throw new Error(`源码契约：MutationObserver 的 attributeFilter 缺少 ${attr}（右栏开合同步会退化成靠 childList 撞运气）`);
+		}
+	}
+	// ── T135-B：浮层内「自动聚焦」的通行证 + IME 压制 ──
+	//
+	// 背景（真机 + 真页面实测）：官方「模型」子面板打开时会**自动聚焦它自己的搜索框**
+	// `input[role=searchbox][aria-label="搜索模型…"]`；hook 的 focusin 守卫把它判成
+	// 「非用户手势偷焦点」并 `el.blur()`，官方按「焦点离开浮层」dismiss ⇒ 菜单 + 刚渲染的
+	// 模型列表整块卸载（实测 blur 后 1.6ms），用户「点一下就自己消失、模型永远选不到」。
+	//
+	// 修法 = 放行焦点但压住 IME：落点在已打开浮层内 ⇒ 开「浮层内手势」窗口；窗口内聚焦
+	// 浮层内的可编辑元素 ⇒ **不 blur**，只打 inputmode="none" + data-dshr-imemute（记原值）；
+	// 用户主动点输入框 / 拆卸痕迹 ⇒ 撤压制并逐字还原。
+	// 对应的行为断言：scripts/fixtures/mobile-selftest.html 的
+	// t135b-no-blur-in-float / t135b-ime-muted-in-float / t135b-release-restores-original /
+	// t135b-outside-landing-not-passed（真页面口径见 scratch/t135/verify-B/model-guard.mjs）。
+	const panelHelpers = ["function floatingLayerOf(node) {", "function isInsideOpenPanel(node) {", "function markPanelFocusIntent() {", "function inPanelFocusWindow(el) {", "function mutePanelIme(el) {", "function releasePanelIme() {"];
+	for (const helper of panelHelpers) {
+		if (!src.includes(helper)) {
+			throw new Error(`源码契约（T135-B）：缺少 ${helper.slice(9, -3)}（浮层内通行证 / IME 压制链路断了）`);
+		}
+	}
+	// ② 落点在已打开浮层内才开窗：markPanelFocusIntent 必须在 onDown 的**非可编辑**分支的
+	//    isInsideOpenPanel 判真分支里（点 composer 的「+」/模型触发器不得开窗 ⇒ T48 §5 防护不变）。
+	const onDownPanelAt = src.indexOf("if (isInsideOpenPanel(target)) markPanelFocusIntent();");
+	if (onDownPanelAt < 0) {
+		throw new Error("源码契约（T135-B）：onDown 的非可编辑分支缺少「落点在已打开浮层内 ⇒ markPanelFocusIntent()」");
+	}
+	const onDownBody = src.slice(Math.max(0, src.indexOf("var onDown = function (event) {")), onDownPanelAt);
+	if (!/if \(!isEditablePoint\(target\)\) \{/.test(onDownBody)) {
+		throw new Error("源码契约（T135-B）：markPanelFocusIntent 必须落在 onDown 的**非可编辑**分支内（否则点输入框也会开浮层窗口）");
+	}
+	// ③ 窗口内聚焦浮层内可编辑元素 ⇒ 只压 IME、不 blur：mutePanelIme 必须在
+	//    inPanelFocusWindow(el) 判真的分支里，且该分支必须在 revokeStealthFocus 之前 return。
+	const muteBranchAt = src.indexOf("if (inPanelFocusWindow(el)) {");
+	if (muteBranchAt < 0) {
+		throw new Error("源码契约（T135-B）：focusin 守卫缺少 inPanelFocusWindow(el) 分支（官方自动聚焦会被 blur ⇒ 浮层 dismiss）");
+	}
+	const muteBranch = src.slice(muteBranchAt, muteBranchAt + 220);
+	if (!/mutePanelIme\(el\);[\s\S]{0,40}return;/.test(muteBranch)) {
+		throw new Error("源码契约（T135-B）：inPanelFocusWindow 分支必须 mutePanelIme(el) 后立刻 return（不得落到 blur）");
+	}
+	const revokeAt = src.indexOf("revokeStealthFocus(el);", muteBranchAt);
+	if (revokeAt < 0 || revokeAt < muteBranchAt) {
+		throw new Error("源码契约（T135-B）：找不到 focusin 守卫的 revokeStealthFocus(el) 兜底");
+	}
+	// ④ 用户主动点输入框（onDown 的可编辑分支）与拆卸痕迹都必须 releasePanelIme()：
+	//    少了前者 ⇒ inputmode=none 残留在搜索框上（点不弹键盘）；少了后者 ⇒ 平板档切换后留痕。
+	const markUserIntentAt = src.indexOf("markUserFocusIntent(intentEls);");
+	if (markUserIntentAt < 0) {
+		throw new Error("源码契约（T135-B）：找不到 onDown 可编辑分支的 markUserFocusIntent(intentEls)");
+	}
+	if (!/markUserFocusIntent\(intentEls\);[\s\S]{0,400}?releasePanelIme\(\);/.test(src.slice(markUserIntentAt, markUserIntentAt + 500))) {
+		throw new Error("源码契约（T135-B）：onDown 的可编辑分支必须 releasePanelIme()（用户主动点输入框要撤 IME 压制并还原）");
+	}
+	if (!/clearRightVisual\(false\);[\s\S]{0,200}?releasePanelIme\(\);/.test(src)) {
+		throw new Error("源码契约（T135-B）：teardownHookTraces 必须 releasePanelIme()（零痕迹拆除要还原 inputmode）");
+	}
+	// ⑤ 窗口生命周期：clearUserFocusWindow 必须同生共死地清 panelFocusUntil，
+	//    否则一次导航/可见性切换后浮层窗口还在（放行范围外溢）。
+	const clearWindowAt = src.indexOf("function clearUserFocusWindow() {");
+	const clearWindowBody = clearWindowAt < 0 ? "" : src.slice(clearWindowAt, clearWindowAt + 240);
+	if (!/panelFocusUntil = 0;/.test(clearWindowBody)) {
+		throw new Error("源码契约（T135-B）：clearUserFocusWindow 必须一并清 panelFocusUntil（窗口生命周期同生共死）");
+	}
+	// ⑥ IME 压制必须「记原值 + 撤时逐字还原」：mutePanelIme 写 data-dshr-imemute=原值，
+	//    releasePanelIme 按空/非空分别 removeAttribute / setAttribute 原值。
+	const muteFnAt = src.indexOf("function mutePanelIme(el) {");
+	const releaseFnAt = src.indexOf("function releasePanelIme() {");
+	const muteFn = muteFnAt < 0 ? "" : src.slice(muteFnAt, muteFnAt + 600);
+	const releaseFn = releaseFnAt < 0 ? "" : src.slice(releaseFnAt, releaseFnAt + 600);
+	if (!/getAttribute\(IME_MUTE_ATTR\) === null/.test(muteFn) || !/var prev = el\.getAttribute\('inputmode'\)/.test(muteFn) || !/setAttribute\(IME_MUTE_ATTR, prev === null \? '' : prev\)/.test(muteFn)) {
+		throw new Error("源码契约（T135-B）：mutePanelIme 必须把 inputmode 原值记进 data-dshr-imemute 才能还原");
+	}
+	if (!/var prev = el\.getAttribute\(IME_MUTE_ATTR\)/.test(releaseFn) || !/if \(prev === ''\) el\.removeAttribute\('inputmode'\)/.test(releaseFn) || !/else el\.setAttribute\('inputmode', prev\)/.test(releaseFn) || !/el\.removeAttribute\(IME_MUTE_ATTR\)/.test(releaseFn)) {
+		throw new Error("源码契约（T135-B）：releasePanelIme 必须按原值逐字还原（空值删属性、非空写回原值）并摘掉标记");
+	}
+	// ⑦ 两个谓词必须**语义上真的在场**，不能被改成恒 false / 恒 null（"函数还在、机制已废"）。
+	const inPanelFn = src.indexOf("function inPanelFocusWindow(el) {");
+	const inPanelBody = inPanelFn < 0 ? "" : src.slice(inPanelFn, inPanelFn + 400);
+	const inPanelGuardAt = inPanelBody.indexOf("if (!panelFocusUntil || Date.now() > panelFocusUntil) return false;");
+	const inPanelFirstFalse = inPanelBody.indexOf("return false;");
+	if (
+		inPanelGuardAt < 0 ||
+		inPanelFirstFalse < inPanelGuardAt ||
+		!/if \(!isElement\(el\) \|\| !isEditableFocus\(el\)\) return false;/.test(inPanelBody) ||
+		!/return !!floatingLayerOf\(el\);/.test(inPanelBody)
+	) {
+		throw new Error("源码契约（T135-B）：inPanelFocusWindow 必须按「窗口未过期 + 可编辑焦点 + 落在浮层内」三条件判真（不得恒 false）");
+	}
+	const floatFnAt = src.indexOf("function floatingLayerOf(node) {");
+	const floatBody = floatFnAt < 0 ? "" : src.slice(floatFnAt, floatFnAt + 520);
+	const floatNullAt = floatBody.indexOf("return null;");
+	const floatWhileAt = floatBody.indexOf("while (isElement(el)");
+	if (
+		floatWhileAt < 0 ||
+		floatNullAt < 0 ||
+		floatNullAt < floatWhileAt ||
+		!/if \(isFloatingHost\(el\)\) return el;/.test(floatBody)
+	) {
+		throw new Error("源码契约（T135-B）：floatingLayerOf 必须沿祖先链找 isFloatingHost 宿主（不得恒 null）");
+	}
 	console.log("  ok  源码契约");
 }
 
