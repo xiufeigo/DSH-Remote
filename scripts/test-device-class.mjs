@@ -777,9 +777,9 @@ try {
 	})()`);
 	record("A", "A-left-swipe 主栏左滑后 data-dshr-expanded 仍为 0", leftAfter.expanded === "0", `expanded=${leftAfter.expanded}（修复前会翻成 1）`);
 	record("A", "A-left-swipe 官方侧栏仍收起且列宽为 0", leftAfter.collapsed === true && leftAfter.sideW === 0, `data-sidebar-collapsed=${leftAfter.collapsed} 侧栏列宽=${leftAfter.sideW}px（修复前第 1 帧就变 360px）`);
-	record("A", "A-left-swipe 右抽屉开后遮罩在左缘细条且拖柄可见（T130 新语义）",
-		leftAfter.mask === "VISIBLE" && leftAfter.handle === "VISIBLE" && leftAfter.maskLeft <= 1 && leftAfter.maskW >= 40 && leftAfter.maskW <= 72 && leftAfter.ropen === "1",
-		`mask=${leftAfter.mask}@(${leftAfter.maskLeft},${leftAfter.maskW}) handle=${leftAfter.handle} ropen=${leftAfter.ropen}（右栏卡片打开时遮罩换边是设计行为）`);
+	record("A", "A-left-swipe 右抽屉开后遮罩/拖柄不挂（T131 全宽覆盖：关闭走右滑/面板按钮/返回键）",
+		leftAfter.mask !== "VISIBLE" && leftAfter.handle !== "VISIBLE" && leftAfter.ropen === "1",
+		`mask=${leftAfter.mask} handle=${leftAfter.handle} ropen=${leftAfter.ropen}（T130 曾换边到左缘细条，T131 全宽后摘下）`);
 	record("A", "A-left-swipe 右抽屉开后鲸鱼收起（不压左缘细条）", leftAfter.whale === "hidden" || leftAfter.whale === "absent",
 		`whale=${leftAfter.whale}（ropen 规则收起，官方 frame 属性缺失时也能兜住）`);
 	record("A", "A-left-swipe 无 data-dshr-dragging / data-dshr-rdrag 残留", leftAfter.dragging === null && leftAfter.rdrag === null, `data-dshr-dragging=${leftAfter.dragging} data-dshr-rdrag=${leftAfter.rdrag}`);
@@ -798,16 +798,16 @@ try {
 		return { open: !!(p && p.hasAttribute('data-sidebar-right-open') && p.getAttribute('aria-hidden') !== 'true'),
 			ariaHidden: p ? p.getAttribute('aria-hidden') : null,
 			box: b ? { x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height), r: Math.round(b.right) } : null,
-			card: !!(b && Math.abs(b.right - innerWidth) <= 1 && Math.abs(b.width - (innerWidth - 52)) <= 2
-				&& b.y === 0 && b.height >= innerHeight - 1 && b.x >= 40 && b.x <= 64),
+			card: !!(b && Math.abs(b.right - innerWidth) <= 1 && Math.abs(b.width - innerWidth) <= 2
+				&& b.y === 0 && b.height >= innerHeight - 1 && b.x >= -1 && b.x <= 1),
 			expanded: r.getAttribute('data-dshr-expanded'),
 			sideW: (function(){var s=document.querySelector('[data-dshr-sidebar-col]');return s?Math.round(s.getBoundingClientRect().width):-1;})(),
 			panelText: p ? (p.innerText||'').replace(/\\s+/g,' ').trim().slice(0,40) : '' };
 	})()`);
 	record("A", "A-left-swipe-opens-rightbar 主栏左滑打开官方右栏", rbAfterLeft.open === true,
 		`data-sidebar-right-open=${rbAfterLeft.open} aria-hidden=${rbAfterLeft.ariaHidden} 面板内容="${rbAfterLeft.panelText}"（官方自身无此手势，故本条只可能由 hook 打开）`);
-	record("A", "A-left-swipe-opens-rightbar 手机上右栏为右锚圆角卡片（T130：宽 100%-52px，不再是 inset:0 全屏）", rbAfterLeft.card === true,
-		`panel=${JSON.stringify(rbAfterLeft.box)} 视口=412x915（T130 Kimi 式卡片：右缘贴屏、左缘让出 52px 细条）`);
+	record("A", "A-left-swipe-opens-rightbar 手机上右栏为右锚圆角卡片（T131：全宽覆盖）", rbAfterLeft.card === true,
+		`panel=${JSON.stringify(rbAfterLeft.box)} 视口=412x915（T131 起全宽覆盖；T130 曾让出 52px 细条）`);
 	record("A", "A-left-swipe-opens-rightbar 打开右栏时左抽屉仍关闭", rbAfterLeft.expanded === "0" && rbAfterLeft.sideW === 0,
 		`expanded=${rbAfterLeft.expanded} 侧栏列宽=${rbAfterLeft.sideW}px`);
 

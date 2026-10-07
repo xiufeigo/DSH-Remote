@@ -944,16 +944,20 @@ function run() {
                 var rr = rdPanel.getBoundingClientRect();
                 add(checks, 'rdrawer-card-anchored-right', rs.position === 'fixed' && Math.abs(rr.right - window.innerWidth) < 2,
                   'pos=' + rs.position + ' right=' + Math.round(rr.right) + ' vw=' + window.innerWidth);
-                add(checks, 'rdrawer-card-width', Math.abs(rr.width - (window.innerWidth - 52)) < 3,
-                  'w=' + Math.round(rr.width) + ' 期望=' + (window.innerWidth - 52));
+                // T131：全宽覆盖（不再有左缘 52px 细条），左缘圆角保留（滑入中途可见）。
+                add(checks, 'rdrawer-card-width', Math.abs(rr.width - window.innerWidth) < 2 && Math.abs(rr.left) < 2,
+                  'w=' + Math.round(rr.width) + ' left=' + Math.round(rr.left) + ' 期望=' + window.innerWidth);
                 add(checks, 'rdrawer-card-radius-left', parseFloat(rs.borderTopLeftRadius) >= 12 && parseFloat(rs.borderTopRightRadius) < 1,
                   'tl=' + rs.borderTopLeftRadius + ' tr=' + rs.borderTopRightRadius);
                 add(checks, 'rdrawer-ropen-flag', document.documentElement.getAttribute('data-dshr-ropen') === '1',
                   'ropen=' + document.documentElement.getAttribute('data-dshr-ropen'));
                 var rdMask = document.getElementById('dshr-mobile-drawer-mask');
-                var rdMaskR = rdMask ? rdMask.getBoundingClientRect() : { left: -1, width: 0 };
-                add(checks, 'rdrawer-mask-left-sliver', !!rdMask && getComputedStyle(rdMask).display !== 'none' && rdMaskR.left <= 1 && rdMaskR.width >= 40,
-                  'd=' + (rdMask ? getComputedStyle(rdMask).display : 'missing') + ' l=' + Math.round(rdMaskR.left) + ' w=' + Math.round(rdMaskR.width));
+                var rdHandle = document.getElementById('dshr-drawer-handle');
+                // T131：全宽后右开态不再挂遮罩/拖柄（关闭走右滑/面板按钮/返回键）。
+                add(checks, 'rdrawer-mask-left-sliver', !!rdMask && getComputedStyle(rdMask).display === 'none'
+                  && !!rdHandle && getComputedStyle(rdHandle).display === 'none',
+                  'mask=' + (rdMask ? getComputedStyle(rdMask).display : 'missing')
+                  + ' handle=' + (rdHandle ? getComputedStyle(rdHandle).display : 'missing'));
                 var rdWhale = document.getElementById('dshr-mobile-whale');
                 add(checks, 'rdrawer-hides-whale', !!rdWhale && getComputedStyle(rdWhale).display === 'none',
                   'd=' + (rdWhale ? getComputedStyle(rdWhale).display : 'missing'));

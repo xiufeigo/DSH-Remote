@@ -824,16 +824,19 @@
 		'html.' + ROOT_CLASS + '[data-dshr-explorer-details="1"] #dshr-drawer-handle {',
 		'  display: none !important;',
 		'}',
-		// ── T130：右抽屉卡片（Kimi 式镜像）──
+		// ── T130：右抽屉卡片（Kimi 式镜像）；T131：全宽覆盖 ──
 		//
 		// 官方右栏在手机档（<768px）打开即 fullscreen（position:fixed;inset:0 盖住一切），
 		// 用户口径「右栏太僵硬」。这里把它重构为与左抽屉镜像的 Kimi 式卡片交互：
-		//   面板 = 盖在主会话卡**上方**的圆角卡片——右锚定、宽 = var(--dshr-drawer-width)
-		//   （手机 = 100% − 52px，与左抽屉同一个变量）、左缘圆角 + 左缘投影；
-		//   主会话卡原地不动，左缘露出 52px 细条（遮罩点按关闭）。
+		//   面板 = 盖在主会话卡**上方**的圆角卡片——右锚定、左缘圆角 + 左缘投影，
+		//   左滑从右缘跟手滑入、右滑跟手关闭。
+		// T131（实机口径「无法完全覆盖主屏幕」）：宽度由 100%−52px 改为 **100vw 全宽**——
+		//   右栏是内容型文件面板，旧官方全屏的覆盖体感保留；左缘不再留细条
+		//   （data-dshr-ropen 的遮罩/拖柄两条规则随之删除），关闭走右滑 / 面板自身按钮 /
+		//   返回键桥。全宽落位时左缘圆角在屏外不可见，跟手滑入中途可见，观感不变。
 		// 卡片形态完全锚在**官方属性**上（[data-sidebar-right-panel="fullscreen"]
 		//   + [data-sidebar-right-open]），无 JS 参与也在位；JS 只经 --dshr-rx 驱动位移：
-		//   0 = 全开、W（= 100vw − peek）= 全藏。缺省 0px ⇒ 官方按钮打开时面板即在终态，
+		//   0 = 全开、W（= 100vw）= 全藏。缺省 0px ⇒ 官方按钮打开时面板即在终态，
 		//   transition 负责从上次位置（或屏外）滑入。
 		// 宽屏（≥768px）官方 push/docked 态面板属性值不是 fullscreen，天然不命中本规则。
 		// 面板 fixed 定位 + 自带 z-index:850 ⇒ 不再需要 T82 那套「抬承载列 z-index/transform」
@@ -846,7 +849,7 @@
 		'  right: 0 !important;',
 		'  bottom: 0 !important;',
 		'  left: auto !important;',
-		'  width: var(--dshr-drawer-width) !important;',
+		'  width: 100vw !important;',
 		'  min-width: 0 !important;',
 		'  max-width: 100vw !important;',
 		'  box-sizing: border-box !important;',
@@ -866,26 +869,11 @@
 		'html.' + ROOT_CLASS + '[data-dshr-rdrag="1"] [data-sidebar-right-panel="fullscreen"][data-sidebar-right-open] {',
 		'  transition: none !important;',
 		'}',
-		// 右抽屉卡片态期间：遮罩换到左缘细条（点按关闭），层级压过面板；
-		// drag handle 镜像到左缘交界（x = peek）；悬浮鲸鱼收起（它会压在细条上，
-		// 双保险：data-dshr-rightbar-fullscreen 那条依赖官方 frame 属性，
-		// 这条只依赖 hook 自己的 ropen 镜像）。data-dshr-ropen 由 syncDom 按
+		// 右抽屉卡片态期间收起悬浮鲸鱼（全宽面板会盖到左上角；双保险：
+		// data-dshr-rightbar-fullscreen 那条依赖官方 frame 属性，这条只依赖
+		// hook 自己的 ropen 镜像）。data-dshr-ropen 由 syncDom 按
 		// 「官方 open 且面板为 fullscreen 卡片态」镜像，push/docked 态不置位。
 		'html.' + ROOT_CLASS + '[data-dshr-ropen="1"] #dshr-mobile-whale {',
-		'  display: none !important;',
-		'}',
-		'html.' + ROOT_CLASS + '[data-dshr-ropen="1"] #dshr-mobile-drawer-mask {',
-		'  display: block;',
-		'  left: 0 !important;',
-		'  right: auto !important;',
-		'  width: var(--dshr-drawer-peek) !important;',
-		'  z-index: 860 !important;',
-		'}',
-		'html.' + ROOT_CLASS + '[data-dshr-ropen="1"] #dshr-drawer-handle {',
-		'  display: block;',
-		'  left: var(--dshr-drawer-peek) !important;',
-		'}',
-		'html.' + ROOT_CLASS + '[data-dshr-rdrag="1"] #dshr-drawer-handle {',
 		'  display: none !important;',
 		'}',
 		// ── 设置弹窗 → 全屏页（盖住侧栏与会话，带进入动画） ──
@@ -3510,6 +3498,7 @@
 	// 兑现仍然只有 dispatchNativeClick/click() 这一条官方通道，绝不自己改写官方 open 状态。
 	var rightToggleBusy = false;
 	var pendingRightbarOpen = null;
+	var rightRetryN = 0;
 
 	function flushPendingRightbar() {
 		if (pendingRightbarOpen === null) return;
@@ -3521,7 +3510,7 @@
 	function setRightbarOpen(open) {
 		open = !!open;
 		if (rightToggleBusy) { pendingRightbarOpen = open; return true; }
-		if (isRightbarOpen() === open) { pendingRightbarOpen = null; return true; }
+		if (isRightbarOpen() === open) { pendingRightbarOpen = null; rightRetryN = 0; return true; }
 		var panel = findRightbarPanel();
 		var toggle = panel ? panel.querySelector('button[data-sidebar-right-toggle]') : null;
 		if (!toggle) return false;
@@ -3533,9 +3522,16 @@
 		rightToggleBusy = true;
 		var before = isRightbarOpen();
 		if (!dispatchNativeClick(toggle)) toggle.click();
+		// T131：验证窗 280 → 650ms。真机实测（rc.2.17 用户报告）：右栏面板的官方
+		// React 提交在主线程繁忙时可超 300ms（面板挂载重），280ms 窗会误判「未翻转」
+		// 而补拍第二次 toggle —— 第一次随后落地关上了、补拍又把它**重新打开**，
+		// 用户看到的就是「划回去后换成右侧栏的动画触发了两次」。
+		// 650ms 覆盖实测提交时延（真机轨迹 ~350–660ms），补拍只在该窗后仍停旧态时发生；
+		// 即便仍慢，下面还有「目标态收敛」有界重试兜底，绝不把面板弹回错误一侧。
 		window.setTimeout(function () {
 			if (isRightbarOpen() !== before) {
 				rightToggleBusy = false;
+				rightRetryN = 0;
 				flushPendingRightbar();
 				return;
 			}
@@ -3544,9 +3540,24 @@
 			if (toggle2 && !toggle2.disabled) dispatchTap(toggle2);
 			window.setTimeout(function () {
 				rightToggleBusy = false;
+				if (isRightbarOpen() === open) {
+					rightRetryN = 0;
+					flushPendingRightbar();
+					return;
+				}
+				// 收敛兜底（T131）：极慢提交/二次 toggle 弹回旧态时，按目标态有界重试
+				// （≤3 次，逐次由 rightToggleBusy 串联），到不了目标就停在官方当前态，
+				// 绝不无限乒乓。健康的单次提交永远走不到这里。
+				if (rightRetryN < 3) {
+					rightRetryN += 1;
+					pendingRightbarOpen = open;
+					window.setTimeout(flushPendingRightbar, 400);
+					return;
+				}
+				rightRetryN = 0;
 				flushPendingRightbar();
-			}, 220);
-		}, 280);
+			}, 400);
+		}, 650);
 		return true;
 	}
 
@@ -3583,9 +3594,9 @@
 	var rightNextX = 0;
 	var rightSettleAnim = 0;
 
-	/** 右卡位移上限 = 卡片宽度（= 视口宽 − 左缘细条 peek）。 */
+	/** 右卡位移上限 = 卡片宽度（T131 起 = 视口全宽，不再减左缘细条）。 */
 	function rightCardMax() {
-		return Math.max(80, (window.innerWidth || 390) - drawerPeekPx());
+		return Math.max(80, window.innerWidth || 390);
 	}
 
 	function setRightVisual(x) {
