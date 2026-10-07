@@ -3494,13 +3494,13 @@
 	//   - rightToggleBusy（官方折叠提交中）时意图入队 pendingRightbarOpen，落地后重放；
 	//   - 按钮 disabled（官方还在提交上一次翻转）⇒ 意图入队 + 300ms 后重放——
 	//     杜绝 T82 那类失同步（close 撞上 disabled 返回 false，右栏永远留在打开态）；
-	//   - 280ms 状态未翻转补一次 dispatchTap，+220ms 释放并 flush（节奏与 toggleSidebar 一致）。
+	//   - 状态翻转一律由 syncDom 的属性观察者落地（rightIntentState 匹配即解 busy）；
+	//     看门狗只兜「派发真的丢了」，绝不按固定节奏补拍（T134，见下）。
 	// 兑现仍然只有 dispatchNativeClick/click() 这一条官方通道，绝不自己改写官方 open 状态。
 	var rightToggleBusy = false;
 	var pendingRightbarOpen = null;
-	var rightRetryN = 0;
 	// T133：在途 toggle 的目标态。syncDom 一见到官方状态与它一致就立刻解除 busy
-	// （观察者驱动，不必等 650ms 盲窗），随后 flushPendingRightbar 串联下一个意图。
+	// （观察者驱动，不必等盲窗），随后 flushPendingRightbar 串联下一个意图。
 	var rightIntentState = null;
 
 	function flushPendingRightbar() {
@@ -3513,7 +3513,7 @@
 	function setRightbarOpen(open) {
 		open = !!open;
 		if (rightToggleBusy) { pendingRightbarOpen = open; return true; }
-		if (isRightbarOpen() === open) { pendingRightbarOpen = null; rightRetryN = 0; return true; }
+		if (isRightbarOpen() === open) { pendingRightbarOpen = null; return true; }
 		var panel = findRightbarPanel();
 		var toggle = panel ? panel.querySelector('button[data-sidebar-right-toggle]') : null;
 		if (!toggle) return false;
@@ -3525,45 +3525,41 @@
 		rightToggleBusy = true;
 		rightIntentState = open;
 		var before = isRightbarOpen();
+		var retriesLeft = 1;
 		if (!dispatchNativeClick(toggle)) toggle.click();
-		// T131：验证窗 280 → 650ms。真机实测（rc.2.17 用户报告）：右栏面板的官方
-		// React 提交在主线程繁忙时可超 300ms（面板挂载重），280ms 窗会误判「未翻转」
-		// 而补拍第二次 toggle —— 第一次随后落地关上了、补拍又把它**重新打开**，
-		// 用户看到的就是「划回去后换成右侧栏的动画触发了两次」。
-		// 650ms 覆盖实测提交时延（真机轨迹 ~350–660ms），补拍只在该窗后仍停旧态时发生；
-		// 即便仍慢，下面还有「目标态收敛」有界重试兜底，绝不把面板弹回错误一侧。
-		window.setTimeout(function () {
+		// T134：看门狗只兜「派发真的丢了」，绝不按固定节奏补拍。
+		// rc.2.18/2.19 的形态是「650ms 没翻转就补拍第二颗 toggle」——真机上官方
+		// React 提交只是**慢**（没丢）：第一颗随后落地开了、补拍那颗又把它关掉、
+		// 收敛重试再打开——用户看到的就是「右侧栏被打开两遍/动画触发两次」
+		//（rc.2.19 实机报告；只有手势路径，官方按钮不经过这里）。
+		// 现在：翻转一律由 syncDom 的属性观察者收口；1200ms 仍停旧态才按「派发丢失」
+		// 补一次（窗口远超实测提交时延 ~90–800ms）；2400ms 还不翻就放弃这次意图——
+		// 宁可少动作一次留给用户下一笔手势，绝不制造「开→关→开」乒乓。
+		var watchdog = function () {
+			if (!rightToggleBusy) return;   // 观察者已收口
 			if (isRightbarOpen() !== before) {
+				// 观察者漏网时的兜底收口（语义与观察者路径逐字一致）。
 				rightToggleBusy = false;
 				rightIntentState = null;
-				rightRetryN = 0;
 				flushPendingRightbar();
 				return;
 			}
-			var panel2 = findRightbarPanel();
-			var toggle2 = panel2 ? panel2.querySelector('button[data-sidebar-right-toggle]') : null;
-			if (toggle2 && !toggle2.disabled) dispatchTap(toggle2);
-			window.setTimeout(function () {
-				rightToggleBusy = false;
-				rightIntentState = null;
-				if (isRightbarOpen() === open) {
-					rightRetryN = 0;
-					flushPendingRightbar();
-					return;
-				}
-				// 收敛兜底（T131）：极慢提交/二次 toggle 弹回旧态时，按目标态有界重试
-				// （≤3 次，逐次由 rightToggleBusy 串联），到不了目标就停在官方当前态，
-				// 绝不无限乒乓。健康的单次提交永远走不到这里。
-				if (rightRetryN < 3) {
-					rightRetryN += 1;
-					pendingRightbarOpen = open;
-					window.setTimeout(flushPendingRightbar, 400);
-					return;
-				}
-				rightRetryN = 0;
-				flushPendingRightbar();
-			}, 400);
-		}, 650);
+			if (retriesLeft > 0) {
+				retriesLeft -= 1;
+				var panel2 = findRightbarPanel();
+				var toggle2 = panel2 ? panel2.querySelector('button[data-sidebar-right-toggle]') : null;
+				if (toggle2 && !toggle2.disabled) dispatchTap(toggle2);
+				window.setTimeout(watchdog, 1200);
+				return;
+			}
+			// 放弃：停在官方当前态，清 busy 让后续手势照常工作；跟手痕迹一并清掉，
+			// 面板如实停在官方状态对应的位置（不留「官方开着但视觉上被拖走」的假态）。
+			rightToggleBusy = false;
+			rightIntentState = null;
+			clearRightVisual(false);
+			flushPendingRightbar();
+		};
+		window.setTimeout(watchdog, 1200);
 		return true;
 	}
 
