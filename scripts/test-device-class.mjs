@@ -861,9 +861,9 @@ try {
 			`data-sidebar-right-open=${rbSwipeAfter.stillOpen}（开着时再点会误关，故此处必须不动作）`);
 		// T130：右开态右滑 = 跟手关闭右抽屉（新语义；旧世界这里是带外 no-op）。
 		// 顺带必须不开左抽屉（两抽屉互斥）。起点仍 ≥200 避开 Chrome 边缘返回雷区；
-		// segments=3 让每段位移 50px、松手速度必然越过 0.45px/ms 的速度门（位置门
-		// 在本台子够不到：x0≥200 时最大位移 212px < 65% 关阀值，速度门才是主路径）。
-		await dispatchSwipe(250, 400, rbLane.y, 3);
+		// segments=2 且全幅 210px：速度门（100px/段 ≫ 0.45px/ms）与位置门
+		// （T132 关阀值 50%，210/411=51%）双保险，任何一臂落都关，杜绝速度抖动。
+		await dispatchSwipe(200, 410, rbLane.y, 2);
 		const rbRightAfter = await evaluate(`(function(){
 			var r = document.documentElement;
 			var s = document.querySelector('[data-dshr-sidebar-col]');
@@ -921,7 +921,7 @@ try {
 			`data-sidebar-right-open=${rbOpenForT66}`);
 		if (rbOpenForT66) {
 			const midY = rbLane ? rbLane.y : 300;
-			await dispatchSwipe(250, 400, midY, 3);
+			await dispatchSwipe(200, 410, midY, 2);
 			const t130Mid = await evaluate(`(function(){
 				var p = document.querySelector('[data-sidebar-right-panel]');
 				return { href: location.href,

@@ -3499,6 +3499,9 @@
 	var rightToggleBusy = false;
 	var pendingRightbarOpen = null;
 	var rightRetryN = 0;
+	// T133：在途 toggle 的目标态。syncDom 一见到官方状态与它一致就立刻解除 busy
+	// （观察者驱动，不必等 650ms 盲窗），随后 flushPendingRightbar 串联下一个意图。
+	var rightIntentState = null;
 
 	function flushPendingRightbar() {
 		if (pendingRightbarOpen === null) return;
@@ -3520,6 +3523,7 @@
 			return true;
 		}
 		rightToggleBusy = true;
+		rightIntentState = open;
 		var before = isRightbarOpen();
 		if (!dispatchNativeClick(toggle)) toggle.click();
 		// T131：验证窗 280 → 650ms。真机实测（rc.2.17 用户报告）：右栏面板的官方
@@ -3531,6 +3535,7 @@
 		window.setTimeout(function () {
 			if (isRightbarOpen() !== before) {
 				rightToggleBusy = false;
+				rightIntentState = null;
 				rightRetryN = 0;
 				flushPendingRightbar();
 				return;
@@ -3540,6 +3545,7 @@
 			if (toggle2 && !toggle2.disabled) dispatchTap(toggle2);
 			window.setTimeout(function () {
 				rightToggleBusy = false;
+				rightIntentState = null;
 				if (isRightbarOpen() === open) {
 					rightRetryN = 0;
 					flushPendingRightbar();
@@ -4242,7 +4248,12 @@
 			if (wasDragging && axisUsed === 'left') {
 				var shift = baseX + (endX - startX);
 				var visual = setDrawerVisual(shift);
-				var wantOpen = visual.p >= 0.35;
+				// T132：开/关阀值不对称——开 35%（跟手一小段就认）、关 50%。
+				// 此前关也是 35%（要拖过 65% 才关）：真机上自然减速松手极难过线，
+				// 面板/主卡被弹回打开态，用户看到的就是「跟着我手收回去，
+				// 然后立刻自己又触发一次」（rc.2.17/2.18 两次实机报告的现象）。
+				// baseX 大（起手已开）= 关闭拖动 → 50%；baseX 小（起手关）= 打开拖动 → 35%。
+				var wantOpen = visual.p >= (baseX >= drawerMaxShift() / 2 ? 0.5 : 0.35);
 				if (Math.abs(releaseVelocity) > 0.45) wantOpen = releaseVelocity > 0;
 				settleDrawer(wantOpen);
 				return;
@@ -4250,7 +4261,9 @@
 			if (wasDragging && axisUsed === 'right') {
 				var rx = baseRx + (endX - startX);
 				var rvisual = setRightVisual(rx);
-				var wantRight = rvisual.p >= 0.35;
+				// T132：右抽屉同款不对称阀值。baseRx 小（起手已开）= 关闭拖动 → 50%；
+				// baseRx 大（起手关）= 打开拖动 → 35%。速度门照旧：快甩按方向直落。
+				var wantRight = rvisual.p >= (baseRx <= rightCardMax() / 2 ? 0.5 : 0.35);
 				// 右抽屉镜像：向左的速度 = 打开方向。
 				if (Math.abs(releaseVelocity) > 0.45) wantRight = releaseVelocity < 0;
 				settleRight(wantRight);
@@ -5618,6 +5631,15 @@
 		var rOpenNow = isRightbarOpen();
 		var rCardNow = !!(rPanelNow && rPanelNow.getAttribute('data-sidebar-right-panel') === 'fullscreen');
 		root.setAttribute('data-dshr-ropen', rOpenNow && rCardNow ? '1' : '0');
+		// T133：官方状态一旦与在途 toggle 的目标态一致，立刻解除 busy（观察者驱动，
+		// 比 650ms 盲窗快），并串联队列里的下一个意图。这让「手势落位 + 返回键桥」
+		// 这类同帧双击在第一颗 toggle 落地后立刻变回可派发，但队列里的同一意图
+		// 会被 flushPendingRightbar 的等态检查吞掉，不会产生第二颗 toggle。
+		if (rightToggleBusy && rightIntentState !== null && rOpenNow === rightIntentState) {
+			rightToggleBusy = false;
+			rightIntentState = null;
+			flushPendingRightbar();
+		}
 		if (!rOpenNow) {
 			// 官方已收起（含 settleRight 关闭落位后的异步收敛、官方按钮直收）：
 			// 清掉右抽屉全部跟手痕迹。此时面板已被官方隐藏，清 --dshr-rx 无可见跳变。
@@ -6801,10 +6823,14 @@
 			// 以展开标记而非显示模式判断；只收起面板，保留文件标签和路由。
 			var rightPanel = document.querySelector('[data-sidebar-right-panel][data-sidebar-right-open]');
 			if (rightPanel && rightPanel.getAttribute('aria-hidden') !== 'true') {
-				// T47：与「右滑关闭」共用同一个动作函数（同一颗官方折叠按钮）。
-				closeOfficialRightbar();
-				// React 状态更新可能异步提交；不能因 DOM 尚未更新再 toggle 一次。
-				// 展开时即使控件暂不可用（closeOfficialRightbar 返回 false）也消费返回，避免误退桌面。
+				// T133：与手势/轻扫同一条 setRightbarOpen 意图队列（此前直接
+				// closeOfficialRightbar）。实机反例（rc.2.18 用户录屏）：用户右滑
+				// 收右栏，手指进右缘系统返回手势区 ⇒ 系统返回键桥与手势落位
+				// **同帧各派发一次 toggle**——第一次关上了，第二次又把它打开，
+				// 录屏里就是「关完后面板自己再从右缘滑回来」。
+				// 走队列后：在途关闭进行中时这里只把意图入队（同一目标态），
+				// 不再产生第二颗 toggle；消费返回的语义逐字不变。
+				setRightbarOpen(false);
 				return true;
 			}
 			if (isSidebarOpen()) return setSidebarOpen(false);

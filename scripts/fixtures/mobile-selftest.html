@@ -652,19 +652,9 @@ function run() {
     add(checks, 'back-closes-rightbar-fullscreen',
       backConsumed === true && rightbarClicks === 1 && !rightbar.hasAttribute('data-sidebar-right-open'),
       'consumed=' + backConsumed + ' clicks=' + rightbarClicks + ' open=' + rightbar.hasAttribute('data-sidebar-right-open'));
-    // push 态（宽屏手动展开）：同样应被返回键收起，而不是直接退桌面。
-    rightbar.setAttribute('data-sidebar-right-open', '');
-    rightbar.setAttribute('data-sidebar-right-panel', 'push');
-    rightbarClicks = 0;
-    var pushConsumed = bridge.closeSidebarIfExpanded();
-    add(checks, 'back-closes-rightbar-push',
-      pushConsumed === true && rightbarClicks === 1 && !rightbar.hasAttribute('data-sidebar-right-open'),
-      'consumed=' + pushConsumed + ' clicks=' + rightbarClicks + ' open=' + rightbar.hasAttribute('data-sidebar-right-open'));
-    rightbar.setAttribute('data-sidebar-right-panel', 'fullscreen');
-    // 失败也清理，避免污染后续版面测试。
     rightbarToggle.onclick = null;
-    rightbar.removeAttribute('data-sidebar-right-open');
-    frameEl.removeAttribute('data-rightbar-fullscreen');
+    // push 态返回键测试挪进末尾的 rdrawer 块串行执行（T133 队列化后它是异步的，
+    // 与 rdrawer 的开关循环共用面板，绝不能并行抢同一份属性）。
     bridge.syncNow();
     add(checks, 'rightbar-flag-cleared', document.documentElement.getAttribute('data-dshr-rightbar-fullscreen') !== '1');
   }
@@ -925,19 +915,69 @@ function run() {
             var rdFrame = document.querySelector('.frame');
             var rdToggle = rdPanel ? rdPanel.querySelector('[data-sidebar-right-toggle]') : null;
             if (rdPanel && rdFrame && rdToggle) {
-              // mock 官方折叠按钮的 React 提交：点击即翻转 open/fullscreen 属性。
+              // 状态驱动等待（T133 队列化后各阶段落地时延不定）：条件命中或超时进回调。
+              function rdWaitFor(cond, cap, cb) {
+                var waited = 0;
+                (function poll() {
+                  var ok = false;
+                  try { ok = !!cond(); } catch (e) { ok = false; }
+                  if (ok || waited >= cap) { cb(waited); return; }
+                  waited += 60;
+                  window.setTimeout(poll, 60);
+                })();
+              }
+              // 痕迹收敛：无跟手属性残留。开着时 syncDom 会把 rx 钉在 '0px'（落位标记），
+              // 关着时 rx 被清掉 ⇒ 只认「缺席或 0px」，补间中的大数值与 rdrag 一律不算收敛。
+              function rdClean() {
+                var rx = document.documentElement.style.getPropertyValue('--dshr-rx');
+                return document.documentElement.getAttribute('data-dshr-rdrag') !== '1' && (!rx || rx === '0px');
+              }
+              function rdOpenState() { return rdPanel.hasAttribute('data-sidebar-right-open'); }
+              // 面板全开且设定位（右缘贴屏）：官方滑入过渡与 rAF 落位都收敛于这条。
+              function rdSettledRight() {
+                var b = rdPanel.getBoundingClientRect();
+                return rdOpenState() && Math.abs(b.right - window.innerWidth) < 2;
+              }
+              var rdSettleCap = 3600;
+              // ① push 态返回键测试（T133：桥已并入意图队列，busy 窗内会排队落地，故轮询）。
+              rdPanel.setAttribute('data-sidebar-right-open', '');
+              rdPanel.setAttribute('data-sidebar-right-panel', 'push');
+              var rdPushClicks = 0;
               rdToggle.onclick = function () {
-                if (rdPanel.hasAttribute('data-sidebar-right-open')) {
-                  rdPanel.removeAttribute('data-sidebar-right-open');
-                  rdFrame.removeAttribute('data-rightbar-fullscreen');
-                } else {
-                  rdPanel.setAttribute('data-sidebar-right-open', '');
-                  rdFrame.setAttribute('data-rightbar-fullscreen', '');
-                }
+                rdPushClicks++;
+                rdPanel.removeAttribute('data-sidebar-right-open');
               };
-              // ① 左滑 → 右抽屉从右缘滑入打开。
-              fireSwipe(column, 360, 400, 40, 400);
-              window.setTimeout(function () {
+              var rdPushConsumed = bridge.closeSidebarIfExpanded();
+              rdWaitFor(function () { return rdPushClicks >= 1; }, rdSettleCap, function (w1) {
+                add(checks, 'back-closes-rightbar-push',
+                  rdPushConsumed === true && rdPushClicks === 1 && !rdOpenState(),
+                  'consumed=' + rdPushConsumed + ' clicks=' + rdPushClicks + ' waited=' + w1 + ' open=' + rdOpenState());
+                rdPanel.setAttribute('data-sidebar-right-panel', 'fullscreen');
+                rdPanel.removeAttribute('data-sidebar-right-open');
+                rdFrame.removeAttribute('data-rightbar-fullscreen');
+                bridge.syncNow();
+                // 归一：排空意图队列并清掉跟手痕迹，从确定的「双闭」态起手（否则
+                // push 测试 busy 窗里排队的意图会落到下面的开关循环里抢戏）。
+                bridge.settleRight(false);
+                rdWaitFor(function () { return !rdOpenState() && rdClean(); }, rdSettleCap, function () {
+                  // mock 官方折叠按钮的 React 提交：点击即翻转 open/fullscreen 属性。
+                  rdToggle.onclick = function () {
+                    if (rdOpenState()) {
+                      rdPanel.removeAttribute('data-sidebar-right-open');
+                      rdFrame.removeAttribute('data-rightbar-fullscreen');
+                    } else {
+                      rdPanel.setAttribute('data-sidebar-right-open', '');
+                      rdFrame.setAttribute('data-rightbar-fullscreen', '');
+                    }
+                  };
+                  // ② 左滑 → 右抽屉从右缘滑入打开；等「开 + 设定位 + 痕迹收敛」再量几何。
+                  fireSwipe(column, 360, 400, 40, 400);
+                  rdWaitFor(function () { return rdSettledRight() && rdClean(); }, rdSettleCap, function () {
+                    rdOpenAssert();
+                  });
+                });
+              });
+              function rdOpenAssert() {
                 var rdOpen = rdPanel.hasAttribute('data-sidebar-right-open');
                 add(checks, 'rdrawer-opens-on-left-swipe', rdOpen, 'open=' + rdOpen);
                 var rs = getComputedStyle(rdPanel);
@@ -961,27 +1001,25 @@ function run() {
                 var rdWhale = document.getElementById('dshr-mobile-whale');
                 add(checks, 'rdrawer-hides-whale', !!rdWhale && getComputedStyle(rdWhale).display === 'none',
                   'd=' + (rdWhale ? getComputedStyle(rdWhale).display : 'missing'));
-                // ② 右开态左滑 = no-op（E5 基线：不关右栏、不开左抽屉）。
+                // ③ 右开态左滑 = no-op（E5 基线：不关右栏、不开左抽屉）。
                 fireSwipe(rdPanel, 300, 400, 100, 400);
                 window.setTimeout(function () {
-                  add(checks, 'rdrawer-left-swipe-noop', rdPanel.hasAttribute('data-sidebar-right-open') && rdFrame.hasAttribute('data-sidebar-collapsed'),
-                    'open=' + rdPanel.hasAttribute('data-sidebar-right-open') + ' collapsed=' + rdFrame.hasAttribute('data-sidebar-collapsed'));
-                  // ③ 右滑 → 补间滑出右缘后官方收起，跟手痕迹全清。
+                  add(checks, 'rdrawer-left-swipe-noop', rdOpenState() && rdFrame.hasAttribute('data-sidebar-collapsed'),
+                    'open=' + rdOpenState() + ' collapsed=' + rdFrame.hasAttribute('data-sidebar-collapsed'));
+                  // ④ 右滑 → 补间滑出右缘后官方收起，跟手痕迹全清。
                   fireSwipe(rdPanel, 100, 400, 320, 400);
-                  window.setTimeout(function () {
-                    add(checks, 'rdrawer-closes-on-right-swipe', !rdPanel.hasAttribute('data-sidebar-right-open'),
-                      'open=' + rdPanel.hasAttribute('data-sidebar-right-open'));
-                    add(checks, 'rdrawer-flags-cleared', document.documentElement.getAttribute('data-dshr-ropen') !== '1'
-                      && !document.documentElement.style.getPropertyValue('--dshr-rx')
-                      && document.documentElement.getAttribute('data-dshr-rdrag') !== '1',
+                  rdWaitFor(function () { return !rdOpenState() && rdClean(); }, rdSettleCap, function () {
+                    add(checks, 'rdrawer-closes-on-right-swipe', !rdOpenState(),
+                      'open=' + rdOpenState());
+                    add(checks, 'rdrawer-flags-cleared', document.documentElement.getAttribute('data-dshr-ropen') !== '1' && rdClean(),
                       'ropen=' + document.documentElement.getAttribute('data-dshr-ropen')
                       + ' rx=' + document.documentElement.style.getPropertyValue('--dshr-rx')
                       + ' rdrag=' + document.documentElement.getAttribute('data-dshr-rdrag'));
                     rdToggle.onclick = null;
                     finish(checks);
-                  }, 700);
+                  });
                 }, 450);
-              }, 700);
+              }
             } else {
               add(checks, 'rdrawer-opens-on-left-swipe', false, 'rightbar fixture missing');
               finish(checks);
