@@ -325,7 +325,7 @@ function assertSourceContracts() {
 			if (at < 0) throw new Error(`源码契约：找不到 ${needle}`);
 			return src.slice(at, src.indexOf("\n\tfunction ", at));
 		};
-		const arm = bodyOf("function armComposerFocus()");
+		const arm = bodyOf("function armComposerFocus(");
 		// 承重三动作：登记意图窗口（且必须带目标元素）/ 打 inputmode=none / 自抢焦点。
 		if (!/markUserFocusIntent\(\s*composer\s*\)/.test(arm)) {
 			throw new Error("源码契约：armComposerFocus 必须 markUserFocusIntent(composer) —— 窗口必须绑定目标元素，不能对整篇文档放行（T51/R1）");
@@ -1427,7 +1427,7 @@ try {
 	//   f2 布防窗口内，面板搜索框抢焦点被收回           ← 窗口外溢 ⇒ 红（T50 §6.1）
 	//   f3 用户真点输入框仍能拿到焦点                   ← 防「修过头把面板/键盘弄没」
 	//   f4 非布防态的 inputmode 残留被兜底清掉          ← R4
-	//   f5 布防 500ms 定时器把放行窗口一起关掉            ← 窗口生命周期（T50 §6.3 根因）
+	//   f5 布防 1000ms 定时器把放行窗口一起关掉（T125，此前 500ms） ← 窗口生命周期（T50 §6.3 根因）
 	async function focusGuardProbe() {
 		const evaluated = await call("Runtime.evaluate", {
 			expression: `(async function () {
@@ -1449,11 +1449,11 @@ try {
 					// 不补 click ⇒ 本探针里 9 次 down 全被算成同一次手势的后续落指，
 					// 于是 onDown 里的 clearUserFocusWindow() 不再触发，
 					// 那条 focus-arm-window-closed-by-disarm-timer 会因为「窗口还活着」而红 ——
-					// 而它要测的是「500ms 定时器把窗口关掉」，与手势划分毫无关系。
+					// 而它要测的是「1000ms 定时器把窗口关掉」，与手势划分毫无关系。
 					//
 					// 这不是把断言放宽：补 click 后每一步都回到「一次 down = 一次新手势」，
 					// f5 那一步照样先 clearUserFocusWindow()，断言测的仍然是
-					// 「布防 500ms 后窗口确实关着 ⇒ 程序化 focus 被收回」。
+					// 「布防 1000ms 后窗口确实关着 ⇒ 程序化 focus 被收回」。
 					// 基线 hook 与 T76 hook 都必须绿（两臂实测见 scratch/t76/report.md 5 节）。
 					el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
 				}
@@ -1515,13 +1515,13 @@ try {
 				out.residualAfter = composer.getAttribute('inputmode');
 				out.residualFocused = document.activeElement === composer;
 
-				// f5：放行窗口的**生命周期**。布防后 500ms 的摘防定时器必须把窗口一起关掉。
-				//     取 650ms 这个点：修复后窗口已关（程序化聚焦 composer 会被守卫收回）；
-				//     若 disarm 不关窗口，窗口还活到 800ms 且仍以 composer 为目标 ⇒ 放行。
+				// f5：放行窗口的**生命周期**。布防后 1000ms（T125，此前 500ms）的摘防定时器必须把窗口一起关掉。
+				//     取 1200ms 这个点：修复后窗口已关（程序化聚焦 composer 会被守卫收回）；
+				//     若 disarm 不关窗口，窗口还活且仍以 composer 为目标 ⇒ 放行。
 				down(trigger);
 				out.reArmInputmode = composer.getAttribute('inputmode');
 				neutral.focus();
-				await sleep(650);
+				await sleep(1200);
 				out.inputmodeAfterTimer = composer.getAttribute('inputmode');
 				composer.focus();
 				out.composerFocusAfterTimer = document.activeElement === composer;
@@ -2014,7 +2014,7 @@ try {
 		"focus-arm-window-closed-by-disarm-timer",
 		focusProbe && focusProbe.composerFocusAfterTimer === false,
 		focusProbe
-			? `reArm=${JSON.stringify(focusProbe.reArmInputmode)} im@650ms=${JSON.stringify(focusProbe.inputmodeAfterTimer)} composerFocusedAfterTimer=${focusProbe.composerFocusAfterTimer}`
+			? `reArm=${JSON.stringify(focusProbe.reArmInputmode)} im@1200ms=${JSON.stringify(focusProbe.inputmodeAfterTimer)} composerFocusedAfterTimer=${focusProbe.composerFocusAfterTimer}`
 			: "no probe",
 	);
 	// ── T53：三条新行为级断言（每条都配了变异反证，见 scratch/t53/report.md §1）──

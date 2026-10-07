@@ -609,7 +609,10 @@
 		'  opacity: 1 !important;',
 		'  overflow: hidden !important;',
 		'  pointer-events: none !important;',
-		'  transform: none !important;',
+		// T125（Kimi 化）：抽屉本身跟手滑入（此前 transform:none = 静止揭开）。
+		// x=0 时藏到左侧（-width），x=max 时归零；与主卡同读 --dshr-drawer-x，同帧 1:1。
+		// 稳态展开仍走下面的非 dragging 规则（transform:none = 完全滑入），交接零台阶。
+		'  transform: translateX(calc(var(--dshr-drawer-x, 0px) - var(--dshr-drawer-width))) !important;',
 		'  z-index: 10 !important;',
 		'  border-right: 0 !important;',
 		'  box-shadow: none !important;',
@@ -1501,7 +1504,7 @@
 	// 为什么 `inputmode="none"` 而不是别的：T46 实测 `contenteditable=true` 的元素支持
 	// inputmode，Chromium/Android WebView 会因此**不向 IME 请求 showSoftInput**，
 	// 同时 DOM 焦点原封不动留在 composer 上 —— 正是官方命令面板要的那个焦点。
-	var FOCUS_ARM_MS = 500;
+	var FOCUS_ARM_MS = 1000;
 	// 往上找 composer 卡片时的深度封顶。冷启动时 hook 的标记可能还没打上，
 	// 没有这道封顶就会一路走到 <body>，让整页（鲸鱼、侧边栏、消息气泡）都变成布防范围。
 	var FOCUS_ARM_HOST_MAX_DEPTH = 8;
@@ -1569,7 +1572,10 @@
 	var COMPOSER_TRIGGER_SELECTOR = [
 		'button[aria-label="Add files or run commands"]',
 		'button[aria-label="添加文件或运行命令"]',
+		'button[aria-label="添加文件或调用指令"]',
+		'button[aria-label="添加文件或运行指令"]',
 		'button[aria-label="命令"]',
+		'button[aria-label="指令"]',
 		'button[aria-label="Commands"]',
 		'[data-dshr-composer-add]',
 		'[data-dshr-composer-model]',
@@ -1768,9 +1774,32 @@
 
 	/**
 	 * composer 输入元素。官方命令面板要的就是这个元素上的焦点。
+	 * T125：页面可能同时存在多个 composer（主会话 + 新建任务 dialog）：
+	 * 优先返回当前持焦的那个，其次返回可见的第一个，避免永远只取 DOM 第一个
+	 * 导致新建任务页的模型/加号走错 composer（inputmode 打错节点、卡片查找走错）。
 	 */
 	function focusComposerEl() {
-		return document.querySelector('[data-composer-input]');
+		try {
+			var active = document.activeElement;
+			if (isElement(active)) {
+				if (active.hasAttribute && (active.hasAttribute('data-composer-input') || active.hasAttribute('data-lexical-editor'))) return active;
+				if (active.closest) {
+					var owned = active.closest('[data-composer-input], [data-lexical-editor]');
+					if (owned) return owned;
+				}
+			}
+		} catch (ignoredActive) { /* 回落到全局查找 */ }
+		var list = null;
+		try {
+			list = document.querySelectorAll('[data-composer-input]');
+		} catch (ignoredQsa) { list = null; }
+		if (!list || !list.length) return document.querySelector('[data-composer-input]');
+		for (var i = 0; i < list.length; i++) {
+			try {
+				if (isVisible(list[i])) return list[i];
+			} catch (ignoredVis) { /* 继续找下一个 */ }
+		}
+		return list[0];
 	}
 
 	/**
@@ -1796,6 +1825,30 @@
 			depth += 1;
 		}
 		return false;
+	}
+
+	/**
+	 * T125：落点是不是**模型选择器**（含其内部 svg/span 等后代）。
+	 * 模型菜单与「+」命令面板语义不同：它不需要 composer 持焦也能打开，
+	 * 而 arm 里的 composer.focus() 会在触摸序列中搬焦点、吞掉模型按钮的 click
+	 * （与 T69 发送按钮同因）。因此模型走“只压 IME、不抢焦点”形态。
+	 */
+	function isModelTriggerPoint(target) {
+		if (!isElement(target) || !target.closest) return false;
+		try {
+			if (target.closest('[data-dshr-composer-model]')) return true;
+		} catch (ignoredModelMark) { /* 选择器异常则走官方名单 */ }
+		var labelled = null;
+		try {
+			labelled = target.closest('button[aria-haspopup="menu"], button[aria-haspopup="dialog"], button[aria-haspopup="listbox"]');
+		} catch (ignoredPopup) { labelled = null; }
+		if (!labelled) return false;
+		// 排除掉 +/权限（它们有自己的标记与 aria-label），剩下的 popup 按钮即模型。
+		try {
+			if (labelled.hasAttribute('data-dshr-composer-add')) return false;
+			if (labelled.hasAttribute('data-dshr-composer-access')) return false;
+		} catch (ignoredAttr) { /* 无属性则继续按名单判 */ }
+		return true;
 	}
 
 	/**
@@ -1875,7 +1928,7 @@
 	 *      结构上就不可能取消事件。AVD 实测整条发送路径 `defaultPrevented` 恒为 false。
 	 *   2. **绝不抢已经持焦的输入区**：见下面的 composerHoldsFocus() 早退。
 	 */
-	function armComposerFocus() {
+	function armComposerFocus(skipFocus) {
 		var composer = focusComposerEl();
 		if (!isElement(composer)) return false;
 		// T69：composer 已经持焦时**不布防**。
@@ -1892,13 +1945,36 @@
 		//     但真机小米 15 上没有）。
 		// 早退同时也让 composer.focus() 不再可能成为"吞点击"的那一步。
 		//
-		// 仍要清掉粘性抑制：若此前给这个 composer 登记过粘性状态，官方打开面板时那次
-		// 抢焦点会被 T42 的粘性抑制收回去，面板就打不开 —— 那是 T48 的原始死结。
-		// clearFocusSticky 是登记处清理，无副作用。
+		// T69 + T125（持焦仍需压键盘）：composer 已经持焦时**不抢焦点、但仍压住 IME**。
+		//
+		// 原 T69 直接 return false（零布防）：理由是“焦点没变 ⇒ 无新 focusin ⇒ 无新
+		// showSoftInput，目的已达成”。但真机上已有文字（composer 持焦、键盘被返回键藏起）
+		// 后点「+」仍弹键盘：官方打开面板时的重申焦点/IME restartInput 不需要新的
+		// focusin 也能把键盘拉起来，此时 inputmode 上无压制 ⇒ 必弹。
+		// 修法：持焦时跳过 composer.focus()（避免触摸序列中搬焦点吞掉触发器的 click，
+		// 也是模型按钮“点不开”的同因），但仍打 inputmode="none" + 开放行窗口 +
+		// 走同样的定时摘防。摘防后若仍持焦的极小重弹风险，远小于面板打开瞬间必弹。
+		//
+		// 仍要清掉粘性抑制：理由同下（T48 原始死结），clearFocusSticky 无副作用。
 		if (composerHoldsFocus()) {
 			clearFocusSticky(composer);
+			if (focusArmEl && focusArmEl !== composer) disarmComposerFocus();
+			watchComposerInputMode();
+			markUserFocusIntent(composer);
+			try {
+				composer.setAttribute('inputmode', 'none');
+			} catch (ignoredArmHeld) { /* 节点已卸载 */ }
+			focusArmed = true;
+			focusArmEl = composer;
+			focusArmUntil = Date.now() + FOCUS_ARM_MS;
+			if (focusArmTimer) clearTimeout(focusArmTimer);
+			focusArmTimer = setTimeout(function () {
+				focusArmTimer = 0;
+				disarmComposerFocus();
+			}, FOCUS_ARM_MS);
 			focusGuardStats.armSkippedHeldFocus += 1;
-			return false;
+			focusGuardStats.armed += 1;
+			return true;
 		}
 		// 兜底：官方换节点实例时旧属性会跟着旧节点走，这里确保布防落在当前节点上。
 		if (focusArmEl && focusArmEl !== composer) disarmComposerFocus();
@@ -1919,9 +1995,15 @@
 		// 真正承重的是另外两步：意图窗口（没有它面板开不开，T46 §1 R1）与 inputmode（没有它键盘弹，NEG-1）。
 		// **仍然保留这一步**：它是「官方抢焦点变成空操作」这件事不依赖 800ms 窗口时序的唯一兜底，
 		// 且实测零副作用（删掉它行为不变）。改动前请重跑 NEG-2，别凭直觉删。
-		try {
-			composer.focus();
-		} catch (ignoredFocus) { /* 节点已卸载 */ }
+		//
+		// T125：模型选择器跳过这一步（skipFocus）：模型菜单不需要 composer 持焦，
+		// 而触摸序列中搬焦点会吞掉模型按钮的 click（与 T69 发送同因、不输入也改不了）。
+		// 只压 inputmode + 开窗口，菜单打开不受影响，子面板搜索框仍由 focusin 守卫正常收回。
+		if (skipFocus !== true) {
+			try {
+				composer.focus();
+			} catch (ignoredFocus) { /* 节点已卸载 */ }
+		}
 		if (focusArmTimer) clearTimeout(focusArmTimer);
 		focusArmTimer = setTimeout(function () {
 			focusArmTimer = 0;
@@ -2128,14 +2210,14 @@
 				//
 				// T69：isPanelTriggerPoint() 第一件事就是排除「发送」⇒ 点发送永远走不到
 				// 这里，布防的抢焦点与 inputmode 搅动不会发生在发送路径上。
-				// armComposerFocus() 自身还有第二道：composer 已持焦时不布防。
+				// T125：模型走“只压 IME、不抢焦点”（见 isModelTriggerPoint），避免吞 click。
 				if (isPanelTriggerPoint(target)) {
 					// T76：同手势内布防**只做一次**。第二、三次（touchstart / mousedown）
 					// 直接跳过 —— 此时防要么还挂着（什么都不用做），要么被别的路摘了
 					//（新落指/超时那两条会先把 focusGestureOpen 清掉，自然落到新手势分支）。
 					if (!focusGestureArmed) {
 						focusGestureArmed = true;
-						armComposerFocus();
+						armComposerFocus(isModelTriggerPoint(target));
 					} else {
 						focusGuardStats.armRepeatSameGesture += 1;
 					}
@@ -3938,7 +4020,11 @@
 		// 不会出现「位移到了、圆角还停在上一帧」的跳动。
 		// 取整到 1/1000：避免把 0.30000000000000004 这类浮点串写进行内样式
 		// （行内属性逐字变化会让 CSS 变量消费者每帧重算，真机上无益）。
-		var cardP = Math.min(1, x / CARD_RADIUS_PX);
+		// T125（Kimi 化）：圆角走全行程渐变 cardP=x/max（此前为 min(1,x/20)，20px 即满）。
+		// 全程渐变更“果冻”、与 Kimi 同味；终态 p=1 时仍是完整 --dshr-card-r，交接零台阶。
+		var cardP = max > 0 ? x / max : 0;
+		if (cardP < 0) cardP = 0;
+		if (cardP > 1) cardP = 1;
 		document.documentElement.style.setProperty('--dshr-card-p', String(Math.round(cardP * 1000) / 1000));
 		return { x: x, p: p, max: max };
 	}
@@ -3991,7 +4077,9 @@
 			return;
 		}
 		var start = 0;
-		var duration = 220;
+		// T125（Kimi 化）：关闭补间与展开同为 0.34s，与主列 CSS 的
+		// cubic-bezier(0.32,0.72,0,1) 同节奏（此前 220ms 偏急）。
+		var duration = 340;
 		var step = function (ts) {
 			if (drawerVisual !== state) {
 				settleAnim = 0;
@@ -4708,7 +4796,26 @@
 		var vw = window.innerWidth || document.documentElement.clientWidth || 390;
 		var vh = window.innerHeight || document.documentElement.clientHeight || 844;
 		var bottomLimit = vh - pad.bottom;
-		var composer = document.querySelector('[data-composer-card]');
+		// T125：页面可能有多个 composer（主会话 + 新建任务 dialog）：取与浮层同 dialog
+		// 的那一个，找不到再取可见 composer 里 top 最大的（最靠近键盘的当前输入），
+		// 避免永远用 DOM 第一个导致新建任务页的菜单被错误地钳到主会话输入框上方。
+		var composer = null;
+		try {
+			var dialogHost = el.closest ? el.closest('[role="dialog"]') : null;
+			if (dialogHost) composer = dialogHost.querySelector('[data-composer-card]');
+			if (!composer) {
+				var cards = document.querySelectorAll('[data-composer-card]');
+				var bestTop = -1;
+				for (var ci = 0; ci < cards.length; ci++) {
+					if (!isVisible(cards[ci])) continue;
+					var cr = cards[ci].getBoundingClientRect();
+					if (cr.top > bestTop) { bestTop = cr.top; composer = cards[ci]; }
+				}
+				if (!composer && cards.length) composer = cards[0];
+			}
+		} catch (ignoredComposerPick) {
+			composer = document.querySelector('[data-composer-card]');
+		}
 		if (isElement(composer) && isVisible(composer)) {
 			var composerRect = composer.getBoundingClientRect();
 			if (composerRect.top > 96) bottomLimit = Math.min(bottomLimit, composerRect.top - 8);
@@ -5674,13 +5781,15 @@
 		mark(send, 'data-dshr-composer-send');
 		for (var j = 0; j < buttons.length; j++) {
 			var label = (buttons[j].getAttribute('aria-label') || '').trim();
-			if (label === '命令' || label === 'Commands') mark(buttons[j], 'data-dshr-composer-add');
+			if (label === '命令' || label === 'Commands' || label === '指令'
+				|| label === 'Add files or run commands' || label === '添加文件或运行命令'
+				|| label === '添加文件或调用指令' || label === '添加文件或运行指令') mark(buttons[j], 'data-dshr-composer-add');
 			if (label.indexOf('访问模式') === 0 || label.indexOf('Access mode') === 0) {
 				markAccessChrome(buttons[j]);
 			}
 		}
 		if (isElement(row)) {
-			var modelButtons = row.querySelectorAll('button[aria-haspopup="menu"]');
+			var modelButtons = row.querySelectorAll('button[aria-haspopup="menu"], button[aria-haspopup="dialog"], button[aria-haspopup="listbox"]');
 			for (var m = 0; m < modelButtons.length; m++) {
 				if (modelButtons[m].hasAttribute('data-dshr-composer-access')) continue;
 				if (modelButtons[m].hasAttribute('data-dshr-composer-add')) continue;

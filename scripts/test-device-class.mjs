@@ -1000,9 +1000,13 @@ try {
 		const heldBlock = jsBlockAfter(armCode, "if (composerHoldsFocus())", "armComposerFocus 的已持焦早退块");
 		const iHeld = armCode.indexOf("composerHoldsFocus()");
 		const iFocus = armCode.indexOf("composer.focus()");
-		record("A/T69", "T69-契约 composer 已持焦时 armComposerFocus 早退（不发布防）",
-			!!heldBlock && /return false;/.test(heldBlock) && iFocus > iHeld,
-			`提取长度=${arm.length} 早退块长度=${heldBlock.length} 块内含 return false=${/return false;/.test(heldBlock)} composerHoldsFocus=${iHeld} composer.focus=${iFocus}（focus 必须在早退之后；掩码后）`);
+		// T125（ supersedes T69 早退语义）：持焦时仍压 IME（打 inputmode + 开窗口 +
+		// 定时摘防），但跳过 composer.focus() 以免吞 click（模型点不开与 + 持焦弹键盘同因）。
+		// 因此持焦块内应含 setAttribute('inputmode','none') 且以 return true 收尾，
+		// 且块内不得直接调用 composer.focus()（focus 只在非持焦/非模型路径）。
+		record("A/T69", "T69-契约 composer 已持焦时 armComposerFocus 仍压制 IME（T125）",
+			!!heldBlock && /setAttribute\(\s*['"]inputmode['"]/.test(heldBlock) && /return true;/.test(heldBlock) && iFocus > iHeld,
+			`提取长度=${arm.length} 早退块长度=${heldBlock.length} 块内含 inputmode=${/setAttribute\(\s*['"]inputmode['"]/.test(heldBlock)} return true=${/return true;/.test(heldBlock)} composerHoldsFocus=${iHeld} composer.focus=${iFocus}（focus 必须在持焦块之后；掩码后）`);
 		record("A/T69", "T69-契约 早退时清粘性抑制（否则 T48 面板死结回来）",
 			!!heldBlock && /clearFocusSticky\(composer\)/.test(heldBlock),
 			`早退块内 clearFocusSticky=${/clearFocusSticky\(composer\)/.test(heldBlock)}`);

@@ -571,7 +571,9 @@ function run() {
           var menuTop = menuEl.isConnected ? menuEl.getBoundingClientRect().top : -1;
           var offset0 = moreMenuTop - moreBtnRect.bottom;
           var offset1 = menuTop - btnBottom;
-          add(checks, 'more-menu-still-after-raf', menuEl.isConnected && Math.abs(offset1 - offset0) < 2,
+          // T125（Kimi 化）：抽屉跟手 + 圆角全行程渐变时，卡片几何每帧都在变，
+          // 相对偏移允许 <6px（旧阈值 <2px 是按旧 min(1,x/20) 恒定圆角定的；旧 bug 是每帧下漂 ~36px）。
+          add(checks, 'more-menu-still-after-raf', menuEl.isConnected && Math.abs(offset1 - offset0) < 6,
             'off0=' + Math.round(offset0) + '→off1=' + Math.round(offset1)
               + ' connected=' + menuEl.isConnected + ' dragging=' + document.documentElement.getAttribute('data-dshr-dragging'));
         }, 150);
@@ -734,7 +736,9 @@ function run() {
     var dragHeight = dragMain.offsetHeight;
     var dragShadow = getComputedStyle(dragMain).boxShadow;
     bridge.setDrawerDrag(0.7);
-    add(checks, 'drag-keeps-layout-and-shadow', dragMain.offsetHeight === dragHeight && getComputedStyle(dragMain).boxShadow === dragShadow);
+    // T125（Kimi 化）：阴影/圆角跟手全行程渐变，0.5→0.7 时阴影必然变大（与旧 min(1,x/20) 恒定不同）。
+    // 布局契约只保 offsetHeight 不变（不重排）且阴影始终存在；不再要求两次阴影逐字相等。
+    add(checks, 'drag-keeps-layout-and-shadow', dragMain.offsetHeight === dragHeight && !!getComputedStyle(dragMain).boxShadow && getComputedStyle(dragMain).boxShadow !== 'none');
     bridge.clearDrawerDrag();
     add(checks, 'drag-cancel-restores-collapsed', frame.hasAttribute('data-sidebar-collapsed'));
     add(checks, 'drag-cleared', document.documentElement.getAttribute('data-dshr-dragging') !== '1');
@@ -781,7 +785,7 @@ function run() {
         'left=' + Math.round(midLeft));
       add(checks, 'close-anim-sidebar-still-wide', !frame.hasAttribute('data-sidebar-collapsed'),
         'collapsed=' + frame.hasAttribute('data-sidebar-collapsed'));
-      add(checks, 'close-anim-keeps-card-geometry', midRounded >= 12 && Math.round(midMain.getBoundingClientRect().height) > 0,
+      add(checks, 'close-anim-keeps-card-geometry', midRounded >= 8 && Math.round(midMain.getBoundingClientRect().height) > 0,
         'r=' + midRounded);
       window.setTimeout(function () {
         add(checks, 'close-anim-settles-collapsed', frame.hasAttribute('data-sidebar-collapsed'),

@@ -1,7 +1,7 @@
 {
   "name": "dsh-remote",
   "private": true,
-  "version": "0.2.0-rc.2.13",
+  "version": "0.2.0-rc.2.14",
   "dshVersion": "0.2.0-rc.2",
   "config": {
     "frpVersion": "0.61.1"
