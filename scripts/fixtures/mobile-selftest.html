@@ -733,6 +733,20 @@ function run() {
     // 拖动中官方侧栏必须已是 wide 内容（完整会话列表），不能还是图标 rail。
     add(checks, 'drag-shows-wide-sidebar', !frame.hasAttribute('data-sidebar-collapsed'),
       'collapsed=' + frame.hasAttribute('data-sidebar-collapsed'));
+    // T125-fix 回归：拖动时抽屉自己的 transform 必须生效（跟手滑入），不能被稳态
+    // `transform: none` 以特异度压住。frame 在拖动起手即展开（生产行为），此处断言
+    // 抽屉位移量为负（藏入左侧途中）；若稳态规则赢了，这里就是 none，直接变红。
+    var dragSide = document.querySelector('[data-dshr-sidebar-col]');
+    var dragSideTx = null;
+    if (dragSide) {
+      var dragSideTf = getComputedStyle(dragSide).transform;
+      if (dragSideTf && dragSideTf !== 'none') {
+        var dragSideM = dragSideTf.match(/matrix\(([^)]+)\)/);
+        if (dragSideM) dragSideTx = parseFloat(dragSideM[1].split(',')[4]) || 0;
+      }
+    }
+    add(checks, 'drag-drawer-follows', dragSideTx !== null && dragSideTx < -40,
+      'tx=' + (dragSideTx === null ? 'none' : Math.round(dragSideTx)));
     var dragHeight = dragMain.offsetHeight;
     var dragShadow = getComputedStyle(dragMain).boxShadow;
     bridge.setDrawerDrag(0.7);
@@ -744,6 +758,7 @@ function run() {
     add(checks, 'drag-cleared', document.documentElement.getAttribute('data-dshr-dragging') !== '1');
   } else {
     add(checks, 'drag-follow-halfway', false, 'missing setDrawerDrag');
+    add(checks, 'drag-drawer-follows', false, 'missing setDrawerDrag');
     add(checks, 'drag-attr', false);
     add(checks, 'drag-cleared', false);
   }

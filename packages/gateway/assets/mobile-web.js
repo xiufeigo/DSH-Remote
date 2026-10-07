@@ -598,7 +598,15 @@
 		'  background: var(--dsw-specific-sidebar-fill, var(--dsw-alias-bg-base, #f5f5f6)) !important;',
 		'  overflow: hidden !important;',
 		'}',
-		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] [data-dshr-sidebar-col],',
+		// T125-fix（特异度）：第一选择器必须带上 [data-dshr-frame] 上下文。
+		// 稳态展开规则 `html.dshr-mobile [data-dshr-frame]:not([data-sidebar-collapsed])
+		// [data-dshr-sidebar-col]` 是 (0,4,1) 且写了 `transform: none`；拖动起手即
+		// setSidebarOpen(true)（frame 展开），若拖动规则只是 (0,3,1)，稳态的 none
+		// 会赢，抽屉真机上永远静止（只有主卡动）——测试 fixture 里因 frame 保持收起、
+		// 第二选择器 (0,5,1) 命中才显得正常，这正是 .14 漏网的原因。
+		// 补上 frame 上下文后同为 (0,4,1)，本块源码顺序在后 ⇒ 拖动期跟手生效；
+		// dragging 属性一摘即回稳态，交接不变。
+		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] [data-dshr-frame] [data-dshr-sidebar-col],',
 		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] [data-dshr-frame][data-sidebar-collapsed] [data-dshr-sidebar-col] {',
 		'  display: block !important;',
 		'  position: absolute !important;',
