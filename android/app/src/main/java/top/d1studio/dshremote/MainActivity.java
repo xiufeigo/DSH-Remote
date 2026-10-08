@@ -302,24 +302,9 @@ public class MainActivity extends Activity {
 	private long lastBackAt = 0;
 	/** DSH 页面是否处于深色（body[data-ds-dark-theme]），用于状态栏图标和 WebView 底色。 */
 	private boolean pageDark = false;
-	/**
-	 * T94：系统栏让位后露出的那两条（状态栏带 / 底部手势条带）**实际用的颜色**。
-	 *
-	 * <p>背景（用户报的"白条"）：T80 把让位落成 WebView 的**外边距**之后，那两条画的是
-	 * 父容器 {@code rootLayout} 的底色，而它的取值一直是**硬编码**的
-	 * {@code dark ? 0xFF141414 : Color.WHITE}。手机档有 hook 经
-	 * {@code setPageDark} 把真实深浅推上来，所以碰巧对；**平板档 hook 严格 OFF**
-	 * （契约 3.5），没人推 ⇒ {@code pageDark} 永远停在 {@code isSystemDark()} 上。
-	 * 页面主题与系统主题不一致时（DSH 侧手选深色/浅色、系统却是另一套），
-	 * 那两条就与页面**反色**：实测页面 #1B1B1C 而两条 #FFFFFF（见 scratch/t94/report.md §1）。
-	 *
-	 * <p>所以这里存**页面自己画出来的颜色**（只读探针 {@link #PAGE_BG_PROBE_JS} 采样，
-	 * 见 {@link #requestPageBackground()}），{@link #PAGE_BG_NONE} 表示"还没取到"——
-	 * 取不到时**逐值退回**改动前的硬编码取值，绝不因为探针失败而改变行为。
-	 */
+	/** 页面上沿底色只用于加载期间的容器填充；系统栏始终透明，由页面绘制背景。 */
 	private static final int PAGE_BG_NONE = 0;
 	private int pageBgTop = PAGE_BG_NONE;
-	private int pageBgBottom = PAGE_BG_NONE;
 	/** T94：探针轮询是否在推进（onResume 起、onPause 停）。 */
 	private boolean pageBgPolling = false;
 	/** 直连重试不得误用当前选中的 FRP 配置组。 */
@@ -339,8 +324,6 @@ public class MainActivity extends Activity {
 	 */
 	private volatile String activeGatewayHost = "";
 	private volatile int activeGatewayPort = -1;
-	/** 会话页沉浸状态栏；注入失败时退回实色。 */
-	private boolean edgeToEdgeChrome = true;
 	/**
 	 * PERF-03：WebView JS 定时器是否已挂起（进程级全局，本标记只用于「不要叠加 pause」）。
 	 *
@@ -654,7 +637,7 @@ public class MainActivity extends Activity {
 		// 相反，API 30–34 上若哪天这条覆盖路径被绕开就会真的涂成不透明色。
 		getWindow().setNavigationBarColor(Color.TRANSPARENT);
 		if (Build.VERSION.SDK_INT >= 28) {
-			getWindow().setNavigationBarDividerColor(Color.WHITE);
+			getWindow().setNavigationBarDividerColor(Color.TRANSPARENT);
 			WindowManager.LayoutParams attrs = getWindow().getAttributes();
 			attrs.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
 			getWindow().setAttributes(attrs);
@@ -1706,7 +1689,6 @@ public class MainActivity extends Activity {
 		dismissPendingHttpAuth();
 		setUiState(nextState);
 		pageDark = isSystemDark();
-		edgeToEdgeChrome = true;
 		webView.setBackgroundColor(shellColor(R.color.shell_background));
 		applySystemBars();
 		if (homeScroll != null) homeScroll.setVisibility(View.GONE);
@@ -2109,6 +2091,7 @@ public class MainActivity extends Activity {
 
 	/** SW 脚本在网关侧的路径（与 pwa.ts 的 SW_PATH、server.ts 路由同名）。 */
 	private static final String SW_SCRIPT_PATH = "/__dsh_remote__/sw.js";
+	private static final String MOBILE_SCRIPT_PATH = "/__dsh_remote__/mobile.js";
 	/** res/raw/dsh_sw.js 的字节缓存（只读一次；SW 源码随 APK 发布，运行期不变）。 */
 	private static volatile byte[] swScriptBytes;
 
@@ -2179,6 +2162,9 @@ public class MainActivity extends Activity {
 						headers.put("X-Content-Type-Options", "nosniff");
 						return new WebResourceResponse("text/javascript", "utf-8", 200, "OK", headers,
 							new ByteArrayInputStream(body));
+					}
+					if (MOBILE_SCRIPT_PATH.equals(request.getUrl().getPath())) {
+						return interceptStaticAsset(request);
 					}
 					// T49：SW 的**子资源** fetch 同样不经 WebViewClient、同样拿不到
 					// proceed() 放行（实测全部 TypeError: Failed to fetch，见 PinnedFetch
@@ -2365,6 +2351,18 @@ public class MainActivity extends Activity {
 		if (!host.equalsIgnoreCase(reqHost) || port != reqPort) {
 			passthroughOrigin.incrementAndGet();
 			return null;
+		}
+		// 网关的旧脚本可能先于 evaluateJavascript 安装完整 hook，幂等守卫会阻止
+		// APK 内的新脚本生效。Android 两条加载路径必须使用同一份 R.raw.mobile。
+		if (MOBILE_SCRIPT_PATH.equals(path)) {
+			Map<String, String> headers = new HashMap<String, String>();
+			headers.put("Content-Type", "text/javascript; charset=utf-8");
+			headers.put("Cache-Control", "no-store");
+			headers.put("X-Content-Type-Options", "nosniff");
+			byte[] script = (deviceModeScript() + ";\n" + readMobileAdaptJs())
+				.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+			return new WebResourceResponse("text/javascript", "utf-8", 200, "OK", headers,
+				new ByteArrayInputStream(script));
 		}
 		// ④ 动态面与 SW 脚本：显式记账后放行（验收要看到 /api 计数为 0 拦截）。
 		if (path.startsWith("/api/") || path.startsWith("/__dsh_remote__/")) {
@@ -3630,8 +3628,8 @@ public class MainActivity extends Activity {
 	 * 而让位入口的并集口径写 36px，最终页面上剩下 24px（该 AVD 的 captionBar 是 72px 高，
 	 * statusBars 只有 48px，并集取 max ⇒ 36 CSS px）；若页面停在 24px，内容会压在
 	 * captionBar 那一层里。
-	 * 手机档口径**逐值不变**（statusBars / navigationBars / DisplayCutout），
-	 * 它的 --dshr-inset-* 行为已被真机取证，不动。
+	 * 手机仍消费 statusBars / navigationBars / DisplayCutout；横屏时导航栏可能
+	 * 位于左右边缘，四向都必须透传。
 	 */
 	private void applyInsetsToPage(WebView view) {
 		if (view == null) return;
@@ -3656,15 +3654,19 @@ public class MainActivity extends Activity {
 			if (Build.VERSION.SDK_INT >= 30) {
 				topPx = insets.getInsets(WindowInsets.Type.statusBars()).top;
 				bottomPx = insets.getInsets(WindowInsets.Type.navigationBars()).bottom;
+				leftPx = insets.getInsets(WindowInsets.Type.navigationBars()).left;
+				rightPx = insets.getInsets(WindowInsets.Type.navigationBars()).right;
 			} else {
 				topPx = insets.getSystemWindowInsetTop();
 				bottomPx = insets.getStableInsetBottom();
+				leftPx = insets.getStableInsetLeft();
+				rightPx = insets.getStableInsetRight();
 			}
 			if (Build.VERSION.SDK_INT >= 28) {
 				DisplayCutout cut = insets.getDisplayCutout();
 				if (cut != null) {
-					leftPx = cut.getSafeInsetLeft();
-					rightPx = cut.getSafeInsetRight();
+					leftPx = Math.max(leftPx, cut.getSafeInsetLeft());
+					rightPx = Math.max(rightPx, cut.getSafeInsetRight());
 				}
 			}
 			top = Math.round(topPx / density);
@@ -3688,7 +3690,7 @@ public class MainActivity extends Activity {
 			null);
 	}
 
-	private String readMobileAdaptJs() {
+	private synchronized String readMobileAdaptJs() {
 		if (mobileAdaptJs == null) mobileAdaptJs = readRawText(R.raw.mobile);
 		return mobileAdaptJs;
 	}
@@ -3715,10 +3717,13 @@ public class MainActivity extends Activity {
 	 */
 	private void applyDeviceModeToPage(WebView view) {
 		if (view == null) return;
-		view.evaluateJavascript(
-			"(function(){window.__DSHR_MOBILE__=Object.assign(window.__DSHR_MOBILE__||{},{device:'"
-				+ deviceMode() + "'});})()",
-			null);
+		view.evaluateJavascript(deviceModeScript(), null);
+	}
+
+	private String deviceModeScript() {
+		String mode = deviceMode();
+		return "(function(){window.__DSHR_MOBILE__=Object.assign(window.__DSHR_MOBILE__||{},{device:'" + mode
+			+ "'});var s=window.__dshrSetDevice;if(typeof s==='function')s('" + mode + "');})()";
 	}
 
 	/**
@@ -3727,12 +3732,7 @@ public class MainActivity extends Activity {
 	 * 折叠/展开与旋转都走这里——不重载 WebView、不碰隧道。
 	 */
 	private void syncDeviceModeToPage(WebView view) {
-		if (view == null) return;
-		String mode = deviceMode();
-		view.evaluateJavascript(
-			"(function(){window.__DSHR_MOBILE__=Object.assign(window.__DSHR_MOBILE__||{},{device:'" + mode
-				+ "'});var s=window.__dshrSetDevice;if(typeof s==='function')s('" + mode + "');})()",
-			null);
+		applyDeviceModeToPage(view);
 	}
 
 	/**
@@ -3942,8 +3942,8 @@ public class MainActivity extends Activity {
 
 	/**
 	 * 注入自检：页面加载数秒后确认移动适配**真的生效**了。
-	 * 若始终未生效则退回实色状态栏模式——内容整体位于状态栏下方，绝不与系统栏重叠；
-	 * 任何一轮生效就自动恢复透明状态栏沉浸模式。
+	 * 未生效时记录错误并有界补注；系统栏透明与内容的 CSS 安全区避让保持独立。
+	 * 手机横屏会主动关闭抽屉适配，不能用鲸鱼可见性决定原生系统栏布局。
 	 *
 	 * T27-B：除了首连窗口，**reload / 会话内导航 / 回前台**也会走到这里
 	 * （那三条路径此前全部绕过，自检永不重排，页面一重载就再也无人补注）。
@@ -3990,8 +3990,6 @@ public class MainActivity extends Activity {
 		view.evaluateJavascript(ADAPT_EFFECT_JS, value -> {
 			if (uiState != UiState.WEB || isTabletClass()) return;
 			boolean effective = isAdaptationEffective(value);
-			// 与原策略一致：未生效立即退回实色状态栏，后续任一轮生效就自动恢复沉浸。
-			applySystemBarMode(effective);
 			if (effective) return;
 			Log.w("dshr-perf", "自检第 " + round + "/" + ADAPT_PROBE_MAX_ROUNDS
 				+ " 轮：移动适配未生效 " + value);
@@ -4005,7 +4003,7 @@ public class MainActivity extends Activity {
 				view.postDelayed(() -> runAdaptationProbe(view, round + 1), 2000);
 			} else {
 				Log.w("dshr-perf", "自检连续 " + ADAPT_PROBE_MAX_ROUNDS
-					+ " 轮未生效，保持实色状态栏兜底：" + value);
+					+ " 轮未生效，移动适配需要排查：" + value);
 			}
 		});
 	}
@@ -4071,12 +4069,6 @@ public class MainActivity extends Activity {
 		}
 	}
 
-	/** edgeToEdge=true：透明状态栏沉浸；false：实色状态栏、内容排在状态栏下方。 */
-	private void applySystemBarMode(boolean edgeToEdge) {
-		edgeToEdgeChrome = edgeToEdge;
-		applySystemBars();
-	}
-
 	private void applyPageDark(boolean dark) {
 		pageDark = dark;
 		if (webView != null) webView.setBackgroundColor(uiState == UiState.WEB
@@ -4096,10 +4088,8 @@ public class MainActivity extends Activity {
 	 * 所以这里从 {@code elementFromPoint} 命中的元素**逐层向上合成**
 	 * {@code background-color}（含 alpha 混色），得到的就是该点**真实的可见底色**。
 	 *
-	 * <p>采样点：(2,2) 与 (2, h-3)，即内容盒的左上/左下角——正是两条带**正下方**那一列。
-	 * 两条带整宽只有一种颜色，而页面在平板上是「左栏 + 主列」两段底色，
-	 * 取左栏那一列是**刻意**的：用户的症状就是"左侧栏灰底、上下却白"。
-	 * 主列那侧的残差在实测里 ≤7/255（≈2.7%），肉眼不可辨；选择理由与残差数字见报告 §3.4。
+	 * <p>从页面左上沿采样，用于系统栏图标深浅与加载期间的容器底色；
+	 * 状态栏和导航栏背景由页面透过透明系统栏绘制，不再涂成采样色。
 	 *
 	 * <p>只读：本探针不 setAttribute / 不写 style / 不建节点，平板档零痕迹（契约 3.5）不受影响。
 	 * 返回**对象**而不是 JSON 字符串——evaluateJavascript 会把字符串结果再编码一层，
@@ -4118,8 +4108,8 @@ public class MainActivity extends Activity {
 		+ "return[Math.round(o[0]),Math.round(o[1]),Math.round(o[2])];};"
 		+ "var h=innerHeight|0;"
 		+ "var k=function(ys){for(var i=0;i<ys.length;i++){var v=e(2,ys[i]);if(v)return v;}return null;};"
-		+ "var t=k([2,h>>4,h>>2,h>>1]);var bo=k([Math.max(0,h-3),h-(h>>4),h>>1]);"
-		+ "return {t:t,b:bo,d:!!(document.body&&document.body.hasAttribute('data-ds-dark-theme'))};"
+		+ "var t=k([2,h>>4,h>>2,h>>1]);"
+		+ "return {t:t,d:!!(document.body&&document.body.hasAttribute('data-ds-dark-theme'))};"
 		+ "}catch(x){return {};}})()";
 
 	/**
@@ -4173,23 +4163,19 @@ public class MainActivity extends Activity {
 	private void handlePageBackgroundResult(String value) {
 		if (destroyed || value == null || value.isEmpty() || "null".equals(value)) return;
 		int top;
-		int bottom;
 		boolean dark;
 		try {
 			JSONObject o = new JSONObject(value);
 			top = packRgb(o.optJSONArray("t"));
 			if (top == PAGE_BG_NONE) return;
-			bottom = packRgb(o.optJSONArray("b"));
 			dark = o.optBoolean("d", pageDark);
 		} catch (Exception e) {
 			return;
 		}
-		if (bottom == PAGE_BG_NONE) bottom = top;
-		if (top == pageBgTop && bottom == pageBgBottom && dark == pageDark) return;
-		Log.i("dshr-immersive", "page-bg top=" + hexOf(top) + " bottom=" + hexOf(bottom)
+		if (top == pageBgTop && dark == pageDark) return;
+		Log.i("dshr-immersive", "page-bg top=" + hexOf(top)
 			+ " dark=" + dark + " tablet=" + isTabletClass() + " uiState=" + uiState);
 		pageBgTop = top;
-		pageBgBottom = bottom;
 		pageDark = dark;
 		applySystemBars();
 	}
@@ -4239,49 +4225,29 @@ public class MainActivity extends Activity {
 	/** T94：换了文档就作废上一页取到的颜色（一次导航的首帧不该沿用旧页底色）。 */
 	private void resetPageBackground() {
 		pageBgTop = PAGE_BG_NONE;
-		pageBgBottom = PAGE_BG_NONE;
 		nextBgSampleAt = 0L;   // T108：新文档 ⇒ 下一拍立刻重采（首帧底色必须对）
 	}
 
 	private void applySystemBars() {
 		boolean session = uiState == UiState.WEB;
 		boolean dark = session ? pageDark : isSystemDark();
-		// 平板档位恒为沉浸态：hook 关闭、页面不知道自己拿的是「缩过」的视口，
-		// 状态栏必须透明 + 让位，不能沿用手机档「注入失败退实色」的判定。
-		boolean tabletSession = session && isTabletClass();
-		boolean edge = !session || tabletSession || edgeToEdgeChrome;
-		// T94：三条都取**同一个**值 ⇒ 系统栏区域与页面连成一片。
-		//   ① rootLayout 是那两条真正的底（T80 把让位落成 WebView 外边距之后，露出的就是它）；
-		//   ② 窗口状态栏/导航栏色也钉成它（三者一致）——有些形态系统**忽略**着色
-		//      （API 35 + targetSdk 34 实测：手势导航下 navigationBarColor 本就不生效，
-		//      见 scratch/t94/report.md §1.3），那时就靠 ① 兜住，像素一样是对的。
-		// 探针没取到颜色时 sessionBarColor() 逐值退回改动前的硬编码取值。
+		// 手机和平板都由页面绘制系统栏背后的像素，原生只控制图标明暗。
+		// 采样色只铺在页面首帧前的容器底部，不能覆盖透明系统栏：抽屉移动时
+		// 顶部/底部同时有侧栏与聊天卡片两种颜色，单一采样色必然形成硬缝。
 		int strip = sessionBarColor(dark);
-		boolean sampled = session && pageBgTop != PAGE_BG_NONE;
 		if (rootLayout != null) rootLayout.setBackgroundColor(session
 			? strip : shellColor(R.color.shell_background));
 		if (!session) {
 			tintShell(homeScroll);
 			tintShell(setupScroll);
 		}
-		// T80：平板档下状态栏/导航栏露出的是「让位外边距」那圈**父容器底色**（rootLayout 已钉成
-		// 页面底色，见上），不再指望 WebView 自己的 padding 区；WebView 底色仍钉到页面底色，
-		// 用来盖住页面首帧前的空白。
-		if (tabletSession && webView != null) {
+		if (session && webView != null) {
 			webView.setBackgroundColor(strip);
 		}
-		// 只在适配已启用的会话中透明：各列 CSS inset 留空间，背景画到手势条下。
-		// T94：取到页面真实底色后，底部这条也用页面色（= 页面自己画在那里的颜色）；
-		// 取不到时逐值退回改动前的「沉浸则透明 / 否则实色」。
-		int nav = sampled ? pageBgBottom : (edge ? Color.TRANSPARENT : (dark ? 0xFF141414 : Color.WHITE));
-		// T115：平板会话档让位已改由页面自己承担（WebView 覆盖全窗）⇒ 状态栏/导航栏交还给
-		// 页面自己的像素，原生两条栏**真的透明**（用户口径「系统栏改走安卓原生透明」）。
-		// 这里是显式覆盖而不是改写上面那两条取值式：T94 的「三条一致」契约在手机档与
-		// 本地壳页仍然逐字保留（那边页面本来就不覆盖系统栏区，靠取色对齐）。
-		if (tabletSession) nav = Color.TRANSPARENT;
 		WindowManager.LayoutParams attrs = getWindow().getAttributes();
 		View decor = getWindow().getDecorView();
-		int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
+		int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+			| View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
 		getWindow().addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
 		getWindow().clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS);
 		if (Build.VERSION.SDK_INT >= 30) getWindow().setDecorFitsSystemWindows(false);
@@ -4289,29 +4255,17 @@ public class MainActivity extends Activity {
 			getWindow().setStatusBarContrastEnforced(false);
 			getWindow().setNavigationBarContrastEnforced(false);
 		}
-		if (edge) {
-			getWindow().setStatusBarColor(sampled ? strip : Color.TRANSPARENT);
-			flags |= View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
-			if (Build.VERSION.SDK_INT >= 28) {
-				attrs.layoutInDisplayCutoutMode =
-					WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
-			}
-		} else {
-			getWindow().setStatusBarColor(sampled ? strip : (dark ? 0xFF141414 : Color.WHITE));
-			if (Build.VERSION.SDK_INT >= 28) {
-				attrs.layoutInDisplayCutoutMode =
-					WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT;
-			}
+		getWindow().setStatusBarColor(Color.TRANSPARENT);
+		if (Build.VERSION.SDK_INT >= 28) {
+			attrs.layoutInDisplayCutoutMode =
+				WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
 		}
 		if (!dark) {
 			flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
 			if (Build.VERSION.SDK_INT >= 26) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
 		}
-		getWindow().setNavigationBarColor(nav);
-		if (Build.VERSION.SDK_INT >= 28) getWindow().setNavigationBarDividerColor(nav);
-		// T115：平板会话档两条栏一律透明（页面自己画到栏后，原生不得再盖一层不透明色）。
-		// 放在 if/else 之后覆盖两条分支，避免改写 T94 断言钉住的那两条取值式。
-		if (tabletSession) getWindow().setStatusBarColor(Color.TRANSPARENT);
+		getWindow().setNavigationBarColor(Color.TRANSPARENT);
+		if (Build.VERSION.SDK_INT >= 28) getWindow().setNavigationBarDividerColor(Color.TRANSPARENT);
 		getWindow().setAttributes(attrs);
 		decor.setSystemUiVisibility(flags);
 		if (Build.VERSION.SDK_INT >= 30) {

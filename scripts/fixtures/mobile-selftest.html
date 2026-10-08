@@ -43,10 +43,12 @@ header { padding: 8px 12px 0 20px; }
 .seat { margin-top: auto; padding-bottom: 8px; }
 .card { margin: 0 16px; border: 1px solid #d9dbe0; background: #fff; border-radius: 22px; display: flex; flex-direction: column; gap: 12px; padding-top: 10px; }
 .ta { min-height: 48px; padding: 8px 16px; border: 0; font: inherit; resize: none; }
-.row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; padding: 2px 8px 6px; }
+.row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; padding: 2px 8px 6px; container-type: inline-size; }
 .tools, .modes, .trailing { display: flex; align-items: center; }
-.tools { gap: 16px; }
-.trailing { gap: 12px; margin-left: auto; }
+.tools { gap: 12px; min-width: 0; }
+.trailing { gap: 12px; margin-left: auto; flex: none; min-width: 0; }
+@container (width<=560px) { .tools, .modes, .trailing { gap: 8px; } }
+@container (width<=460px) { #access-label { display: none; } }
 .add, .send { border: 0; border-radius: 999px; }
 .add { width: 28px; height: 28px; background: #ececee; }
 .send { width: 34px; height: 34px; background: #1b66ff; color: #fff; }
@@ -70,7 +72,10 @@ header { padding: 8px 12px 0 20px; }
 .attach-item { flex: none; height: 64px; }
 .attach-file { display: flex; align-items: center; gap: 8px; width: 200px; height: 64px; box-sizing: border-box; border: .5px solid #d9dbe0; border-radius: 12px; background: #f6f6f7; padding: 0 10px; font-size: 12px; }
 .access { height: 28px; border: 0; background: none; display: inline-flex; align-items: center; gap: 4px; padding: 0 4px 0 8px; }
-.model { max-width: none; min-width: max-content; height: 28px; border: 0; background: #ececee; display: flex; align-items: center; gap: 4px; }
+.model { max-width: min(360px, 45cqw); min-width: 0; height: 28px; border: 0; background: #ececee; display: flex; align-items: center; gap: 4px; }
+.model span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model span:nth-child(2) { flex-shrink: 1000; }
+.model svg { flex: none; }
 .stats { text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 4px 32px 0; font-size: 12px; color: #8b8b93; }
 /* 官方会话头部动作区（flex:none，窄屏会横向挤出头部——回归用） */
 .header-actions { display: flex; align-items: center; gap: 8px; flex: none; }
@@ -518,12 +523,11 @@ function run() {
   add(checks, 'reply2-visible', rect('reply-2').height > 24, 'h=' + Math.round(rect('reply-2').height));
   add(checks, 'user-msg-visible', rect('user-msg').height > 24, 'h=' + Math.round(rect('user-msg').height));
   add(checks, 'user-msg-full', (document.getElementById('user-msg').innerText || '').indexOf('你是什么模型') === 0);
-  add(checks, 'composer-row-marked', row.hasAttribute('data-dshr-composer-row'));
-  add(checks, 'row-has-no-textarea', !row.querySelector('textarea'));
-  add(checks, 'card-not-row', !card.hasAttribute('data-dshr-composer-row'));
-  add(checks, 'model-marked', model.hasAttribute('data-dshr-composer-model'));
-  add(checks, 'tools-marked', !!row.querySelector('[data-dshr-composer-tools]'));
-  add(checks, 'trailing-marked', !!row.querySelector('[data-dshr-composer-trailing]'));
+  add(checks, 'composer-official-dom', !card.querySelector('[data-dshr-composer-model], [data-dshr-composer-row]'));
+  add(checks, 'composer-official-wrap', getComputedStyle(row).flexWrap === 'wrap');
+  add(checks, 'composer-official-gap', getComputedStyle(row).gap === '12px');
+  add(checks, 'composer-official-send', rect('send-btn').width === 34 && rect('send-btn').height === 34);
+  add(checks, 'composer-official-model', rect('model-btn').height === 28 && getComputedStyle(model.children[1]).display !== 'none');
   var addBtn = document.getElementById('add-btn');
   var accessBtn = document.getElementById('access-btn');
   var addR = addBtn.getBoundingClientRect();
@@ -531,7 +535,7 @@ function run() {
   var modelR = model.getBoundingClientRect();
   add(checks, 'model-not-cover-add', !overlaps(addR, modelR), 'add.r=' + Math.round(addR.right) + ' model.l=' + Math.round(modelR.left));
   add(checks, 'model-not-cover-access', !overlaps(accessR, modelR), 'access.r=' + Math.round(accessR.right) + ' model.l=' + Math.round(modelR.left));
-  add(checks, 'add-visible', addR.width >= 20 && addR.height >= 20, 'w=' + Math.round(addR.width));
+  add(checks, 'add-visible', addR.width === 28 && addR.height === 28, 'w=' + Math.round(addR.width));
   add(checks, 'model-width', modelR.width >= 64, 'w=' + Math.round(modelR.width));
   var shown = (label && label.innerText || '').trim();
   add(checks, 'model-long-name', shown.indexOf('DeepSeek') === 0, 'text=' + shown);
@@ -540,8 +544,8 @@ function run() {
   add(checks, 'access-label-hidden', accessHidden);
   var chevron = document.getElementById('access-chevron');
   var chevronHidden = chevron && getComputedStyle(chevron).display === 'none';
-  add(checks, 'access-chevron-hidden', chevronHidden);
-  add(checks, 'access-compact', accessR.width <= 28 && accessR.width >= 20, 'w=' + Math.round(accessR.width));
+  add(checks, 'access-official-chevron', !chevronHidden);
+  add(checks, 'access-official-height', accessR.height === 28, 'h=' + accessR.height);
   var accessSvgs = accessBtn ? accessBtn.querySelectorAll('svg') : [];
   var visibleAccessSvg = 0;
   for (var si = 0; si < accessSvgs.length; si++) {
@@ -549,7 +553,7 @@ function run() {
     var wrapSt = accessSvgs[si].parentElement ? getComputedStyle(accessSvgs[si].parentElement) : st;
     if (st.display !== 'none' && wrapSt.display !== 'none') visibleAccessSvg++;
   }
-  add(checks, 'access-shield-only', visibleAccessSvg === 1, 'visibleSvg=' + visibleAccessSvg);
+  add(checks, 'access-official-icons', visibleAccessSvg === 2, 'visibleSvg=' + visibleAccessSvg);
   add(checks, 'stats-marked', stats.hasAttribute('data-dshr-stats-line') || (stats.parentElement && stats.parentElement.hasAttribute('data-dshr-stats-line')));
   var statsStyle = getComputedStyle(stats);
   add(checks, 'stats-nowrap', statsStyle.whiteSpace === 'nowrap' || (stats.parentElement && getComputedStyle(stats.parentElement).whiteSpace === 'nowrap'), 'ws=' + statsStyle.whiteSpace);
@@ -565,7 +569,7 @@ function run() {
   // 1) 上下文环：官方面板（role=dialog）是 trailing 集群的后代，集群一旦
   //    overflow:hidden 就整块被裁掉——点了环"没反应"。
   var refs = window.__dshrTestRefs || {};
-  var trailingEl = document.querySelector('[data-dshr-composer-trailing]');
+  var trailingEl = row.querySelector('.trailing');
   add(checks, 'trailing-not-clipping',
     !!trailingEl && getComputedStyle(trailingEl).overflowX !== 'hidden' && getComputedStyle(trailingEl).overflowY !== 'hidden',
     trailingEl ? 'overflow=' + getComputedStyle(trailingEl).overflow : 'trailing missing');
@@ -979,7 +983,7 @@ function run() {
             var noticeApi = window.__dshRemoteAndroidMobile;
             var idleNotice = noticeApi && noticeApi.readSessionNotice ? noticeApi.readSessionNotice() : null;
             add(checks, 'notice-idle', idleNotice && idleNotice.running === false, idleNotice ? JSON.stringify(idleNotice) : 'missing');
-            var sendBtn = document.querySelector('[data-dshr-composer-send], .send');
+            var sendBtn = document.querySelector('.send');
             if (sendBtn) sendBtn.setAttribute('aria-label', '停止生成');
             if (noticeApi && noticeApi.syncNow) noticeApi.syncNow();
             var runNotice = noticeApi && noticeApi.readSessionNotice ? noticeApi.readSessionNotice() : null;

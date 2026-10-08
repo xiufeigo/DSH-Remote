@@ -10,6 +10,7 @@ import { extname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import net from "node:net";
+import { javaMethod } from "./lib/source-extract.mjs";
 
 const ROOT = resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
 const FIXTURE = "/scripts/fixtures/mobile-selftest.html";
@@ -78,7 +79,7 @@ function stripJavaComments(src) {
 }
 
 function assertSourceContracts() {
-	const src = readFileSync(join(ROOT, "android/app/src/main/res/raw/mobile.js"), "utf8");
+	const src = readFileSync(join(ROOT, "android/app/src/main/res/raw/mobile.js"), "utf8").replace(/\r\n/g, "\n");
 	const block = src.match(/\[data-dshr-msg-actions\] \{\s*([^}]+)\}/);
 	if (!block) throw new Error("源码契约：找不到 [data-dshr-msg-actions] 容器样式");
 	if (/height\s*:/.test(block[1])) {
@@ -93,27 +94,8 @@ function assertSourceContracts() {
 	if (src.includes("max-width: 42%")) {
 		throw new Error("源码契约：不得用 max-width:42% 误伤模型选择器");
 	}
-	if (!src.includes("[data-dshr-composer-model]")) {
-		throw new Error("源码契约：缺少 [data-dshr-composer-model]");
-	}
-	if (!src.includes("[data-dshr-composer-trailing]")) {
-		throw new Error("源码契约：缺少 [data-dshr-composer-trailing]，超长模型名会盖住 +");
-	}
-	if (!src.includes("[data-dshr-composer-tools]")) {
-		throw new Error("源码契约：缺少 [data-dshr-composer-tools]");
-	}
-	const modelRule = src.match(/\[data-dshr-composer-model\] \{[\s\S]*?'\}/);
-	if (!modelRule) {
-		throw new Error("源码契约：找不到 [data-dshr-composer-model] 规则块");
-	}
-	if (!/min-width:\s*0/.test(modelRule[0])) {
-		throw new Error("源码契约：模型按钮必须 min-width:0 才能省略超长名");
-	}
-	if (/max-width:\s*none/.test(modelRule[0])) {
-		throw new Error("源码契约：模型按钮不得 max-width:none（会盖住左侧按钮）");
-	}
-	if (!src.includes("[data-dshr-composer-access-chevron]")) {
-		throw new Error("源码契约：缺少权限按钮箭头隐藏 [data-dshr-composer-access-chevron]");
+	if (/data-dshr-composer-/.test(src)) {
+		throw new Error("源码契约：输入区必须使用官方组件，不得重新添加手机专属样式或标记");
 	}
 	if (!src.includes("[data-dshr-main-col]")) {
 		throw new Error("源码契约：缺少 [data-dshr-main-col]（DeepSeek 式浮层会话栏）");
@@ -192,6 +174,19 @@ function assertSourceContracts() {
 		// ⚠ 判据必须在**去掉注释后**的代码上做：这段说明文字本身就含 `url.contains(...)`
 		// 这个字面量，直接在原文上匹配 ⇒ 契约会被自己的注释触发（我第一版就踩了，当场红）。
 		const mainCode = stripJavaComments(main);
+		const asset = javaMethod(mainCode, "private WebResourceResponse interceptStaticAsset(");
+		const mobileAt = asset.indexOf("if (MOBILE_SCRIPT_PATH.equals(path)) {");
+		for (const boundary of ['!"GET".equalsIgnoreCase(request.getMethod())', 'request.isForMainFrame()', '!"https".equals(uri.getScheme())', '!host.equalsIgnoreCase(reqHost) || port != reqPort']) {
+			const at = asset.indexOf(boundary);
+			if (at < 0 || mobileAt < at) throw new Error(`Android 本地移动脚本必须先核验请求边界：${boundary}`);
+		}
+		const swClient = javaMethod(mainCode, "private void installServiceWorkerClient()");
+		if (!/MOBILE_SCRIPT_PATH\.equals\(request\.getUrl\(\)\.getPath\(\)\)[\s\S]*?return interceptStaticAsset\(request\);/.test(swClient)) {
+			throw new Error("Android 普通加载与 Service Worker 必须共用本地移动脚本入口");
+		}
+		if (!asset.includes('deviceModeScript() + ";\\n" + readMobileAdaptJs()') || !asset.includes('headers.put("Cache-Control", "no-store")')) {
+			throw new Error("Android 移动脚本必须先写原生档位、再执行 APK 内脚本，并禁止缓存");
+		}
 		if (/url\s*\.\s*contains\(\s*SW_SCRIPT_PATH\s*\)/.test(mainCode)) {
 			throw new Error("源码契约（R7）：不得用 url.contains(SW_SCRIPT_PATH) 判 SW 脚本——必须走 isSwScriptRequest() 的路径精确匹配");
 		}
@@ -1004,21 +999,6 @@ function assertSourceContracts() {
 	if (!src.includes("function clampFloatingMenus")) {
 		throw new Error("源码契约：缺少浮动选框 clampFloatingMenus");
 	}
-	// ── 浮层缺陷回归（上下文环浮层被裁 / 更多菜单被搬到屏幕底部）──
-	{
-		const block = src.match(/\[data-dshr-composer-trailing\] \{[\s\S]{0,500}?'\}/);
-		if (!block) {
-			throw new Error("源码契约：找不到 [data-dshr-composer-trailing] 规则块");
-		}
-		// 注释里会出现 "overflow:hidden" 这类字样，先剔掉注释行再看真实声明
-		const rule = block[0].split("\n").filter((line) => !line.includes("//")).join("\n");
-		if (/overflow:\s*hidden/.test(rule)) {
-			throw new Error("源码契约：trailing 集群不得 overflow:hidden——上下文环浮层是它的后代，被裁掉就是「点环没反应」");
-		}
-		if (!/overflow:\s*visible/.test(rule)) {
-			throw new Error("源码契约：trailing 必须显式 overflow:visible（防后续改动又把它裁掉）");
-		}
-	}
 	if (!src.includes("function fixedContainingBlock")) {
 		throw new Error("源码契约：缺少 fixedContainingBlock——position:fixed 浮层在带 transform 的会话列里必须换算到包含块坐标系");
 	}
@@ -1533,6 +1513,212 @@ function cdpCall(ws, id, method, params = {}) {
 	});
 }
 
+// 用 Chromium 的 LayoutCount 检查热路径，offsetHeight 相同并不能证明没有重排。
+async function assertDrawerPerformance(call, url) {
+	await call("Page.navigate", { url: `${url}?manual=1` });
+	await wait(2200);
+	await call("Performance.enable");
+	const evaluate = async (expression) => {
+		const result = await call("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
+		if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
+		return result.result.value;
+	};
+	await evaluate("window.__dshRemoteInsets.set(36,24); window.__dshRemoteAndroidMobile.setDrawerDrag(0)");
+	await wait(150); // 起手的官方 wide 内容提交不属于逐帧位移热路径。
+	const before = await call("Performance.getMetrics");
+	const geometry = await evaluate(`new Promise(resolve => {
+		const main = document.querySelector('[data-dshr-main-col]');
+		const header = main.querySelector('header');
+		const whale = document.getElementById('dshr-mobile-whale');
+		const frames = [];
+		let i = 0;
+		function tick() {
+			const p = i <= 30 ? i / 30 : (60 - i) / 30;
+			window.__dshRemoteAndroidMobile.setDrawerDrag(p);
+			const r = main.getBoundingClientRect();
+			frames.push({ top: r.top, bottom: r.bottom, height: r.height,
+				headerTop: header.getBoundingClientRect().top,
+				whaleDrift: whale.getBoundingClientRect().left - r.left - 10 });
+			if (++i <= 60) requestAnimationFrame(tick);
+			else resolve(frames);
+		}
+		requestAnimationFrame(tick);
+	})`);
+	const after = await call("Performance.getMetrics");
+	const metric = (result, name) => result.metrics.find((m) => m.name === name).value;
+	const layouts = metric(after, "LayoutCount") - metric(before, "LayoutCount");
+	const layoutMs = (metric(after, "LayoutDuration") - metric(before, "LayoutDuration")) * 1000;
+	const stable = geometry.every((f) => Math.abs(f.height - geometry[0].height) < 0.5
+		&& Math.abs(f.headerTop - geometry[0].headerTop) < 0.5);
+	const covered = geometry.every((f) => Math.abs(f.top) < 0.5 && Math.abs(f.bottom - 844) < 0.5);
+	const aligned = geometry.every((f) => Math.abs(f.whaleDrift) < 1);
+	console.log(`  drawer performance: frames=${geometry.length} layouts=${layouts} layoutMs=${layoutMs.toFixed(2)} stable=${stable} covered=${covered} aligned=${aligned}`);
+	await evaluate("window.__dshRemoteAndroidMobile.clearDrawerDrag()");
+	if (layouts !== 0 || !stable || !covered || !aligned) {
+		throw new Error("左抽屉逐帧拖动必须零重排、固定内容几何、覆盖系统栏背景且鲸鱼同步");
+	}
+	// 模拟 React 延迟提交关闭状态，逐帧检查交接窗里卡片不会弹回展开位。
+	const close = await evaluate(`new Promise(resolve => {
+		const bridge = window.__dshRemoteAndroidMobile;
+		bridge.setDrawerDrag(1);
+		const frame = document.querySelector('[data-dshr-frame]');
+		const main = document.querySelector('[data-dshr-main-col]');
+		const button = document.getElementById('sidebar-toggle');
+		const root = document.documentElement;
+		const frames = [];
+		button.addEventListener('click', function delayCommit(event) {
+			event.stopImmediatePropagation();
+			button.removeEventListener('click', delayCommit, true);
+			setTimeout(() => frame.setAttribute('data-sidebar-collapsed', ''), 180);
+		}, true);
+		const start = performance.now();
+		bridge.settleDrawer(false);
+		function tick(ts) {
+			frames.push({ t: ts - start, left: main.getBoundingClientRect().left,
+				collapsed: frame.hasAttribute('data-sidebar-collapsed') });
+			if (ts - start < 850) requestAnimationFrame(tick);
+			else resolve({ frames, cleared: !root.hasAttribute('data-dshr-dragging')
+				&& !root.style.getPropertyValue('--dshr-drawer-x')
+				&& !root.style.getPropertyValue('--dshr-card-p') });
+		}
+		requestAnimationFrame(tick);
+	})`);
+	const handoff = close.frames.filter((f) => f.t > 380 && !f.collapsed);
+	if (!handoff.length || handoff.some((f) => f.left > 1) || !close.cleared) {
+		throw new Error(`左抽屉异步关闭交接闪回或未清理：${JSON.stringify(close)}`);
+	}
+	console.log(`  ok  左抽屉延迟提交交接：${handoff.length} 帧保持关闭位置，跟手样式已清理`);
+	const slowCommits = await evaluate(`(async () => {
+		const bridge = window.__dshRemoteAndroidMobile;
+		const frame = document.querySelector('[data-dshr-frame]');
+		const button = document.getElementById('sidebar-toggle');
+		// 官方 frame 用 inline minmax 列定位，严格 OFF 会移除 hook 自己的标记。
+		frame.style.gridTemplateColumns = '0px minmax(0, 1fr) 0px';
+		const cases = [
+			{ name: '重复关闭', initial: true, actions: ['closeSidebarIfExpanded', 'closeSidebarIfExpanded'], open: false, clicks: 1 },
+			{ name: '关闭途中重新打开', initial: true, actions: ['closeSidebarIfExpanded', 'openSidebarIfCollapsed'], open: true, clicks: 2 },
+			{ name: '打开途中返回关闭', initial: false, actions: ['openSidebarIfCollapsed', 'closeSidebarIfExpanded'], open: false, clicks: 2 },
+			{ name: '切到平板后提交再回手机关闭', initial: false, actions: ['openSidebarIfCollapsed'], switchMode: true, open: false, clicks: 2 },
+		];
+		const results = [];
+		for (const c of cases) {
+			bridge[c.initial ? 'openSidebarIfCollapsed' : 'closeSidebarIfExpanded']();
+			await new Promise(resolve => setTimeout(resolve, 100));
+			let clicks = 0;
+			function delayCommit(event) {
+				event.stopImmediatePropagation();
+				clicks++;
+				setTimeout(() => frame.toggleAttribute('data-sidebar-collapsed'), 360);
+			}
+			button.addEventListener('click', delayCommit, true);
+			for (const action of c.actions) bridge[action]();
+			if (c.switchMode) {
+				window.__dshrSetDevice('tablet');
+				await new Promise(resolve => setTimeout(resolve, 500));
+				window.__dshrSetDevice('phone');
+				bridge.closeSidebarIfExpanded();
+			}
+			await new Promise(resolve => setTimeout(resolve, 950));
+			button.removeEventListener('click', delayCommit, true);
+			results.push({ ...c, actualClicks: clicks, actualOpen: !frame.hasAttribute('data-sidebar-collapsed') });
+		}
+		return results;
+	})()`);
+	if (slowCommits.some(c => c.actualClicks !== c.clicks || c.actualOpen !== c.open)) {
+		throw new Error(`左栏慢提交意图未按最终目标收敛：${JSON.stringify(slowCommits)}`);
+	}
+	console.log("  ok  左栏 360ms 慢提交：重复关闭只点击一次，反向意图按序兑现");
+	await evaluate(`(() => {
+		const panel = document.querySelector('[data-sidebar-right-panel]');
+		panel.querySelector('[data-sidebar-right-toggle]').onclick = () => setTimeout(() => {
+			const open = panel.toggleAttribute('data-sidebar-right-open');
+			document.querySelector('[data-dshr-frame]').toggleAttribute('data-rightbar-fullscreen', open);
+		}, 60);
+		const scroller = document.createElement('div');
+		scroller.id = 'drawer-long-conversation';
+		scroller.setAttribute('data-conversation-scroll', '');
+		scroller.style.cssText = 'position:absolute;left:0;right:8px;top:160px;height:300px;overflow-y:auto';
+		const messages = document.createElement('div');
+		messages.style.cssText = 'height:2500px';
+		const wideMessage = document.createElement('div');
+		wideMessage.style.cssText = 'width:650px;height:20px;margin-top:2200px';
+		wideMessage.textContent = 'long conversation overflow';
+		messages.appendChild(wideMessage);
+		scroller.appendChild(messages);
+		const code = document.createElement('pre');
+		code.id = 'drawer-horizontal-code';
+		code.style.cssText = 'position:absolute;top:30px;left:110px;width:180px;height:55px;overflow:auto';
+		code.textContent = 'horizontal code '.repeat(80);
+		scroller.appendChild(code);
+		document.querySelector('[data-dshr-main-col]').appendChild(scroller);
+	})()`);
+	const longConversation = await evaluate(`(() => {
+		const s = document.getElementById('drawer-long-conversation');
+		return { width: s.clientWidth, scrollWidth: s.scrollWidth, height: s.clientHeight, scrollHeight: s.scrollHeight };
+	})()`);
+	if (longConversation.scrollWidth <= longConversation.width || longConversation.scrollHeight <= longConversation.height) {
+		throw new Error(`长会话回归必须同时覆盖横向溢出与纵向滚动：${JSON.stringify(longConversation)}`);
+	}
+	const touch = (type, x, y = 360) => call("Input.dispatchTouchEvent", {
+		type, touchPoints: type === "touchEnd" ? [] : [{ x, y }],
+	});
+	const swipe = async (from, to) => {
+		await touch("touchStart", from);
+		for (let i = 1; i <= 12; i++) {
+			await touch("touchMove", from + (to - from) * i / 12);
+			await wait(20);
+		}
+		await touch("touchEnd");
+		await wait(550);
+	};
+	await swipe(80, 320);
+	if (!await evaluate("!document.querySelector('[data-dshr-frame]').hasAttribute('data-sidebar-collapsed') && !document.documentElement.hasAttribute('data-dshr-dragging')")) {
+		throw new Error("真实触摸右滑未完成左抽屉展开或跟手样式未清理");
+	}
+	await swipe(365, 60);
+	if (!await evaluate("document.querySelector('[data-dshr-frame]').hasAttribute('data-sidebar-collapsed') && !document.documentElement.hasAttribute('data-dshr-dragging')")) {
+		throw new Error("真实触摸左滑未完成左抽屉关闭或跟手样式未清理");
+	}
+	await swipe(340, 100);
+	if (!await evaluate("!!document.querySelector('[data-sidebar-right-open]')")) {
+		throw new Error("长会话右侧 1/4 区域左滑未打开右栏");
+	}
+	await swipe(70, 370);
+	if (!await evaluate("!document.querySelector('[data-sidebar-right-open]')")) {
+		throw new Error("真实触摸右滑未关闭右栏");
+	}
+	await touch("touchStart", 240, 235);
+	for (let i = 1; i <= 12; i++) {
+		await touch("touchMove", 240 - i * 10, 235);
+		await wait(20);
+	}
+	await touch("touchEnd");
+	await wait(400);
+	const codeScroll = await evaluate("({ left: document.getElementById('drawer-horizontal-code').scrollLeft, right: !!document.querySelector('[data-sidebar-right-open]'), leftOpen: !document.querySelector('[data-dshr-frame]').hasAttribute('data-sidebar-collapsed') })");
+	if (codeScroll.left <= 0 || codeScroll.right || codeScroll.leftOpen) {
+		throw new Error(`代码块横滚被抽屉抢占：${JSON.stringify(codeScroll)}`);
+	}
+	console.log("  ok  长会话横向溢出仍可从左右 1/4 区域开栏，代码块真实横滚保留");
+	// 手指仍按住时旋转，旧手势不得在横屏重新安装跟手样式。
+	await evaluate("window.__dshrSetDevice('phone')");
+	await touch("touchStart", 80);
+	await touch("touchMove", 180);
+	await wait(80);
+	if (!await evaluate("document.documentElement.hasAttribute('data-dshr-dragging')")) {
+		throw new Error("旋转回归未进入实际拖动状态");
+	}
+	await call("Emulation.setDeviceMetricsOverride", { width: 844, height: 390, deviceScaleFactor: 2, mobile: true });
+	await wait(100);
+	await touch("touchMove", 220);
+	await touch("touchEnd");
+	await wait(450);
+	if (!await evaluate("!document.documentElement.classList.contains('dshr-mobile') && !document.documentElement.hasAttribute('data-dshr-dragging') && !document.documentElement.style.getPropertyValue('--dshr-drawer-x') && !document.documentElement.style.getPropertyValue('--dshr-card-p')")) {
+		throw new Error("旋转到手机横屏后遗留拖动状态");
+	}
+	await call("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
+	console.log("  ok  CDP 真实触摸开合与拖动中旋转清理");
+}
+
 assertSourceContracts();
 
 const server = createServer((req, res) => {
@@ -1614,6 +1800,7 @@ try {
 
 	const shot = await call("Page.captureScreenshot", { format: "png" });
 	writeFileSync(SCREENSHOT, Buffer.from(shot.data, "base64"));
+	await assertDrawerPerformance(call, pageUrl);
 
 	await call("Emulation.setUserAgentOverride", {
 		userAgent:
@@ -1678,8 +1865,8 @@ try {
 					var h = mk('div', { 'data-composer-card': 'true', id: 't64-trg-card' });
 					var c = mk('div', { 'data-composer-input': 'true', id: 't64-trg-wrap' }, h);
 					c.textContent = 't64trg';
-					var r = mk('div', { 'data-dshr-composer-row': 'true' }, h);
-					var b = mk('button', { 'data-dshr-composer-model': 'true' }, r);
+					var r = mk('div', {}, h);
+					var b = mk('button', { 'aria-label': '添加文件或调用指令' }, r);
 					b.textContent = 'M';
 					return b;
 				}
@@ -1693,8 +1880,8 @@ try {
 				var host = mk('div', { 'data-composer-card': 'true', id: 't51-card' });
 				var composer = mk('div', { 'data-composer-input': 'true', 'contenteditable': 'true' }, host);
 				composer.textContent = 'dshr';
-				var row = mk('div', { 'data-dshr-composer-row': 'true' }, host);
-				var trigger = mk('button', { 'data-dshr-composer-model': 'true', 'aria-haspopup': 'menu' }, row);
+				var row = mk('div', {}, host);
+				var trigger = mk('button', { 'aria-haspopup': 'menu' }, row);
 				trigger.textContent = 'M';
 				// 「模型」子面板那类**自带输入框**的弹层：与 composer 无亲缘关系。
 				var panel = mk('div', { role: 'listbox', id: 't51-panel' });

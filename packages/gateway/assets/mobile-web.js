@@ -276,6 +276,9 @@
 		'}',
 		'html.dshr-official-inset [data-dshr-frame] {',
 		'  padding-top: 0 !important;',
+		'  padding-left: var(--dshr-inset-left, env(safe-area-inset-left, 0px)) !important;',
+		'  padding-right: var(--dshr-inset-right, env(safe-area-inset-right, 0px)) !important;',
+		'  box-sizing: border-box !important;',
 		'}',
 		'html.dshr-official-inset [data-dshr-sidebar-col] {',
 		'  box-sizing: border-box !important;',
@@ -565,38 +568,34 @@
 		'  border-radius: 0;',
 		'  box-shadow: none;',
 		'  transform: translateX(0);',
-		'  margin-top: 0;',
+		// 背景始终覆盖全窗，内容始终让开状态栏。拖动只改变位移和外观，
+		// 不再逐帧抵消 margin/padding：offsetHeight 不变仍然会触发整棵聊天树重排。
+		'  margin-top: calc(-1 * var(--dshr-inset-top, env(safe-area-inset-top, 0px))) !important;',
+		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
+		'  max-height: calc(100% + var(--dshr-inset-top, env(safe-area-inset-top, 0px))) !important;',
 		'  margin-bottom: 0;',
 		'  touch-action: pan-y;',
 		'  transition: transform 0.34s cubic-bezier(0.32, 0.72, 0, 1),',
 		'    border-radius 0.34s cubic-bezier(0.32, 0.72, 0, 1),',
-		'    box-shadow 0.34s ease,',
-		'    margin 0.34s cubic-bezier(0.32, 0.72, 0, 1);',
+		'    box-shadow 0.34s ease;',
 		'  will-change: transform;',
+		'}',
+		// 官方外层消息滚动区只负责纵向滚动；overflow-y:auto 会隐式把 x 轴也变成 auto。
+		// 长消息溢出时不能把整片聊天区域变成横向滚动豁免，代码块内部仍可独立横滚。
+		'html.' + ROOT_CLASS + ' [data-dshr-main-col] [data-conversation-scroll] {',
+		'  overflow-x: hidden !important;',
+		'  touch-action: pan-y;',
 		'}',
 		'html.' + ROOT_CLASS + ' [data-dshr-frame]:not([data-sidebar-collapsed]) [data-dshr-main-col] {',
 		'  transform: translateX(var(--dshr-drawer-width)) !important;',
 		'  border-radius: var(--dshr-card-r, 20px) !important;',
 		'  box-shadow: -14px 0 36px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(0, 0, 0, 0.04) !important;',
 		'  overflow: hidden !important;',
-		// T82：这里原来有 margin-top/bottom: 8px。它把**展开态**的会话浮层整体下推 8px，
-		// 而 header 也在这张卡片里 ⇒ 打开抽屉时 header.y 从 54 跳到 62，松开后**不回落**。
-		// 真值见 scratch/t82/report.md §B。删掉即可，不要用 translateY(8px) 反向补偿——
-		// 那只是把 header 一起推下去，位移还在，只是换了来源。
-		// max-height 同步从 calc(100% - 16px) 提到 100%：原来那 16px 就是给上下 margin 让位的，
-		// margin 没了还留着会让卡片底部空出 16px。
-		//
-		// ── T105：终态卡片背景同样铺到 y=0（与拖动期 p=1 的算式**逐字一致**，交接零台阶） ──
-		// margin-top = −inset、padding-top = +inset、max-height = 100% + inset
-		// —— 把 `--dshr-card-p` 取 1 代进拖动块那三条，就是这三个值（真机交接台阶真值见 §4.1）。
-		'  margin-top: calc(-1 * var(--dshr-inset-top, env(safe-area-inset-top, 0px))) !important;',
-		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
-		'  max-height: calc(100% + var(--dshr-inset-top, env(safe-area-inset-top, 0px))) !important;',
 		'}',
 		'@media (prefers-reduced-motion: reduce) {',
 		'  html.' + ROOT_CLASS + ' [data-dshr-main-col] { transition: none !important; }',
 		'}',
-		// 跟手拖动：用 --dshr-drawer-x / --dshr-drawer-p 驱动，关掉过渡。
+		// 跟手拖动：用 --dshr-drawer-x / --dshr-card-p 驱动，关掉过渡。
 		'html.' + ROOT_CLASS + '[data-dshr-dragging="1"] [data-dshr-frame] {',
 		'  background: var(--dsw-specific-sidebar-fill, var(--dsw-alias-bg-base, #f5f5f6)) !important;',
 		'  overflow: hidden !important;',
@@ -657,26 +656,6 @@
 		'  border-radius: calc(var(--dshr-card-p, 0) * var(--dshr-card-r, 20px)) !important;',
 		'  box-shadow: calc(var(--dshr-card-p, 0) * -14px) 0 calc(var(--dshr-card-p, 0) * 36px) rgba(0, 0, 0, calc(var(--dshr-card-p, 0) * 0.18)),',
 		'    0 0 0 1px rgba(0, 0, 0, calc(var(--dshr-card-p, 0) * 0.04)) !important;',
-		// ── T105：卡片背景（含圆角）铺到屏幕最顶 y=0，**内容仍让开状态栏** ──
-		// 做法：margin-top 负向抵消、padding-top 等量补齐，两者都由同一个 p 缩放 ⇒
-		//   边框盒顶 = inset − p·inset（p=1 时 = 0）；内容盒顶 = inset − p·inset + p·inset = inset。
-		//   ⇒ 背景/圆角顶到 y=0，而**页面内容一个像素都不动**（仍从 --dshr-inset-top 起）。
-		// 为什么不用"另铺一层底色"：圆角属于**卡片自己的边框盒**，只有让边框盒真的顶到 0，
-		//   圆弧才画在屏幕顶边上；外部色块只能补一块方角，反而在卡片圆角处露馅。
-		// 为什么不动 frame 的 padding-top：那是抽屉盒顶(y=0)、状态栏让位与
-		//   `dshr-official-inset`（官方横屏）三方共同依赖的既有结构。
-		// 键盘抬页是 applyImeLift() 的 `--dshr-ime` + translateY，另一个属性、另一条通道，
-		//   与这里的 margin/padding 互不相干（§3.3）；右栏/平板档不吃这条规则（档位闸）。
-		'  margin-top: calc(-1 * var(--dshr-card-p, 0) * var(--dshr-inset-top, env(safe-area-inset-top, 0px))) !important;',
-		'  padding-top: calc(var(--dshr-card-p, 0) * var(--dshr-inset-top, env(safe-area-inset-top, 0px))) !important;',
-		// 拖动期钉住几何（半径/阴影都不参与布局，只重绘；offsetHeight 不变 ⇒
-		// 既有 fixture 断言 drag-keeps-layout-and-shadow 的「不重排」语义保持不变）。
-		// T82：跟手态也不许带 8px 上/下 margin（否则手指一按下去 header 就跳 8px，
-		// 与展开态那处的下移同帧发生，观感上就是"拖动一开始整块往下掉"）。
-		// T105：max-height 必须跟着 +p·inset，否则它会把这个"长高了 p·inset"的边框盒
-		// 又按 grid 区高度(100%)夹回去 ⇒ 卡片底边离屏底差 46px。
-		// （拉伸项高度 = grid 区高 − margin 和 = (H−inset) + p·inset。）
-		'  max-height: calc(100% + var(--dshr-card-p, 0) * var(--dshr-inset-top, env(safe-area-inset-top, 0px))) !important;',
 		'  overflow: hidden !important;',
 		'}',
 		// ── T105：拖动期抽屉**不再有右缘圆角 / 不再裁剪**（删 T91 那两条规则） ──
@@ -1101,7 +1080,7 @@
 		'html.' + ROOT_CLASS + ' button[data-dshr-job-count] [data-dshr-job-chevron] {',
 		'  display: none !important;',
 		'}',
-		// ── 窄屏会话条：只收缩已标记的操作行/输入底栏/统计，不改官方布局变量 ──
+		// ── 窄屏会话条：只收缩消息操作行和统计，输入区沿用官方响应式布局 ──
 		// 回复下的复制 / 点赞 / 分支 + 耗时：只缩小图标与耗时字号。
 		// 容器上绝不设 height / overflow / display / gap / flex-wrap：
 		// 万一误标到整列聊天，也不能把消息裁成 22px 或挤成一行。
@@ -1143,114 +1122,6 @@
 		'}',
 		'html.' + ROOT_CLASS + ' [data-dshr-msg-time] [aria-hidden="true"] {',
 		'  margin: 0 3px !important;',
-		'}',
-		// 输入框底栏：单行；+ / 权限固定不缩，模型名超长省略，不得盖住左侧按钮。
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-row] {',
-		'  display: flex !important;',
-		'  flex-wrap: nowrap !important;',
-		'  align-items: center !important;',
-		'  gap: 6px !important;',
-		'  min-width: 0 !important;',
-		'}',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-tools] {',
-		'  display: flex !important;',
-		'  flex: 0 0 auto !important;',
-		'  align-items: center !important;',
-		'  gap: 6px !important;',
-		'  position: relative;',
-		'  z-index: 1;',
-		'}',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-trailing] {',
-		'  display: flex !important;',
-		'  flex: 1 1 0% !important;',
-		'  align-items: center !important;',
-		'  justify-content: flex-end !important;',
-		'  gap: 6px !important;',
-		'  min-width: 0 !important;',
-		'  margin-left: 0 !important;',
-		// 绝不 overflow:hidden：上下文环的浮层（.JObwrW_panel，position:absolute；
-		// bottom: calc(100% + 8px)）就在这一行的子节点里，裁剪会把整块面板吃掉——
-		// 手机端点环"没反应"就是这个裁剪。不裁剪也不会盖住 +/权限：模型按钮自己
-		// min-width:0 + 省略号，其余子按钮 flex:0 0 auto，宽度不会溢出。
-		'  overflow: visible !important;',
-		'}',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-trailing] > button:not([data-dshr-composer-model]) {',
-		'  flex: 0 0 auto !important;',
-		'}',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-add] {',
-		'  width: 26px !important;',
-		'  height: 26px !important;',
-		'  flex: 0 0 auto !important;',
-		'  position: relative;',
-		'  z-index: 1;',
-		'}',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-access] {',
-		'  display: inline-flex !important;',
-		'  align-items: center !important;',
-		'  justify-content: center !important;',
-		'  width: 26px !important;',
-		'  max-width: 26px !important;',
-		'  height: 26px !important;',
-		'  padding: 0 !important;',
-		'  gap: 0 !important;',
-		'  flex: 0 0 auto !important;',
-		'  overflow: hidden !important;',
-		'  position: relative;',
-		'  z-index: 1;',
-		'}',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-access-label],',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-access-chevron],',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-access] > :last-child:not(:first-child) {',
-		'  display: none !important;',
-		'}',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-model] {',
-		'  display: flex !important;',
-		'  align-items: center !important;',
-		'  flex: 1 1 0% !important;',
-		'  min-width: 0 !important;',
-		'  max-width: 100% !important;',
-		'  height: 26px !important;',
-		'  padding: 0 4px 0 6px !important;',
-		'  font-size: 12px !important;',
-		'  line-height: 18px !important;',
-		'  gap: 2px !important;',
-		'  overflow: hidden !important;',
-		'  white-space: nowrap !important;',
-		'  box-sizing: border-box !important;',
-		'}',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-model] > span:nth-child(2) {',
-		'  display: none !important;',
-		'}',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-model] > div {',
-		'  flex: 1 1 0% !important;',
-		'  min-width: 0 !important;',
-		'  overflow: hidden !important;',
-		'  display: flex !important;',
-		'  align-items: center !important;',
-		'}',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-model] span {',
-		'  min-width: 0 !important;',
-		'  overflow: hidden !important;',
-		'  text-overflow: ellipsis !important;',
-		'  white-space: nowrap !important;',
-		'}',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-model] > span:first-child {',
-		'  flex: 1 1 0% !important;',
-		'}',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-model] > svg,',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-model] svg {',
-		'  flex: none !important;',
-		'  min-width: 12px !important;',
-		'}',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-send] {',
-		'  width: 30px !important;',
-		'  height: 30px !important;',
-		'  transform: none !important;',
-		'  flex: none !important;',
-		'}',
-		'html.' + ROOT_CLASS + ' [data-dshr-composer-row] button svg {',
-		'  width: 14px !important;',
-		'  height: 14px !important;',
 		'}',
 		// 底部会话统计：单行、略缩小；超出横向滑动，不折行。
 		'html.' + ROOT_CLASS + ' [data-dshr-stats-line] {',
@@ -1588,8 +1459,7 @@
 
 	/**
 	 * T48：算「打开命令面板/弹层的非可编辑触发器」的选择器。
-	 * 用官方 aria-label（中英都列）而不是只靠 hook 自己打的 data-dshr-* 标记 ——
-	 * 那些标记由 syncComposerChrome 写，冷启动第一次点「+」时可能还没写上。
+	 * 使用官方 aria-label（中英都列），不再给输入区维护另一套 DOM 标记。
 	 */
 	var COMPOSER_TRIGGER_SELECTOR = [
 		'button[aria-label="Add files or run commands"]',
@@ -1598,11 +1468,7 @@
 		'button[aria-label="添加文件或运行指令"]',
 		'button[aria-label="命令"]',
 		'button[aria-label="指令"]',
-		'button[aria-label="Commands"]',
-		'[data-dshr-composer-add]',
-		'[data-dshr-composer-model]',
-		'[data-dshr-composer-access]',
-		'[data-dshr-composer-trailing]'
+		'button[aria-label="Commands"]'
 	].join(', ');
 
 	/**
@@ -1611,17 +1477,15 @@
 	 * 与 armComposerFocus 的注释）。所以这里给它一份**独立的**名单，并让
 	 * isPanelTriggerPoint() 第一件事就是排除它。
 	 *
-	 * 为什么不能只从 COMPOSER_TRIGGER_SELECTOR 里删掉 `[data-dshr-composer-send]`：
+	 * 仅把发送移出触发器名单不够：
 	 * isPanelTriggerPoint() 的**兜底分支**（composer 卡片内任意可交互控件）会把发送按钮
 	 * 重新判成触发器 —— AVD 实测该兜底分支让 40 个元素命中，其中就包括发送按钮本身
 	 * 以及它内部的 svg/path（它们各自 closest('button') 都回到发送按钮）。
 	 * ⇒ 排除必须发生在兜底分支**之前**，且要覆盖"落在发送按钮内部任意后代"的情况。
 	 *
-	 * 名单同时列了 hook 自己的标记与官方 aria-label（中英），冷启动时 hook 标记可能还没
-	 * 写上，不能只靠标记。
+	 * 名单直接使用官方 aria-label（中英）。
 	 */
 	var COMPOSER_SEND_SELECTOR = [
-		'[data-dshr-composer-send]',
 		'button[aria-label="Send message"]',
 		'button[aria-label="发送消息"]',
 		'button[aria-label="Send"]',
@@ -1964,32 +1828,22 @@
 	 */
 	function isModelTriggerPoint(target) {
 		if (!isElement(target) || !target.closest) return false;
-		try {
-			if (target.closest('[data-dshr-composer-model]')) return true;
-		} catch (ignoredModelMark) { /* 选择器异常则走官方名单 */ }
-		var labelled = null;
-		try {
-			labelled = target.closest('button[aria-haspopup="menu"], button[aria-haspopup="dialog"], button[aria-haspopup="listbox"]');
-		} catch (ignoredPopup) { labelled = null; }
+		var labelled = target.closest('button[aria-haspopup="menu"], button[aria-haspopup="dialog"], button[aria-haspopup="listbox"]');
 		if (!labelled) return false;
-		// 排除掉 +/权限（它们有自己的标记与 aria-label），剩下的 popup 按钮即模型。
-		try {
-			if (labelled.hasAttribute('data-dshr-composer-add')) return false;
-			if (labelled.hasAttribute('data-dshr-composer-access')) return false;
-		} catch (ignoredAttr) { /* 无属性则继续按名单判 */ }
-		return true;
+		// +/权限沿用各自的聚焦语义；模型菜单无需输入框持焦。
+		if (labelled.matches(COMPOSER_TRIGGER_SELECTOR)) return false;
+		var label = labelled.getAttribute('aria-label') || '';
+		return !/^(访问模式|Access mode)/.test(label);
 	}
 
 	/**
 	 * 落点算不算「会打开命令面板/弹层的那类非可编辑触发器」。
 	 *
-	 * 判据用**官方 aria-label**（中英都列）而不是 hook 自己打的标记：
-	 * hook 标记（data-dshr-composer-add 等）由 syncComposerChrome 写，
-	 * 冷启动第一次点「+」时它可能还没写上，用它会漏掉最关键的那一次。
+	 * 判据用官方 aria-label（中英都列），无需等待 DOM 标记。
 	 * 其次再兜一层：落点位于 composer 卡片内、且是可交互控件（按钮/菜单项等）。
 	 *
 	 * T69：**发送按钮必须在这里第一个被排除**（见 isComposerSendPoint）。
-	 * 删除 `[data-dshr-composer-send]` 出 COMPOSER_TRIGGER_SELECTOR 是不够的 ——
+	 * 仅把发送移出 COMPOSER_TRIGGER_SELECTOR 不够 ——
 	 * 下面的兜底分支会把它（连同其内部 svg/path）重新判成触发器。
 	 */
 	function isPanelTriggerPoint(target) {
@@ -3140,6 +2994,10 @@
 		var tablet = isTabletViewport();
 		var portrait = isPortraitViewport();
 		var on = resolveHookEnabled(portrait);
+		if (!on) {
+			pendingSidebarOpen = null;
+			clearDrawerVisual(true);
+		}
 		hookOn = on;
 		// T90：连接态观测跟着 hook 启用态走 —— 严格 OFF（平板）与关闭态一律还原
 		// `window.WebSocket`（零痕迹不只 DOM），启用态安装（幂等）。必须放在下面那条
@@ -3370,7 +3228,7 @@
 	 * WEB-04：首选标准 DOM 事件分发触发官方按钮——不依赖 React 内部缓存
 	 * （__reactProps$/__reactFiber$），React 升级或官方改事件绑定也稳定生效
 	 * （React 17+ 委托监听挂在根容器上，冒泡的合成 click 一样会被接住）。
-	 * 是否真正生效由调用方用状态验证（sidebarStateChanged）判定；
+	 * 是否真正生效由调用方观察官方目标状态判定；
 	 * 本函数返回「派发动作是否完成」——旧 WebView 缺 MouseEvent 构造器时
 	 * 返回 false，由上层退回 HTMLElement.click() 等其它通道。
 	 */
@@ -3390,88 +3248,6 @@
 		} catch (ignoredDispatch) {
 			return false;
 		}
-	}
-
-	/**
-	 * WEB-04 兜底通道（标准事件分发未生效时才探测）：React 把当前元素 props
-	 * 缓存在 __reactProps$*（兼容回退为 fiber.memoizedProps），直接调用官方
-	 * 按钮的 onClick 闭包，走与真人点击完全相同的处理。
-	 * eventStub 补齐 nativeEvent/type/坐标/persist 等防御字段，处理器读取
-	 * 常见原生字段时不抛错。
-	 */
-	function invokeReactOnClick(target) {
-		var names;
-		try {
-			names = Object.getOwnPropertyNames(target);
-		} catch (ignored) {
-			return false;
-		}
-		var cx = 0;
-		var cy = 0;
-		try {
-			var rect = target.getBoundingClientRect();
-			cx = rect.left + rect.width / 2;
-			cy = rect.top + rect.height / 2;
-		} catch (ignoredRect) { /* 坐标留 0，不影响 onClick 主流程 */ }
-		var nativeEvent = null;
-		try {
-			nativeEvent = new MouseEvent('click', {
-				bubbles: true, cancelable: true, view: window, button: 0, clientX: cx, clientY: cy,
-			});
-		} catch (ignoredNative) {
-			nativeEvent = {
-				type: 'click', target: target, currentTarget: target,
-				bubbles: true, cancelable: true, defaultPrevented: false,
-				clientX: cx, clientY: cy, screenX: cx, screenY: cy, button: 0,
-				preventDefault: function () {}, stopPropagation: function () {},
-			};
-		}
-		var eventStub = {
-			target: target,
-			currentTarget: target,
-			type: 'click',
-			bubbles: true,
-			cancelable: true,
-			defaultPrevented: false,
-			eventPhase: 2,
-			timeStamp: Date.now(),
-			nativeEvent: nativeEvent,
-			clientX: cx,
-			clientY: cy,
-			screenX: cx,
-			screenY: cy,
-			pageX: cx,
-			pageY: cy,
-			button: 0,
-			buttons: 0,
-			detail: 1,
-			preventDefault: function () {
-				this.defaultPrevented = true;
-				try { if (this.nativeEvent && this.nativeEvent.preventDefault) this.nativeEvent.preventDefault(); } catch (ignoredPd) {}
-			},
-			stopPropagation: function () {},
-			stopImmediatePropagation: function () {},
-			persist: function () {},
-			isDefaultPrevented: function () { return !!this.defaultPrevented; },
-			isPropagationStopped: function () { return false; },
-		};
-		for (var i = 0; i < names.length; i++) {
-			var key = names[i];
-			var props = null;
-			if (key.indexOf('__reactProps$') === 0) props = target[key];
-			else if (key.indexOf('__reactFiber$') === 0) {
-				var fiber = target[key];
-				props = fiber && fiber.memoizedProps;
-			}
-			if (!props || typeof props.onClick !== 'function') continue;
-			try {
-				props.onClick.call(target, eventStub);
-				return true;
-			} catch (ignoredClick) {
-				// 继续尝试其他 React 缓存或 DOM 事件通道。
-			}
-		}
-		return false;
 	}
 
 	/** 完整指针事件序列：兜底 onClick 之外还监听 pointer/mouse 事件的实现。 */
@@ -3498,28 +3274,30 @@
 		target.dispatchEvent(new MouseEvent('click', opts));
 	}
 
-	function sidebarStateChanged(before) {
-		var frame = findFrame();
-		if (!frame) return false;
-		if (before === null) return true;
-		return frame.hasAttribute('data-sidebar-collapsed') !== before;
-	}
-
 	/**
-	 * 切换官方侧栏，带状态验证与分层重试：
-	 *   1. WEB-04：首选标准 DOM 事件分发（不依赖 React 内部缓存，React 升级/改绑定也稳定）；
-	 *   2. 旧 WebView 缺 MouseEvent 构造器时退回 HTMLElement.click()；
-	 *   3. 280ms 后状态仍未翻转：再探测 React onClick 缓存，不中就补
-	 *      完整 pointer/mouse/click 序列。
+	 * 一次意图只派发一次官方点击；DOM 未提交不代表事件丢失。
+	 * 长会话提交超过 280ms 时重派 toggle 会把刚关闭的左栏反向打开。
 	 */
 	var toggleBusy = false;
 	var pendingSidebarOpen = null;
+	var sidebarIntentState = null;
+	var sidebarCommitTimer = 0;
+	var SIDEBAR_COMMIT_TIMEOUT_MS = 5000;
 
 	function flushPendingSidebar() {
 		if (pendingSidebarOpen === null) return;
 		var want = pendingSidebarOpen;
 		pendingSidebarOpen = null;
-		if (isSidebarOpen() !== want) toggleSidebar();
+		setSidebarOpen(want);
+	}
+
+	function completeSidebarIntent() {
+		if (!toggleBusy || isSidebarOpen() !== sidebarIntentState) return;
+		toggleBusy = false;
+		sidebarIntentState = null;
+		window.clearTimeout(sidebarCommitTimer);
+		sidebarCommitTimer = 0;
+		flushPendingSidebar();
 	}
 
 	function toggleSidebar() {
@@ -3534,44 +3312,34 @@
 		// 同设备同粘滞态三路对照：hook 鲸鱼弹（724ms / 760ms）、官方 Collapse sidebar 不弹
 		// （composer 失焦）、滚动不弹 —— 官方按钮靠的就是这条被吃掉的默认行为。
 		//
-		// 放在「确实要派发合成 click」之前：一处覆盖鲸鱼 touchend / click、官方开关兜底
-		// 重试、flushPendingSidebar 的重放等全部入口；连点护栏命中（toggleBusy）与
+		// 放在「确实要派发合成 click」之前：一处覆盖鲸鱼 touchend / click、
+		// flushPendingSidebar 的重放等全部入口；连点护栏命中（toggleBusy）与
 		// 找不到官方开关（!button）这两条不派发动作的路径不受影响。
 		//
 		// 影响面：只在「IME 本来就收起」时才需要动作——此时用户看不到光标，视觉无变化；
 		// 用户正输入时点鲸鱼，焦点本来也会被官方侧栏切换带走（T18 K-7-4/K-7-6：平板档
 		// 官方 Collapse/Open sidebar 同样让 composer 失焦），故与官方桌面行为一致。
 		var frame = findFrame();
-		var before = frame ? frame.hasAttribute('data-sidebar-collapsed') : null;
 		var button = findToggleControl();
-		if (!button) return false;
+		if (!frame || !button || button.disabled) return false;
 		blurEditableFocus();
 		toggleBusy = true;
-		var dispatched = dispatchNativeClick(button);
-		if (!dispatched) button.click();
-		if (sidebarStateChanged(before)) {
-			toggleBusy = false;
-			flushPendingSidebar();
-			return true;
-		}
-		window.setTimeout(function () {
-			if (sidebarStateChanged(before)) {
-				toggleBusy = false;
-				flushPendingSidebar();
+		sidebarIntentState = !isSidebarOpen();
+		sidebarCommitTimer = window.setTimeout(function () {
+			if (isSidebarOpen() === sidebarIntentState) {
+				completeSidebarIntent();
 				return;
 			}
-			var button2 = findToggleControl();
-			if (button2) {
-				// 标准分发未生效：探测 React 缓存兜底（可能在 hydration 后才有）；
-				// 不中再走完整事件序列。
-				var retriedReact = invokeReactOnClick(button2);
-				if (!retriedReact) dispatchTap(button2);
-			}
-			window.setTimeout(function () {
-				toggleBusy = false;
-				flushPendingSidebar();
-			}, 220);
-		}, 280);
+			console.error('[DSH Remote] 左栏开关已派发，但官方状态未在 5 秒内提交');
+			toggleBusy = false;
+			sidebarIntentState = null;
+			pendingSidebarOpen = null;
+			sidebarCommitTimer = 0;
+			clearDrawerVisual();
+		}, SIDEBAR_COMMIT_TIMEOUT_MS);
+		var dispatched = dispatchNativeClick(button);
+		if (!dispatched) button.click();
+		completeSidebarIntent();
 		return true;
 	}
 
@@ -3949,60 +3717,27 @@
 	var drawerRaf = 0;
 	var drawerNextX = 0;
 
-	// T91：圆角「成形位移」= 一个半径的量。依据：圆角是**卡片的属性**，不是位移的比例——
-	// 卡片一旦从屏幕边缘分离出来就该是完整圆角（参考图里卡片本身就是刚性的，只是平移过去；
-	// 用户明确否掉了缩放）。但 x=0 时若直接给满半径就是跳变（改前缺陷：真机真值
-	// x=7px 就已经是 18px 圆角，见 report §2），所以取「半径不能超过卡片自身的分离量」
-	// 这条几何约束做斜坡：r(x) = min(x, R)。x>=20px 起就是完整圆角，之后半径恒定、
-	// 只跟随平移 ⇒ 观感上正是用户要的「圆角平移过去」。
-	var CARD_RADIUS_PX = 20;
-
 	function setDrawerVisual(x) {
-		if (!drawerVisual) {
+		var starting = !drawerVisual;
+		if (starting) {
 			var frame = findFrame();
-			drawerVisual = { max: drawerMaxShift(), main: frame ? findMainCol(frame) : null, wasOpen: isSidebarOpen() };
-			// 先锁住跟手样式，再请求官方渲染 wide 内容；不能只把 rail 拉宽。
-			document.documentElement.setAttribute('data-dshr-dragging', '1');
-			// T82：**实测推翻了"把这次官方打开挪到落位阶段"的方案**，所以它留在这里。
-			//
-			// 改前设想：拖动期只用 hook 自己的 CSS 点亮侧栏，把 setSidebarOpen(true)
-			// 挪到 settleDrawer 的 wantOpen 分支，好让热路径只剩 transform/opacity。
-			// 实测（scratch/t82/b-content-signature.json，真实 DSH 0.2.0-rc.2 页面）：
-			//   仅靠 hook CSS 点亮：侧栏列确实被拉宽到 360px，但**可见文本 0 个**、
-			//                      只有 5 个 svg/按钮 ⇒ 用户拖出来的是一条"被拉宽的图标 rail"；
-			//   官方打开态：        同一列可见文本 28 个字符、8 按钮 / 10 svg ⇒ 完整会话列表。
-			// 也就是说"拖动期只靠 CSS 点亮"会让**整个拖动过程**都看不到会话列表，
-			// 直到落位才"啪"地补上内容 —— 比原来的跟手更不可接受。
-			// 既有 fixture 断言 drag-shows-wide-sidebar（scripts/fixtures/mobile-selftest.html:732）
-			// 钉的正是这条语义，它也确实是**有判别力**的守卫，因此不改断言、改回本实现。
-			//
-			// 那"最长帧永远落在 expanded 0→1"怎么修？见下面 [data-dshr-main-col] 的
-			// margin 说明：那一帧的重排来自 margin/max-height 的 0.34s 过渡（margin 参与布局），
-			// 本轮把两处 8px margin 删掉后该帧不再做整列布局，真机帧率真值见 report §B。
-			setSidebarOpen(true);
-			// T105：手上这笔手势一定会走"松手落位"，而落位后鲸鱼读的是
-			// `--dshr-drawer-shift`（主列终态位移的 px 值）。这里在**起手**（每笔手势一次、
-			// 不在每帧热路径上）刷一次，保证它与这一帧的主列宽度一致。
-			syncDrawerShift();
+			drawerVisual = { max: drawerMaxShift(), main: frame ? findMainCol(frame) : null,
+				wasOpen: isSidebarOpen(), x: null, closing: false };
 		}
 		var max = drawerVisual.max;
 		x = Math.max(0, Math.min(max, x));
 		var p = max > 0 ? x / max : 0;
-		// T82：变量改写到 <html>。原本只写主列，是为了少让一棵子树继承失效；
-		// 但鲸鱼必须读**同一个变量**才能与主列同帧同缓动交接（见 report §B），
-		// 所以写到共同祖先上。消费方只有 [data-dshr-main-col] 与 #dshr-mobile-whale。
-		document.documentElement.style.setProperty('--dshr-drawer-x', Math.round(x) + 'px');
-		// T91：圆角/阴影跟手量（0..1，无单位，供 CSS calc 相乘）。
-		// 与 --dshr-drawer-x 同帧同源写入 ⇒ 半径、阴影、位移三者永远在同一帧上一致，
-		// 不会出现「位移到了、圆角还停在上一帧」的跳动。
-		// 取整到 1/1000：避免把 0.30000000000000004 这类浮点串写进行内样式
-		// （行内属性逐字变化会让 CSS 变量消费者每帧重算，真机上无益）。
-		// T125（Kimi 化）：圆角走全行程渐变 cardP=x/max（此前为 min(1,x/20)，20px 即满）。
-		// 全程渐变更“果冻”、与 Kimi 同味；终态 p=1 时仍是完整 --dshr-card-r，交接零台阶。
-		var cardP = max > 0 ? x / max : 0;
-		if (cardP < 0) cardP = 0;
-		if (cardP > 1) cardP = 1;
-		document.documentElement.style.setProperty('--dshr-card-p', String(Math.round(cardP * 1000) / 1000));
+		// 主列与鲸鱼共用根变量，官方重挂载节点时仍能读到同一帧的位移。
+		if (drawerVisual.x !== x) {
+			drawerVisual.x = x;
+			document.documentElement.style.setProperty('--dshr-drawer-x', Math.round(x) + 'px');
+			document.documentElement.style.setProperty('--dshr-card-p', String(Math.round(p * 1000) / 1000));
+		}
+		if (starting) {
+			// 先写起始几何再启用跟手样式，官方展开只负责渲染完整会话列表。
+			document.documentElement.setAttribute('data-dshr-dragging', '1');
+			setSidebarOpen(true);
+		}
 		return { x: x, p: p, max: max };
 	}
 
@@ -4024,10 +3759,7 @@
 		drawerVisual = null;
 		var root = document.documentElement;
 		root.removeAttribute('data-dshr-dragging');
-		// T82：变量统一写在 <html> 上（见 setDrawerVisual），清理也只清这一处。
 		root.style.removeProperty('--dshr-drawer-x');
-		// T91：跟手圆角量同一处写入、同一处清理（残留会让下一次进入跟手态时
-		// 第一帧先按旧半径画一下，观感就是「拖动开始时圆角闪一下」）。
 		root.style.removeProperty('--dshr-card-p');
 		if (previous && !keepState) setSidebarOpen(previous.wasOpen);
 	}
@@ -4046,8 +3778,7 @@
 			done();
 			return;
 		}
-		// T82：起点读 <html>（变量已统一写到那里）。
-		var from = parseFloat(document.documentElement.style.getPropertyValue('--dshr-drawer-x')) || 0;
+		var from = state.x;
 		if (Math.abs(x - from) < 2 || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
 			setDrawerVisual(x);
 			done();
@@ -4093,30 +3824,14 @@
 		}
 		// 关闭：先补间回 0，卡片盖满后再切官方收起，rail 重排被卡片挡住。
 		animateMainTo(0, function () {
-			var closing = drawerVisual;
-			drawerVisual = null;
-			if (settleAnim) { window.cancelAnimationFrame(settleAnim); settleAnim = 0; }
-			if (drawerRaf) { window.cancelAnimationFrame(drawerRaf); drawerRaf = 0; }
-			// T112b（V1 P2-2，1 帧观感修正）：**这一帧**必须先把鲸鱼的"展开终态位移"归零。
-			//
-			// 真值（两台设备、同一套逐帧判据 `|whaleX − (10 + mainX)|`）：
-			//   · V1 真机（`scratch/v1/pf-drawer-close.json` t=427549）：`dr=null, ex='1'`，漂移 **+42.97px**；
-			//   · 我的装置（`scratch/t112b/exp-drawer-close-new.json`）：同一个交接帧漂移 **+111.73px**
-			//     （峰值的绝对值取决于该帧多长，机制相同）。
-			// 机制：`data-dshr-dragging` 在这一行被摘掉，而 `setSidebarOpen(false)` 是**异步**提交
-			// （官方 React），于是有 1–2 帧同时满足「拖动规则已失效」+「`data-dshr-expanded` 还是 1」
-			// ⇒ 鲸鱼回落到展开态规则 `translateX(var(--dshr-drawer-shift))`，而那个变量此刻是
-			// **360px**（展开态的解析值）⇒ 它带着 0.34s 的 transition 朝右飞，下一帧 expanded=0
-			// 再把它拽回来（观感：鲸鱼抖一下）。
-			// 修法：关闭落位的终态里，主列终态位移**本来就是 0**（rail 态 translateX=0），
-			// 所以这里把它显式写 0 —— 交接帧的目标就是 10px（鲸鱼该在的位置），不再有"朝 360 飞"。
-			// 安全性：**任何**打开路径都会先 `setSidebarOpen(true)`，而它第一件事就是
-			// `syncDrawerShift()`（:3788）重算成正确的 px 值 ⇒ 这条归零不可能污染打开态。
+			// 官方异步提交前继续保持 x=0，不能提前撤样式让卡片弹回展开位。
+			state.closing = true;
 			document.documentElement.style.setProperty('--dshr-drawer-shift', '0px');
-			document.documentElement.removeAttribute('data-dshr-dragging');
-			document.documentElement.style.removeProperty('--dshr-drawer-x');
-			document.documentElement.style.removeProperty('--dshr-card-p');
 			setSidebarOpen(false);
+			if (!isSidebarOpen()) {
+				document.documentElement.setAttribute('data-dshr-expanded', '0');
+				clearDrawerVisual(true);
+			}
 		});
 		return true;
 	}
@@ -4331,14 +4046,16 @@
 			startTarget = target;
 			activePointer = pointerId == null ? 'touch' : pointerId;
 			baseX = drawerVisual && drawerVisual.main
-				? parseFloat(document.documentElement.style.getPropertyValue('--dshr-drawer-x')) || 0
+				? drawerVisual.x
 				: isSidebarOpen() ? drawerMaxShift() : 0;
+			if (drawerVisual) drawerVisual.closing = false;
 			baseRx = rightVisual ? rightVisual.x : (isRightbarOpen() ? 0 : rightCardMax());
 			return true;
 		}
 
 		function onDragMove(clientX, clientY, event) {
 			if (!tracking) return;
+			if (!isMobileMode()) { resetTrack(); return; }
 			var dx = clientX - startX;
 			var dy = clientY - startY;
 			if (!dragging) {
@@ -4392,6 +4109,7 @@
 
 		function onDragEnd(clientX, clientY) {
 			if (!tracking) return;
+			if (!isMobileMode()) { resetTrack(); return; }
 			var endX = clientX;
 			var endY = clientY;
 			var wasDragging = dragging;
@@ -4445,6 +4163,7 @@
 
 		function onDragCancel() {
 			if (!tracking) return;
+			if (!isMobileMode()) { resetTrack(); return; }
 			var wasDragging = dragging;
 			var axisUsed = axis;
 			resetTrack();
@@ -5355,12 +5074,6 @@
 		return label === '复制' || label === 'Copy' || label === '复制成功' || label === 'Copied';
 	}
 
-	function isSendActionButton(button) {
-		if (!isElement(button)) return false;
-		var label = (button.getAttribute('aria-label') || '').trim();
-		return label === '发送消息' || label === 'Send message' || label === '停止生成' || label === 'Stop generating';
-	}
-
 	function looksLikeStatsText(text) {
 		var compact = String(text || '').replace(/\s+/g, ' ').trim();
 		if (compact.length < 6 || compact.length > 480) return false;
@@ -5386,21 +5099,6 @@
 			if (text.length > 20) return true;
 		}
 		return false;
-	}
-
-	/**
-	 * 输入卡底栏：取「不含 textarea」的最高祖先（仍在 card 内）。
-	 * 避免把整张输入卡标成 toolbar，从而把输入框和四键挤成一行。
-	 */
-	function findComposerToolbar(card, send) {
-		var node = send.parentElement;
-		var best = null;
-		while (node && node !== card) {
-			if (node.querySelector('textarea')) break;
-			best = node;
-			node = node.parentElement;
-		}
-		return best || send.parentElement;
 	}
 
 	/**
@@ -5456,8 +5154,6 @@
 	/**
 	 * 窄屏会话条标记（结构特征，不依赖 CSS Module 哈希类名）：
 	 *   - 带「复制」图标按钮的回复操作行 → data-dshr-msg-actions / data-dshr-msg-time；
-	 *   - 输入卡片底栏（含发送按钮的那一行）→ data-dshr-composer-row，
-	 *     权限按钮 → data-dshr-composer-access；
 	 *   - 输入卡片下方「N 轮 · M 步 | …」统计 → data-dshr-stats-line。
 	 */
 	function markChatChrome() {
@@ -5477,7 +5173,8 @@
 
 		var cards = document.querySelectorAll('[data-composer-card]');
 		for (var c = 0; c < cards.length; c++) {
-			markComposerCard(cards[c]);
+			var statsHost = cards[c].nextElementSibling;
+			if (isElement(statsHost) && looksLikeStatsText(statsHost.textContent)) markStatsHost(statsHost);
 		}
 
 		if (document.querySelector('[data-dshr-stats-line]') === null) markStatsLineFallback();
@@ -5492,7 +5189,7 @@
 	}
 
 	function isAgentRunning() {
-		var buttons = document.querySelectorAll('button[aria-label], [data-dshr-composer-send]');
+		var buttons = document.querySelectorAll('button[aria-label]');
 		for (var i = 0; i < buttons.length; i++) {
 			var label = (buttons[i].getAttribute('aria-label') || '').trim();
 			if (label === '停止生成' || label === 'Stop generating') return true;
@@ -5626,90 +5323,6 @@
 		}, NOTICE_DEBOUNCE_MS);
 	}
 
-	function markComposerCard(card) {
-		var send = null;
-		var buttons = card.querySelectorAll('button[aria-label]');
-		for (var i = 0; i < buttons.length; i++) {
-			if (isSendActionButton(buttons[i])) {
-				send = buttons[i];
-				break;
-			}
-		}
-		if (!send) {
-			var statsOnly = card.nextElementSibling;
-			if (isElement(statsOnly) && looksLikeStatsText(statsOnly.textContent)) markStatsHost(statsOnly);
-			return;
-		}
-		var row = findComposerToolbar(card, send);
-		if (isElement(row) && !row.querySelector('textarea')) mark(row, 'data-dshr-composer-row');
-		mark(send, 'data-dshr-composer-send');
-		for (var j = 0; j < buttons.length; j++) {
-			var label = (buttons[j].getAttribute('aria-label') || '').trim();
-			if (label === '命令' || label === 'Commands' || label === '指令'
-				|| label === 'Add files or run commands' || label === '添加文件或运行命令'
-				|| label === '添加文件或调用指令' || label === '添加文件或运行指令') mark(buttons[j], 'data-dshr-composer-add');
-			if (label.indexOf('访问模式') === 0 || label.indexOf('Access mode') === 0) {
-				markAccessChrome(buttons[j]);
-			}
-		}
-		if (isElement(row)) {
-			var modelButtons = row.querySelectorAll('button[aria-haspopup="menu"], button[aria-haspopup="dialog"], button[aria-haspopup="listbox"]');
-			for (var m = 0; m < modelButtons.length; m++) {
-				if (modelButtons[m].hasAttribute('data-dshr-composer-access')) continue;
-				if (modelButtons[m].hasAttribute('data-dshr-composer-add')) continue;
-				mark(modelButtons[m], 'data-dshr-composer-model');
-			}
-			markComposerClusters(row);
-		}
-		var statsHost = card.nextElementSibling;
-		if (isElement(statsHost) && looksLikeStatsText(statsHost.textContent)) {
-			markStatsHost(statsHost);
-		}
-	}
-
-	function markAccessChrome(btn) {
-		if (!isElement(btn)) return;
-		mark(btn, 'data-dshr-composer-access');
-		var kids = btn.children;
-		for (var k = 0; k < kids.length; k++) {
-			if (kids[k].tagName !== 'SPAN') continue;
-			if (kids[k].querySelector('svg')) continue;
-			mark(kids[k], 'data-dshr-composer-access-label');
-		}
-		var svgs = btn.querySelectorAll('svg');
-		if (svgs.length < 2) return;
-		var chevron = svgs[svgs.length - 1];
-		var wrap = chevron.parentElement;
-		if (isElement(wrap) && wrap !== btn && wrap.querySelectorAll('svg').length === 1) {
-			mark(wrap, 'data-dshr-composer-access-chevron');
-		} else {
-			mark(chevron, 'data-dshr-composer-access-chevron');
-		}
-	}
-
-	function markComposerClusters(row) {
-		if (!isElement(row)) return;
-		var kids = row.children;
-		for (var i = 0; i < kids.length; i++) {
-			var kid = kids[i];
-			if (!isElement(kid) || kid.tagName === 'BUTTON' || kid.tagName === 'TEXTAREA') continue;
-			if (
-				kid.hasAttribute('data-dshr-composer-send') ||
-				kid.hasAttribute('data-dshr-composer-model') ||
-				kid.querySelector('[data-dshr-composer-send], [data-dshr-composer-model]')
-			) {
-				mark(kid, 'data-dshr-composer-trailing');
-			}
-			if (
-				kid.hasAttribute('data-dshr-composer-add') ||
-				kid.hasAttribute('data-dshr-composer-access') ||
-				kid.querySelector('[data-dshr-composer-add], [data-dshr-composer-access]')
-			) {
-				mark(kid, 'data-dshr-composer-tools');
-			}
-		}
-	}
-
 	function markStatsHost(host) {
 		if (!isElement(host)) return;
 		var inner = host;
@@ -5748,6 +5361,8 @@
 			else frame.removeAttribute('data-dshr-collapsed');
 			root.setAttribute('data-dshr-ready', '1');
 			root.setAttribute('data-dshr-expanded', collapsed ? '0' : '1');
+			if (collapsed && drawerVisual && drawerVisual.closing) clearDrawerVisual(true);
+			completeSidebarIntent();
 			var sidebarColumn = findSidebarCol(frame);
 			mark(sidebarColumn, 'data-dshr-sidebar-col');
 			var mainColumn = findMainCol(frame);
@@ -5890,6 +5505,8 @@
 	// 仍走同步 syncDom，不受影响。
 	var syncQueued = false;
 	function scheduleSyncDom() {
+		// 已派发的官方点击仍会在切档后提交；完成在途意图不依赖手机样式是否启用。
+		completeSidebarIntent();
 		// 严格 OFF（平板档，契约 3.5）：不得再排程任何同步定时器。观察器在
 		// 档位切换后仍然挂着（见 startObserver：拆除不 disconnect，切回 phone 档
 		// 才复用），若无条件起 50ms 定时器，平板档每次官方 DOM 变更都会白白唤醒
@@ -7001,12 +6618,11 @@
 				setRightbarOpen(false);
 				return true;
 			}
-			if (isSidebarOpen()) return setSidebarOpen(false);
+			if (isSidebarOpen() || toggleBusy) return setSidebarOpen(false);
 			return false;
 		},
 		openSidebarIfCollapsed: function () {
 			if (!isMobileMode() || isDrawerLocked()) return false;
-			if (isSidebarOpen()) return true;
 			return setSidebarOpen(true);
 		},
 		considerSwipe: considerSwipe,

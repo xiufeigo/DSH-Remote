@@ -730,10 +730,50 @@ try {
 	const overflowA = await evaluate(`({sw:document.documentElement.scrollWidth,cw:document.documentElement.clientWidth})`);
 	record("A", "页面无横向溢出", overflowA.sw <= overflowA.cw + 1, `scrollWidth=${overflowA.sw} clientWidth=${overflowA.cw}`);
 	// 顺带覆盖：输入卡底栏集群是否仍在视口内
-	const trailing = await evaluate(`(()=>{const e=document.querySelector('[data-dshr-composer-trailing]');if(!e)return null;const b=e.getBoundingClientRect();
+	const trailing = await evaluate(`(()=>{const e=document.querySelector('[data-composer-card] button[aria-label="发送消息"], [data-composer-card] button[aria-label="Send message"]')?.parentElement;if(!e)return null;const b=e.getBoundingClientRect();
 		return{left:Math.round(b.left),right:Math.round(b.right),inViewport:b.left>=-1&&b.right<=innerWidth+1};})()`);
 	if (trailing) record("A", "输入卡底栏集群在视口内", trailing.inViewport, JSON.stringify(trailing));
-	else record("A", "输入卡底栏集群在视口内", null, "未找到 [data-dshr-composer-trailing]（该页无底栏集群）");
+	else record("A", "输入卡底栏集群在视口内", null, "未找到官方发送按钮（该页无底栏集群）");
+	// 相同可用宽度下比对官方输入区；消除桌面侧栏占宽，不复制官方 CSS。
+	const composerParity = await evaluate(`(async()=>{
+		const frame=document.querySelector('[data-sidebar-collapsed]');
+		if(!frame)throw Error('官方 frame 缺失');
+		const grid=frame.style.getPropertyValue('grid-template-columns');
+		const priority=frame.style.getPropertyPriority('grid-template-columns');
+		const sample=()=>{
+			const card=document.querySelector('[data-composer-card]');
+			if(!card)throw Error('官方 composer 缺失');
+			const root=card.getBoundingClientRect();
+			const nodes=[card,card.querySelector('[data-composer-input]'),...card.querySelectorAll('button')];
+			return nodes.map(e=>{
+				if(!e)throw Error('官方 composer input 缺失');
+				const s=getComputedStyle(e),r=e.getBoundingClientRect();
+				return {label:e.getAttribute('aria-label'),text:e.textContent,
+					geometry:[r.x-root.x,r.y-root.y,r.width,r.height].map(n=>Math.round(n*100)/100),
+					style:Object.fromEntries(['display','flexWrap','gap','padding','fontSize','overflow','transform'].map(k=>[k,s[k]]))};
+			});
+		};
+		const phone=sample();
+		const custom=[...document.querySelector('[data-composer-card]').querySelectorAll('*')]
+			.flatMap(e=>[...e.attributes].filter(a=>a.name.startsWith('data-dshr-composer-')).map(a=>a.name));
+		try{
+			window.__dshrSetDevice('tablet');
+			frame.style.setProperty('grid-template-columns','0px minmax(0,1fr) 0px');
+			await new Promise(r=>setTimeout(r,200));
+			return {phone,official:sample(),custom};
+		}finally{
+			if(grid)frame.style.setProperty('grid-template-columns',grid,priority);
+			else frame.style.removeProperty('grid-template-columns');
+			window.__dshrSetDevice('phone');
+			await new Promise(r=>setTimeout(r,200));
+		}
+	})()`);
+	record("A/composer", "手机与平板官方输入区样式和几何一致",
+		JSON.stringify(composerParity.phone) === JSON.stringify(composerParity.official),
+		JSON.stringify(composerParity.phone) === JSON.stringify(composerParity.official)
+			? `同宽度 412px；输入框及 ${composerParity.phone.length - 2} 个官方按钮`
+			: JSON.stringify(composerParity));
+	record("A/composer", "输入区没有手机专属标记", composerParity.custom.length === 0, JSON.stringify(composerParity.custom));
 	// ── WEB-08 手势方向门：主页面左滑**不得**点亮左侧抽屉（用户报告的 bug）──
 	// 修复前：onDragMove 越过 10px 阈值就 dragging=true + setDrawerVisual(baseX)，
 	// 而 setDrawerVisual 首次调用会无条件 setSidebarOpen(true) 再把负位移夹到 0，
@@ -967,12 +1007,12 @@ try {
 			!!trigList && !/data-dshr-composer-send/.test(trigList),
 			trigList ? `名单含 send=${/data-dshr-composer-send/.test(trigList)}` : "提取失败：COMPOSER_TRIGGER_SELECTOR");
 		const sendList = extractInitializer(HOOK_SOURCE, "COMPOSER_SEND_SELECTOR", "COMPOSER_SEND_SELECTOR");
-		const sendHasMarker = !!sendList && /data-dshr-composer-send/.test(sendList);
+		const sendUsesOfficialOnly = !!sendList && !/data-dshr-composer-/.test(sendList);
 		const sendHasCn = !!sendList && /发送消息/.test(sendList);
 		const sendHasEn = !!sendList && /Send message/.test(sendList);
-		record("A/T69", "T69-契约 COMPOSER_SEND_SELECTOR 同时含 hook 标记与官方中英文案",
-			sendHasMarker && sendHasCn && sendHasEn,
-			`marker=${sendHasMarker} cn=${sendHasCn} en=${sendHasEn}`);
+		record("A/T69", "T69-契约 COMPOSER_SEND_SELECTOR 使用官方中英文案",
+			sendUsesOfficialOnly && sendHasCn && sendHasEn,
+			`official=${sendUsesOfficialOnly} cn=${sendHasCn} en=${sendHasEn}`);
 		const pt = extractDecl(HOOK_SOURCE, /function isPanelTriggerPoint\b/, "isPanelTriggerPoint");
 		// ⚠️ T76：所有 indexOf **顺序**断言都打在「掩掉注释与字符串」的等价长副本上。
 		// 实测就栽在这：armComposerFocus 的 T69 说明注释里就写着
@@ -1065,20 +1105,17 @@ try {
 		// ── b) + c) 行为：真实落指（合成 pointerdown，页面侧观测 composer）──
 		const t69Probe = await evaluate(`(function(){
 			function composer(){ return document.querySelector('[data-composer-input]'); }
-			var send = document.querySelector('[data-dshr-composer-send]')
-				|| document.querySelector('button[aria-label="Send message"]');
+			var send = document.querySelector('button[aria-label="发送消息"], button[aria-label="Send message"]');
 			// ⚠️ T76：这里原本**只**认英文 aria-label 'Add files or run commands'，
 			// 而真实官方页面在本 harness 里是**中文**（见同文件「官方 Collapse sidebar
 			// 真实点按」那条断言读到 aria-label="收起侧边栏"），「+」的官方中文文案实测是
 			// **「添加文件或调用指令」**（探针一次性打出来的原文见 report §1.1），
 			// 于是 hasPlus=false、整组 T69 行为断言被一条「探针就绪」卡成红。
 			// 修法：与 hook 自己认「+」的**同一份名单**保持一致 ——
-			// 先 hook 标记 data-dshr-composer-add（syncComposerChrome 写），
-			// 再把官方中英文案**逐条列全**（与 COMPOSER_TRIGGER_SELECTOR 逐条同源）。
+			// 把官方中英文案**逐条列全**（与 COMPOSER_TRIGGER_SELECTOR 逐条同源）。
 			// 别再写死单个英文 aria-label，也别只补一个中文字符串 ——
 			// 「命令」/「指令」一字之差就会重演 hasPlus=false。
-			var plus = document.querySelector('[data-dshr-composer-add]')
-				|| document.querySelector('button[aria-label="Add files or run commands"]')
+			var plus = document.querySelector('button[aria-label="Add files or run commands"]')
 				|| document.querySelector('button[aria-label="添加文件或运行命令"]')
 				|| document.querySelector('button[aria-label="添加文件或调用指令"]')
 				|| document.querySelector('button[aria-label="添加文件或运行指令"]')
@@ -1087,7 +1124,7 @@ try {
 				|| document.querySelector('button[aria-label="Commands"]');
 			if (!composer() || !send || !plus) {
 				return { ok:false, why:'missing', hasComposer:!!composer(), hasSend:!!send, hasPlus:!!plus,
-					plusLabels: Array.prototype.slice.call(document.querySelectorAll('[data-dshr-composer-row] button, [data-composer-card] button, [data-composer-card] [role="button"]'))
+					plusLabels: Array.prototype.slice.call(document.querySelectorAll('[data-composer-card] button, [data-composer-card] [role="button"]'))
 						.map(function(b){return b.getAttribute('aria-label');}).filter(Boolean).slice(0,12) };
 			}
 			function fire(el, type){
@@ -1120,13 +1157,12 @@ try {
 						? (document.activeElement.getAttribute('aria-label') || '').slice(0, 30) : '' };
 			}
 			return { ok:true, send: probe(send), plus: probe(plus),
-				sendLabel: send.getAttribute('aria-label'), plusLabel: plus.getAttribute('aria-label'),
-				plusByHookMark: plus.hasAttribute('data-dshr-composer-add') };
+				sendLabel: send.getAttribute('aria-label'), plusLabel: plus.getAttribute('aria-label') };
 		})()`);
 		record("A/T69", "T69-行为 探针就绪（composer / 发送 / 「+」都在真实页面上）",
 			t69Probe.ok === true,
 			t69Probe.ok
-				? `发送 aria-label=${JSON.stringify(t69Probe.sendLabel)}；「+」aria-label=${JSON.stringify(t69Probe.plusLabel)}（hook 标记命中=${t69Probe.plusByHookMark}）`
+				? `发送 aria-label=${JSON.stringify(t69Probe.sendLabel)}；「+」aria-label=${JSON.stringify(t69Probe.plusLabel)}`
 				: JSON.stringify(t69Probe));
 		if (t69Probe.ok) {
 			record("A/T69", "T69-行为 落指发送：composer 不被打 inputmode=none（发送不再布防）",

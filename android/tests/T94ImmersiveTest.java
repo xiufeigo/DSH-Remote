@@ -14,8 +14,8 @@ import java.nio.file.Paths;
  *       （setAttribute / appendChild / innerHTML / classList / style. / localStorage / setTimeout …）；
  *       必须用 {@code elementFromPoint} + {@code getComputedStyle} 读，且**返回对象**而不是 JSON 字符串
  *       （字符串会被 evaluateJavascript 再编码一层，{@code new JSONObject(value)} 直接抛）。</li>
- *   <li><b>三条一致 + 回退路径</b>：{@code rootLayout} 用 {@code strip}；窗口状态栏/导航栏也用同一取值；
- *       {@code sessionBarColor()} 在取不到时逐值退回改动前的 {@code dark ? 0xFF141414 : Color.WHITE}。</li>
+	 *   <li><b>原生透明</b>：手机和平板的窗口系统栏始终透明；采样色只铺容器底色，
+	 *       移动适配自检不能改变系统栏布局。</li>
  *   <li><b>不回归 T80</b>：让位仍写 WebView 的**布局盒**（{@code lp.setMargins(left, top, right, bottom)}），
  *       四向仍来自 {@code readSystemBarInsetsPx()}。</li>
  * </ol>
@@ -92,21 +92,27 @@ public final class T94ImmersiveTest {
 		check(probe.contains("parentElement"), "probe walks ancestors to composite the painted colour");
 		check(probe.contains("return {t:t") || probe.contains("return {t:t,"),
 			"probe returns an OBJECT literal (not a JSON string: double-encoding would break JSONObject)");
-		check(probe.contains("innerHeight"), "probe derives the bottom sample from the viewport height");
+		check(probe.contains("innerHeight"), "probe derives sample positions from the viewport height");
 		check(probe.contains("data-ds-dark-theme"),
 			"probe reads the official dark marker (same first-order signal as the hook's syncPageTheme)");
 
-		// ── 2. 三条一致 + 回退 ────────────────────────────────────────
+		// ── 2. 页面画系统栏背景，采样色只用于容器首帧 ─────────────────
 		check(src.contains("int strip = sessionBarColor(dark);"),
 			"applySystemBars takes ONE strip colour from sessionBarColor(dark)");
 		String bars = methodBody(src, "private void applySystemBars()");
 		check(bars.length() > 500, "applySystemBars body extracted");
 		check(bars.contains("rootLayout.setBackgroundColor(session"), "rootLayout is painted with the strip colour");
 		check(bars.contains("? strip :"), "rootLayout (and WebView) use `strip`");
-		check(bars.contains("setStatusBarColor(strip") || bars.contains("setStatusBarColor(sampled ? strip"),
-			"window status bar colour is synced to the same value");
-		check(bars.contains("setNavigationBarColor(nav)"), "window navigation bar colour is still applied");
-		check(bars.contains("int nav = sampled ? pageBgBottom"), "navigation bar colour comes from the sampled page colour");
+		check(bars.contains("setStatusBarColor(Color.TRANSPARENT)"),
+			"phone and tablet status bars are transparent");
+		check(bars.contains("setNavigationBarColor(Color.TRANSPARENT)"),
+			"phone and tablet navigation bars are transparent");
+		check(!bars.contains("sampled") && !bars.contains("tabletSession"),
+			"page sampling and device class cannot repaint opaque system bars");
+		check(!src.contains("edgeToEdgeChrome") && !src.contains("applySystemBarMode("),
+			"adaptation health never gates the edge-to-edge window layout");
+		check(bars.contains("SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN") && bars.contains("SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION"),
+			"both system-bar areas remain part of the page viewport");
 		String pick = methodBody(src, "private int sessionBarColor(boolean dark)");
 		check(pick.contains("pageBgTop"), "sessionBarColor returns the sampled page colour when available");
 		check(pick.contains("0xFF141414") && pick.contains("Color.WHITE"),
@@ -158,7 +164,13 @@ public final class T94ImmersiveTest {
 			"T115: applyInsetsToPage uses the SAME source as the avoidance for the tablet class (no race between two writers)");
 		check(insetsToPage.contains("getInsets(WindowInsets.Type.statusBars())")
 			&& insetsToPage.contains("getInsets(WindowInsets.Type.navigationBars())"),
-			"T115: the phone path keeps its verified statusBars/navigationBars source value-for-value");
+			"phone insets consume statusBars/navigationBars");
+		check(insetsToPage.contains("navigationBars()).left") && insetsToPage.contains("navigationBars()).right")
+			&& insetsToPage.contains("getStableInsetLeft()") && insetsToPage.contains("getStableInsetRight()"),
+			"phone landscape passes lateral navigation insets on modern and legacy Android");
+		check(insetsToPage.contains("Math.max(leftPx, cut.getSafeInsetLeft())")
+			&& insetsToPage.contains("Math.max(rightPx, cut.getSafeInsetRight())"),
+			"cutout avoidance cannot overwrite lateral navigation insets");
 
 		// ── 6. T115：系统栏「原生透明」字面一致（含 API 30–34 的形态） ──
 		String barsInit = methodBody(src, "private void configureSystemBars()");
@@ -168,13 +180,13 @@ public final class T94ImmersiveTest {
 			"T115: the literal setNavigationBarColor(shell_background) is gone (it contradicted 'native transparent')");
 		check(barsInit.contains("setStatusBarColor(Color.TRANSPARENT)"),
 			"T115: status bar is native-transparent too");
+		check(barsInit.contains("setNavigationBarDividerColor(Color.TRANSPARENT)"),
+			"initial navigation divider is transparent too");
 		check(barsInit.contains("setNavigationBarContrastEnforced(false)")
 			&& barsInit.contains("setStatusBarContrastEnforced(false)"),
 			"T115: contrast enforcement stays off (kept from before, no scrim over the page)");
-		check(bars.contains("if (tabletSession) nav = Color.TRANSPARENT;"),
-			"T115: in a tablet session the nav bar is genuinely transparent (page paints the band)");
-		check(bars.contains("if (tabletSession) getWindow().setStatusBarColor(Color.TRANSPARENT);"),
-			"T115: in a tablet session the status bar is genuinely transparent (page paints the band)");
+		check(bars.contains("setNavigationBarDividerColor(Color.TRANSPARENT)"),
+			"navigation divider cannot leave an opaque line over the page");
 		check(bars.contains("setSystemBarsAppearance(dark ? 0 : mask, mask)"),
 			"T115: the pageDark / setSystemBarsAppearance icon-brightness logic is preserved");
 
