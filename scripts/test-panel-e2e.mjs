@@ -61,6 +61,11 @@ assert.ok(routes.has("/dsh-remote/restart"), "应注册 restart 路由");
 assert.ok(routes.has("/dsh-remote/pair-code"), "应注册 pair-code 路由");
 assert.equal(settingsRegistrations.length, 1, "应注册 settings 命名空间");
 assert.equal(settingsRegistrations[0].namespace, "dsh-remote");
+const schema = settingsRegistrations[0].schema;
+assert.equal(schema({ frp: { mode: "xtcp", entryEnabled: true, remotePort: 9443 } }).frp.entryEnabled, true);
+assert.equal(schema({ frp: { mode: "xtcp", entryEnabled: true, remotePort: 9443 } }).frp.remotePort, 9443);
+assert.equal(schema.toJSON().properties.frp.properties.entryEnabled.type, "boolean");
+assert.equal(schema.toJSON().properties.frp.properties.remotePort.maximum, 65535);
 console.log("✓ 5 条路由 + settings 命名空间注册到位");
 
 // 假 req/res 工具
@@ -122,7 +127,7 @@ async function callRoute(path, req, timeoutMs = 12_000) {
 	const res = await callRoute(
 		"/dsh-remote/config",
 		// 与真实设置卡片一致：frp 段全量提交（表单用展示默认值补齐过）
-		fakeReq(JSON.stringify({ autoStart: true, frp: { enabled: true, serverAddr: "203.0.113.7", serverPort: 17000, remotePort: 18448, mode: "xtcp" } })),
+		fakeReq(JSON.stringify({ autoStart: true, frp: { enabled: true, serverAddr: "203.0.113.7", serverPort: 17000, remotePort: 18448, mode: "xtcp", entryEnabled: true } })),
 	);
 	const payload = parseBody(res, "config-post");
 	assert.equal(payload.ok, true, `保存应成功：${res.state.body}`);
@@ -132,6 +137,8 @@ async function callRoute(path, req, timeoutMs = 12_000) {
 	assert.equal(persisted.frp.enabled, true);
 	assert.equal(persisted.frp.serverAddr, "203.0.113.7");
 	assert.equal(persisted.frp.mode, "xtcp", "访客形态应写盘");
+	assert.equal(persisted.frp.entryEnabled, true);
+	assert.equal(persisted.frp.remotePort, 18448);
 	console.log("✓ 配置已写盘");
 
 	const up = await waitForPort(LISTEN_PORT, 15000);
@@ -186,4 +193,3 @@ console.log("✓ dispose 后网关已释放");
 await rm(tempHome, { recursive: true, force: true });
 console.log("\n✅ 面板后端端到端全部通过");
 process.exit(0);
-

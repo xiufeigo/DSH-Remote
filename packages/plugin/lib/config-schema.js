@@ -56,10 +56,10 @@ function isHostOrIp(value) {
 
 /**
  * 登录密钥 / 访客密钥：非空、不过长、不含控制字符。
- * 网关侧密钥为自动生成（无长度约束）；此上限是面板输入护栏，与网关无同步约束。
+ * 访客密钥上限与网关 auth.ts MAX_VISITOR_KEY_LENGTH 一致（512）。
  */
 function isSecret(value) {
-	return typeof value === "string" && value.length > 0 && value.length <= 512 && !/[\r\n\0]/.test(value);
+	return typeof value === "string" && value.trim().length > 0 && value.length <= 512 && !/[\r\n\0]/.test(value);
 }
 
 /**
@@ -90,7 +90,7 @@ export function validateConfigPatch(input) {
 			case "authToken":
 			case "visitorKey":
 				if (!isSecret(value)) errors.push(`${key === "authToken" ? "登录密钥" : "访客密钥"}必须是 1-512 位且不含换行`);
-				else secrets[key] = value;
+				else secrets[key] = value.trim();
 				break;
 			case "autoFixUpstreamPort":
 			case "autoStart":
@@ -115,16 +115,16 @@ export function validateConfigPatch(input) {
 					break;
 				}
 				const frpPatch = {};
-				const frpAllowed = new Set(["enabled", "serverAddr", "serverPort", "remotePort", "mode", "name"]);
+				const frpAllowed = new Set(["enabled", "entryEnabled", "serverAddr", "serverPort", "remotePort", "mode", "name"]);
 				for (const frpKey of Object.keys(value)) {
 					if (!frpAllowed.has(frpKey)) {
 						errors.push(`未知 frp 配置项：${frpKey}`);
 						continue;
 					}
 					const frpValue = value[frpKey];
-					if (frpKey === "enabled") {
-						if (typeof frpValue !== "boolean") errors.push("frp.enabled 必须是布尔值");
-						else frpPatch.enabled = frpValue;
+					if (frpKey === "enabled" || frpKey === "entryEnabled") {
+						if (typeof frpValue !== "boolean") errors.push(`frp.${frpKey} 必须是布尔值`);
+						else frpPatch[frpKey] = frpValue;
 					} else if (frpKey === "mode") {
 						// 白名单与网关 frp.ts normalizeFrpMode 的合法集一致（entry/stcp/xtcp）
 						if (typeof frpValue !== "string" || !FRP_MODES.has(frpValue)) {
@@ -191,5 +191,5 @@ export const DISPLAY_DEFAULTS = {
 	upstreamPort: 52392,
 	autoFixUpstreamPort: true,
 	autoStart: true,
-	frp: { enabled: false, serverPort: 7000, remotePort: 8443, mode: "xtcp", name: "dsh-remote" },
+	frp: { enabled: false, entryEnabled: false, serverPort: 7000, remotePort: 8443, mode: "xtcp", name: "dsh-remote" },
 };

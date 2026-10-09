@@ -61,6 +61,9 @@ test("validateConfigPatch：登录密钥与访客密钥进 secrets 不进 config
 
 	const bad = validateConfigPatch({ authToken: "has\nnewline" });
 	assert.equal(bad.ok, false);
+	assert.equal(validateConfigPatch({ visitorKey: "   " }).ok, false);
+	assert.equal(validateConfigPatch({ visitorKey: "visit-key\n" }).ok, false);
+	assert.deepEqual(validateConfigPatch({ visitorKey: " visit-key " }).secrets, { visitorKey: "visit-key" });
 });
 
 test("validateConfigPatch：frp.mode 白名单", () => {
@@ -72,6 +75,21 @@ test("validateConfigPatch：frp.mode 白名单", () => {
 	const bad = validateConfigPatch({ frp: { mode: "tcp" } });
 	assert.equal(bad.ok, false);
 	assert.ok(bad.errors.some((e) => e.includes("frp.mode")));
+});
+
+test("公网映射开关：显式布尔值，端口保留，关闭不改访客模式", () => {
+	for (const entryEnabled of [true, false]) {
+		const result = validateConfigPatch({ frp: { entryEnabled, remotePort: 9443 } });
+		assert.equal(result.ok, true);
+		const next = mergeConfigFile({ frp: { enabled: true, mode: "xtcp", name: "pc" } }, result.patch);
+		assert.deepEqual(next.frp, { enabled: true, mode: "xtcp", name: "pc", entryEnabled, remotePort: 9443 });
+	}
+	for (const entryEnabled of ["true", 1, null]) {
+		assert.equal(validateConfigPatch({ frp: { entryEnabled } }).ok, false);
+	}
+	for (const remotePort of [0, 65536, 9443.5, "9443"]) {
+		assert.equal(validateConfigPatch({ frp: { entryEnabled: true, remotePort } }).ok, false);
+	}
 });
 
 test("validateConfigPatch：frp.name 白名单与归一化", () => {
@@ -121,7 +139,7 @@ test("handleConfigPost：合法补丁 → 写盘 + 重启联动", async () => {
 
 	const res = fakeRes();
 	await handlers.handleConfigPost(
-		fakeReq(JSON.stringify({ frp: { enabled: true, serverAddr: "5.6.7.8" } })),
+		fakeReq(JSON.stringify({ frp: { enabled: true, serverAddr: "5.6.7.8", mode: "xtcp", entryEnabled: true, remotePort: 9443 } })),
 		res,
 	);
 	assert.equal(res.calls.status, 200);
@@ -129,11 +147,14 @@ test("handleConfigPost：合法补丁 → 写盘 + 重启联动", async () => {
 	assert.equal(written.frp.enabled, true);
 	assert.equal(written.frp.serverAddr, "5.6.7.8");
 	assert.equal(written.frp.serverPort, 7000);
+	assert.equal(written.frp.mode, "xtcp");
+	assert.equal(written.frp.entryEnabled, true);
+	assert.equal(written.frp.remotePort, 9443);
 	assert.equal(restarts, 1, "保存后必须联动重启网关");
 	await rm(home, { recursive: true, force: true });
 });
 
-test("handleConfigPost：密钥写入 secrets.json 且不进 config", async () => {
+test("handleConfigPost：仅公网模式也保存自定义访客密钥，密钥不进 config", async () => {
 	let writtenConfig = null;
 	let writtenSecrets = null;
 	const handlers = createRouteHandlers({
@@ -149,7 +170,7 @@ test("handleConfigPost：密钥写入 secrets.json 且不进 config", async () =
 	const res = fakeRes();
 	await handlers.handleConfigPost(
 		fakeReq(JSON.stringify({
-			frp: { enabled: true, serverAddr: "9.9.9.9", serverPort: 7000, mode: "xtcp" },
+			frp: { enabled: true, serverAddr: "9.9.9.9", serverPort: 7000, mode: "entry" },
 			authToken: "login-key",
 			visitorKey: "visit-key",
 		})),
@@ -301,12 +322,18 @@ type = "stcp"
 [[proxies]]
 name = "dsh-remote"
 type = "xtcp"
+
+[[proxies]]
+name = "dsh-remote-entry"
+type = "tcp"
+remotePort = 9443
 `);
 	const snap = readTunnelSnapshot(dir);
 	assert.equal(snap.serverAddr, "8.138.19.15");
 	assert.equal(snap.serverPort, 7180);
 	assert.equal(snap.dualProxy, true);
-	assert.deepEqual(snap.proxies.map((p) => `${p.name}:${p.type}`), ["dsh-remote-stcp:stcp", "dsh-remote:xtcp"]);
+	assert.deepEqual(snap.proxies.map((p) => `${p.name}:${p.type}`), ["dsh-remote-stcp:stcp", "dsh-remote:xtcp", "dsh-remote-entry:tcp"]);
+	assert.equal(snap.proxies[2].remotePort, 9443);
 	assert.equal(readTunnelSnapshot(join(dir, "missing")), null);
 	await rm(dir, { recursive: true, force: true });
 });
@@ -328,7 +355,7 @@ type = "xtcp"
 	const handlers = createRouteHandlers({
 		home: dir,
 		log: () => {},
-		readConfig: () => ({ listenPort: 18443 }),
+		readConfig: () => ({ listenPort: 18443, frp: { enabled: true } }),
 		writeConfig: async () => {},
 		restartGateway: () => {},
 		adminRequest: async () => undefined,
@@ -362,6 +389,21 @@ test("handlePairCodePost：转发成功与失败", async () => {
 	assert.equal(res2.calls.status, 502);
 });
 
+test("停用 frp 时不展示磁盘残留的公网配置", async () => {
+	const dir = await makeTempHome("dshr-disabled-");
+	await mkdir(join(dir, "frp"), { recursive: true });
+	await writeFile(join(dir, "frp", "frpc.toml"), '[[proxies]]\nname = "old-entry"\ntype = "tcp"\nremotePort = 9443\n');
+	const handlers = createRouteHandlers({
+		home: dir, log: () => {}, readConfig: () => ({ frp: { enabled: false } }),
+		writeConfig: async () => {}, restartGateway: () => {},
+		adminRequest: async () => ({ status: 200, body: '{"frp":{"running":false}}' }),
+	});
+	const res = fakeRes();
+	await handlers.handleStatusGet(fakeReq(), res);
+	assert.equal(JSON.parse(res.calls.body).tunnel, null);
+	await rm(dir, { recursive: true, force: true });
+});
+
 test("resolveRemoteHome：显式环境变量优先", () => {
 	const saved = process.env.DSH_REMOTE_HOME;
 	process.env.DSH_REMOTE_HOME = "C:\\tmp\\dshr-x";
@@ -375,6 +417,8 @@ test("DISPLAY_DEFAULTS 与网关 DEFAULT_CONFIG 对齐抽查", async () => {
 	assert.equal(DISPLAY_DEFAULTS.listenPort, DEFAULT_CONFIG.listenPort);
 	assert.equal(DISPLAY_DEFAULTS.upstreamPort, DEFAULT_CONFIG.upstreamPort);
 	assert.equal(DISPLAY_DEFAULTS.frp.serverPort, DEFAULT_CONFIG.frp.serverPort);
+	assert.equal(DISPLAY_DEFAULTS.frp.remotePort, DEFAULT_CONFIG.frp.remotePort);
+	assert.equal(DISPLAY_DEFAULTS.frp.entryEnabled, DEFAULT_CONFIG.frp.entryEnabled);
 	assert.equal(DISPLAY_DEFAULTS.frp.mode, "xtcp", "插件面板缺省形态为 xtcp（访客密钥连入）");
 	assert.equal(DISPLAY_DEFAULTS.frp.name, "dsh-remote");
 	assert.equal(DEFAULT_CONFIG.frp.mode, "entry", "网关文件缺省仍为 entry，避免未写 mode 的历史部署被改写");

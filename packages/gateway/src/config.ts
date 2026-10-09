@@ -39,9 +39,11 @@ export interface FrpConfig {
 	serverPort: number;
 	/** frpc↔frps 共享密钥；缺省自动生成并持久化 */
 	authToken?: string;
-	/** 隧道形态；文件缺省为 entry。插件设置页保存时写 xtcp（访客密钥连入）。 */
+	/** 主隧道形态；文件缺省为 entry，插件缺省为 xtcp。 */
 	mode?: FrpMode;
-	/** VPS 对外入口端口，仅 mode=entry 时使用；手机访问 https://<vps>:<该端口> */
+	/** 在 stcp/xtcp 之外同时启用公网入口；缺省关闭，公网入口通过访客密钥登录。 */
+	entryEnabled?: boolean;
+	/** VPS 对外入口端口，mode=entry 或 entryEnabled=true 时使用。 */
 	remotePort: number;
 	/** 访客密钥（mode=stcp/xtcp）：proxy 与 visitor 必须一致；缺省自动生成并持久化 */
 	secretKey?: string;
@@ -172,6 +174,7 @@ export const DEFAULT_CONFIG: GatewayConfig = {
 		serverPort: 7000,
 		remotePort: 8443,
 		mode: "entry",
+		entryEnabled: false,
 	},
 };
 

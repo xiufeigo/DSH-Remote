@@ -1,7 +1,7 @@
 /**
  * 认证与限流：
  * - 设备 Token 放在 httpOnly Cookie（`dr_device`），只存哈希；
- * - 未认证请求统一导向网关自带的一次性配对页（`/__dsh_remote__/pair`）；
+ * - 未认证请求导向访客密钥 / 访问 Token 登录页，或一次性配对页；
  * - 连续配对失败按 IP 锁定；全局每 IP 滑动窗口限流；
  * - 本机管理端点仅接受 127.0.0.1 来源（CLI 与守护进程同机通信）。
  */
@@ -15,10 +15,15 @@ export const COOKIE_NAME = "dr_device";
 export const PAIR_PAGE = "/__dsh_remote__/pair";
 export const LOGIN_PAGE = "/__dsh_remote__/login";
 export const INTERNAL_PREFIX = "/__dsh_remote__/";
+export type LoginKind = "visitor-key" | "access-token";
+export const MAX_VISITOR_KEY_LENGTH = 512;
+const MAX_ACCESS_TOKEN_LENGTH = 256;
 
 export interface AuthDeps {
 	store: Store;
 	config: GatewayConfig;
+	/** 桌面公网会话绑定当前访客密钥；轮换后旧 Cookie 必须失效。 */
+	credentialHash?: string;
 }
 
 // ---------- Cookie ----------
@@ -238,7 +243,7 @@ export async function checkRequest(
 ): Promise<{ ok: true; deviceId: string } | { ok: false; status: number; reason: string }> {
 	const token = deviceTokenOf(req);
 	if (token === undefined || token.length === 0) return { ok: false, status: 401, reason: "no-device-token" };
-	const device = await deps.store.deviceByToken(token);
+	const device = await deps.store.deviceByToken(token, deps.credentialHash);
 	if (device === undefined) return { ok: false, status: 401, reason: "invalid-device-token" };
 	// P2-6：touchDevice 内部落盘可 reject（EPERM/EBUSY 重试耗尽、ENOSPC 等），
 	// fire-and-forget 必须兜 .catch，否则未处理 rejection 会击杀网关进程
@@ -270,11 +275,11 @@ export function clearDeviceCookie(res: ServerResponse): void {
 }
 
 /**
- * stcp/xtcp 下隧道本身就是准入：VPS 不开入口，只有持有访客密钥的 frpc visitor
- * 能打到本机网关。此时不再要求一次性配对码 / 扫码。
+ * 仅桌面访客监听口可依赖 stcp/xtcp 密钥准入；公网监听口和 edge 必须设备认证。
+ * publicEntry 由服务端监听接线决定，不能由请求头或 URL 指定。
  */
-export function visitorKeyAdmits(config: GatewayConfig): boolean {
-	if (config.frp.enabled !== true) return false;
+export function visitorKeyAdmits(config: GatewayConfig, publicEntry = false): boolean {
+	if (publicEntry || config.role === "edge" || config.frp.enabled !== true) return false;
 	const mode = config.frp.mode;
 	return mode === "stcp" || mode === "xtcp";
 }
@@ -312,12 +317,18 @@ export function verifyAdminToken(input: string | undefined, stored: string | und
  * 校验明文访问 Token 与持久化哈希是否一致（恒时比较）。
  * 未配置哈希（undefined / 长度不对）一律拒绝 —— 门禁缺失时应走配对页而非放行。
  */
-export function verifyAccessToken(input: string, storedHash: string | undefined): boolean {
+export function verifyLoginSecret(input: string, storedHash: string | undefined, kind: LoginKind = "visitor-key"): boolean {
+	const maxLength = kind === "visitor-key" ? MAX_VISITOR_KEY_LENGTH : MAX_ACCESS_TOKEN_LENGTH;
 	// GW-14：超长输入直接拒绝，避免对无谓的大 Token 做 SHA-256（防资源滥用）
-	if (typeof input !== "string" || input.length > 256) return false;
+	if (typeof input !== "string" || input.length === 0 || input.length > maxLength) return false;
 	if (typeof storedHash !== "string" || !/^[0-9a-f]{64}$/.test(storedHash)) return false;
 	const candidate = hashAccessToken(input);
 	return timingSafeEqual(Buffer.from(candidate, "utf8"), Buffer.from(storedHash, "utf8"));
+}
+
+/** edge 访问 Token 保留原有 256 位上限；访客密钥与插件的 512 位上限一致。 */
+export function verifyAccessToken(input: string, storedHash: string | undefined): boolean {
+	return verifyLoginSecret(input, storedHash, "access-token");
 }
 
 /**

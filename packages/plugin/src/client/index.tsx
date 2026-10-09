@@ -147,7 +147,6 @@ input.dshr-input[type="number"] { width: 130px; }
   background: var(--dsw-alias-bg-layer-1, #f6f6f7);
   border: 1px solid var(--dsw-alias-border-l2, rgba(20, 20, 30, 0.18));
 }
-.dshr-code b { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: 1px; }
 .dshr-tunnel {
   margin: 8px 0 4px; padding: 10px 12px; border-radius: 8px;
   background: var(--dsw-alias-bg-layer-1, #f6f6f7);
@@ -284,10 +283,9 @@ export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {})
           ...{
             autoStart: true, listenHost: '127.0.0.1', listenPort: 18443,
             upstreamPort: 52392, autoFixUpstreamPort: true,
-            frp: { enabled: false, serverAddr: '', serverPort: 7000, remotePort: 8443, mode: 'xtcp', name: 'dsh-remote' },
           },
           ...payload.config,
-          frp: { enabled: false, serverAddr: '', serverPort: 7000, remotePort: 8443, mode: 'xtcp', name: 'dsh-remote', ...payload.config?.frp },
+          frp: { ...payload.defaults.frp, serverAddr: '', ...payload.config?.frp },
         }
         setForm(merged)
         setAuthToken(typeof payload.secrets?.authToken === 'string' ? payload.secrets.authToken : '')
@@ -332,7 +330,9 @@ export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {})
           enabled: form.frp.enabled,
           serverAddr: String(form.frp.serverAddr ?? '').trim(),
           serverPort: form.frp.serverPort,
-          mode: 'xtcp',
+          mode: form.frp.mode,
+          entryEnabled: form.frp.entryEnabled,
+          remotePort: form.frp.remotePort,
           name: String(form.frp.name ?? '').trim() || 'dsh-remote',
         },
       }
@@ -375,14 +375,20 @@ export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {})
   const formAddr = String(form?.frp?.serverAddr ?? '').trim()
   const formPort = Number(form?.frp?.serverPort ?? 0)
   const formName = String(form?.frp?.name ?? '').trim() || 'dsh-remote'
-  const liveName = Array.isArray(tunnel?.proxies)
-    ? (tunnel.proxies.find((proxy: { type: string }) => proxy.type === 'xtcp')?.name
-      ?? tunnel.proxies[0]?.name)
-    : undefined
+  const proxies: Array<{ name: string; type: string; remotePort?: number }> = tunnel?.proxies ?? []
+  const liveName = proxies.find(proxy => proxy.type === 'xtcp')?.name ?? proxies[0]?.name
+  const entryProxy = proxies.find(proxy => proxy.type === 'tcp')
+  const publicUrl = entryProxy && status?.config?.frp?.enabled === true && status?.gateway?.frp?.running === true
+    ? `https://${String(tunnel.serverAddr)}:${String(entryProxy.remotePort)}/` : null
+  const expectsEntry = form?.frp?.mode === 'entry' || form?.frp?.entryEnabled === true
   const tunnelMismatch = tunnel !== null
     && (formAddr !== String(tunnel.serverAddr ?? '')
       || formPort !== Number(tunnel.serverPort ?? 0)
-      || (typeof liveName === 'string' && liveName.length > 0 && liveName !== formName))
+      || (typeof liveName === 'string' && liveName.length > 0 && liveName !== formName)
+      || !proxies.some(proxy => proxy.name === formName && proxy.type === (form.frp.mode === 'entry' ? 'tcp' : form.frp.mode))
+      || (form.frp.mode === 'xtcp' && !proxies.some(proxy => proxy.name === `${formName}-stcp` && proxy.type === 'stcp'))
+      || expectsEntry !== (entryProxy !== undefined)
+      || (expectsEntry && form.frp.remotePort !== entryProxy?.remotePort))
 
   const Root = as
   return (
@@ -391,7 +397,7 @@ export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {})
         <span className="dshr-copy">
           <span className="dshr-name">DSH Remote</span>
           <span className="dshr-desc">
-            手机远程访问本机 DSH：填写与 Android 端相同的 VPS、端口、隧道名和两把密钥即可连入。展开后可看到正在生效的 xtcp + stcp 双代理。
+            手机远程访问本机 DSH：支持 xtcp + stcp 访客通道，并可同时启用指定公网端口供浏览器访问。
             {status !== undefined && status !== null
               ? (
                 <span className="dshr-desc-inline">
@@ -443,6 +449,25 @@ export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {})
                     onChange={v => { patchForm({ frp: { ...form.frp, name: v } }) }}
                     hint="写进 frps 的 proxy 名。多人共用一台 VPS 时必须互不相同；手机填同一名字（扫码会自动带上）。仅字母开头，字母数字和 - _，最多 32 位。留空则用 dsh-remote。"
                   />
+                  <Row label="隧道模式">
+                    <select className="dshr-input" aria-label="隧道模式" value={form.frp.mode}
+                      onChange={event => { patchForm({ frp: { ...form.frp, mode: event.target.value } }) }}>
+                      <option value="xtcp">打洞优先，失败中转</option>
+                      <option value="stcp">访客中转</option>
+                      <option value="entry">仅公网入口</option>
+                    </select>
+                  </Row>
+                  {form.frp.mode !== 'entry'
+                    ? <Row label="同时启用公网端口映射" hint="保留访客通道；浏览器访问公网入口时输入同一访客密钥">
+                        <Toggle checked={form.frp.entryEnabled} ariaLabel="同时启用公网端口映射"
+                          onChange={v => { patchForm({ frp: { ...form.frp, entryEnabled: v } }) }} />
+                      </Row>
+                    : null}
+                  {expectsEntry
+                    ? <TextField label="公网入口端口" placeholder="8443" value={String(form.frp.remotePort ?? '')}
+                        onChange={v => { patchForm({ frp: { ...form.frp, remotePort: Number(v) } }) }}
+                        hint="frps 必须允许该端口，防火墙和云安全组也需放行；默认自签证书会提示浏览器告警" />
+                    : null}
                   <TextField
                     label="登录密钥"
                     password
@@ -455,26 +480,26 @@ export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {})
                     password
                     value={visitorKey}
                     onChange={setVisitorKey}
-                    hint="Android 端填写同一把钥匙即可连入；网关固定走 127.0.0.1:18443，手机无需填本地端口"
+                    hint="可自定义，建议使用较长的随机密钥。Android 和公网网页使用同一密钥；修改并保存后，浏览器需重新验证，Android 也需更新密钥。"
                   />
                   {tunnel !== null
                     ? (
                       <div className="dshr-tunnel">
-                        <span className="dshr-label">当前生效的隧道</span>
+                        <span className="dshr-label">网关生成的隧道配置</span>
                         <p className="dshr-hint">
-                          双 proxy 写在本机 ~/.dsh-remote/frp/frpc.toml，保存后由网关覆盖生成。同一 Wi-Fi 也会走 VPS 控制口，手机配置组必须和下面这一行相同。
+                          保存并重启后生效。手机的 VPS、控制端口和访客隧道名应与这里一致。
                         </p>
                         <div className="dshr-proxy">
                           {`${String(tunnel.serverAddr)}:${String(tunnel.serverPort)}`}
                           {"\n"}
                           {Array.isArray(tunnel.proxies) && tunnel.proxies.length > 0
-                            ? tunnel.proxies.map((proxy: { name: string; type: string }) => `${proxy.name} · ${proxy.type}`).join("\n")
+                            ? proxies.map(proxy => `${proxy.name} · ${proxy.type}${proxy.remotePort ? ` · 公网端口 ${proxy.remotePort}` : ''}`).join("\n")
                             : "尚未解析到 [[proxies]]"}
                           {"\n"}
-                          {tunnel.dualProxy === true ? "xtcp 打洞 + stcp 降级已就绪" : "还没有 stcp 降级代理，请点保存并重启网关"}
+                          {tunnel.dualProxy === true ? "已配置 xtcp 打洞 + stcp 降级" : ""}
                         </div>
                         {tunnelMismatch
-                          ? <div className="dshr-note">输入框和正在运行的 frpc 不一致。只改上面几栏不会生效；要对齐手机请按「当前生效」填写，或点保存并重启网关。点「重启网关」不会把输入框写进 toml。</div>
+                          ? <div className="dshr-note">输入框和网关生成的配置不一致。请点保存并重启网关；只点「重启网关」不会保存输入框里的改动。</div>
                           : null}
                       </div>
                     )
@@ -491,6 +516,8 @@ export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {})
                 {busy === 'restart' ? '重启中…' : '重启网关'}
               </button>
             </div>
+
+            {publicUrl !== null ? <div className="dshr-code">公网访问：<a href={publicUrl} target="_blank" rel="noreferrer">{publicUrl}</a><p className="dshr-hint">在网页中输入上方设置的访客密钥即可进入。</p></div> : null}
 
             {message !== null ? <div className={`dshr-note${message.kind === 'ok' ? ' ok' : ''}`}>{message.text}</div> : null}
           </div>

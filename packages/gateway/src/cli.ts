@@ -18,7 +18,7 @@ import process from "node:process";
 import { GatewayServer } from "./server.ts";
 import { Store } from "./store.ts";
 import { applyEnvOverrides, type GatewayConfig, normalizeEdgeFrpRole } from "./config.ts";
-import { locateFrBinary, locateFrpcBinary, normalizeFrpMode, normalizeTunnelName, renderVisitorToml, visitorBindPortOf, visitorConnectionString } from "./frp.ts";
+import { locateFrBinary, locateFrpcBinary, normalizeFrpMode, normalizeTunnelName, publicEntryEnabled, renderVisitorToml, visitorBindPortOf, visitorConnectionString } from "./frp.ts";
 import { ensureAccessTokenHash, generatePairingCode } from "./auth.ts";
 import { ensureCert } from "./cert.ts";
 import { hasDshFingerprint, listLoopbackListeners, resolveUpstreamPort } from "./upstream.ts";
@@ -223,13 +223,14 @@ async function cmdStart(store: Store, flags: Map<string, string | boolean>): Pro
 
 function printDesktopBanner(config: GatewayConfig, server: { actualPort?: number }): void {
 	const frpMode = normalizeFrpMode(config.frp.mode);
-	const frpEntry = config.frp.enabled && typeof config.frp.serverAddr === "string" && frpMode === "entry";
+	const frpEntry = publicEntryEnabled(config.frp) && typeof config.frp.serverAddr === "string";
 	const entry = frpEntry
 		? `https://${config.frp.serverAddr}:${String(config.frp.remotePort)}/`
 		: `https://${config.listenHost}:${String(server.actualPort ?? config.listenPort)}/`;
 	console.log(`[dsh-remote] 入口地址：${entry}`);
-	if (config.frp.enabled && !frpEntry) {
-		console.log(`[dsh-remote] ${frpMode} 形态：VPS 不开公网入口；手机端运行 dsh-remote visitor 生成访客配置后连入`);
+	if (frpEntry) console.log("[dsh-remote] 浏览器访问：输入电脑端设置的访客密钥；修改密钥后需重新验证");
+	if (config.frp.enabled && frpMode !== "entry") {
+		console.log(`[dsh-remote] ${frpMode} 访客通道保留；运行 dsh-remote visitor 生成手机端配置`);
 	}
 	console.log(`[dsh-remote] 上游：http://127.0.0.1:${String(config.upstreamPort)}（DSH Web GUI）`);
 	if (!config.frp.enabled) console.log("[dsh-remote] 提示：config.json 里 frp.enabled=true 后将自动托管 frpc");
@@ -255,7 +256,7 @@ async function cmdPair(store: Store, flags: Map<string, string | boolean>): Prom
 	const pending = await store.putPendingCode(code, config.pairingCodeMinutes);
 
 	const name = typeof flags.get("name") === "string" ? String(flags.get("name")) : "";
-	const publicEntry = config.frp.enabled && typeof config.frp.serverAddr === "string"
+	const publicEntry = publicEntryEnabled(config.frp) && typeof config.frp.serverAddr === "string"
 		? entryUrl(config, config.frp.remotePort)
 		: undefined;
 
@@ -374,13 +375,12 @@ async function cmdStatus(store: Store): Promise<number> {
 	if (config.frp.enabled) {
 		const binary = await locateFrpcBinary(config.frp, store);
 		const mode = normalizeFrpMode(config.frp.mode);
-		const shape = mode === "entry"
-			? ` → 公网入口:${String(config.frp.remotePort)}`
-			: ` 形态=${mode}（不开公网端口）`;
+		const shape = ` 形态=${mode}` + (publicEntryEnabled(config.frp) ? ` + 公网入口:${String(config.frp.remotePort)}` : "（不开公网端口）");
 		console.log(`frp           ${config.frp.serverAddr ?? "?"}:${String(config.frp.serverPort)}${shape} 隧道名=${normalizeTunnelName(config.frp.name)} ${binary === undefined ? "[缺 frpc 二进制]" : "[frpc 就绪]"}`);
-		if (mode === "entry") {
+		if (publicEntryEnabled(config.frp)) {
 			console.log(`公网入口      https://${config.frp.serverAddr ?? "?"}:${String(config.frp.remotePort)}`);
-		} else {
+		}
+		if (mode !== "entry") {
 			console.log("访客连入      运行 dsh-remote visitor 生成手机端配置（壳 App 扫码导入）");
 		}
 	} else {
@@ -459,9 +459,9 @@ async function cmdDoctor(store: Store): Promise<number> {
 		if (typeof config.frp.serverAddr === "string") {
 			const controlOk = await probeTcp(config.frp.serverAddr, config.frp.serverPort);
 			checks.push({ name: `frps 控制端口 ${String(config.frp.serverPort)}`, ok: controlOk, detail: controlOk ? "可达" : "不可达（检查 VPS 防火墙/frps 是否运行）" });
-			if (frpMode === "entry") {
+			if (publicEntryEnabled(config.frp)) {
 				const entryOk = await probeTcp(config.frp.serverAddr, config.frp.remotePort);
-				checks.push({ name: `公网入口端口 ${String(config.frp.remotePort)}`, ok: true, detail: entryOk ? "开放" : "未开放（网关+frpc 未连上时属正常）" });
+				checks.push({ name: `公网入口端口 ${String(config.frp.remotePort)}`, ok: entryOk, detail: entryOk ? "开放" : "不可达（检查网关、frpc 注册、frps allowPorts 和防火墙）" });
 			} else {
 				checks.push({ name: "公网入口端口", ok: true, detail: `${frpMode} 形态不开入口端口，VPS 暴露面仅剩控制口 + 访客密钥` });
 			}
@@ -574,7 +574,7 @@ function reportChecks(checks: DoctorCheck[]): number {
 }
 
 function entryUrl(config: GatewayConfig, port: number): string {
-	return `https://${typeof config.frp.serverAddr === "string" && config.frp.enabled ? config.frp.serverAddr : config.listenHost}:${String(port)}/`;
+	return `https://${typeof config.frp.serverAddr === "string" && publicEntryEnabled(config.frp) ? config.frp.serverAddr : config.listenHost}:${String(port)}/`;
 }
 
 function probeTcp(host: string, port: number, timeoutMs = 2000): Promise<boolean> {

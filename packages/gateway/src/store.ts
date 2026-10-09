@@ -25,6 +25,8 @@ export interface DeviceRecord {
 	id: string;
 	name: string;
 	tokenHash: string;
+	/** 桌面公网登录时绑定的访客密钥哈希；不存明文，改密钥后旧会话失效。 */
+	credentialHash?: string;
 	createdAt: string;
 	lastSeenAt: string;
 	revokedAt?: string;
@@ -39,7 +41,7 @@ export interface PendingCode {
 interface SecretsFile {
 	/** frpc↔frps 登录密钥 */
 	frpAuthToken: string;
-	/** stcp/xtcp 访客密钥（proxy 与 visitor 两端必须一致） */
+	/** stcp/xtcp 与桌面公网登录共用的访客密钥 */
 	frpVisitorKey: string;
 	/**
 	 * 管理端点共享密钥（P0-2）。回环 socket 源地址无法区分「本机 CLI/插件」与
@@ -180,20 +182,22 @@ export class Store {
 		this.devicesCache = { at: Date.now(), devices };
 	}
 
-	async deviceByToken(token: string): Promise<DeviceRecord | undefined> {
+	async deviceByToken(token: string, credentialHash?: string): Promise<DeviceRecord | undefined> {
 		const hash = hashToken(token);
 		return (await this.listDevices()).find(
-			(device) => !device.revokedAt && safeEqualHex(device.tokenHash, hash),
+			(device) => !device.revokedAt && safeEqualHex(device.tokenHash, hash)
+				&& (credentialHash === undefined || device.credentialHash === credentialHash),
 		);
 	}
 
-	async addDevice(name: string): Promise<{ device: DeviceRecord; token: string }> {
+	async addDevice(name: string, credentialHash?: string): Promise<{ device: DeviceRecord; token: string }> {
 		const token = randomBytes(32).toString("base64url");
 		const now = new Date().toISOString();
 		const device: DeviceRecord = {
 			id: `dev-${randomBytes(4).toString("hex")}`,
 			name: name.trim().length > 0 ? name.trim().slice(0, 64) : "未命名设备",
 			tokenHash: hashToken(token),
+			...(credentialHash === undefined ? {} : { credentialHash }),
 			createdAt: now,
 			lastSeenAt: now,
 		};

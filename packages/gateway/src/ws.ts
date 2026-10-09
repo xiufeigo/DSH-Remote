@@ -14,6 +14,10 @@ import type { Store } from "./store.ts";
 export interface UpgradeDeps {
 	config: GatewayConfig;
 	store: Store;
+	/** 由监听入口传入；公网入口必须验证设备 Cookie。 */
+	publicEntry?: boolean;
+	/** 与 HTTP 相同的当前登录凭据绑定。 */
+	credentialHash?: string;
 	/** 生效上游地址（含 0.1.2+ 浏览器会话 cookie 接线）。 */
 	resolveUpstream: () => Upstream;
 }
@@ -35,10 +39,10 @@ export async function handleGatewayUpgrade(
 		return;
 	}
 	// edge 一律要求设备 Cookie；desktop 保留访客密钥直通（与 HTTP 路径同一判定）
-	const tunnelAdmits = deps.config.role !== "edge" && visitorKeyAdmits(deps.config);
+	const tunnelAdmits = visitorKeyAdmits(deps.config, deps.publicEntry);
 	const verdict = tunnelAdmits
 		? { ok: true as const, deviceId: "visitor-key" }
-		: await checkRequest(req, { store: deps.store, config: deps.config });
+		: await checkRequest(req, deps);
 	if (!verdict.ok) {
 		socket.write("HTTP/1.1 401 Unauthorized\r\nconnection: close\r\n\r\n");
 		socket.destroy();

@@ -1,19 +1,19 @@
 /**
- * 网关自带页面的 HTML 模板（配对页 / edge 登录页）。
+ * 网关自带页面的 HTML 模板（配对页 / 密钥登录页）。
  *
  * 全部为纯函数：入参只有页面数据（next 回跳、锁定态、请求头特征），
  * 不触碰 Store / 配置。配对页可被未认证访问，因此渲染走纯静态模板 +
  * safeNext 白名单，无任何注入面（GW-15 的 XSS 护栏也在这里）。
  *
  * 三种页面：
- * - renderDefaultPairPage / renderTokenLoginPage：深色卡片同族（F15 合并
+ * - renderDefaultPairPage / renderLoginPage：深色卡片同族（F15 合并
  *   为参数化单模板 renderCardAuthPage，两者 CSS/骨架原先 ~90% 相同）；
  * - renderAndroidPairPage：Android WebView 专用 Material 风格，有意另立
  *   （有独立的品牌头/标签/浅色主题），不做合并。
  */
 
 import type { IncomingMessage } from "node:http";
-import { LOGIN_PAGE, PAIR_PAGE } from "./auth.ts";
+import { LOGIN_PAGE, PAIR_PAGE, type LoginKind } from "./auth.ts";
 
 /** Android 壳 WebView 的 UA 特征（配对页切换 Material 风格版式）。 */
 export function isDshRemoteAndroid(req: IncomingMessage): boolean {
@@ -117,14 +117,18 @@ export function renderDefaultPairPage(next: string, locked: boolean): string {
 }
 
 /**
- * edge 前置 Token 登录页。观感与默认配对页同族（深色卡片）；
+ * 桌面访客密钥与 edge 访问 Token 共用登录页（深色卡片）；
  * 未认证可访问，因此渲染走纯静态模板 + safeNext 白名单，无任何注入面。
  */
-export function renderTokenLoginPage(next: string, locked: boolean): string {
+export function renderLoginPage(next: string, locked: boolean, kind: LoginKind): string {
+	const visitor = kind === "visitor-key";
+	const label = visitor ? "访客密钥" : "访问 Token";
 	return renderCardAuthPage({
 		title: "DSH Remote · 访问验证",
-		lead: "此入口受访问 Token 保护。输入服务器上配置的 Token，验证通过后本设备将被授权并长期保持登录。",
-		inputs: `<input id="token" type="password" placeholder="访问 Token" autocomplete="off">
+		lead: visitor
+			? "输入电脑端插件中设置的访客密钥，验证通过后即可访问 DSH。本浏览器会记住授权；修改访客密钥后需要重新验证。"
+			: "此入口受访问 Token 保护。输入服务器上配置的 Token，验证通过后本设备将被授权并长期保持登录。",
+		inputs: `<input id="token" type="password" aria-label="${label}" placeholder="${label}" autocomplete="off">
 <input id="name" placeholder="设备名称（可选，如 我的 iPad）">`,
 		buttonLabel: "验证并进入",
 		inputExtraCss: "",

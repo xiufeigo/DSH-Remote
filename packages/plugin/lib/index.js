@@ -80,7 +80,10 @@ export function readTunnelSnapshot(home) {
 		for (const block of toml.split("[[proxies]]").slice(1)) {
 			const name = /(?:^|\n)\s*name\s*=\s*"([^"]+)"/.exec(block)?.[1];
 			const type = /(?:^|\n)\s*type\s*=\s*"([^"]+)"/.exec(block)?.[1];
-			if (name !== undefined && type !== undefined) proxies.push({ name, type });
+			if (name !== undefined && type !== undefined) {
+				const remotePort = /(?:^|\n)\s*remotePort\s*=\s*(\d+)/.exec(block)?.[1];
+				proxies.push({ name, type, ...(remotePort === undefined ? {} : { remotePort: Number(remotePort) }) });
+			}
 		}
 		const serverAddr = /(?:^|\n)\s*serverAddr\s*=\s*"([^"]+)"/.exec(toml)?.[1] ?? "";
 		const portMatch = /(?:^|\n)\s*serverPort\s*=\s*(\d+)/.exec(toml);
@@ -323,7 +326,7 @@ export function createRouteHandlers(deps) {
 					? deviceList.devices.filter((device) => !device.revokedAt).length
 					: null,
 				listenPort,
-				tunnel: readTunnelSnapshot(deps.home),
+				tunnel: config.frp?.enabled === true ? readTunnelSnapshot(deps.home) : null,
 			});
 		},
 
@@ -733,7 +736,7 @@ function sendJsonSafe(res, payload, status) {
  *
  * PLG-02：字段与真实 GatewayConfig 的面板可编辑项对齐（参照
  * src/client/index.tsx 表单）：autoStart / listenHost / upstreamPort /
- * autoFixUpstreamPort / frp.{enabled,serverAddr,serverPort,mode,name}。
+ * autoFixUpstreamPort / frp.{enabled,entryEnabled,serverAddr,serverPort,remotePort,mode,name}。
  * 历史残留的 frpEnabled/serverAddr 扁平字段不再存在，但输入里出现时做
  * 向后兼容归一化到 frp.*。校验与 config-schema.js 的 validateConfigPatch
  * 共用单一真相源（该文件与网关 config.ts/frp.ts 规则同步，见其头注）。
@@ -769,8 +772,10 @@ function buildSettingsSchema() {
 				: defaults.autoFixUpstreamPort,
 			frp: {
 				enabled: typeof frpPatch.enabled === "boolean" ? frpPatch.enabled : defaults.frp.enabled,
+				entryEnabled: typeof frpPatch.entryEnabled === "boolean" ? frpPatch.entryEnabled : defaults.frp.entryEnabled,
 				serverAddr: typeof frpPatch.serverAddr === "string" ? frpPatch.serverAddr : "",
 				serverPort: Number.isInteger(frpPatch.serverPort) ? frpPatch.serverPort : defaults.frp.serverPort,
+				remotePort: Number.isInteger(frpPatch.remotePort) ? frpPatch.remotePort : defaults.frp.remotePort,
 				mode: typeof frpPatch.mode === "string" ? frpPatch.mode : defaults.frp.mode,
 				name: typeof frpPatch.name === "string" ? frpPatch.name : defaults.frp.name,
 			},
@@ -801,8 +806,10 @@ function buildSettingsSchema() {
 					title: "frp 隧道",
 					properties: {
 						enabled: { type: "boolean", default: defaults.frp.enabled, title: "启用 frp 隧道" },
+						entryEnabled: { type: "boolean", default: defaults.frp.entryEnabled, title: "同时启用公网端口映射" },
 						serverAddr: { type: "string", default: "", title: "VPS 地址" },
 						serverPort: { type: "integer", minimum: 1, maximum: 65535, default: defaults.frp.serverPort, title: "控制端口" },
+						remotePort: { type: "integer", minimum: 1, maximum: 65535, default: defaults.frp.remotePort, title: "公网入口端口" },
 						mode: { type: "string", enum: ["entry", "stcp", "xtcp"], default: defaults.frp.mode, title: "隧道形态" },
 						name: { type: "string", default: defaults.frp.name, title: "隧道名" },
 					},

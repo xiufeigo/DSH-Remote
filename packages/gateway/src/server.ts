@@ -28,12 +28,14 @@ import {
 	clientIp,
 	ensureAccessTokenHash,
 	generatePairingCode,
+	hashAccessToken,
 	isLoopback,
 	issueDeviceCookie,
 	parseCookies,
-	verifyAccessToken,
+	verifyLoginSecret,
 	verifyAdminToken,
 	visitorKeyAdmits,
+	type LoginKind,
 } from "./auth.ts";
 import { readJsonBody, respondInvalidBody } from "./body.ts";
 import { ensureCert, loadManualCert, type GatewayCert } from "./cert.ts";
@@ -52,6 +54,7 @@ import {
 	locateFrpcBinary,
 	normalizeFrpMode,
 	normalizeTunnelName,
+	publicEntryEnabled,
 	renderFrpcToml,
 	renderFrpsToml,
 	renderVisitorToml,
@@ -69,7 +72,7 @@ import {
 	isDshRemoteAndroid,
 	renderAndroidPairPage,
 	renderDefaultPairPage,
-	renderTokenLoginPage,
+	renderLoginPage,
 	safeNext,
 } from "./views.ts";
 import { handleGatewayUpgrade } from "./ws.ts";
@@ -97,11 +100,14 @@ export class GatewayServer {
 	private readonly log: (line: string) => void;
 	private readonly env: NodeJS.ProcessEnv;
 	private server?: https.Server;
+	private entryServer?: https.Server;
+	private startPromise?: Promise<void>;
+	private stopPromise?: Promise<void>;
 	private frp?: FrpSupervisor;
 	private frps?: FrpSupervisor;
 	private visitor?: FrpSupervisor;
 	private cert?: GatewayCert;
-	private accessTokenHash?: string;
+	private loginCredential?: { kind: LoginKind; hash: string };
 	/** P0-2：管理端点共享密钥（state/secrets.json 的 adminToken），start() 时加载。 */
 	private adminToken?: string;
 	private htmlInjector: (body: Buffer) => Buffer = injectIntoHtml;
@@ -131,6 +137,10 @@ export class GatewayServer {
 
 	get certificate(): GatewayCert | undefined {
 		return this.cert;
+	}
+
+	private get credentialHash(): string | undefined {
+		return this.loginCredential?.kind === "visitor-key" ? this.loginCredential.hash : undefined;
 	}
 
 	/**
@@ -188,10 +198,26 @@ export class GatewayServer {
 		return { ...base, sessionCookie, onUnauthorized: () => this.session.invalidate(base) };
 	}
 
-	async start(): Promise<void> {
-		this.accessTokenHash = await ensureAccessTokenHash(this.store, this.env);
+	start(): Promise<void> {
+		if (this.stopPromise !== undefined) return Promise.reject(new Error("网关已关闭，请创建新的实例"));
+		this.startPromise ??= this.startInternal().catch(async (error: unknown) => {
+			await this.cleanup();
+			throw error;
+		});
+		return this.startPromise;
+	}
+
+	private async startInternal(): Promise<void> {
 		// P0-2：admin 门禁密钥（ensureSecrets 对旧 secrets.json 自动补齐 adminToken）
-		this.adminToken = (await this.store.ensureSecrets()).adminToken;
+		const secrets = await this.store.ensureSecrets();
+		this.adminToken = secrets.adminToken;
+		if (this.config.role !== "edge" && publicEntryEnabled(this.config.frp)) {
+			// 与 frpc 使用同一来源；不新增另一份浏览器密码配置。
+			this.loginCredential = { kind: "visitor-key", hash: hashAccessToken(secrets.frpVisitorKey) };
+		} else {
+			const hash = await ensureAccessTokenHash(this.store, this.env);
+			if (hash !== undefined) this.loginCredential = { kind: "access-token", hash };
+		}
 		this.htmlInjector = makeHtmlInjector(
 			mobileInjectionEnabled(this.config)
 				? { mobile: { enabled: true, breakpointPx: mobileBreakpointPx(this.config) } }
@@ -205,33 +231,54 @@ export class GatewayServer {
 				`edge 角色：上游 http${upstream.tls ? "s" : ""}://${upstream.host}:${String(upstream.port)}` +
 				`（frp 形态 ${effectiveEdgeFrpRole(this.config)}，跳过本机端口探测）`,
 			);
-			if (this.accessTokenHash === undefined) {
+			if (this.loginCredential === undefined) {
 				this.log("警告：未配置访问 Token（DSHR_ACCESS_TOKEN）——公网入口将退化为配对码认证，强烈建议配置");
 			}
 		}
 		this.cert = await this.resolveCert();
-		this.server = https.createServer(
+		this.server = this.createHttpsServer(false);
+		await this.listen(this.server, this.config.listenPort, this.config.listenHost);
+		this.log(`网关监听 https://${this.config.listenHost}:${String(this.actualPort)}`);
+		if (this.config.role !== "edge" && publicEntryEnabled(this.config.frp)
+			&& normalizeFrpMode(this.config.frp.mode) !== "entry") {
+			// OS 分配回环端口；只有附加 TCP proxy 使用此口，禁止访客免配对准入。
+			this.entryServer = this.createHttpsServer(true);
+			await this.listen(this.entryServer, 0, "127.0.0.1");
+		}
+		await this.startFrpIfNeeded();
+	}
+
+	private createHttpsServer(publicEntry: boolean): https.Server {
+		if (this.cert === undefined) throw new Error("HTTPS 监听前必须加载证书");
+		const server = https.createServer(
 			{ key: this.cert.keyPem, cert: this.cert.certPem },
 			(req, res) => {
 				// P0-1 兜底：handle 全程 try/catch，这里只拦日志回调等极端抛出，
 				// 绝不让 handle 演变成未处理 rejection（同类问题曾可打死进程）
-				void this.handle(req, res).catch(() => res.destroy());
+				void this.handle(req, res, publicEntry).catch(() => res.destroy());
 			},
 		);
-		this.server.on("upgrade", (req, socket, head) => {
+		server.on("upgrade", (req, socket, head) => {
 			// 认证门与直通转发都在 ws.ts；这里只做接线（P0-1 同款兜底）
 			void handleGatewayUpgrade(req, socket as Duplex, head, {
 				config: this.config,
 				store: this.store,
+				publicEntry,
+				credentialHash: this.credentialHash,
 				resolveUpstream: () => this.upstreamAddress(),
 			}).catch(() => socket.destroy());
 		});
-		await new Promise<void>((resolve, reject) => {
-			this.server?.once("error", reject);
-			this.server?.listen(this.config.listenPort, this.config.listenHost, () => resolve());
+		return server;
+	}
+
+	private listen(server: https.Server, port: number, host: string): Promise<void> {
+		return new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(port, host, () => {
+				server.removeListener("error", reject);
+				resolve();
+			});
 		});
-		this.log(`网关监听 https://${this.config.listenHost}:${String(this.actualPort)}`);
-		await this.startFrpIfNeeded();
 	}
 
 	/** TLS 证书来源：config.tls 提供则加载手工证书，失败回退自签并告警。 */
@@ -266,12 +313,15 @@ export class GatewayServer {
 		}
 		const secrets = await this.store.ensureSecrets();
 		const mode = normalizeFrpMode(frp.mode);
+		const entryAddress = this.entryServer?.address();
+		const entryLocalPort = typeof entryAddress === "object" && entryAddress !== null ? entryAddress.port : undefined;
 		const toml = renderFrpcToml({
 			serverAddr: frp.serverAddr,
 			serverPort: frp.serverPort,
 			authToken: secrets.frpAuthToken,
 			localPort: this.actualPort ?? this.config.listenPort,
 			remotePort: frp.remotePort,
+			entryLocalPort,
 			mode,
 			secretKey: secrets.frpVisitorKey,
 			name: frp.name,
@@ -281,7 +331,8 @@ export class GatewayServer {
 		await this.store.writeAtomic("frp/frpc.toml", toml);
 		this.log(mode === "entry"
 			? `frp 传输适配器启动（entry，入口端口 ${String(frp.remotePort)}，隧道名 ${normalizeTunnelName(frp.name)}）`
-			: `frp 传输适配器启动（${mode}，隧道名 ${normalizeTunnelName(frp.name)}；VPS 不开入口端口；手机填写同一把访客密钥和同一隧道名即可连入）`);
+			: `frp 传输适配器启动（${mode}，隧道名 ${normalizeTunnelName(frp.name)}；手机凭访客密钥连入）`);
+		if (entryLocalPort !== undefined) this.log(`附加公网入口 https://${frp.serverAddr}:${String(frp.remotePort)}（浏览器输入访客密钥验证）`);
 		this.frp = new FrpSupervisor(binary, configPath, (line) => this.log(`[frpc] ${line}`));
 		this.frp.start();
 	}
@@ -369,38 +420,37 @@ export class GatewayServer {
 	}
 
 	async stop(): Promise<void> {
+		// 先等启动完成或失败，再回收全部资源；失败仍由 start() 的调用方接收。
+		this.stopPromise ??= (this.startPromise ?? Promise.resolve()).then(
+			() => this.cleanup(),
+			() => this.cleanup(),
+		);
+		await this.stopPromise;
+	}
+
+	private async cleanup(): Promise<void> {
 		if (this.frp !== undefined) await this.frp.stop();
 		if (this.visitor !== undefined) await this.visitor.stop();
 		if (this.frps !== undefined) await this.frps.stop();
 		this.limiter.stop(); // GW-02：停止限流桶后台清理定时器
-		// CLI-02 遗留：幂等关闭 —— 重复/并发调用（信号重入、doctor/清理路径、
-		// 从未 start 的实例）都必须安全，绝不因 ERR_SERVER_NOT_RUNNING 拒绝或悬挂
-		if (this.httpClosePromise === undefined) this.httpClosePromise = this.closeHttpServer();
-		await this.httpClosePromise;
+		await this.closeHttpServer();
 	}
 
-	/** 关闭 Promise 记忆化：并发调用并入同一 Promise，二次调用直接复用已 settle 的结果。 */
-	private httpClosePromise?: Promise<void>;
-
-	private closeHttpServer(): Promise<void> {
-		const server = this.server;
+	private async closeHttpServer(): Promise<void> {
+		const servers = [this.server, this.entryServer];
 		this.server = undefined;
+		this.entryServer = undefined;
 		// 从未 start（或句柄已被接管）：原先 `this.server?.close(...)` 短路后
 		// resolve 永不被调用 → stop() 悬挂；这里直接视为已关闭
-		if (server === undefined) return Promise.resolve();
-		return new Promise<void>((resolve) => {
-			try {
+		await Promise.all(servers.map((server) => {
+			if (server === undefined) return Promise.resolve();
+			return new Promise<void>((resolve, reject) => {
 				server.close((error) => {
-					// 二次关闭/未运行时回调携带 ERR_SERVER_NOT_RUNNING；
-					// close 语义为尽力而为，吞掉错误正常 resolve（幂等）
-					void error;
-					resolve();
+					if (error && !("code" in error && error.code === "ERR_SERVER_NOT_RUNNING")) reject(error);
+					else resolve();
 				});
-			} catch {
-				// 部分 Node 版本对未运行的服务器同步抛 ERR_SERVER_NOT_RUNNING，同样视为已关闭
-				resolve();
-			}
-		});
+			});
+		}));
 	}
 
 	frpStatus() {
@@ -409,7 +459,7 @@ export class GatewayServer {
 
 	// ---------- HTTP ----------
 
-	private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	private async handle(req: IncomingMessage, res: ServerResponse, publicEntry: boolean): Promise<void> {
 		try {
 			// P0-1：绝对形式请求行（RFC 7230 合法语法，Node http 照单全收）遇畸形
 			// authority（端口越界/坏 IPv6 字面量）会让 URL 构造器抛 TypeError——
@@ -503,16 +553,15 @@ export class GatewayServer {
 			// —— 认证门 ——
 			// desktop：stcp/xtcp 形态下访客密钥已挡在隧道外，可免配对码；
 			// edge：本身是公网入口，一律要求设备 Cookie（登录页 / 配对页二选一）。
-			const tunnelAdmits = this.config.role !== "edge" && visitorKeyAdmits(this.config);
+			const tunnelAdmits = visitorKeyAdmits(this.config, publicEntry);
 			const verdict = tunnelAdmits
 				? { ok: true as const, deviceId: "visitor-key" }
-				: await checkRequest(req, { store: this.store, config: this.config });
+				: await checkRequest(req, { store: this.store, config: this.config, credentialHash: this.credentialHash });
 			if (!verdict.ok) {
 				const acceptsHtml = String(req.headers.accept ?? "").includes("text/html");
 				if (acceptsHtml) {
-					const authPage = this.config.role === "edge" && this.accessTokenHash !== undefined
-						? LOGIN_PAGE
-						: PAIR_PAGE;
+					const authPage = this.loginCredential !== undefined
+						&& (this.config.role === "edge" || this.loginCredential.kind === "visitor-key") ? LOGIN_PAGE : PAIR_PAGE;
 					res.writeHead(302, { location: `${authPage}?next=${encodeURIComponent(pathname + url.search)}` });
 					res.end();
 				} else {
@@ -539,7 +588,7 @@ export class GatewayServer {
 	// ---------- 配对 ----------
 
 	private async handlePairPage(req: IncomingMessage, res: ServerResponse): Promise<void> {
-		if (await this.store.deviceByToken(parseCookies(req.headers.cookie).get(COOKIE_NAME) ?? "")) {
+		if (await this.store.deviceByToken(parseCookies(req.headers.cookie).get(COOKIE_NAME) ?? "", this.credentialHash)) {
 			res.writeHead(302, { location: "/" }).end();
 			return;
 		}
@@ -574,22 +623,22 @@ export class GatewayServer {
 			res.end(JSON.stringify({ message: stillAllowed ? "配对码无效或已过期" : "失败次数过多，已临时锁定" }));
 			return;
 		}
-		const { token } = await this.store.addDevice(String(payload.name ?? ""));
+		const { token } = await this.store.addDevice(String(payload.name ?? ""), this.credentialHash);
 		await issueDeviceCookie(res, token, this.config.deviceTokenDays);
 		await this.store.audit("pair_success", { ip });
 		res.writeHead(200, { "content-type": "application/json" });
 		res.end(JSON.stringify({ ok: true }));
 	}
 
-	// ---------- edge 前置 Token 登录 ----------
+	// ---------- 访客密钥 / edge 访问 Token 登录 ----------
 
 	private async handleLoginPage(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
-		if (await this.store.deviceByToken(parseCookies(req.headers.cookie).get(COOKIE_NAME) ?? "")) {
+		if (await this.store.deviceByToken(parseCookies(req.headers.cookie).get(COOKIE_NAME) ?? "", this.credentialHash)) {
 			const next = safeNext(new URL(req.url ?? "/", "https://gateway.invalid").searchParams.get("next"));
 			res.writeHead(302, { location: next }).end();
 			return;
 		}
-		if (this.accessTokenHash === undefined) {
+		if (this.loginCredential === undefined) {
 			// 未配置门禁 Token：引导去配对页，避免出现永远登不进的页面
 			res.writeHead(302, { location: PAIR_PAGE }).end();
 			return;
@@ -597,7 +646,7 @@ export class GatewayServer {
 		const locked = this.limiter.isLocked(clientIp(req, this.config));
 		const next = safeNext(url.searchParams.get("next"));
 		res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-		res.end(renderTokenLoginPage(next, locked));
+		res.end(renderLoginPage(next, locked, this.loginCredential.kind));
 	}
 
 	private async handleLoginSubmit(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -613,22 +662,23 @@ export class GatewayServer {
 			return;
 		}
 		const payload = parsed.value;
-		const submitted = String(payload.token ?? "");
-		// 空 token 也走一次恒时比较路径，避免用响应时间区分「未配置/为空」
-		const ok = verifyAccessToken(submitted, this.accessTokenHash ?? "");
+		const submitted = typeof payload.token === "string" ? payload.token : "";
+		const visitor = this.loginCredential?.kind === "visitor-key";
+		const ok = verifyLoginSecret(submitted, this.loginCredential?.hash, this.loginCredential?.kind ?? "access-token");
 		if (!ok) {
 			const stillAllowed = this.limiter.notePairFail(ip);
-			await this.store.audit("token_failed", { ip });
+			await this.store.audit(visitor ? "visitor_key_failed" : "token_failed", { ip });
 			res.writeHead(stillAllowed ? 403 : 429, { "content-type": "application/json" });
-			res.end(JSON.stringify({ message: stillAllowed ? "访问 Token 无效" : "失败次数过多，已临时锁定" }));
+			res.end(JSON.stringify({ message: stillAllowed ? `${visitor ? "访客密钥" : "访问 Token"}无效` : "失败次数过多，已临时锁定" }));
 			return;
 		}
 		const requested = String(payload.name ?? "").trim();
 		const deviceName = (requested || deriveDeviceName(req)).slice(0, 64);
-		const { token } = await this.store.addDevice(deviceName);
-		const days = typeof this.config.auth?.tokenLoginDays === "number" ? this.config.auth.tokenLoginDays : 30;
+		const { token } = await this.store.addDevice(deviceName, this.credentialHash);
+		const days = visitor ? this.config.deviceTokenDays
+			: typeof this.config.auth?.tokenLoginDays === "number" ? this.config.auth.tokenLoginDays : 30;
 		await issueDeviceCookie(res, token, days);
-		await this.store.audit("token_login", { ip, device: deviceName });
+		await this.store.audit(visitor ? "visitor_key_login" : "token_login", { ip, device: deviceName });
 		res.writeHead(200, { "content-type": "application/json" });
 		res.end(JSON.stringify({ ok: true }));
 	}
@@ -636,7 +686,7 @@ export class GatewayServer {
 	// ---------- 移动 hook 资产（需设备认证，缩小公网指纹面） ----------
 
 	private async handleMobileScript(req: IncomingMessage, res: ServerResponse): Promise<void> {
-		const verdict = await checkRequest(req, { store: this.store, config: this.config });
+		const verdict = await checkRequest(req, { store: this.store, config: this.config, credentialHash: this.credentialHash });
 		if (!verdict.ok) {
 			res.writeHead(401, { "content-type": "application/json" });
 			res.end(JSON.stringify({ error: "unpaired-device", reason: verdict.reason }));
@@ -696,7 +746,7 @@ export class GatewayServer {
 					port: this.actualPort,
 					role: this.config.role ?? "desktop",
 					edgeFrpRole: effectiveEdgeFrpRole(this.config),
-					tokenGate: this.accessTokenHash !== undefined,
+					tokenGate: this.loginCredential !== undefined,
 					certFingerprint: this.cert?.fingerprintSha256,
 					frpMode: normalizeFrpMode(this.config.frp.mode),
 					frp: this.frpStatus(),

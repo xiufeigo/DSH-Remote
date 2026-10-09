@@ -77,7 +77,7 @@ https://github.com/fatedier/frp/releases/tag/v0.61.1
     //   "xtcp"   访客模式·P2P 打洞（推荐）：优先直连，失败自动回退 stcp 中转
     "mode": "xtcp",
     "name": "dsh-remote",        // 可选；多人共用一台 VPS 时改成互不相同，例如 dsh-zhangsan
-    "remotePort": 8443          // 仅 entry 形态使用
+    "remotePort": 8443          // entry 形态或附加公网映射使用
     // authToken / 访客 secretKey 缺省读取 ~/.dsh-remote/state/secrets.json，
     // 需要与 VPS 的 token 一致：手动把 install-frps.sh 回显的值
     // 写进 secrets.json 的 frpAuthToken 字段即可
@@ -112,7 +112,46 @@ node packages/gateway/src/cli.ts doctor    # 各环节逐项检查
 stcp / xtcp 形态下「公网入口端口」一项会显示
 `xtcp 形态不开入口端口，VPS 暴露面仅剩控制口 + 访客密钥`，同样属于全绿。
 
-## 4.5 访客模式（不开公网入口端口）
+## 4.5 同时保留访客通道和指定公网端口
+
+电脑端插件的「远程隧道」中保留 `xtcp`（或 `stcp`），打开「同时启用公网端口映射」，
+填写「公网入口端口」并保存重启。等价的配置为：
+
+```jsonc
+"frp": {
+  "enabled": true,
+  "serverAddr": "<VPS 地址>",
+  "serverPort": 7000,
+  "mode": "xtcp",
+  "name": "dsh-remote",
+  "entryEnabled": true,
+  "remotePort": 8443
+}
+```
+
+Android 继续使用原访客配置（打洞失败仍回退 stcp）；浏览器访问
+`https://<VPS 地址>:8443/`，输入电脑端插件中设置的「访客密钥」即可进入。
+可直接在插件中自定义该密钥；Android 和网页使用同一把密钥，建议使用较长的随机值。
+浏览器验证后会记住授权。修改密钥并保存重启后，旧网页会话失效，需输入新密钥；
+Android 也需更新密钥。历史仅用配对码授权的浏览器首次需重新验证。
+`serverPort` 是 frps 控制口，`remotePort` 是公网访问口，两者必须区分。
+frps 的 `allowPorts`、服务器防火墙和云安全组都需允许 `remotePort`，该端口也不能被其他服务占用。
+使用一键安装脚本时，`--entry-port` 应与这里的 `remotePort` 一致。
+
+同一个 frpc 会注册原访客代理和附加 `<name>-entry` TCP 代理。
+公网代理指向电脑上独立的回环 HTTPS 监听口（端口由系统分配），与访客代理共用网关处理逻辑，
+但 HTTP 和 WebSocket 均强制校验设备 Cookie；公网连接不能借用访客隧道的免登录准入。
+访客密钥只在登录时经 HTTPS 提交，不附在公网地址中。
+默认自签证书通过 VPS 地址访问时仍会出现浏览器证书告警。
+
+关闭 `entryEnabled` 并保存重启即可移除公网入口，访客配置无需修改。
+旧的 `mode: "entry"` 单入口配置继续有效；附加公网映射默认关闭。
+
+本地验证：`pnpm test:frp` 测试配置/认证契约；安装 frpc/frps 后运行
+`pnpm smoke:dual:frp`，验证真实双通道、访客密钥网页登录、HTTP/WS 授权及吊销和监听口清理。
+`pnpm test:visitor` 验证密钥轮换、旧会话失效和错误密钥锁定。
+
+## 4.6 访客模式（未启用附加公网入口时不开公网端口）
 
 `mode = "stcp"` 或 `"xtcp"` 时，手机不再访问 VPS 的公网端口，而是通过
 **frpc visitor** 凭访客密钥连入。VPS 被扫到的面只剩一个 frps 控制口。
@@ -146,8 +185,8 @@ node packages/gateway/src/cli.ts visitor --mode xtcp
 
 **入口模式**：浏览器打开 `https://<VPS IP>:8443`：
 
-1. 出现「DSH Remote · 设备配对」页（说明隧道+网关全通）
-2. PC 上 `dsh-remote pair --name 我的手机` 扫码/输码
+1. 出现「DSH Remote · 访问验证」页（说明隧道+网关全通）
+2. 输入电脑端插件中的「访客密钥」（也可使用 `state/secrets.json.frpVisitorKey`）
 3. 进入熟悉的 DSH 界面 🎉
 
 > 自签证书首次访问会有告警，属预期；壳 App 阶段会用证书锁定消除。
@@ -162,8 +201,8 @@ node packages/gateway/src/cli.ts visitor --mode xtcp
 |---|---|
 | doctor 显示控制端口不可达 | 安全组没放行 7000；frps 没起来（`systemctl status`） |
 | 控制通但入口不通 | PC 侧 frpc 没跑起来（看 `[frpc]` 日志）；token 不一致 |
-| 入口通但配对页打不开 | 网关没监听（`netstat -ano \| findstr 18443`）；upstreamPort 填错不影响配对页 |
-| 配对页能开、登录后 502 | `upstreamPort` 不是当前 DSH GUI 端口；网关启动时会自动探测跟随 |
+| 入口通但登录页打不开 | 网关没监听（`netstat -ano \| findstr 18443`）；upstreamPort 填错不影响登录页 |
+| 登录页能开、验证后 502 | `upstreamPort` 不是当前 DSH GUI 端口；网关启动时会自动探测跟随 |
 | frpc 反复重启 | 网关日志里找 `[frpc]` 报错：多为 token 不匹配或 allowPorts 未覆盖 remotePort |
 
 ## 7. 不想先动 VPS？本地先把整条链路验掉

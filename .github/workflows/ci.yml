@@ -43,6 +43,8 @@ jobs:
           pnpm smoke
           pnpm smoke:edge
           pnpm test:routes
+          pnpm test:frp
+          pnpm test:visitor
           pnpm test:session
           pnpm test:fixes
           pnpm test:perf

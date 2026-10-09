@@ -18,6 +18,11 @@ export function normalizeFrpMode(mode: string | undefined): FrpMode {
 	return mode === "stcp" || mode === "xtcp" ? mode : "entry";
 }
 
+/** 公网入口可单独启用，也可与访客隧道并存。 */
+export function publicEntryEnabled(frp: FrpConfig): boolean {
+	return frp.enabled && (normalizeFrpMode(frp.mode) === "entry" || frp.entryEnabled === true);
+}
+
 /** 写进 frps 的缺省 proxy 名；历史配置没有 `frp.name` 时沿用这个值。 */
 export const DEFAULT_TUNNEL_NAME = "dsh-remote";
 
@@ -158,82 +163,69 @@ ${allowBlock}webServer.addr = "127.0.0.1"
 `;
 }
 
-export function renderFrpcToml(options: {
+interface FrpcTomlOptions {
 	serverAddr: string;
 	serverPort: number;
 	authToken: string;
 	localPort: number;
-	/** 仅 mode=entry 需要；其余形态 VPS 上不监听任何端口 */
+	/** 公网 TCP 映射的服务器端口。 */
 	remotePort?: number;
+	/** 访客模式的附加公网映射必须指向独立的配对认证监听口。 */
+	entryLocalPort?: number;
 	mode?: string;
 	/** mode=stcp/xtcp 时的访客密钥 */
 	secretKey?: string;
 	name?: string;
 	/** T31-1：控制连接心跳；undefined = 缺省 25/90，false = 不写 */
 	heartbeat?: FrpHeartbeatInput;
-}): string {
+}
+
+/** 共享同一控制连接；公网 proxy 与访客 proxy 使用不同的本地认证入口。 */
+export function renderFrpcToml(options: FrpcTomlOptions): string {
 	const mode = normalizeFrpMode(options.mode);
-	const proxyName = normalizeTunnelName(options.name);
-	const beat = heartbeatBlock(options.heartbeat);
+	const name = normalizeTunnelName(options.name);
+	const proxies: string[] = [];
 	if (mode === "entry") {
-		return `# 由 dsh-remote 自动生成，手工修改会在下次 start 时被覆盖
-serverAddr = "${options.serverAddr}"
+		proxies.push(renderTcpProxy(name, options.localPort, options.remotePort));
+	} else {
+		if (mode === "xtcp") proxies.push(renderSecretProxy(`${name}-stcp`, "stcp", options));
+		proxies.push(renderSecretProxy(name, mode, options));
+		if (options.entryLocalPort !== undefined) {
+			if (options.entryLocalPort === options.localPort) {
+				throw new Error("公网入口必须使用独立的配对认证监听口");
+			}
+			proxies.push(renderTcpProxy(`${name}-entry`, options.entryLocalPort, options.remotePort));
+		}
+	}
+	return `# 由 dsh-remote 自动生成，手工修改会在下次 start 时被覆盖
+serverAddr = ${tomlString(options.serverAddr)}
 serverPort = ${options.serverPort}
 
 auth.token = ${tomlString(options.authToken)}
 transport.tls.enable = true
-${beat}
-[[proxies]]
-name = "${proxyName}"
+${heartbeatBlock(options.heartbeat)}
+${proxies.join("\n")}`;
+}
+
+function renderTcpProxy(name: string, localPort: number, remotePort: number | undefined): string {
+	if (!Number.isInteger(remotePort) || remotePort === undefined || remotePort < 1 || remotePort > 65535) {
+		throw new Error("公网入口 remotePort 必须是 1-65535 的整数");
+	}
+	return `[[proxies]]
+name = "${name}"
 type = "tcp"
 localIP = "127.0.0.1"
-localPort = ${options.localPort}
-remotePort = ${options.remotePort}
+localPort = ${localPort}
+remotePort = ${remotePort}
 transport.useEncryption = false
 transport.useCompression = false
 `;
-	}
-	if (mode === "stcp") {
-		return `# 由 dsh-remote 自动生成，手工修改会在下次 start 时被覆盖
-# 形态：stcp（秘密中转，VPS 不开任何入口端口）
-serverAddr = "${options.serverAddr}"
-serverPort = ${options.serverPort}
+}
 
-auth.token = ${tomlString(options.authToken)}
-transport.tls.enable = true
-${beat}
-[[proxies]]
-name = "${proxyName}"
-type = "stcp"
-secretKey = ${tomlString(options.secretKey ?? "")}
-localIP = "127.0.0.1"
-localPort = ${options.localPort}
-transport.useEncryption = false
-transport.useCompression = false
-`;
-	}
-	// xtcp：同时挂一条同端口的 stcp，供 visitor 的 fallbackTo 使用。
-	// 官方 frpc 不会因为 type=xtcp 就自动中转，必须显式配置双 proxy。
-	return `# 由 dsh-remote 自动生成，手工修改会在下次 start 时被覆盖
-# 形态：xtcp（P2P 打洞；visitor 侧 fallbackTo stcp 中转）
-serverAddr = "${options.serverAddr}"
-serverPort = ${options.serverPort}
-
-auth.token = ${tomlString(options.authToken)}
-transport.tls.enable = true
-${beat}
-[[proxies]]
-name = "${proxyName}-stcp"
-type = "stcp"
-secretKey = ${tomlString(options.secretKey ?? "")}
-localIP = "127.0.0.1"
-localPort = ${options.localPort}
-transport.useEncryption = false
-transport.useCompression = false
-
-[[proxies]]
-name = "${proxyName}"
-type = "xtcp"
+function renderSecretProxy(name: string, mode: "stcp" | "xtcp", options: FrpcTomlOptions): string {
+	return `[[proxies]]
+name = "${name}"
+type = "${mode}"
 secretKey = ${tomlString(options.secretKey ?? "")}
 localIP = "127.0.0.1"
 localPort = ${options.localPort}
