@@ -17,6 +17,14 @@ import { mobileHeadTags } from "./mobile.ts";
 
 /** Service Worker 路径：既是被注册的资源，也是注入幂等标记。 */
 const SW_PATH = "/__dsh_remote__/sw.js";
+/**
+ * 公网入口把官方 connection 客户端认成「本机宿主」的幂等标记。
+ * 官方用地址栏 hostname 计算 `connection.isLoopback`，非 127/8 时设置镜像
+ * 停在 memory、模型页报 settings are unavailable in this browser。
+ * 桌面壳靠 `__DSH_TRANSPORT__.ownsHost === true` 走同一条放行；网关侧在
+ * 插件加载前补上这个标记。设备 Cookie 与 Host 改写仍是真正的门禁。
+ */
+const OWNS_HOST_MARK = "__DSHR_OWNS_HOST__";
 /** apple-touch-icon（iOS 只认 PNG，不读 manifest 图标）。 */
 export const APPLE_TOUCH_ICON_PATH = "/__dsh_remote__/icon-192.png";
 
@@ -50,6 +58,14 @@ export function homeScreenHeadTags(): string {
 }
 
 /**
+ * 插在 `<head>` 最前、官方脚本之前。已有 transport 只补 ownsHost，
+ * 避免盖掉 fetch / openStream / streamBaseUrl。
+ */
+export function ownsHostHeadTag(): string {
+	return `<script>window.${OWNS_HOST_MARK}=1;(function(){var t=window.__DSH_TRANSPORT__;if(t&&typeof t==="object"){t.ownsHost=true;}else{window.__DSH_TRANSPORT__={ownsHost:true};}})();</script>`;
+}
+
+/**
  * 在 HTML 里注入主屏标记：优先插到 <head…> 开标签之后；
  * 没有 head 标签时插到文档最前（宽松处理，避免破坏上游页面）。
  */
@@ -69,6 +85,7 @@ export interface HtmlInjectOptions {
  *
  * 幂等按标记独立判断：edge 的上游是另一台 dsh-remote 网关时，
  * 响应里可能已有它注入的主屏标记——此时只补移动 hook 块，不重复注。
+ * ownsHost 引导同样单独幂等：旧网关只有主屏标记时仍要补上，已有则不重复。
  *
  * WEB-08：补写的 viewport meta 一次性带上目标值（`viewport-fit=cover` +
  * 浏览器缺省的 `interactive-widget=resizes-content`）。iOS 对 JS 动态改
@@ -83,9 +100,11 @@ export function makeHtmlInjector(options: HtmlInjectOptions = {}): (body: Buffer
 		const text = body.toString("utf8");
 		const needHome = !text.includes(SW_PATH);
 		const needMobile = extraTags !== "" && !text.includes("/__dsh_remote__/mobile.js");
-		if (!needHome && !needMobile) return body;
+		const needOwnsHost = !text.includes(OWNS_HOST_MARK);
+		if (!needHome && !needMobile && !needOwnsHost) return body;
 		const payload =
-			(needHome ? homeScreenHeadTags() : "")
+			(needOwnsHost ? ownsHostHeadTag() : "")
+			+ (needHome ? homeScreenHeadTags() : "")
 			+ (needMobile
 				? extraTags
 					+ (!/name=["']viewport["']/i.test(text)

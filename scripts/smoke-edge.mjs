@@ -216,6 +216,8 @@ test("认证后反代上游：注入主屏标记+移动 hook+viewport 兜底，�
 	assert.match(r.body, /<script src="\/__dsh_remote__\/mobile\.js" defer><\/script>/, "移动 hook 标记必须注入");
 	assert.match(r.body, /window\.__DSHR_MOBILE__=\{breakpoint:900\}/, "断点以内联变量下发");
 	assert.match(r.body, /name="viewport"/, "上游缺 viewport 时应兜底注入");
+	assert.match(r.body, /__DSHR_OWNS_HOST__/, "公网入口要在官方脚本前声明 ownsHost");
+	assert.ok(r.body.indexOf("__DSHR_OWNS_HOST__") < r.body.indexOf("__dsh_boot__"), "ownsHost 必须先于上游正文");
 	assert.match(r.body, /__dsh_boot__/, "上游正文原样保留");
 	assert.ok(!fixture.seenByUpstream.cookie?.includes("dr_device"), "设备 Cookie 不得透传上游");
 	assert.equal(fixture.seenByUpstream.host, `127.0.0.1:${String(fixture.upstreamPort)}`, "Host 应改写为上游回环形态");
@@ -320,15 +322,62 @@ test("双网关链路：上游已注入主屏标记时 edge 仍补移动 hook �
 	const twice = edgeInject(Buffer.from(pcInjected)).toString();
 	assert.match(twice, /__DSHR_MOBILE__/, "已有主屏标记也不得跳过移动 hook 注入");
 	assert.ok(twice.split("/__dsh_remote__/sw.js").length - 1 === 1, "主屏标记不得重复注入");
+	assert.equal(twice.split("__DSHR_OWNS_HOST__").length - 1, 1, "ownsHost 标记不得重复注入");
 	assert.match(twice, /name="viewport"/);
 
 	// 完全无标记的页面：一次注入齐主屏标记 + 移动 hook + viewport
 	const once = edgeInject(Buffer.from("<html><head></head></html>")).toString();
 	assert.match(once, /__dsh_remote__\/sw\.js/);
 	assert.match(once, /mobile\.js/);
+	assert.match(once, /__DSHR_OWNS_HOST__/);
+	const ownsAt = once.indexOf("__DSHR_OWNS_HOST__");
+	const swAt = once.indexOf("/__dsh_remote__/sw.js");
+	assert.ok(ownsAt >= 0 && ownsAt < swAt, "ownsHost 必须排在官方脚本之前");
 	// 幂等：二次注入不重复
 	const re = edgeInject(Buffer.from(once)).toString();
 	assert.deepEqual(re, once);
+
+	// 旧网关只注过主屏标记：补 ownsHost，不重注 SW
+	const legacy = "<html><head><script>\"/__dsh_remote__/sw.js\"</script></head></html>";
+	const upgraded = edgeInject(Buffer.from(legacy)).toString();
+	assert.match(upgraded, /__DSHR_OWNS_HOST__/);
+	assert.equal(upgraded.split("/__dsh_remote__/sw.js").length - 1, 1);
+});
+
+test("公网入口：注入的 ownsHost 让官方 isLoopback 判定为真", async () => {
+	const vm = await import("node:vm");
+	const { makeHtmlInjector } = await import("../packages/gateway/src/pwa.ts");
+	const html = makeHtmlInjector()(Buffer.from("<html><head></head></html>")).toString();
+	const matched = html.match(/<script>([\s\S]*?__DSHR_OWNS_HOST__[\s\S]*?)<\/script>/);
+	assert.ok(matched !== null, "页面里要有 ownsHost 引导脚本");
+	const context = {
+		window: /** @type {Record<string, unknown>} */ ({}),
+		location: { hostname: "203.0.113.10" },
+	};
+	context.window = context;
+	vm.createContext(context);
+	vm.runInContext(matched[1], context);
+	const transport = /** @type {{ ownsHost?: boolean } | undefined} */ (context.window.__DSH_TRANSPORT__);
+	const pageLocation = context.location;
+	const isLoopbackHostname = (hostname) => {
+		if (hostname === "localhost" || hostname === "[::1]") return true;
+		const parts = hostname.split(".");
+		return parts.length === 4 && parts[0] === "127" && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+	};
+	const isLoopback = transport?.ownsHost === true || pageLocation === undefined || isLoopbackHostname(pageLocation.hostname);
+	assert.equal(isLoopbackHostname("203.0.113.10"), false, "公网地址本身不是 loopback");
+	assert.equal(isLoopback, true, "ownsHost 之后官方判定应为 loopback");
+	assert.equal(transport?.ownsHost, true);
+
+	const preserved = { window: /** @type {Record<string, unknown>} */ ({}) };
+	preserved.window = preserved;
+	preserved.__DSH_TRANSPORT__ = { streamBaseUrl: "https://vps.example:8443", fetch: "keep" };
+	vm.createContext(preserved);
+	vm.runInContext(matched[1], preserved);
+	const kept = /** @type {{ ownsHost?: boolean, streamBaseUrl?: string, fetch?: string }} */ (preserved.window.__DSH_TRANSPORT__);
+	assert.equal(kept.ownsHost, true);
+	assert.equal(kept.streamBaseUrl, "https://vps.example:8443");
+	assert.equal(kept.fetch, "keep");
 });
 
 test("effectiveUpstreamTls：edge+隧道推断 HTTPS，显式配置优先", async () => {
