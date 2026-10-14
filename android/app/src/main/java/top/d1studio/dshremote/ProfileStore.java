@@ -16,8 +16,8 @@ import java.util.UUID;
 /**
  * Android 端配置组：与电脑插件面板相同的五项
  * （VPS / 控制端口 / 隧道名 / 登录密钥 / 访客密钥）。
- * 本地监听端口首选 18443（与网关 listenPort 对齐），被占用时在
- * 16225~16235 内协商首个空闲端口（AND-07），均无需用户填写。
+ * 本地监听端口首选 18443（与网关 listenPort 对齐）。多台机器同时挂在一个 frpc 里时，
+ * 每台各用一个固定端口（18443，然后 16225 起），写在配置组的 {@code bindPort} 上。
  */
 public final class ProfileStore {
 
@@ -27,6 +27,10 @@ public final class ProfileStore {
 	public static final int PORT_RANGE_MAX = 16235;
 	/** AND-07：本轮隧道实际绑定端口的持久化键（MainActivity/TunnelService 复用探测用）。 */
 	public static final String KEY_BOUND_PORT = "tunnel_bound_port";
+	/** 前台挂同一台中转上的访客，或只留当前这台。进程被系统拉起时按这个恢复。 */
+	public static final String KEY_FLEET_SCOPE = "tunnel_fleet_scope";
+	/** 缺省打开：连上当前隧道时，把同一台 frps 上的其他服务器一起挂上。 */
+	public static final String KEY_PRECONNECT_SAME_FRPS = "preconnect_same_frps";
 	/** 与 KEY_BOUND_PORT 成对落盘：当前前台隧道实际服务的配置组 id。复用探测据此判断能否直接复用。 */
 	public static final String KEY_TUNNEL_PROFILE = "tunnel_profile_id";
 	/**
@@ -114,6 +118,11 @@ public final class ProfileStore {
 		 * 指纹，按配置档身份锁定（见 CertPin），切档才不会再互相误报。
 		 */
 		public String fingerprint = "";
+		/**
+		 * 这台机器在手机上的固定本地端口。0 表示还没分配。
+		 * 同一个 frpc 进程里每台各听一个端口，切换时直接打开对应的 127.0.0.1。
+		 */
+		public int bindPort = 0;
 
 		public boolean isValid() {
 			return serverAddr.length() > 0
@@ -130,7 +139,7 @@ public final class ProfileStore {
 			c.serverName = normalizeTunnelName(tunnelName);
 			c.secretKey = secretKey;
 			c.authToken = authToken;
-			c.bindPort = BIND_PORT;
+			c.bindPort = bindPort >= 1 && bindPort <= 65535 ? bindPort : BIND_PORT;
 			c.fingerprint = CertPin.normalizeFingerprint(fingerprint);
 			// T104：策略原样带过去；"打洞优先在这台电脑上不成立"时由 VisitorConfig.effectiveStrategy()
 			// 统一落回 relay（判据只有一处，UI 与 toml 不会各说一套）。
@@ -153,6 +162,7 @@ public final class ProfileStore {
 				o.put("pcMode", VisitorConfig.normalizePcMode(pcMode));
 				o.put("tunnelName", tunnelName);
 				o.put("fingerprint", fingerprint);
+				if (bindPort >= 1 && bindPort <= 65535) o.put("bindPort", bindPort);
 			} catch (Exception ignored) {
 			}
 			return o;
@@ -176,6 +186,8 @@ public final class ProfileStore {
 			// 存量配置组没有这个键（optString 兜空），由 toVisitorConfig() 规范化为空串
 			// ⇒ 退化到 TOFU，不会拿旧值误判。
 			p.fingerprint = CertPin.normalizeFingerprint(o.optString("fingerprint", ""));
+			int storedPort = o.optInt("bindPort", 0);
+			p.bindPort = storedPort >= 1 && storedPort <= 65535 ? storedPort : 0;
 			return p;
 		}
 	}
@@ -269,6 +281,11 @@ public final class ProfileStore {
 
 	public static void setActiveId(SharedPreferences prefs, String id) {
 		prefs.edit().putString(KEY_ACTIVE, id == null ? "" : id).apply();
+	}
+
+	/** 没存过这个键时视为打开。关掉后只连接当前这一台。 */
+	public static boolean preconnectSameFrps(SharedPreferences prefs) {
+		return prefs.getBoolean(KEY_PRECONNECT_SAME_FRPS, true);
 	}
 
 	public static Profile getActive(SharedPreferences prefs) {

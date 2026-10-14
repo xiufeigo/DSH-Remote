@@ -99,7 +99,7 @@
  *      给原生状态栏。WebView 用 DayNight 让「跟随系统」吃到 prefers-color-scheme。
  *  12. 前台通知：探测「停止生成」即智能体正在跑，把会话标题和当前用户
  *      内容交给 DshRemoteApp.setSessionNotice；空闲则 running=false，
- *      原生改走静默渠道，不再展示本机端口直通文案。
+ *      原生撤掉通知，不再留一条空闲保活通知。
  *  13. 底部导航栏避让：会话列（含 Explorer 替换模式的第三列）让出
  *      --dshr-inset-bottom，输入卡底栏与底部统计不被系统手势条/三键导航压住。
  *  14. 键盘抬起按整块输入区：焦点在官方输入卡内时报 [data-composer-seat]
@@ -310,7 +310,9 @@
 		'  box-sizing: border-box !important;',
 		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
 		'}',
-		'html.dshr-official-inset:not([data-dshr-ready="1"]) body {',
+		// 列还没标上时由 body 顶住状态栏。列一旦出现就改由列自己垫，
+		// 两边同时垫会多出一条，就绪后再摘掉 body 那层，页面就跳一下（切换时的「归位」）。
+		'html.dshr-official-inset:not([data-dshr-ready="1"]):not(:has([data-dshr-sidebar-col])):not(:has([data-dshr-main-col])) body {',
 		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
 		'  box-sizing: border-box !important;',
 		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
@@ -443,7 +445,8 @@
 		'  display: none !important;',
 		'}',		// 兜底：结构探测暂时失败（frame 未标记）时，body 自身让出状态栏，
 		// 保证任何官方构建下内容都不会顶进时钟/挖孔区域。
-		'html.' + ROOT_CLASS + ':not([data-dshr-ready="1"]) body {',
+		// frame 还没标上时 body 先让位。frame 标上后只留 frame 的 padding，避免和 body 叠成两倍再弹回去。
+		'html.' + ROOT_CLASS + ':not([data-dshr-ready="1"]):not(:has([data-dshr-frame])) body {',
 		'  box-sizing: border-box !important;',
 		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
 		'}',
@@ -3091,6 +3094,15 @@
 			applyImeLift();
 		},
 	};
+	// 切换页可能在 documentElement 还没有的时候就被要求让位。原生先把高度放在这里，
+	// 脚本真正装上的这一刻补上，避免第一帧顶进状态栏。
+	try {
+		var pendingInsets = window.__dshrPendingInsets;
+		if (pendingInsets && pendingInsets.length >= 2) {
+			window.__dshRemoteInsets.set(pendingInsets[0], pendingInsets[1],
+				pendingInsets[2] || 0, pendingInsets[3] || 0);
+		}
+	} catch (ignoredPendingInsets) { /* 原生还没写入 */ }
 
 	// ── 官方控件定位（只用稳定结构特征，不依赖哈希类名） ──
 	var TOGGLE_SELECTOR = [
@@ -4222,6 +4234,10 @@
 		if (!isElement(node)) return true;
 		if (node.id === 'dshr-mobile-whale' || node.id === 'dshr-mobile-drawer-mask') return true;
 		if (node.id === 'dshr-status-guard' || node.id === 'dshr-drawer-handle') return true;
+		// 服务器菜单自己按触发按钮定位，并且挂在 body 上。抽屉展开时它的底边
+		// 往往会低于右侧会话输入卡，clampFloatHost 会在下一帧用 !important 把
+		// top 收到安全区上沿，菜单立刻盖住触发按钮。它不是官方浮层，不参与钳位。
+		if (node.id === 'dshr-server-menu' || node.id === 'dshr-server-picker') return true;
 		if (node.hasAttribute('data-dshr-frame')) return true;
 		if (node.hasAttribute('data-dshr-sidebar-col')) return true;
 		if (node.hasAttribute('data-dshr-main-col')) return true;
@@ -4558,9 +4574,6 @@
 				event.preventDefault();
 				cancelLongPress();
 				unguardMultiTouch();
-				longPressFired = true;
-				armClickSuppress();
-				openAppSettings();
 			});
 			whale.addEventListener('touchstart', function (event) {
 				var touch = event.touches && event.touches[0];
@@ -4581,10 +4594,7 @@
 				guardMultiTouch();
 				longPress = window.setTimeout(function () {
 					longPress = null;
-					longPressFired = true;
 					unguardMultiTouch();
-					armClickSuppress();
-					openAppSettings();
 				}, 650);
 			}, { passive: true });
 			whale.addEventListener('touchmove', function (event) {
@@ -4757,7 +4767,8 @@
 	 * 手机横屏（`hookOn=false`）同样不挂 ⇒ 该档位连监听器都不存在。
 	 */
 	function brandLongPressWanted() {
-		return isStrictOff() || (deviceMode === 'phone' && hookOn === true);
+		// 连接设置不再从品牌区长按进入。服务器菜单在「新会话」上方。
+		return false;
 	}
 
 	/**

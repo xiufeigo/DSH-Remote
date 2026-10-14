@@ -43,15 +43,34 @@ public class FrpcManager {
 
 	private final File workDir;
 	private final File binFile;
+	private final String confName;
 	private Process process;
 	private volatile boolean stopping = false;
 	private volatile int startEpoch = 0;
 	private Thread watcher;
 	private long backoffMs = 1000;
+	/** 崩溃重启时重新向调用方要 toml，好让粘性回落写进下一次进程，而不是把旧文件再跑一遍。 */
+	private TomlSource managedSource;
+	private String launchedToml;
+
+	/** 一组访客的 toml。返回空串表示这组不该再拉起。 */
+	public interface TomlSource {
+		String toml();
+		String strategy();
+	}
 
 	public FrpcManager(Context context) {
+		this(context, "frpc-visitor.toml");
+	}
+
+	/**
+	 * @param confName 配置文件名。会话里切到另一条隧道时，备用进程必须写另一份 toml，
+	 *                 不能和正在给当前页用的那份互相覆盖。
+	 */
+	public FrpcManager(Context context, String confName) {
 		workDir = context.getFilesDir();
 		binFile = new File(context.getApplicationInfo().nativeLibraryDir, "libfrpc.so");
+		this.confName = (confName == null || confName.isEmpty()) ? "frpc-visitor.toml" : confName;
 	}
 
 	/** frpc 二进制是否存在（APK 里没打包 libfrpc.so 时给出可读错误）。 */
@@ -60,29 +79,58 @@ public class FrpcManager {
 	}
 
 	public synchronized void start(final VisitorConfig cfg) {
+		managedSource = null;
+		launchToml(cfg.toToml(), cfg.effectiveStrategy(), cfg);
+	}
+
+	/**
+	 * 按调用方现算的 toml 启动。崩溃后续跑时再问一次 {@link TomlSource}，
+	 * 同一份文本已经在跑就由 {@link #matchesRunning} 告诉调用方别重启。
+	 */
+	public synchronized void startManaged(TomlSource source) {
+		managedSource = source;
+		String toml = source == null ? "" : source.toml();
+		String strategy = source == null ? VisitorConfig.STRATEGY_P2P : source.strategy();
+		if (toml == null || toml.isEmpty()) {
+			managedSource = null;
+			launchedToml = null;
+			stopLocked();
+			return;
+		}
+		launchToml(toml, strategy, null);
+	}
+
+	public synchronized boolean matchesRunning(String toml) {
+		return toml != null && toml.equals(launchedToml) && !stopping && isProcessAlive(process);
+	}
+
+	private void launchToml(String toml, String strategy, VisitorConfig single) {
 		stopLocked();
 		stopping = false;
 		final int epoch = startEpoch;
+		launchedToml = toml;
 		if (!binaryAvailable()) {
 			log("frpc 二进制缺失：" + binFile.getAbsolutePath());
 			return;
 		}
 		try {
-			File conf = new File(workDir, "frpc-visitor.toml");
+			File conf = new File(workDir, confName);
 			OutputStream os = new FileOutputStream(conf);
-			os.write(cfg.toToml().getBytes(StandardCharsets.UTF_8));
+			os.write(toml.getBytes(StandardCharsets.UTF_8));
 			os.close();
 			// T104：本次 frpc 生效的打洞策略 + 路径判定归零。
 			// 必须在 exec 之前置位：下一行起的任意日志都归属这一次的档位，
 			// 否则"切档后的第一条日志"会被算到上一档的判定里（诊断行说谎）。
-			TunnelPath.reset(cfg.effectiveStrategy());
+			TunnelPath.reset(strategy == null || strategy.isEmpty()
+				? VisitorConfig.STRATEGY_P2P : strategy);
 
 			ProcessBuilder pb = new ProcessBuilder(binFile.getAbsolutePath(), "-c", conf.getAbsolutePath());
 			pb.redirectErrorStream(true);
 			process = pb.start();
 			log("frpc 启动：-c " + conf.getName());
 			pump(process);
-			watch(cfg, epoch);
+			if (single != null) watch(single, epoch);
+			else watchManaged(epoch);
 		} catch (Exception e) {
 			log("frpc 启动失败：" + e.getMessage());
 		}
@@ -151,7 +199,46 @@ public class FrpcManager {
 		start(cfg);
 	}
 
+	private void watchManaged(final int epoch) {
+		final Process p = process;
+		if (p == null) return;
+		watcher = new Thread(() -> {
+			try {
+				int code = p.waitFor();
+				if (stopping || epoch != startEpoch) return;
+				log("frpc 退出 code=" + code + "，" + backoffMs + "ms 后重启");
+				Thread.sleep(backoffMs);
+				if (stopping || epoch != startEpoch) return;
+				backoffMs = Math.min(backoffMs * 2, 60000);
+				restartManaged(epoch);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		}, "frpc-watch");
+		watcher.setDaemon(true);
+		watcher.start();
+	}
+
+	private synchronized void restartManaged(final int epoch) {
+		if (stopping || epoch != startEpoch) return;
+		TomlSource source = managedSource;
+		if (source == null) return;
+		String toml;
+		String strategy;
+		try {
+			toml = source.toml();
+			strategy = source.strategy();
+		} catch (Exception e) {
+			log("frpc 重读配置失败：" + e.getMessage());
+			return;
+		}
+		if (toml == null || toml.isEmpty()) return;
+		launchToml(toml, strategy, null);
+	}
+
 	public synchronized void stop() {
+		managedSource = null;
+		launchedToml = null;
 		stopLocked();
 	}
 

@@ -17,7 +17,10 @@ import android.util.Log;
 
 import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
+import java.util.ArrayList;
 import java.util.Enumeration;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -31,18 +34,31 @@ import java.util.TreeSet;
  * FGS 类型：specialUse（AND-02）。dataSync 在 Android 14+ 有累计时长限制、
  * 系统可随时杀，不适合长时隧道代理；用途在 Manifest 的 property 里声明。
  *
- * 通知：Android 要求前台服务必须挂一条通知。有智能体任务在跑时，通知显示
- * 会话标题和当前内容；空闲时改到静默渠道（尽量不进通知栏）。旧的「隧道」
- * 渠道一旦创建就降不了重要性，空闲必须换新渠道 id。
- * 通知带「断开」操作（AND-02），不进 App 即可停隧道；另有「连接设置」操作（D6 ②），
+ * 通知：只有智能体正在跑时才显示，内容是会话标题和当前这条会话。
+ * 没有会话时不留通知。startForegroundService 的 5 秒契约仍要先兑现一次，
+ * 兑现后立刻撤掉，避免空闲时在通知栏留下「DSH Remote」。
+ * 会话通知带「断开」操作（AND-02），不进 App 即可停隧道；另有「连接设置」操作（D6 ②），
  * 给平板档（hook 关闭、页面上没有长按鲸鱼入口）补一个运行中进连接设置页的入口。
  */
 public class TunnelService extends Service {
 
 	/** 通知「断开」操作（AND-02）。 */
 	public static final String ACTION_STOP = "top.d1studio.dshremote.action.STOP_TUNNEL";
+	/** 会话内切隧道：新访客已经画好，停掉旧进程并接管备用进程。 */
+	public static final String ACTION_COMMIT_OVERLAP = "top.d1studio.dshremote.action.COMMIT_OVERLAP";
+	/** 会话内切隧道失败：停掉备用进程，正在服务当前页的那条不动。 */
+	public static final String ACTION_ABORT_OVERLAP = "top.d1studio.dshremote.action.ABORT_OVERLAP";
+	/** 按已保存的配置组重写 frpc：同一台 frps 上的访客进同一个进程。 */
+	public static final String ACTION_SYNC = "top.d1studio.dshremote.action.SYNC_FLEET";
+	public static final String EXTRA_FLEET_SCOPE = "dshr_fleet_scope";
+	public static final String SCOPE_FULL = "full";
+	public static final String SCOPE_ACTIVE = "active";
+	/** 当前这台，加上同一台 frps 上的其他服务器。 */
+	public static final String SCOPE_SAME_FRPS = "same-frps";
 	/** MainActivity 传入协商后的本地绑定端口（AND-07）；缺省时服务侧自行协商。 */
 	public static final String EXTRA_BIND_PORT = "dshr_bind_port";
+	/** 为 true 时另起一个 frpc，不停当前这条。当前页继续用旧端口，直到交接。 */
+	public static final String EXTRA_OVERLAP = "dshr_overlap";
 	private static final String TAG = "dshr-svc";
 
 	private static final String CHANNEL_SESSION = "session_progress";
@@ -51,17 +67,34 @@ public class TunnelService extends Service {
 
 	private static volatile TunnelService instance;
 	private static volatile boolean sessionRunning;
+	/** 当前是否正处于前台服务。空闲时为 false，通知也已撤掉。 */
+	private boolean holdingForeground;
 	private static volatile String sessionTitle = "";
 	private static volatile String sessionText = "";
 
 	private final Object frpcLock = new Object();
 	private final Handler mainHandler = new Handler(Looper.getMainLooper());
 	private FrpcManager frpc;
+	/** 会话内切隧道时先并行拉起的访客。交接前当前页仍走 {@link #frpc}。 */
+	private FrpcManager pendingFrpc;
+	private VisitorConfig pendingCfg;
+	private volatile boolean overlapStarting;
+	private volatile boolean pendingShouldPromote;
+	private volatile boolean pendingShouldDiscard;
+	/** 粘性回落改写 cfg.strategy 之前的用户档位。交接落盘用它，避免把「暂时中转」写成用户选择。 */
+	private String pendingUserStrategy;
 
 	/** T113：隧道环境巡检（网络变化清零 + 粘性挂载，见 {@link #watchTunnelEnvironment}）。 */
 	private Runnable stickyWatch;
 	/** T113：本次 frpc 启动实际用的配置对象（巡检要它能改到下一次重启写出的 toml）。 */
 	private volatile VisitorConfig runningCfg;
+	/** 同一台 frps 一个进程。key 是地址、端口和登录密钥。 */
+	private final Map<String, FrpcManager> fleet = new LinkedHashMap<>();
+	private int fleetGeneration;
+
+	public static boolean isRunning() {
+		return instance != null;
+	}
 
 	public static void updateSessionNotice(Context ctx, String title, String text, boolean running) {
 		sessionTitle = title == null ? "" : title.trim();
@@ -89,7 +122,7 @@ public class TunnelService extends Service {
 
 			NotificationChannel keep = new NotificationChannel(
 				CHANNEL_KEEP, "后台保活", NotificationManager.IMPORTANCE_MIN);
-			keep.setDescription("隧道保活。没有正在运行的会话时尽量不显示");
+			keep.setDescription("仅用于满足系统的前台服务契约，没有会话时会立刻撤掉");
 			keep.setShowBadge(false);
 			keep.enableLights(false);
 			keep.enableVibration(false);
@@ -109,43 +142,123 @@ public class TunnelService extends Service {
 			stopSelfHonoringForegroundContract();
 			return START_NOT_STICKY;
 		}
-		ProfileStore.migrateLegacy(getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE));
-		ProfileStore.Profile profile = ProfileStore.getActive(
-			getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE));
-		if (profile == null || !profile.isValid()) {
-			stopSelfHonoringForegroundContract();
-			return START_NOT_STICKY;
+		if (intent != null && ACTION_COMMIT_OVERLAP.equals(intent.getAction())) {
+			if (frpc == null && pendingFrpc == null && !overlapStarting) {
+				stopSelf();
+				return START_NOT_STICKY;
+			}
+			commitOverlap();
+			return START_STICKY;
 		}
-		VisitorConfig cfg = profile.toVisitorConfig();
-
-		// AND-07：端口协商。优先采用 MainActivity 协商后经 Intent 传入的端口；
-		// 缺失时（如进程被杀后 START_STICKY 以 null intent 重启）就地协商，
-		// 并把实际端口落盘，供 MainActivity 下次复用探测。
-		int requested = intent == null ? -1 : intent.getIntExtra(EXTRA_BIND_PORT, -1);
-		int port = (requested >= 1 && requested <= 65535) ? requested : ProfileStore.negotiateBindPort();
-		if (port < 0) {
-			Log.e(TAG, "端口协商失败：首选 " + ProfileStore.BIND_PORT + " 与回退范围 "
-				+ ProfileStore.PORT_RANGE_MIN + "-" + ProfileStore.PORT_RANGE_MAX + " 均被占用");
-			stopSelfHonoringForegroundContract();
-			return START_NOT_STICKY;
+		if (intent != null && ACTION_ABORT_OVERLAP.equals(intent.getAction())) {
+			abortOverlap();
+			if (frpc == null && pendingFrpc == null && !overlapStarting) {
+				stopSelf();
+				return START_NOT_STICKY;
+			}
+			return START_STICKY;
 		}
-		cfg.bindPort = port;
-		// 端口与「本隧道服务的配置组 id」成对落盘：MainActivity 复用探测据此
-		// 判断存活隧道是否属于本次所选配置组，防止错复用连到旧 server。
-		// T104：再落一个「实际生效的打洞策略」——复用探测也要比它，否则用户切了档
-		// 却因为端口还活着被复用，跑到下一次重启前都还是旧档（切档名不副实）。
-		getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
-			.putInt(ProfileStore.KEY_BOUND_PORT, port)
-			.putString(ProfileStore.KEY_TUNNEL_PROFILE, profile.id)
-			.putString(ProfileStore.KEY_TUNNEL_STRATEGY, cfg.effectiveStrategy())
-			.apply();
+		SharedPreferences prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
+		ProfileStore.migrateLegacy(prefs);
+		String scope;
+		if (intent != null && ACTION_SYNC.equals(intent.getAction())) {
+			scope = intent.getStringExtra(EXTRA_FLEET_SCOPE);
+		} else if (intent == null) {
+			scope = prefs.getString(ProfileStore.KEY_FLEET_SCOPE, SCOPE_SAME_FRPS);
+		} else {
+			scope = SCOPE_SAME_FRPS;
+		}
+		syncFleet(canonicalScope(scope, prefs));
+		return START_STICKY;
+	}
 
+	/** 旧的「全部中转」在这个开关打开时收成同一台 frps，关掉时只留当前这台。 */
+	private static String canonicalScope(String scope, SharedPreferences prefs) {
+		if (SCOPE_ACTIVE.equals(scope)) return SCOPE_ACTIVE;
+		if (SCOPE_SAME_FRPS.equals(scope)) return SCOPE_SAME_FRPS;
+		return ProfileStore.preconnectSameFrps(prefs) ? SCOPE_SAME_FRPS : SCOPE_ACTIVE;
+	}
+
+	/**
+	 * 把已保存的隧道收成若干 frpc 进程：同一台 frps 的访客写进同一份 toml。
+	 * 文本没变并且进程还活着时不重启，避免切服务器时把当前页的连接掐掉。
+	 */
+	private void syncFleet(final String scope) {
 		publishForeground();
+		final int generation = ++fleetGeneration;
+		getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
+			.putString(ProfileStore.KEY_FLEET_SCOPE, scope).apply();
+		noteStickyOnSync();
+		new Thread(() -> {
+			synchronized (frpcLock) {
+				if (generation != fleetGeneration || instance != TunnelService.this) return;
+				SharedPreferences prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
+				List<ProfileStore.Profile> profiles = ProfileStore.list(prefs);
+				String activeId = ProfileStore.getActiveId(prefs);
+				int preferred = activeId.equals(prefs.getString(ProfileStore.KEY_TUNNEL_PROFILE, ""))
+					? prefs.getInt(ProfileStore.KEY_BOUND_PORT, 0) : 0;
+				if (VisitorFleet.assignPorts(profiles, activeId, preferred)) {
+					ProfileStore.saveAll(prefs, profiles);
+				}
+				ProfileStore.Profile active = null;
+				for (ProfileStore.Profile profile : profiles) {
+					if (profile.id.equals(activeId)) active = profile;
+				}
+				if (active != null && active.bindPort > 0) {
+					runningCfg = active.toVisitorConfig();
+					prefs.edit()
+						.putInt(ProfileStore.KEY_BOUND_PORT, active.bindPort)
+						.putString(ProfileStore.KEY_TUNNEL_PROFILE, active.id)
+						.putString(ProfileStore.KEY_TUNNEL_STRATEGY, ProfileStore.effectiveStrategy(active))
+						.apply();
+				}
+				List<VisitorFleet.Group> groups = groupsFor(profiles, activeId, scope);
+				Log.i(TAG, "访客集 " + scope + "：" + groups.size() + " 个 frpc 进程");
+				if (groups.isEmpty()) {
+					stopFleetLocked();
+					mainHandler.post(() -> {
+						if (generation == fleetGeneration && instance == TunnelService.this) {
+							stopSelfHonoringForegroundContract();
+						}
+					});
+					return;
+				}
+				if (frpc != null) {
+					frpc.stop();
+					frpc = null;
+				}
+				if (pendingFrpc != null) {
+					pendingFrpc.stop();
+					pendingFrpc = null;
+				}
+				List<String> keep = new ArrayList<>();
+				for (VisitorFleet.Group group : groups) {
+					keep.add(group.key);
+					FrpcManager existing = fleet.get(group.key);
+					if (existing != null && existing.matchesRunning(group.toml)) continue;
+					if (existing != null) existing.stop();
+					FrpcManager manager = new FrpcManager(TunnelService.this, group.fileName);
+					final String key = group.key;
+					manager.startManaged(new FrpcManager.TomlSource() {
+						@Override public String toml() { return tomlFor(key); }
+						@Override public String strategy() { return strategyFor(key); }
+					});
+					fleet.put(group.key, manager);
+				}
+				Iterator<Map.Entry<String, FrpcManager>> it = fleet.entrySet().iterator();
+				while (it.hasNext()) {
+					Map.Entry<String, FrpcManager> entry = it.next();
+					if (keep.contains(entry.getKey())) continue;
+					entry.getValue().stop();
+					it.remove();
+				}
+			}
+		}, "frpc-fleet").start();
+		watchTunnelEnvironment();
+	}
 
-		// ── T113：打洞回落的两个处置（粘性 / 网络清零）────────────────────────
-		// 顺序要求：必须在上面的 KEY_TUNNEL_STRATEGY 落盘（用户档位）**之后**再改 cfg.strategy，
-		// 否则 MainActivity 的「复用存活隧道」探测会拿"粘性中转"去比"用户选的打洞优先"，
-		// 每次都判成策略变了而反复重启隧道。
+	/** 粘性作用域在写 toml 之前先对一次，换网络后这次同步会重新试打洞。 */
+	private void noteStickyOnSync() {
 		try {
 			String netId = networkId();
 			String ctx = stickyContext(netId);
@@ -153,30 +266,153 @@ public class TunnelService extends Service {
 			Log.i(TAG, "T113 网络身份=" + netId + " 粘性作用域=" + ctx
 				+ (ctxChanged ? "（上下文变化 ⇒ 已清零：" + TunnelPath.stickyResetReason() + "）" : "（未变化）")
 				+ " 连续打洞失败=" + TunnelPath.holeFailStreak() + " 粘住中转=" + TunnelPath.stickyRelay());
-			// 只有"用户选打洞优先"这一档才谈粘性；用户显式选「只用中转」时本来就写纯 stcp toml。
-			if (VisitorConfig.STRATEGY_P2P.equals(cfg.effectiveStrategy()) && TunnelPath.stickyRelay()) {
-				// 复用 T104 已有的「只用中转」toml（同一条 stcp 访客分支），不新发明任何 toml 写法。
-				cfg.strategy = VisitorConfig.STRATEGY_RELAY;
-				TunnelPath.noteStickyApplied();
-				Log.i(TAG, "T113 粘性回落生效：连续 " + TunnelPath.holeFailStreak()
-					+ " 次打洞超时 ⇒ 本次隧道直接用纯中转 toml（0 空等），换网络或重开 App 后自动重试打洞");
-			}
 		} catch (Exception e) {
 			Log.w(TAG, "T113 粘性判定失败（按用户档位原样启动）：" + e);
 		}
+	}
 
-		final VisitorConfig toStart = cfg;
-		runningCfg = cfg;
+	private String tomlFor(String key) {
+		VisitorFleet.Group group = groupFor(key);
+		return group == null ? "" : group.toml;
+	}
+
+	private String strategyFor(String key) {
+		VisitorFleet.Group group = groupFor(key);
+		return group == null ? VisitorConfig.STRATEGY_P2P : group.strategy;
+	}
+
+	private VisitorFleet.Group groupFor(String key) {
+		SharedPreferences prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
+		String scope = canonicalScope(prefs.getString(ProfileStore.KEY_FLEET_SCOPE, SCOPE_SAME_FRPS), prefs);
+		for (VisitorFleet.Group group : groupsFor(
+			ProfileStore.list(prefs), ProfileStore.getActiveId(prefs), scope)) {
+			if (group.key.equals(key)) return group;
+		}
+		return null;
+	}
+
+	private static List<VisitorFleet.Group> groupsFor(List<ProfileStore.Profile> profiles, String activeId, String scope) {
+		if (SCOPE_ACTIVE.equals(scope)) {
+			if (activeId == null || activeId.length() == 0) return new ArrayList<>();
+			return VisitorFleet.build(profiles, activeId, TunnelPath.stickyRelay());
+		}
+		if (SCOPE_SAME_FRPS.equals(scope)) {
+			return VisitorFleet.buildSameFrps(profiles, activeId, TunnelPath.stickyRelay());
+		}
+		return VisitorFleet.build(profiles, "", TunnelPath.stickyRelay());
+	}
+
+	private void stopFleetLocked() {
+		for (FrpcManager manager : fleet.values()) manager.stop();
+		fleet.clear();
+		if (frpc != null) {
+			frpc.stop();
+			frpc = null;
+		}
+		if (pendingFrpc != null) {
+			pendingFrpc.stop();
+			pendingFrpc = null;
+		}
+	}
+
+	/** 备用访客。当前 frpc 继续跑，直到 {@link #commitOverlap()}。 */
+	private void startOverlapped(final VisitorConfig cfg, final String userStrategy) {
+		synchronized (frpcLock) {
+			pendingShouldPromote = false;
+			pendingShouldDiscard = false;
+			overlapStarting = true;
+			pendingCfg = cfg;
+			pendingUserStrategy = userStrategy;
+		}
+		Log.i(TAG, "重叠切换：备用隧道端口 " + cfg.bindPort + "，当前隧道保持");
+		new Thread(() -> {
+			FrpcManager next = new FrpcManager(TunnelService.this, "frpc-visitor-pending.toml");
+			next.start(cfg);
+			synchronized (frpcLock) {
+				overlapStarting = false;
+				if (pendingShouldDiscard) {
+					next.stop();
+					pendingFrpc = null;
+					pendingCfg = null;
+					pendingUserStrategy = null;
+					pendingShouldDiscard = false;
+					Log.i(TAG, "重叠切换已取消，备用隧道已停");
+					return;
+				}
+				if (pendingFrpc != null && pendingFrpc != next) pendingFrpc.stop();
+				pendingFrpc = next;
+				if (pendingShouldPromote) {
+					promoteLocked();
+					pendingShouldPromote = false;
+				}
+			}
+		}, "frpc-overlap").start();
+	}
+
+	private void commitOverlap() {
 		new Thread(() -> {
 			synchronized (frpcLock) {
-				if (frpc != null) frpc.stop();
-				FrpcManager next = new FrpcManager(TunnelService.this);
-				next.start(toStart);
-				frpc = next;
+				pendingShouldDiscard = false;
+				if (pendingFrpc != null) {
+					pendingShouldPromote = false;
+					promoteLocked();
+				} else {
+					// 进程还在启动：等它把自己放进 pendingFrpc 后再交接，避免先停掉当前隧道。
+					pendingShouldPromote = true;
+				}
 			}
-		}, "frpc-start").start();
-		watchTunnelEnvironment();
-		return START_STICKY;
+		}, "frpc-promote").start();
+	}
+
+	private void abortOverlap() {
+		new Thread(() -> {
+			synchronized (frpcLock) {
+				pendingShouldPromote = false;
+				if (pendingFrpc != null) {
+					pendingFrpc.stop();
+					pendingFrpc = null;
+					pendingCfg = null;
+					pendingUserStrategy = null;
+					pendingShouldDiscard = false;
+					Log.i(TAG, "重叠切换已取消，备用隧道已停");
+				} else {
+					pendingShouldDiscard = true;
+				}
+			}
+		}, "frpc-overlap-abort").start();
+	}
+
+	/** 调用方持有 {@link #frpcLock}。停旧进程可能要等它退出，不要在主线程调用。 */
+	private void promoteLocked() {
+		FrpcManager old = frpc;
+		if (pendingFrpc != null) {
+			frpc = pendingFrpc;
+			pendingFrpc = null;
+		}
+		if (pendingCfg != null) {
+			runningCfg = pendingCfg;
+			persistRunningTunnel();
+			pendingCfg = null;
+		}
+		Log.i(TAG, "重叠切换交接：当前隧道改为端口 "
+			+ (runningCfg == null ? "?" : runningCfg.bindPort));
+		if (old != null && old != frpc) old.stop();
+	}
+
+	private void persistRunningTunnel() {
+		VisitorConfig cfg = runningCfg;
+		if (cfg == null) return;
+		SharedPreferences prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
+		ProfileStore.Profile active = ProfileStore.getActive(prefs);
+		String id = active == null || active.id == null ? "" : active.id;
+		String strategy = pendingUserStrategy != null && !pendingUserStrategy.isEmpty()
+			? pendingUserStrategy : cfg.effectiveStrategy();
+		pendingUserStrategy = null;
+		prefs.edit()
+			.putInt(ProfileStore.KEY_BOUND_PORT, cfg.bindPort)
+			.putString(ProfileStore.KEY_TUNNEL_PROFILE, id)
+			.putString(ProfileStore.KEY_TUNNEL_STRATEGY, strategy)
+			.apply();
 	}
 
 	/**
@@ -296,40 +532,51 @@ public class TunnelService extends Service {
 			mainHandler.post(this::publishForeground);
 			return;
 		}
-		Notification n = buildNotification();
-		if (Build.VERSION.SDK_INT >= 34) {
-			// AND-02：Android 14+ 以 specialUse 类型启动（与 Manifest 声明一致）。
-			// dataSync 有累计时长限制（默认 6 小时内系统可杀），不适合长时隧道。
-			// 34 以下无 FGS 类型强约束，直接无类型启动。
-			startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
-		} else {
-			startForeground(NOTIFICATION_ID, n);
+		if (sessionRunning) {
+			enterForeground(buildNotification());
+			return;
 		}
+		// 空闲不留通知。若这次由 startForegroundService 拉起且还没进过前台，
+		// 必须先 startForeground，否则约 5 秒后系统会杀掉服务；随后立刻撤掉。
+		// 这条临时通知不带按钮，Android 12+ 会推迟显示，撤掉时通常还没出现。
+		if (!holdingForeground) enterForeground(buildNotification());
+		leaveForeground();
+	}
+
+	private void enterForeground(Notification notification) {
+		try {
+			if (Build.VERSION.SDK_INT >= 34) {
+				// AND-02：Android 14+ 以 specialUse 类型启动（与 Manifest 声明一致）。
+				// dataSync 有累计时长限制（默认 6 小时内系统可杀），不适合长时隧道。
+				startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+			} else {
+				startForeground(NOTIFICATION_ID, notification);
+			}
+			holdingForeground = true;
+		} catch (Exception e) {
+			Log.w(TAG, "进入前台失败：" + e);
+		}
+	}
+
+	private void leaveForeground() {
+		stopForegroundCompat();
+		holdingForeground = false;
+		NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+		if (nm != null) nm.cancel(NOTIFICATION_ID);
 	}
 
 	/**
 	 * AND-01：早停路径退出前必须满足 startForegroundService 的 5 秒契约——
 	 * 本次启动若经 startForegroundService() 拉起，却从未调 startForeground()
 	 * 就 stopSelf()，Android 8+ 会抛 "did not then call Service.startForeground()"。
-	 * 单纯 stopForegroundCompat 无法补上该契约（从未 publish 过时解除是空操作），
-	 * 因此先用当前通知补一次 startForeground，再解除前台并退出。已在前台时
-	 * 该调用仅刷新通知，无副作用；通知 PendingIntent 触发的重启场景受系统
-	 * 临时豁免保护，try/catch 兜底任何厂商差异。
+	 * 单纯 stopForeground 无法补上该契约（从未进过前台时解除是空操作），
+	 * 因此还没进前台时先补一次 startForeground，再撤掉通知并退出。
 	 */
 	private void stopSelfHonoringForegroundContract() {
-		if (Build.VERSION.SDK_INT >= 26) {
-			try {
-				if (Build.VERSION.SDK_INT >= 34) {
-					startForeground(NOTIFICATION_ID, buildNotification(),
-						ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
-				} else {
-					startForeground(NOTIFICATION_ID, buildNotification());
-				}
-			} catch (Exception e) {
-				Log.w(TAG, "早停前补 startForeground 失败（继续退出）：" + e);
-			}
+		if (Build.VERSION.SDK_INT >= 26 && !holdingForeground) {
+			enterForeground(buildNotification());
 		}
-		stopForegroundCompat();
+		leaveForeground();
 		stopSelf();
 	}
 
@@ -357,24 +604,19 @@ public class TunnelService extends Service {
 			b.setPriority(running ? Notification.PRIORITY_LOW : Notification.PRIORITY_MIN);
 		}
 		b.setSmallIcon(R.drawable.ic_stat_tunnel)
-			.setOngoing(true)
+			.setOngoing(running)
 			.setOnlyAlertOnce(true)
 			.setShowWhen(running)
 			.setContentIntent(launchIntent());
-		// AND-02：通知直达「断开」，不必先进 App 再停隧道。
-		b.addAction(new Notification.Action.Builder(
-			R.drawable.ic_stat_tunnel, "断开", stopIntent()).build());
-		// D6 ②：通知直达「连接设置」。平板档不装移动 hook，页面上没有长按鲸鱼入口，
-		// 这里是运行中进连接设置页的进程外入口；点它不碰隧道，只切 MainActivity 的界面。
-		b.addAction(new Notification.Action.Builder(
-			R.drawable.ic_stat_tunnel, "连接设置", settingsIntent()).build());
+		if (running && Build.VERSION.SDK_INT >= 31) {
+			b.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
+		}
 		if (Build.VERSION.SDK_INT >= 21) {
 			b.setVisibility(running ? Notification.VISIBILITY_PUBLIC : Notification.VISIBILITY_SECRET);
-			b.setCategory(running ? Notification.CATEGORY_PROGRESS : Notification.CATEGORY_SERVICE);
+			if (running) b.setCategory(Notification.CATEGORY_PROGRESS);
 		}
-		// 静音由渠道保证（onCreate 里两渠道均 setSound(null,null)、无振动无灯光，
-		// 空闲另走 IMPORTANCE_MIN 渠道）。framework Notification.Builder 没有
-		// setSilent(boolean)——那是 androidx NotificationCompat 的 API。
+		// 静音由渠道保证（onCreate 里两渠道均 setSound(null,null)、无振动无灯光）。
+		// framework Notification.Builder 没有 setSilent(boolean)——那是 androidx 的 API。
 
 		if (running) {
 			String title = sessionTitle.length() > 0 ? clip(sessionTitle, 64) : "DSH 会话";
@@ -383,6 +625,14 @@ public class TunnelService extends Service {
 			if (Build.VERSION.SDK_INT >= 16) {
 				b.setStyle(new Notification.BigTextStyle().bigText(text));
 			}
+			// AND-02：通知直达「断开」，不必先进 App 再停隧道。
+			// 按钮只加在会话通知上。空闲那条临时通知若带按钮，系统会立刻展示。
+			b.addAction(new Notification.Action.Builder(
+				R.drawable.ic_stat_tunnel, "断开", stopIntent()).build());
+			// D6 ②：通知直达「连接设置」。平板档不装移动 hook，页面上没有长按鲸鱼入口，
+			// 这里是运行中进连接设置页的进程外入口；点它不碰隧道，只切 MainActivity 的界面。
+			b.addAction(new Notification.Action.Builder(
+				R.drawable.ic_stat_tunnel, "连接设置", settingsIntent()).build());
 		} else {
 			b.setContentTitle("DSH Remote").setContentText("");
 		}
@@ -445,10 +695,12 @@ public class TunnelService extends Service {
 		// 粘性的清零只由 noteStickyContext（网络/配置组/策略变化）与 App 进程退出负责。
 		TunnelPath.clear();
 		synchronized (frpcLock) {
-			if (frpc != null) {
-				frpc.stop();
-				frpc = null;
-			}
+			pendingShouldPromote = false;
+			pendingShouldDiscard = true;
+			pendingCfg = null;
+			pendingUserStrategy = null;
+			fleetGeneration += 1;
+			stopFleetLocked();
 		}
 		super.onDestroy();
 	}

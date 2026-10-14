@@ -50,11 +50,10 @@ public final class VisitorConfig {
 	public String fingerprint = "";   // 网关自签证书 SHA-256（hex 小写无冒号；空 = 退化为 TOFU 确认）
 
 	/**
-	 * T31-1：frpc 控制连接心跳（秒）。与网关 renderFrpcToml/renderVisitorToml 的缺省一致；
+	 * frpc 控制连接心跳（秒）。40 秒仍低于常见蜂窝网络的空闲回收，超时保持 90 秒。
 	 * 写成 ≤0 即不输出这两行（回落 frp 内建默认 30/90）。
-	 * 刻意不做用户可见开关：只在访客配置里改，且 App 不让用户编辑这段 toml。
 	 */
-	public int heartbeatIntervalSec = 25;
+	public int heartbeatIntervalSec = 40;
 	public int heartbeatTimeoutSec = 90;
 
 	/**
@@ -121,6 +120,13 @@ public final class VisitorConfig {
 	/** 渲染访客侧 frpc.toml —— 与网关 renderVisitorToml 同构。 */
 	public String toToml() {
 		StringBuilder b = new StringBuilder();
+		appendHeader(b);
+		appendVisitors(b, "");
+		return b.toString();
+	}
+
+	/** 控制连接头。同一台 frps 上的多台访客共用这一段，只能写一次。 */
+	public void appendHeader(StringBuilder b) {
 		b.append("# 由 DSH Remote App 自动生成\n");
 		b.append("serverAddr = \"").append(serverAddr).append("\"\n");
 		b.append("serverPort = ").append(serverPort).append("\n\n");
@@ -133,12 +139,20 @@ public final class VisitorConfig {
 			b.append("transport.heartbeatTimeout = ").append(timeout).append("\n");
 		}
 		b.append("\n");
+	}
+
+	/**
+	 * 这一台机器的访客块。{@code nameSuffix} 为空时与改前单访客 toml 逐字相同；
+	 * 同一进程里隧道名撞车时才加后缀，并且只加在本地 visitor 名上，远端 serverName 不动。
+	 */
+	public void appendVisitors(StringBuilder b, String nameSuffix) {
+		String suffix = nameSuffix == null ? "" : nameSuffix;
 		if ("xtcp".equals(mode) && STRATEGY_P2P.equals(strategy)) {
 			// ── 打洞优先（默认档）：**逐字保持 T104 之前的样子** ──
 			// 网关 xtcp 形态同时注册了 `<名>-stcp`（stcp）与 `<名>`（xtcp）两条代理，
 			// 所以访客侧也要两条：先试 xtcp 打洞，{@link #FALLBACK_TIMEOUT_MS} 毫秒不通就
 			// fallbackTo 那条 stcp 访客走中转。
-			String stcpVisitor = serverName + "-stcp-visitor";
+			String stcpVisitor = serverName + "-stcp-visitor" + suffix;
 			b.append("[[visitors]]\n");
 			b.append("name = \"").append(stcpVisitor).append("\"\n");
 			b.append("type = \"stcp\"\n");
@@ -146,7 +160,7 @@ public final class VisitorConfig {
 			b.append("secretKey = \"").append(secretKey).append("\"\n");
 			b.append("bindPort = -1\n\n");
 			b.append("[[visitors]]\n");
-			b.append("name = \"").append(serverName).append("-visitor\"\n");
+			b.append("name = \"").append(serverName).append("-visitor").append(suffix).append("\"\n");
 			b.append("type = \"xtcp\"\n");
 			b.append("serverName = \"").append(serverName).append("\"\n");
 			b.append("secretKey = \"").append(secretKey).append("\"\n");
@@ -157,7 +171,7 @@ public final class VisitorConfig {
 			// T113：5000 → FALLBACK_TIMEOUT_MS（缺省 800）。语义与写法一字未新：
 			// 仍是同一条 fallbackTo 关系上的同一个 toml 键，只改数值。
 			b.append("fallbackTimeoutMs = ").append(FALLBACK_TIMEOUT_MS).append("\n");
-			return b.toString();
+			return;
 		}
 		if ("xtcp".equals(mode)) {
 			// ── 只用中转（电脑端=xtcp）：**不试打洞** ──
@@ -167,23 +181,22 @@ public final class VisitorConfig {
 			// 名字与 serverName 保持与 fallback 访客**逐字相同**（`<名>-stcp-visitor` /
 			// `<名>-stcp`）：那是网关侧唯一注册过的 stcp 代理名，自己发明名字会连不上。
 			b.append("[[visitors]]\n");
-			b.append("name = \"").append(serverName).append("-stcp-visitor\"\n");
+			b.append("name = \"").append(serverName).append("-stcp-visitor").append(suffix).append("\"\n");
 			b.append("type = \"stcp\"\n");
 			b.append("serverName = \"").append(serverName).append("-stcp\"\n");
 			b.append("secretKey = \"").append(secretKey).append("\"\n");
 			b.append("bindAddr = \"127.0.0.1\"\n");
 			b.append("bindPort = ").append(bindPort).append("\n");
-			return b.toString();
+			return;
 		}
 		// ── 电脑端=stcp / 策略=只用中转：与 T104 之前**逐字相同**的 stcp 访客 ──
 		b.append("[[visitors]]\n");
-		b.append("name = \"").append(serverName).append("-visitor\"\n");
+		b.append("name = \"").append(serverName).append("-visitor").append(suffix).append("\"\n");
 		b.append("type = \"stcp\"\n");
 		b.append("serverName = \"").append(serverName).append("\"\n");
 		b.append("secretKey = \"").append(secretKey).append("\"\n");
 		b.append("bindAddr = \"127.0.0.1\"\n");
 		b.append("bindPort = ").append(bindPort).append("\n");
-		return b.toString();
 	}
 
 	/**

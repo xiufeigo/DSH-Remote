@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>服务器弹窗审查</title>
+<style>
+  :root {
+    --side: #f5f5f7;
+    --ink: #1c1c1e;
+    --muted: #8e8e93;
+    --line: #ececef;
+    --hover: #f3f3f5;
+    --ok: #2f9e6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--ink);
+    background: #fff;
+  }
+  .app { height: 100%; display: flex; }
+  aside {
+    width: 280px;
+    background: var(--side);
+    display: flex;
+    flex-direction: column;
+    padding: 28px 12px 16px;
+    position: relative;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 36px;
+    padding: 0 8px 12px;
+    font-size: 14px;
+  }
+  .brand b { font-weight: 700; }
+  .brand span { font-size: 11px; letter-spacing: .08em; color: #6e6e73; font-weight: 650; }
+  .trigger {
+    height: 40px;
+    margin: 0 4px;
+    border-radius: 12px;
+    border: 1px solid #e6e6ea;
+    background: #fff;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 12px;
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
+  .trigger .name { flex: 1; text-align: left; }
+  .folders { margin-top: 18px; padding: 0 12px; color: #3a3a3c; font-size: 14px; }
+  .folders div { height: 32px; display: flex; align-items: center; }
+  .side-foot { margin-top: auto; padding: 8px 12px; font-size: 14px; }
+  main { flex: 1; padding: 72px 8% 0; }
+  .hero { display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 20px; font-weight: 650; }
+  .badge { font-size: 12px; font-weight: 500; color: #7aa2e3; background: #eef4ff; border-radius: 8px; padding: 2px 6px; }
+  .composer {
+    margin: 28px auto 0;
+    max-width: 640px;
+    border: 1px dashed #e3e3e8;
+    border-radius: 16px;
+    min-height: 92px;
+    color: #b0b0b6;
+    padding: 16px;
+  }
+
+  .menu {
+    position: absolute;
+    z-index: 2;
+    left: 16px;
+    right: 16px;
+    top: 118px;
+    width: auto;
+    padding: 6px;
+    border-radius: 16px;
+    background: #fff;
+    border: 1px solid rgba(0,0,0,.06);
+    box-shadow: 0 16px 40px rgba(0,0,0,.12);
+    font-size: 14px;
+  }
+  .menu h2 {
+    margin: 0;
+    padding: 8px 12px 6px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--muted);
+  }
+  .row {
+    width: 100%;
+    min-height: 56px;
+    border: 0;
+    border-radius: 12px;
+    background: transparent;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 4px 8px 12px;
+    text-align: left;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+  }
+  .row:hover, .row[aria-current="true"] { background: var(--hover); }
+  .status { width: 8px; height: 8px; border-radius: 50%; background: #c7c7cc; flex: none; }
+  .status[data-status="up"] { background: #38a677; }
+  .status[data-status="down"] { background: #e11d48; }
+  .copy { flex: 1; min-width: 0; }
+  .copy b, .copy small {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .copy b { font-weight: 600; font-size: 14px; line-height: 1.25; }
+  .copy small { margin-top: 3px; font-size: 12px; line-height: 1.25; color: var(--muted); }
+  .trail {
+    display: flex;
+    align-items: center;
+    flex: none;
+    margin-left: auto;
+  }
+  .check {
+    width: 22px;
+    text-align: center;
+    color: var(--ok);
+    font-size: 15px;
+    line-height: 1;
+  }
+  .edit {
+    width: 32px;
+    height: 32px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: #8e8e93;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    flex: none;
+  }
+  .edit:hover { background: #e7e7eb; color: var(--ink); }
+  .rule { height: 1px; margin: 6px 10px; background: var(--line); }
+  .action {
+    width: 100%;
+    height: 40px;
+    border: 0;
+    border-radius: 12px;
+    background: transparent;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 12px;
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+    color: var(--ink);
+  }
+  .action:hover { background: var(--hover); }
+  .mark {
+    width: 18px;
+    height: 18px;
+    border-radius: 6px;
+    display: grid;
+    place-items: center;
+    background: #f2f2f4;
+    color: var(--ink);
+    flex: none;
+  }
+  .mark svg { display: block; }
+
+  .form { padding: 2px 6px 6px; }
+  .form-head { display: flex; align-items: center; gap: 4px; height: 36px; }
+  .back, .reveal {
+    border: 0;
+    background: transparent;
+    font: inherit;
+    cursor: pointer;
+    color: var(--muted);
+  }
+  .back { width: 28px; height: 28px; border-radius: 8px; }
+  .back:hover { background: var(--hover); color: var(--ink); }
+  .form-head h2 { padding: 0; }
+  .seg {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2px;
+    padding: 2px;
+    margin: 4px 0 12px;
+    border-radius: 10px;
+    background: #f2f2f4;
+  }
+  .seg button {
+    height: 30px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .seg button[aria-pressed="true"] { background: #fff; font-weight: 650; }
+  label { display: block; margin: 0 0 10px; font-size: 12px; color: var(--muted); }
+  input {
+    display: block;
+    width: 100%;
+    height: 38px;
+    margin-top: 4px;
+    border: 1px solid #e6e6ea;
+    border-radius: 10px;
+    padding: 0 12px;
+    font: inherit;
+    font-size: 14px;
+    color: var(--ink);
+  }
+  .pair { display: grid; grid-template-columns: 104px 1fr; gap: 8px; }
+  .secret { position: relative; }
+  .secret input { padding-right: 52px; }
+  .reveal { position: absolute; right: 10px; bottom: 9px; font-size: 12px; }
+  .choices { display: grid; gap: 6px; margin-bottom: 12px; }
+  .choice {
+    display: grid;
+    grid-template-columns: 16px 1fr;
+    gap: 8px;
+    align-items: start;
+    padding: 8px 10px;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    text-align: left;
+    font: inherit;
+    cursor: pointer;
+  }
+  .choice[aria-pressed="true"] { background: var(--hover); }
+  .choice i {
+    width: 14px; height: 14px; margin-top: 2px;
+    border-radius: 50%;
+    border: 1.5px solid #c7c7cc;
+  }
+  .choice[aria-pressed="true"] i { border: 4px solid var(--ink); }
+  .choice b { display: block; font-size: 13px; }
+  .choice small { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; line-height: 1.35; }
+  .actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 2px; }
+  .ghost, .save {
+    height: 36px;
+    padding: 0 14px;
+    border-radius: 10px;
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .ghost { border: 0; background: transparent; color: var(--ink); }
+  .save { border: 0; background: var(--ink); color: #fff; }
+  .list[hidden], .form[hidden] { display: none; }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <div class="brand">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 13c2-6 8-8 14-6-2 2-2 4-1 6 2 0 4-1 5-3-1 6-6 9-12 8-2 2-4 2-6 1 2-2 2-4 0-6Z"/></svg>
+      <b>deepseek</b><span>HARNESS</span>
+    </div>
+    <button class="trigger" type="button"><span class="monitor">▣</span><i class="dot"></i><span class="name">铭凡</span><span>⌃</span></button>
+    <div class="folders">
+      <div>DSH-Remote</div>
+      <div>opencode-android-shell</div>
+      <div>optoolkit</div>
+      <div>未分组</div>
+    </div>
+    <div class="side-foot">设置</div>
+    <div class="menu" id="menu">
+      <div class="list" id="list">
+        <h2>切换服务器</h2>
+        <div id="rows"></div>
+        <div class="rule"></div>
+        <button class="action" id="add" type="button"><span class="mark" aria-hidden="true"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 1.5v9M1.5 6h9"/></svg></span>添加服务器</button>
+        <button class="action" id="stop" type="button"><span class="mark" aria-hidden="true"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2.4" y="2.4" width="7.2" height="7.2" rx="1.2"/></svg></span>停止隧道</button>
+      </div>
+      <form class="form" id="form" hidden>
+        <div class="form-head">
+          <button class="back" id="back" type="button" aria-label="返回">←</button>
+          <h2>添加服务器</h2>
+        </div>
+        <div class="seg">
+          <button type="button" aria-pressed="true">隧道</button>
+          <button type="button" aria-pressed="false">直连</button>
+        </div>
+        <label>名称<input placeholder="例如 家里的电脑"></label>
+        <label>VPS 地址<input placeholder="与电脑端一致"></label>
+        <div class="pair">
+          <label>控制端口<input value="7000"></label>
+          <label>隧道名<input value="dsh-remote"></label>
+        </div>
+        <label class="secret">登录密钥<input type="password" placeholder="frps 的 auth.token"><button class="reveal" type="button">显示</button></label>
+        <label class="secret">访客密钥<input type="password" placeholder="与电脑插件一致"><button class="reveal" type="button">显示</button></label>
+        <div class="choices">
+          <button class="choice" type="button" aria-pressed="true"><i></i><span><b>打洞优先</b><small>先试直连，打不通再经 VPS 中转。</small></span></button>
+          <button class="choice" type="button" aria-pressed="false"><i></i><span><b>只用中转</b><small>不打洞，建连更稳，流量经过 VPS。</small></span></button>
+        </div>
+        <div class="actions">
+          <button class="ghost" id="cancel" type="button">取消</button>
+          <button class="save" type="button">保存并连接</button>
+        </div>
+      </form>
+    </div>
+  </aside>
+  <main>
+    <div class="hero">探索未至之境 <span class="badge">预览版</span></div>
+    <div class="composer">选择一个工作区开始</div>
+  </main>
+</div>
+<script>
+(function () {
+  var servers = [
+    { name: '铭凡', detail: '隧道 · 8.138.19.15', current: true, status: 'up' },
+    { name: '机械君', detail: '隧道 · 8.138.19.15', current: false, status: 'up' },
+    { name: '原直连入口', detail: '直连 · deepseek-harness.xiufeigo.xyz', current: false, status: 'idle' }
+  ];
+  var rows = document.getElementById('rows');
+  var pencil = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 20h4l10-10-4-4L4 16v4Z"/><path d="m12 6 4 4"/></svg>';
+  servers.forEach(function (item) {
+    var row = document.createElement('div');
+    row.className = 'row';
+    row.setAttribute('role', 'button');
+    if (item.current) row.setAttribute('aria-current', 'true');
+    row.innerHTML = '<span class="status"></span><span class="copy"><b></b><small></small></span><span class="trail"><span class="check"></span><button class="edit" type="button" aria-label="编辑"></button></span>';
+    row.querySelector('.status').setAttribute('data-status', item.status || 'idle');
+    row.querySelector('b').textContent = item.name;
+    row.querySelector('small').textContent = item.detail;
+    row.querySelector('.check').textContent = item.current ? '✓' : '';
+    row.querySelector('.edit').innerHTML = pencil;
+    row.querySelector('.edit').addEventListener('click', function (event) {
+      event.stopPropagation();
+      showForm();
+    });
+    rows.appendChild(row);
+  });
+  var list = document.getElementById('list');
+  var form = document.getElementById('form');
+  function showForm() { list.hidden = true; form.hidden = false; }
+  function showList() { form.hidden = true; list.hidden = false; }
+  document.getElementById('add').addEventListener('click', showForm);
+  document.getElementById('back').addEventListener('click', showList);
+  document.getElementById('cancel').addEventListener('click', showList);
+})();
+</script>
+</body>
+</html>

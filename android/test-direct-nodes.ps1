@@ -11,8 +11,8 @@ if (!(Test-Path $json)) {
 $platform = Join-Path $sdk 'platforms/android-36/android.jar'
 $src = Join-Path $PSScriptRoot 'app/src/main/java/top/d1studio/dshremote'
 & "$jdk/bin/javac.exe" -encoding UTF-8 -cp "$json;$platform" -d "$out/classes" `
-    "$PSScriptRoot/tests/stubs/android/text/TextUtils.java" "$src/VisitorConfig.java" "$src/ProfileStore.java" "$src/CertPin.java" "$src/TunnelReady.java" `
-    "$PSScriptRoot/tests/DirectNodesTest.java" "$PSScriptRoot/tests/CertPinTest.java" "$PSScriptRoot/tests/TunnelReadyTest.java"
+    "$PSScriptRoot/tests/stubs/android/text/TextUtils.java" "$src/TunnelPath.java" "$src/VisitorConfig.java" "$src/ProfileStore.java" "$src/CertPin.java" "$src/TunnelReady.java" "$src/ServerPicker.java" `
+    "$PSScriptRoot/tests/DirectNodesTest.java" "$PSScriptRoot/tests/CertPinTest.java" "$PSScriptRoot/tests/TunnelReadyTest.java" "$PSScriptRoot/tests/ServerPickerTest.java"
 if ($LASTEXITCODE -ne 0) { throw 'JVM test compile failed' }
 & "$jdk/bin/java.exe" -cp "$out/classes;$json;$platform" top.d1studio.dshremote.DirectNodesTest
 if ($LASTEXITCODE -ne 0) { throw 'Direct node tests failed' }
@@ -20,3 +20,5 @@ if ($LASTEXITCODE -ne 0) { throw 'Direct node tests failed' }
 if ($LASTEXITCODE -ne 0) { throw 'CertPin tests failed' }
 & "$jdk/bin/java.exe" -cp "$out/classes;$json;$platform" top.d1studio.dshremote.TunnelReadyTest
 if ($LASTEXITCODE -ne 0) { throw 'TunnelReady tests failed' }
+& "$jdk/bin/java.exe" -cp "$out/classes;$json;$platform" top.d1studio.dshremote.ServerPickerTest
+if ($LASTEXITCODE -ne 0) { throw 'Server picker tests failed' }

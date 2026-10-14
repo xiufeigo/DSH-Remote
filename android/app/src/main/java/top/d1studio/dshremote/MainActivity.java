@@ -35,9 +35,11 @@ import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsAnimation;
 import android.view.WindowManager;
+import android.view.animation.DecelerateInterpolator;
 import android.view.inputmethod.EditorInfo;
 import android.webkit.JavascriptInterface;
 import android.webkit.CookieManager;
+import android.webkit.DownloadListener;
 import android.webkit.HttpAuthHandler;
 import android.webkit.ServiceWorkerClient;
 import android.webkit.ServiceWorkerController;
@@ -77,8 +79,17 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.security.MessageDigest;
 import java.security.cert.X509Certificate;
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SNIServerName;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
@@ -86,6 +97,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
@@ -114,6 +126,8 @@ public class MainActivity extends Activity {
 	public static final String ACTION_OPEN_SETTINGS = "top.d1studio.dshremote.action.OPEN_SETTINGS";
 
 	private static final String KEY_URL = "gateway_url";
+	private static final String KEY_LAST_KIND = "last_server_kind";
+	private static final String KEY_LAST_ID = "last_server_id";
 	/** 地址维度的证书指纹键前缀（存量安装 + 直连/局域网节点），见 CertPin.HOST_PREFIX。 */
 	private static final String KEY_CERT_PREFIX = CertPin.HOST_PREFIX;
 	private static final String KEY_HTTP_AUTH_REMEMBER_PREFIX = "http_auth_remember_";
@@ -169,8 +183,24 @@ public class MainActivity extends Activity {
 	private String editingPcMode = "";
 	private TextView tvTunnelState;
 	private Button resumeSessionBtn;
+	private ScrollView welcomeScroll;
+	private LinearLayout welcomeTunnelBlock;
+	private LinearLayout welcomeDirectBlock;
+	private EditText welcomeName;
+	private EditText welcomeHost;
+	private EditText welcomePort;
+	private EditText welcomeTunnel;
+	private EditText welcomeToken;
+	private EditText welcomeSk;
+	private EditText welcomeUrl;
+	private String welcomeKind = ServerPicker.TUNNEL;
+	private String welcomeStrategy = VisitorConfig.STRATEGY_P2P;
 	private String editingProfileId = "";
 	private WebView webView;
+	/** 前台页和后台切换页共用同一套回调；回调用 view 参数区分，不把后台页当成当前会话。 */
+	private WebViewClient sessionClient;
+	private WebChromeClient sessionChrome;
+	private DownloadListener sessionDownload;
 	private ValueCallback<Uri[]> fileCallback;
 	/**
 	 * T78：重连状态探针的**防抖状态机**（连续 2 次真才"显示" / 连续 3 次假才"隐藏" /
@@ -285,6 +315,8 @@ public class MainActivity extends Activity {
 	private final Set<String> submittedHttpAuthThisConnection = new HashSet<>();
 	/** 缓存的移动适配脚本（res/raw/mobile.js）；远端页面加载完成后注入。 */
 	private String mobileAdaptJs;
+	private String serverPickerJs;
+	private String serverPickerCapability = "";
 	/** 当前已应用到根布局的 IME 底边距（px）。-1 表示尚未同步。 */
 	private int currentImePadding = -1;
 	/** 当前实际平移量（可能小于 IME 高度，避免把输入框顶出屏幕）。 */
@@ -309,6 +341,71 @@ public class MainActivity extends Activity {
 	private boolean pageBgPolling = false;
 	/** 直连重试不得误用当前选中的 FRP 配置组。 */
 	private String directTarget = "";
+	/** 本轮连接身份与配置快照；持久化的 active_id 只是上次选择。 */
+	private ServerPicker.Current serverPickerCurrent;
+	/** 服务器 id → up/down。up 表示网关真的握上手了，不是本地端口在听。直连和隧道共用这一张表。 */
+	private volatile Map<String, String> tunnelReachability = Collections.emptyMap();
+	private boolean tunnelDotPortPending;
+	private volatile boolean tunnelDotRunning;
+	/** 正在给状态点握手的套接字。切服务器时关掉，避免这只握手把整组 frpc 挂住。 */
+	private volatile SSLSocket tunnelDotSocket;
+	private static SSLSocketFactory reachabilityFactory;
+	private static final int REACH_CONNECT_MS = 800;
+	private static final int REACH_HANDSHAKE_MS = 1200;
+	private static final int REACH_PORT_WAIT_MS = 2500;
+	private static final int REACH_PORT_WAIT_LIMIT = 8;
+	private volatile int tunnelDotGeneration;
+	/** 当前这轮探活持有的代次。取消只把代次加一，由这轮自己清掉运行标记。 */
+	private volatile int tunnelDotOwner;
+	private int tunnelDotRetries;
+	/** 切到一台 frpc 之后，同组其它服务器要再探一次。切换完成前只排队，不握手。 */
+	private ProfileStore.Profile siblingRefreshTarget;
+	/**
+	 * 会话内切机器：目标页在 {@link #stagingWebView} 里加载，当前页保持可操作。
+	 * 目标界面真正画出来之后再淡入，因此不会先闪出「正在连接 DSH」，也不会整页硬切。
+	 */
+	private static final String STAGING_TAG = "dshr-staging";
+	private static final long SWITCH_REVEAL_INTERVAL_MS = 80L;
+	private static final int SWITCH_REVEAL_MAX_TRIES = 40;
+	private static final long SWITCH_FADE_MS = 220L;
+	private static final long SWITCH_PRESENT_DELAY_MS = 64L;
+	/** 关掉「同一中转一起挂」之后，退后台超过这段时间就只留当前这台。 */
+	private static final long FLEET_TRIM_DELAY_MS = 45000L;
+	private final Runnable trimFleet = new Runnable() {
+		@Override public void run() {
+			if (destroyed || appInForeground || !TunnelService.isRunning()) return;
+			if (ProfileStore.preconnectSameFrps(prefs())) return;
+			requestFleet(true);
+		}
+	};
+	private volatile WebView stagingWebView;
+	private WebView fadingOutWebView;
+	private WebView retiringWebView;
+	private volatile boolean serverSwitchInFlight;
+	private boolean stagingCommitting;
+	private boolean abortingSeamless;
+	private boolean switchRevealArmed;
+	private boolean switchPresentationDone;
+	private boolean switchOverlapTunnel;
+	private int switchOverlapPort;
+	private String switchOverlapProfileId = "";
+	private String switchOverlapStrategy = "";
+	private boolean switchVisualLock;
+	private int switchRevealTries;
+	private int switchPresentationTicket;
+	private final Runnable switchRevealPoll = new Runnable() {
+		@Override public void run() { pollStagingReveal(); }
+	};
+	private boolean switchRollbackArmed;
+	private boolean switchDisplacedTunnel;
+	private String switchRollbackActiveId = "";
+	private String pendingSwitchUrl = "";
+	private String pendingSwitchProfileId = "";
+	private int pendingSwitchGeneration;
+	private String stagingFailedUrl = "";
+	private ServerPicker.Current pendingSwitchCurrent;
+	private ProfileStore.Profile pendingSwitchProfile;
+	private ProfileStore.DirectNode pendingSwitchNode;
 	/**
 	 * T23-A：本次连接来自哪个配置组（直连/局域网节点为空串）。
 	 * 隧道模式下一律连本机回环地址 127.0.0.1:&lt;端口&gt;，两个配置档背后是两台不同的
@@ -407,11 +504,12 @@ public class MainActivity extends Activity {
 		ensureWebView();
 		ProfileStore.migrateLegacy(prefs());
 		ProfileStore.migrateDirect(prefs());
+		buildWelcome();
 		if (!handleImportIntent(getIntent()) && !handleOpenSettingsIntent(getIntent())) {
-			// 启动一律进服务器选择页：上次连的 server 不在线时，自动连接会把 App
-			// 卡死在连接壳。连哪个 server 由用户当场手选（导入链接除外，那是显式意图）。
-			showHome();
+			// 已有服务器就进最后一次用的那台。一台都没有才落在添加页。
+			if (!launchLastServer()) showWelcome();
 		}
+		scheduleReachability();
 	}
 
 	@Override
@@ -453,12 +551,16 @@ public class MainActivity extends Activity {
 			}
 		}
 		appInForeground = false;
+		if (rootLayout != null) rootLayout.postDelayed(trimFleet, FLEET_TRIM_DELAY_MS);
 	}
 
 	@Override
 	protected void onResume() {
 		super.onResume();
 		appInForeground = true;
+		if (rootLayout != null) rootLayout.removeCallbacks(trimFleet);
+		// 会话还在，或者隧道进程没停：把退后台时拆掉的访客补回来。停在服务器列表上时不冷启动。
+		if (uiState == UiState.WEB || TunnelService.isRunning()) requestFleet(false);
 		// T72：平板档系统栏让位的最后一层兜底。insets listener（2342 附近）已覆盖
 		// 任务栏显隐/导航模式/旋转，但「冷启动 + 后台期间状态变化」这条路上未必有新 insets
 		// 事件；这里 post 一次重算（幂等，成本一次 setPadding），保证冷启动首帧就避让。
@@ -548,6 +650,25 @@ public class MainActivity extends Activity {
 		// 归还在此发生，新实例那次仍会走"回调已丢失"诊断分支（结果确实拿不回来，
 		// 那要靠 onSaveInstanceState 才能救），但**页面 input 一定不会永久悬空**。
 		releaseInFlightFileCallback("onDestroy");
+		if (rootLayout != null) {
+			rootLayout.removeCallbacks(switchRevealPoll);
+			rootLayout.removeCallbacks(trimFleet);
+		}
+		if (switchOverlapTunnel) {
+			if (!stagingCommitting && switchRollbackArmed) {
+				ProfileStore.setActiveId(prefs(), switchRollbackActiveId);
+			}
+			finishOverlap(stagingCommitting);
+		}
+		switchRevealArmed = false;
+		switchVisualLock = false;
+		discardStagingWebView();
+		WebView fade = fadingOutWebView;
+		WebView retire = retiringWebView;
+		fadingOutWebView = null;
+		retiringWebView = null;
+		if (fade != null && fade != webView) destroyWebViewQuietly(fade);
+		if (retire != null && retire != webView && retire != fade) destroyWebViewQuietly(retire);
 		if (webView != null) {
 			// AND-03：非静态内部类 AppBridge 经 addJavascriptInterface 被 WebView 持有，
 			// 不销毁则 Chromium 内核与 Activity Context 全部泄漏。顺序：摘 JS 桥
@@ -754,6 +875,15 @@ public class MainActivity extends Activity {
 
 		LinearLayout maintain = card(d);
 		maintain.addView(cardTitle("连接维护", d));
+		android.widget.CheckBox preconnect = new android.widget.CheckBox(this);
+		preconnect.setText("后台自动连接同一中转上的其他服务器");
+		preconnect.setChecked(ProfileStore.preconnectSameFrps(prefs()));
+		preconnect.setOnCheckedChangeListener((button, checked) -> {
+			prefs().edit().putBoolean(ProfileStore.KEY_PRECONNECT_SAME_FRPS, checked).apply();
+			if (TunnelService.isRunning()) requestFleet(false);
+		});
+		maintain.addView(preconnect);
+		maintain.addView(hintText("默认打开。同一台中转上多挂几台，心跳还是一份。这些服务器的端口会先挂好，进入会话后切换不用再显示正在连接。关掉后只连接当前这一台。", d));
 		Button disconnect = styledButton("停止隧道", false, d);
 		disconnect.setOnClickListener(v -> stopTunnel());
 		maintain.addView(disconnect, new LinearLayout.LayoutParams(
@@ -776,6 +906,315 @@ public class MainActivity extends Activity {
 		homeScroll.setVisibility(View.GONE);
 		rootLayout.addView(homeScroll,
 			new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+	}
+
+	/** 还没有服务器时的启动页：灰底，表单居中，样式对齐侧栏里的添加卡片。 */
+	private void buildWelcome() {
+		float d = getResources().getDisplayMetrics().density;
+		LinearLayout page = new LinearLayout(this);
+		page.setOrientation(LinearLayout.VERTICAL);
+		page.setGravity(android.view.Gravity.CENTER);
+		page.setBackgroundColor(0xFFF4F5F7);
+		int side = dp(24, d);
+		page.setPadding(side, side, side, side);
+
+		LinearLayout card = new LinearLayout(this);
+		card.setOrientation(LinearLayout.VERTICAL);
+		int pad = dp(16, d);
+		card.setPadding(pad, pad, pad, pad);
+		GradientDrawable cardBg = new GradientDrawable();
+		cardBg.setColor(Color.WHITE);
+		cardBg.setCornerRadius(16 * d);
+		card.setBackground(cardBg);
+
+		LinearLayout seg = new LinearLayout(this);
+		seg.setOrientation(LinearLayout.HORIZONTAL);
+		GradientDrawable segBg = new GradientDrawable();
+		segBg.setColor(0xFFF2F2F4);
+		segBg.setCornerRadius(10 * d);
+		seg.setBackground(segBg);
+		seg.setPadding(dp(2, d), dp(2, d), dp(2, d), dp(2, d));
+		Button tunnelTab = welcomeSegButton("隧道", d);
+		Button directTab = welcomeSegButton("直连", d);
+		seg.addView(tunnelTab, new LinearLayout.LayoutParams(0, dp(32, d), 1f));
+		LinearLayout.LayoutParams directTabParams = new LinearLayout.LayoutParams(0, dp(32, d), 1f);
+		directTabParams.leftMargin = dp(2, d);
+		seg.addView(directTab, directTabParams);
+		card.addView(seg);
+
+		welcomeName = welcomeField(card, "名称", "例如 家里的电脑", d, InputType.TYPE_CLASS_TEXT);
+		welcomeTunnelBlock = new LinearLayout(this);
+		welcomeTunnelBlock.setOrientation(LinearLayout.VERTICAL);
+		welcomeHost = welcomeField(welcomeTunnelBlock, "VPS 地址", "与电脑端一致", d, InputType.TYPE_TEXT_VARIATION_URI);
+		LinearLayout pair = new LinearLayout(this);
+		pair.setOrientation(LinearLayout.HORIZONTAL);
+		LinearLayout portCol = new LinearLayout(this);
+		portCol.setOrientation(LinearLayout.VERTICAL);
+		welcomePort = welcomeField(portCol, "控制端口", "7000", d, InputType.TYPE_CLASS_NUMBER);
+		welcomePort.setText("7000");
+		LinearLayout tunnelCol = new LinearLayout(this);
+		tunnelCol.setOrientation(LinearLayout.VERTICAL);
+		welcomeTunnel = welcomeField(tunnelCol, "隧道名", "dsh-remote", d, InputType.TYPE_CLASS_TEXT);
+		welcomeTunnel.setText(ProfileStore.DEFAULT_TUNNEL_NAME);
+		pair.addView(portCol, new LinearLayout.LayoutParams(dp(104, d), LinearLayout.LayoutParams.WRAP_CONTENT));
+		LinearLayout.LayoutParams tunnelColParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+		tunnelColParams.leftMargin = dp(8, d);
+		pair.addView(tunnelCol, tunnelColParams);
+		welcomeTunnelBlock.addView(pair);
+		welcomeToken = welcomeField(welcomeTunnelBlock, "登录密钥", "frps 的 auth.token", d,
+			InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+		welcomeSk = welcomeField(welcomeTunnelBlock, "访客密钥", "与电脑插件一致", d,
+			InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+		welcomeTunnelBlock.addView(welcomeChoice("打洞优先", "先试直连，打不通再经 VPS 中转。",
+			VisitorConfig.STRATEGY_P2P, d));
+		welcomeTunnelBlock.addView(welcomeChoice("只用中转", "不打洞，建连更稳，流量经过 VPS。",
+			VisitorConfig.STRATEGY_RELAY, d));
+		card.addView(welcomeTunnelBlock);
+
+		welcomeDirectBlock = new LinearLayout(this);
+		welcomeDirectBlock.setOrientation(LinearLayout.VERTICAL);
+		welcomeDirectBlock.setVisibility(View.GONE);
+		welcomeUrl = welcomeField(welcomeDirectBlock, "网关地址", "https://192.168.1.8:18443", d,
+			InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+		card.addView(welcomeDirectBlock);
+
+		tunnelTab.setOnClickListener(v -> setWelcomeKind(ServerPicker.TUNNEL, tunnelTab, directTab, d));
+		directTab.setOnClickListener(v -> setWelcomeKind(ServerPicker.DIRECT, tunnelTab, directTab, d));
+		setWelcomeKind(ServerPicker.TUNNEL, tunnelTab, directTab, d);
+
+		LinearLayout actions = new LinearLayout(this);
+		actions.setOrientation(LinearLayout.HORIZONTAL);
+		actions.setGravity(android.view.Gravity.END);
+		Button save = new Button(this);
+		save.setText("保存并连接");
+		save.setAllCaps(false);
+		save.setTextColor(Color.WHITE);
+		GradientDrawable saveBg = new GradientDrawable();
+		saveBg.setColor(0xFF1C1C1E);
+		saveBg.setCornerRadius(10 * d);
+		save.setBackground(saveBg);
+		save.setOnClickListener(v -> saveWelcome());
+		actions.addView(save, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(40, d)));
+		LinearLayout.LayoutParams actionParams = new LinearLayout.LayoutParams(
+			LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+		actionParams.topMargin = dp(8, d);
+		card.addView(actions, actionParams);
+
+		int max = dp(400, d);
+		LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(max, LinearLayout.LayoutParams.WRAP_CONTENT);
+		page.addView(card, cardParams);
+		welcomeScroll = insetScroll(page);
+		welcomeScroll.setBackgroundColor(0xFFF4F5F7);
+		rootLayout.addView(welcomeScroll, new FrameLayout.LayoutParams(
+			FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+	}
+
+	private Button welcomeSegButton(String text, float d) {
+		Button button = new Button(this);
+		button.setText(text);
+		button.setAllCaps(false);
+		button.setTextSize(13);
+		button.setPadding(0, 0, 0, 0);
+		return button;
+	}
+
+	private void setWelcomeKind(String kind, Button tunnelTab, Button directTab, float d) {
+		welcomeKind = kind;
+		boolean tunnel = ServerPicker.TUNNEL.equals(kind);
+		welcomeTunnelBlock.setVisibility(tunnel ? View.VISIBLE : View.GONE);
+		welcomeDirectBlock.setVisibility(tunnel ? View.GONE : View.VISIBLE);
+		paintWelcomeSeg(tunnelTab, tunnel, d);
+		paintWelcomeSeg(directTab, !tunnel, d);
+	}
+
+	private void paintWelcomeSeg(Button button, boolean selected, float d) {
+		GradientDrawable bg = new GradientDrawable();
+		bg.setCornerRadius(8 * d);
+		bg.setColor(selected ? Color.WHITE : Color.TRANSPARENT);
+		button.setBackground(bg);
+		button.setTextColor(0xFF1C1C1E);
+		button.setTypeface(null, selected ? android.graphics.Typeface.BOLD : android.graphics.Typeface.NORMAL);
+	}
+
+	private View welcomeChoice(String title, String hint, String strategy, float d) {
+		LinearLayout row = new LinearLayout(this);
+		row.setOrientation(LinearLayout.HORIZONTAL);
+		row.setPadding(dp(10, d), dp(8, d), dp(10, d), dp(8, d));
+		GradientDrawable bg = new GradientDrawable();
+		bg.setCornerRadius(10 * d);
+		row.setBackground(bg);
+		TextView mark = new TextView(this);
+		mark.setTextSize(14);
+		LinearLayout.LayoutParams markParams = new LinearLayout.LayoutParams(dp(22, d), LinearLayout.LayoutParams.WRAP_CONTENT);
+		row.addView(mark, markParams);
+		LinearLayout text = new LinearLayout(this);
+		text.setOrientation(LinearLayout.VERTICAL);
+		TextView heading = new TextView(this);
+		heading.setText(title);
+		heading.setTextSize(13);
+		heading.setTextColor(0xFF1C1C1E);
+		heading.setTypeface(null, android.graphics.Typeface.BOLD);
+		TextView detail = new TextView(this);
+		detail.setText(hint);
+		detail.setTextSize(12);
+		detail.setTextColor(0xFF8E8E93);
+		text.addView(heading);
+		text.addView(detail);
+		row.addView(text, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+		row.setOnClickListener(v -> {
+			welcomeStrategy = strategy;
+			paintWelcomeChoices();
+		});
+		row.setTag(strategy);
+		LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+			LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+		params.bottomMargin = dp(6, d);
+		row.setLayoutParams(params);
+		return row;
+	}
+
+	private void paintWelcomeChoices() {
+		if (welcomeTunnelBlock == null) return;
+		float d = getResources().getDisplayMetrics().density;
+		for (int i = 0; i < welcomeTunnelBlock.getChildCount(); i++) {
+			View child = welcomeTunnelBlock.getChildAt(i);
+			if (!(child instanceof LinearLayout) || !(child.getTag() instanceof String)) continue;
+			boolean selected = welcomeStrategy.equals(child.getTag());
+			GradientDrawable bg = (GradientDrawable) child.getBackground();
+			bg.setColor(selected ? 0xFFF3F3F5 : Color.TRANSPARENT);
+			TextView mark = (TextView) ((LinearLayout) child).getChildAt(0);
+			mark.setText(selected ? "●" : "○");
+			mark.setTextColor(selected ? 0xFF1C1C1E : 0xFFC7C7CC);
+		}
+	}
+
+	private EditText welcomeField(LinearLayout parent, String label, String hint, float d, int inputType) {
+		TextView title = new TextView(this);
+		title.setText(label);
+		title.setTextSize(12);
+		title.setTextColor(0xFF8E8E93);
+		parent.addView(title);
+		EditText input = new EditText(this);
+		input.setHint(hint);
+		input.setSingleLine(true);
+		input.setInputType(inputType);
+		input.setTextSize(14);
+		input.setTextColor(0xFF1C1C1E);
+		input.setPadding(dp(12, d), 0, dp(12, d), 0);
+		GradientDrawable bg = new GradientDrawable();
+		bg.setColor(Color.WHITE);
+		bg.setCornerRadius(10 * d);
+		bg.setStroke(Math.max(1, dp(1, d)), 0xFFE6E6EA);
+		input.setBackground(bg);
+		LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+			LinearLayout.LayoutParams.MATCH_PARENT, dp(40, d));
+		params.topMargin = dp(4, d);
+		params.bottomMargin = dp(10, d);
+		parent.addView(input, params);
+		return input;
+	}
+
+	private void showWelcome() {
+		setUiState(UiState.HOME);
+		if (homeScroll != null) homeScroll.setVisibility(View.GONE);
+		if (setupScroll != null) setupScroll.setVisibility(View.GONE);
+		if (webView != null) webView.setVisibility(View.GONE);
+		paintWelcomeChoices();
+		if (welcomeScroll != null) welcomeScroll.setVisibility(View.VISIBLE);
+		applySystemBars();
+	}
+
+	private void hideWelcome() {
+		if (welcomeScroll != null) welcomeScroll.setVisibility(View.GONE);
+	}
+
+	private boolean hasSavedServer() {
+		for (ProfileStore.Profile profile : ProfileStore.list(prefs())) {
+			if (profile.isValid() && !ProfileStore.tunnelUnavailable(profile)) return true;
+		}
+		for (ProfileStore.DirectNode node : ProfileStore.listDirect(prefs())) {
+			if (node.isValid()) return true;
+		}
+		return false;
+	}
+
+	/** 启动时连最后一次用过的那台。没有可连的服务器时返回 false。 */
+	private boolean launchLastServer() {
+		String kind = prefs().getString(KEY_LAST_KIND, "");
+		String id = prefs().getString(KEY_LAST_ID, "");
+		if (ServerPicker.TUNNEL.equals(kind)) {
+			ProfileStore.Profile profile = ProfileStore.get(prefs(), id);
+			if (profile != null && profile.isValid() && !ProfileStore.tunnelUnavailable(profile)) {
+				connectProfile(profile);
+				return true;
+			}
+		}
+		if (ServerPicker.DIRECT.equals(kind)) {
+			ProfileStore.DirectNode node = ServerPicker.findDirect(prefs(), id);
+			if (node != null && node.isValid()) {
+				connectDirectNode(node);
+				return true;
+			}
+		}
+		ProfileStore.Profile active = ProfileStore.getActive(prefs());
+		if (active != null && active.isValid() && !ProfileStore.tunnelUnavailable(active)) {
+			connectProfile(active);
+			return true;
+		}
+		String url = prefs().getString(KEY_URL, "");
+		ProfileStore.DirectNode lastDirect = ServerPicker.findDirect(prefs(),
+			prefs().getString(ProfileStore.KEY_DIRECT_ACTIVE, ""));
+		if (lastDirect != null && lastDirect.isValid() && lastDirect.url.equals(url)) {
+			connectDirectNode(lastDirect);
+			return true;
+		}
+		for (ProfileStore.DirectNode node : ProfileStore.listDirect(prefs())) {
+			if (node.isValid()) {
+				connectDirectNode(node);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private void rememberLast(String kind, String id) {
+		if (TextUtils.isEmpty(kind) || TextUtils.isEmpty(id)) return;
+		prefs().edit().putString(KEY_LAST_KIND, kind).putString(KEY_LAST_ID, id).apply();
+	}
+
+	private void saveWelcome() {
+		try {
+			JSONObject body = new JSONObject().put("kind", welcomeKind)
+				.put("name", textOf(welcomeName));
+			if (ServerPicker.TUNNEL.equals(welcomeKind)) {
+				body.put("host", textOf(welcomeHost)).put("port", textOf(welcomePort))
+					.put("tunnel", textOf(welcomeTunnel)).put("token", textOf(welcomeToken))
+					.put("sk", textOf(welcomeSk)).put("strategy", welcomeStrategy);
+			} else {
+				body.put("url", textOf(welcomeUrl));
+			}
+			JSONObject result = ServerPicker.applyEdit(prefs(), "save", body, null);
+			if (!result.optBoolean("ok")) {
+				Toast.makeText(this, result.optString("error", "无法保存"), Toast.LENGTH_LONG).show();
+				return;
+			}
+			hideWelcome();
+			String kind = result.optString("kind");
+			String id = result.optString("id");
+			if (ServerPicker.TUNNEL.equals(kind)) {
+				ProfileStore.Profile profile = ProfileStore.get(prefs(), id);
+				if (profile != null) connectProfile(profile);
+			} else if (ServerPicker.DIRECT.equals(kind)) {
+				ProfileStore.DirectNode node = ServerPicker.findDirect(prefs(), id);
+				if (node != null) connectDirectNode(node);
+			}
+		} catch (org.json.JSONException error) {
+			Toast.makeText(this, "无法保存", Toast.LENGTH_LONG).show();
+		}
+	}
+
+	private static String textOf(EditText input) {
+		return input == null || input.getText() == null ? "" : input.getText().toString().trim();
 	}
 
 	private void refreshProfileCards() {
@@ -905,6 +1344,8 @@ public class MainActivity extends Activity {
 		String url = node.url;
 		prefs().edit().putString(KEY_URL, url).putString(ProfileStore.KEY_DIRECT_ACTIVE, node.id).apply();
 		directTarget = url;
+		serverPickerCurrent = ServerPicker.Current.direct(node);
+		rememberLast(ServerPicker.DIRECT, node.id);
 		clearResumeSession();
 		openGateway(url);
 	}
@@ -1213,6 +1654,11 @@ public class MainActivity extends Activity {
 		directTarget = "";
 		refreshProfileCards();
 		refreshDirectNodes();
+		if (!hasSavedServer()) {
+			showWelcome();
+			return;
+		}
+		hideWelcome();
 		if (homeScroll != null) homeScroll.setVisibility(View.VISIBLE);
 		if (setupScroll != null) setupScroll.setVisibility(View.GONE);
 		if (webView != null) {
@@ -1260,6 +1706,7 @@ public class MainActivity extends Activity {
 			// 见 handleAppBack() 的 HOME 分支），多承诺才会。
 			tvTunnelState.setText("隧道仍在运行。点上方「返回当前会话」继续，无需重新连接。");
 		}
+		hideWelcome();
 		if (homeScroll != null) homeScroll.setVisibility(View.VISIBLE);
 		if (setupScroll != null) setupScroll.setVisibility(View.GONE);
 		// T117：进设置页 = 用户主动排查时刻 ⇒ 无条件打一份完整诊断快照（绕过最小间隔闸）。
@@ -1628,6 +2075,7 @@ public class MainActivity extends Activity {
 			return;
 		}
 		ProfileStore.setActiveId(prefs(), profile.id);
+		rememberLast(ServerPicker.TUNNEL, profile.id);
 		beginTunnel(profile);
 	}
 
@@ -1661,6 +2109,7 @@ public class MainActivity extends Activity {
 		p.fingerprint = CertPin.normalizeFingerprint(c.fingerprint);
 		ProfileStore.upsert(prefs(), p);
 		ProfileStore.setActiveId(prefs(), p.id);
+		rememberLast(ServerPicker.TUNNEL, p.id);
 		// T117：导入/扫码成功 = 一次**授权数据写入**，顺手把 cookie 存储刷盘
 		// （同一个洞口：写完就 force-stop 不该丢东西）。日志理由见 flushDeviceCookies。
 		flushDeviceCookies("importLink");
@@ -1691,6 +2140,7 @@ public class MainActivity extends Activity {
 		pageDark = isSystemDark();
 		webView.setBackgroundColor(shellColor(R.color.shell_background));
 		applySystemBars();
+		hideWelcome();
 		if (homeScroll != null) homeScroll.setVisibility(View.GONE);
 		if (setupScroll != null) setupScroll.setVisibility(View.GONE);
 		suppressGatewayErrorsBriefly();
@@ -1709,13 +2159,19 @@ public class MainActivity extends Activity {
 	}
 
 	private String readRawText(int resourceId) {
+		try {
+			return readRawTextStrict(resourceId);
+		} catch (IOException error) {
+			return "<!doctype html><title>DSH Remote</title><p>连接状态不可用。</p>";
+		}
+	}
+
+	private String readRawTextStrict(int resourceId) throws IOException {
 		StringBuilder out = new StringBuilder();
 		try (InputStream stream = getResources().openRawResource(resourceId);
 			 BufferedReader reader = new BufferedReader(new InputStreamReader(stream, "UTF-8"))) {
 			String line;
 			while ((line = reader.readLine()) != null) out.append(line).append('\n');
-		} catch (IOException error) {
-			return "<!doctype html><title>DSH Remote</title><p>连接状态不可用。</p>";
 		}
 		return out.toString();
 	}
@@ -1727,15 +2183,28 @@ public class MainActivity extends Activity {
 	// ---------- 隧道模式 ----------
 
 	private void beginTunnel(final ProfileStore.Profile profile) {
-		directTarget = "";
+		beginTunnel(profile, false);
+	}
+
+	/**
+	 * @param seamless 会话内切机器。不盖连接壳。目标端口已经在听就直接打开那一页，
+	 *                 当前页保持可操作，目标界面让位画好后再淡入。
+	 */
+	private void beginTunnel(final ProfileStore.Profile profile, final boolean seamless) {
+		if (!seamless) {
+			directTarget = "";
+			serverPickerCurrent = ServerPicker.Current.tunnel(profile);
+			serverPickerCapability = "";
+			// T23-A：证书按配置档身份锁定，连接全程（含复用活隧道的直连 openGateway）都要带着它。
+			activeProfileId = profile.id;
+		}
 		clearResumeSession();
-		// T23-A：证书按配置档身份锁定，连接全程（含复用活隧道的直连 openGateway）都要带着它。
-		activeProfileId = profile.id;
 		final int generation = ++connectionGeneration;
 		final VisitorConfig cfg = profile.toVisitorConfig();
 		if (!cfg.isValid()) {
 			Toast.makeText(this, "连接配置不完整，请检查配置组。", Toast.LENGTH_LONG).show();
-			showHome();
+			if (seamless) abortSeamlessSwitch(null);
+			else showHome();
 			return;
 		}
 		if (Build.VERSION.SDK_INT >= 33
@@ -1748,69 +2217,102 @@ public class MainActivity extends Activity {
 		// false，复用逻辑整段失效：每次重连都杀掉存活隧道换端口重启），且 400ms
 		// 超时本身也会阻塞主线程。结论统一回到 UI 线程后按 generation 过期丢弃。
 		runInBackground("tunnel-probe", () -> {
-			// 只复用「确实为这个配置组起的」存活隧道：端口存活不代表就是本次要连的
-			// server——启动改为手选后，换配置组连接是常规路径，错复用会连到旧 server。
-			String tunnelProfile = prefs().getString(ProfileStore.KEY_TUNNEL_PROFILE, "");
-			int savedPort = prefs().getInt(ProfileStore.KEY_BOUND_PORT, 0);
-			// T104：存活隧道还必须**同一档策略**才算能复用。"切了档但端口还活着"若照样复用，
-			// 用户会看到新选项被选中、实际跑的却还是旧档（frpc 的 toml 没换），切档名不副实。
-			// 策略不一致就当作"没有存活隧道"⇒ 重启隧道（与换配置组连接同一条路径）。
-			String tunnelStrategy = prefs().getString(ProfileStore.KEY_TUNNEL_STRATEGY, "");
-			boolean sameStrategy = cfg.effectiveStrategy().equals(tunnelStrategy);
-			int reusePort = 0;
-			if (profile.id.equals(tunnelProfile) && sameStrategy) {
-				if (savedPort >= 1 && savedPort <= 65535 && isLocalPortOpen(savedPort)) reusePort = savedPort;
-				else if (isLocalPortOpen(ProfileStore.BIND_PORT)) reusePort = ProfileStore.BIND_PORT;
+			List<ProfileStore.Profile> all = ProfileStore.list(prefs());
+			int preferred = profile.id.equals(prefs().getString(ProfileStore.KEY_TUNNEL_PROFILE, ""))
+				? prefs().getInt(ProfileStore.KEY_BOUND_PORT, 0) : 0;
+			if (VisitorFleet.assignPorts(all, profile.id, preferred)) ProfileStore.saveAll(prefs(), all);
+			ProfileStore.Profile assigned = profile;
+			for (ProfileStore.Profile item : all) {
+				if (profile.id.equals(item.id)) assigned = item;
 			}
-			// AND-07：复用存活隧道——先探上次记录的实际绑定端口，再探首选端口。
-			final int reused = reusePort;
-			// AND-07：端口协商——首选 BIND_PORT，被占用时在 16225~16235 取首个空闲端口；
-			// 实际端口传给 frpc visitor（Intent extra）与 WebView 加载 URL（cfg.bindPort）。
-			final int negotiated = reused > 0 ? reused : ProfileStore.negotiateBindPort();
+			final ProfileStore.Profile readyProfile = assigned;
+			final int port = readyProfile.bindPort;
+			cfg.bindPort = port > 0 ? port : cfg.bindPort;
+			final boolean open = port > 0 && isLocalPortOpen(port);
 			runOnUiThread(() -> {
 				if (destroyed) return;
-				if (generation != connectionGeneration) return;
-				if (reused > 0) {
-					cfg.bindPort = reused;
-					String target = "https://127.0.0.1:" + reused + "/";
+				if (generation != connectionGeneration) {
+					if (seamless && serverSwitchInFlight && stagingWebView == null && pendingSwitchUrl.isEmpty()) {
+						abortSeamlessSwitch(null);
+					}
+					return;
+				}
+				if (port < 1) {
+					Toast.makeText(MainActivity.this, "本地端口 " + ProfileStore.BIND_PORT + " 与回退范围 "
+						+ ProfileStore.PORT_RANGE_MIN + "-" + VisitorFleet.PORT_MAX
+						+ " 均被占用，无法启动隧道。", Toast.LENGTH_LONG).show();
+					if (seamless) abortSeamlessSwitch(null);
+					else showHome();
+					return;
+				}
+				// 同一份 toml 已经在跑时服务侧不会重启，当前页的连接留着。
+				requestFleet(false);
+				String target = "https://127.0.0.1:" + port + "/";
+				if (open) {
+					seedTunnelFingerprint(profile.id, port, cfg.fingerprint);
 					setTunnelState("隧道已在运行，正在打开会话…");
+					if (seamless) {
+						startBackgroundPage(target, profile.id, ServerPicker.Current.tunnel(readyProfile),
+							readyProfile, null, generation);
+						return;
+					}
 					if (resumeLiveSession(target)) return;
 					openGateway(target, profile.id);
 					return;
 				}
-				if (negotiated < 0) {
-					Toast.makeText(MainActivity.this, "本地端口 " + ProfileStore.BIND_PORT + " 与回退范围 "
-						+ ProfileStore.PORT_RANGE_MIN + "-" + ProfileStore.PORT_RANGE_MAX
-						+ " 均被占用，无法启动隧道。", Toast.LENGTH_LONG).show();
-					showHome();
-					return;
-				}
-				int port = negotiated;
-				cfg.bindPort = port;
-				prefs().edit().putInt(ProfileStore.KEY_BOUND_PORT, port).apply();
-				// T23-B：状态标签逐步更新。改前只有「隧道启动中（…3~10 秒）…」这一句，
-				// 且 openGateway 之后再也不动它 ⇒ 用户是在看一个过期标签判断卡没卡。
 				setTunnelState("正在启动隧道（端口 " + port + "）…");
-				Intent svc = new Intent(MainActivity.this, TunnelService.class);
-				svc.putExtra(TunnelService.EXTRA_BIND_PORT, port);
-				if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc);
-				else startService(svc);
-				showLocalShell(
-					UiState.CONNECTING,
-					"connecting",
-					"正在连接 DSH",
-					"正在建立安全隧道。",
-					"dsh-remote://app/retry",
-					"重新连接",
-					"",
-					""
-				);
-				// 壳页已经就位，这一条才会同时落到壳页正文上（用户真正在看的那块屏）。
-				setShellStage("正在建立隧道（frpc 打洞/建联）…"
-					+ (port == ProfileStore.BIND_PORT ? "" : "（端口 " + port + "）"));
-				waitAndOpen(cfg, generation, profile.id);
+				if (!seamless) {
+					showLocalShell(
+						UiState.CONNECTING,
+						"connecting",
+						"正在连接 DSH",
+						"正在建立安全隧道。",
+						"dsh-remote://app/retry",
+						"重新连接",
+						"",
+						""
+					);
+					setShellStage("正在建立隧道（frpc 打洞/建联）…"
+						+ (port == ProfileStore.BIND_PORT ? "" : "（端口 " + port + "）"));
+				}
+				waitAndOpen(cfg, generation, profile.id, seamless);
 			});
 		});
+	}
+
+	/** activeOnly 时只留当前这台；否则按连接设置，默认挂上同一台中转上的其他服务器。 */
+	private void requestFleet(boolean activeOnly) {
+		boolean any = false;
+		for (ProfileStore.Profile profile : ProfileStore.list(prefs())) {
+			if (profile.isValid() && !ProfileStore.tunnelUnavailable(profile)) {
+				any = true;
+				break;
+			}
+		}
+		if (!any) return;
+		if (activeOnly && !TunnelService.isRunning()) return;
+		boolean sameFrps = !activeOnly && ProfileStore.preconnectSameFrps(prefs());
+		Intent svc = new Intent(this, TunnelService.class);
+		svc.setAction(TunnelService.ACTION_SYNC);
+		svc.putExtra(TunnelService.EXTRA_FLEET_SCOPE, sameFrps
+			? TunnelService.SCOPE_SAME_FRPS : TunnelService.SCOPE_ACTIVE);
+		try {
+			if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc);
+			else startService(svc);
+		} catch (Exception e) {
+			Log.w("dshr-frpc", "同步访客失败：" + e);
+		}
+	}
+
+	private void seedTunnelFingerprint(String profileId, int port, String fingerprint) {
+		String seedFp = CertPin.normalizeFingerprint(fingerprint);
+		if (seedFp.length() != 64) return;
+		SharedPreferences.Editor seed = prefs().edit();
+		for (String key : CertPin.seedKeys(profileId, "127.0.0.1", port)) {
+			seed.putString(key, seedFp);
+		}
+		seed.apply();
+		Log.i("dshr-perf", "预置网关证书指纹 profile=" + profileId + " 端口=" + port);
 	}
 
 	/**
@@ -1823,7 +2325,8 @@ public class MainActivity extends Activity {
 	 *   日志只用来提前触发，【端口可连仍是唯一判据】——frp 的文案会随版本/语言漂移，
 	 *   绝不放行任何连接。
 	 */
-	private void waitAndOpen(final VisitorConfig cfg, final int generation, final String profileId) {
+	private void waitAndOpen(final VisitorConfig cfg, final int generation, final String profileId,
+			final boolean seamless) {
 		final long startMs = System.currentTimeMillis();
 		final long deadline = startMs + TunnelReady.TUNNEL_READY_TIMEOUT_MS;
 		final Object signal = new Object();
@@ -1878,8 +2381,24 @@ public class MainActivity extends Activity {
 			final boolean ok = up;
 			runOnUiThread(() -> {
 				if (destroyed) return;
-				if (generation != connectionGeneration || uiState != UiState.CONNECTING) return;
+				if (generation != connectionGeneration) {
+					if (seamless && serverSwitchInFlight && stagingWebView == null && pendingSwitchUrl.isEmpty()) {
+						abortSeamlessSwitch(null);
+					}
+					return;
+				}
+				if (seamless) {
+					if (uiState != UiState.WEB || webView == null) {
+						abortSeamlessSwitch("当前不在会话中，已取消切换。");
+						return;
+					}
+				} else if (uiState != UiState.CONNECTING) return;
 				if (!ok) {
+					if (seamless) {
+						abortSeamlessSwitch("隧道未在 " + (TunnelReady.TUNNEL_READY_TIMEOUT_MS / 1000)
+							+ " 秒内就绪。已停留在当前主机。");
+						return;
+					}
 					setTunnelState("隧道未就绪：检查电脑网关、密钥和 frps 网络。");
 					showLocalShell(
 						UiState.CONNECTING,
@@ -1898,15 +2417,16 @@ public class MainActivity extends Activity {
 				// T27-A：预置**只**写配置档键。判定侧已把「配置档连接」与「直连地址」
 				// 两个信任语境彻底分开（不再互回退），此时写共享地址键对本档毫无用处，
 				// 反而会把这份信任泄漏给同一 host:port 上的直连/局域网节点。
-				String seedFp = CertPin.normalizeFingerprint(cfg.fingerprint);
-				if (seedFp.length() == 64) {
-					SharedPreferences.Editor seed = prefs().edit();
-					for (String key : CertPin.seedKeys(profileId, "127.0.0.1", cfg.bindPort)) {
-						seed.putString(key, seedFp);
+				seedTunnelFingerprint(profileId, cfg.bindPort, cfg.fingerprint);
+				if (seamless) {
+					ProfileStore.Profile ready = ProfileStore.get(prefs(), profileId);
+					if (ready == null) {
+						abortSeamlessSwitch("服务器配置已删除或不可用，请检查连接设置。");
+						return;
 					}
-					seed.apply();
-					Log.i("dshr-perf", "预置网关证书指纹 profile=" + profileId
-						+ " 端口=" + cfg.bindPort);
+					startBackgroundPage("https://127.0.0.1:" + cfg.bindPort + "/", profileId,
+						ServerPicker.Current.tunnel(ready), ready, null, generation);
+					return;
 				}
 				setTunnelState("隧道已就绪，正在打开 DSH…");
 				openGateway("https://127.0.0.1:" + cfg.bindPort + "/", profileId);
@@ -2011,6 +2531,11 @@ public class MainActivity extends Activity {
 
 	private void stopTunnel() {
 		connectionGeneration += 1;
+		tunnelReachability = Collections.emptyMap();
+		tunnelDotPortPending = false;
+		tunnelDotRetries = 0;
+		siblingRefreshTarget = null;
+		cancelTunnelDotProbe();
 		stopService(new Intent(this, TunnelService.class));
 		if (tvTunnelState != null) tvTunnelState.setText("隧道已停止");
 		showHome();
@@ -2032,6 +2557,7 @@ public class MainActivity extends Activity {
 		submittedHttpAuthThisConnection.clear();
 		final String target = url.trim();
 		activeProfileId = profileId == null ? "" : profileId;
+		serverPickerCapability = UUID.randomUUID().toString();
 		// T49：记下本轮网关的 host/port，供 ServiceWorkerClient 的可信取数通道限定范围。
 		Uri targetUri = Uri.parse(target);
 		activeGatewayHost = targetUri.getHost() == null ? "" : targetUri.getHost();
@@ -2543,6 +3069,75 @@ public class MainActivity extends Activity {
 
 	// ---------- WebView ----------
 
+	private void applySessionSettings(WebView target) {
+		target.setBackgroundColor(shellColor(R.color.shell_background));
+		WebSettings s = target.getSettings();
+		s.setJavaScriptEnabled(true);
+		s.setDomStorageEnabled(true);
+		s.setUseWideViewPort(true);
+		s.setLoadWithOverviewMode(false);
+		s.setTextZoom(100);
+		s.setLayoutAlgorithm(WebSettings.LayoutAlgorithm.NORMAL);
+		s.setAllowFileAccess(false);
+		s.setAllowFileAccessFromFileURLs(false);
+		s.setAllowUniversalAccessFromFileURLs(false);
+		if (Build.VERSION.SDK_INT >= 33) {
+			s.setAlgorithmicDarkeningAllowed(false);
+		} else if (Build.VERSION.SDK_INT >= 29) {
+			s.setForceDark(WebSettings.FORCE_DARK_OFF);
+		}
+		String userAgent = s.getUserAgentString();
+		if (userAgent == null || !userAgent.contains(MOBILE_UA_TOKEN.trim())) {
+			s.setUserAgentString((userAgent == null ? "" : userAgent) + MOBILE_UA_TOKEN);
+		}
+	}
+
+	private void attachSessionBridge(WebView target) {
+		target.addJavascriptInterface(new AppBridge(), "DshRemoteApp");
+		target.setOnKeyListener((v, keyCode, event) -> {
+			if (keyCode != KeyEvent.KEYCODE_BACK) return false;
+			// 必须在 ACTION_DOWN 就吃掉，否则 WebView 会自己 goBack 到连接壳并触发断线误报。
+			if (event.getAction() == KeyEvent.ACTION_UP) handleAppBack();
+			return true;
+		});
+	}
+
+	/** 后台切换页。客户端在 ensureWebView 里装好后才能调用。 */
+	private WebView spawnSessionWebView() {
+		Context webCtx = this;
+		if (Build.VERSION.SDK_INT >= 29) {
+			webCtx = new ContextThemeWrapper(this, android.R.style.Theme_DeviceDefault_DayNight);
+		}
+		WebView created = new WebView(webCtx);
+		if (appInForeground) {
+			try {
+				created.resumeTimers();
+			} catch (Exception e) {
+				Log.w("dshr-perf", "切换页 resumeTimers 失败 " + e);
+			}
+		}
+		applySessionSettings(created);
+		if (Build.VERSION.SDK_INT >= 23) {
+			try {
+				created.getSettings().setOffscreenPreRaster(true);
+			} catch (Exception e) {
+				Log.w("dshr-server-picker", "预光栅失败 " + e);
+			}
+		}
+		if (Build.VERSION.SDK_INT >= 26) {
+			// 盖在当前页下面时也不要把渲染优先级让掉，否则一换到前面就是空白帧。
+			created.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, false);
+		}
+		if (pageBgTop != PAGE_BG_NONE) created.setBackgroundColor(pageBgTop);
+		else if (pageDark) created.setBackgroundColor(0xFF141414);
+		attachSessionBridge(created);
+		created.setTag(STAGING_TAG);
+		if (sessionClient != null) created.setWebViewClient(sessionClient);
+		if (sessionChrome != null) created.setWebChromeClient(sessionChrome);
+		if (sessionDownload != null) created.setDownloadListener(sessionDownload);
+		return created;
+	}
+
 	private void ensureWebView() {
 		if (webView != null) return;
 		// 测试期可观测性：仅当 APK 自身带 FLAG_DEBUGGABLE（即用 `build.ps1 -Debug`
@@ -2576,35 +3171,10 @@ public class MainActivity extends Activity {
 		webTimersPaused = false;
 		Log.i("dshr-perf", "ensureWebView 新建 WebView：appInForeground=" + appInForeground
 			+ "，进程级定时器标志归零");
-		webView.setBackgroundColor(shellColor(R.color.shell_background));
-		WebSettings s = webView.getSettings();
-		s.setJavaScriptEnabled(true);
-		s.setDomStorageEnabled(true);
-		s.setUseWideViewPort(true);
-		s.setLoadWithOverviewMode(false);
-		s.setTextZoom(100);
-		s.setLayoutAlgorithm(WebSettings.LayoutAlgorithm.NORMAL);
-		s.setAllowFileAccess(false);
-		s.setAllowFileAccessFromFileURLs(false);
-		s.setAllowUniversalAccessFromFileURLs(false);
-		if (Build.VERSION.SDK_INT >= 33) {
-			s.setAlgorithmicDarkeningAllowed(false);
-		} else if (Build.VERSION.SDK_INT >= 29) {
-			s.setForceDark(WebSettings.FORCE_DARK_OFF);
-		}
-		String userAgent = s.getUserAgentString();
-		if (userAgent == null || !userAgent.contains(MOBILE_UA_TOKEN.trim())) {
-			s.setUserAgentString((userAgent == null ? "" : userAgent) + MOBILE_UA_TOKEN);
-		}
-		webView.addJavascriptInterface(new AppBridge(), "DshRemoteApp");
-		webView.setOnKeyListener((v, keyCode, event) -> {
-			if (keyCode != KeyEvent.KEYCODE_BACK) return false;
-			// 必须在 ACTION_DOWN 就吃掉，否则 WebView 会自己 goBack 到连接壳并触发断线误报。
-			if (event.getAction() == KeyEvent.ACTION_UP) handleAppBack();
-			return true;
-		});
+		applySessionSettings(webView);
+		attachSessionBridge(webView);
 		webView.setVisibility(View.GONE);
-		webView.setWebViewClient(new WebViewClient() {
+		sessionClient = new WebViewClient() {
 			/**
 			 * T65：首屏静态资源落盘。
 			 *
@@ -2620,12 +3190,22 @@ public class MainActivity extends Activity {
 			 */
 			@Override
 			public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+				// 后台切换页走 WebView 自己的网络栈。前台 pin 属于当前这台机器，不能拿去拉下一台。
+				if (isStaging(view)) return null;
 				return interceptStaticAsset(request);
 			}
 
 			@Override
 			public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
 				Uri uri = request.getUrl();
+				if (isStaging(view)) {
+					String scheme = uri.getScheme();
+					if ("http".equals(scheme) || "https".equals(scheme)) return false;
+					if (view == stagingWebView) {
+						abortSeamlessSwitch("目标服务器跳到了不支持的地址，已停留在当前主机。");
+					}
+					return true;
+				}
 				if (handleAppAction(uri)) return true;
 				String scheme = uri.getScheme();
 				boolean web = "http".equals(scheme) || "https".equals(scheme);
@@ -2640,6 +3220,12 @@ public class MainActivity extends Activity {
 
 			@Override
 			public void onPageStarted(WebView view, String url, Bitmap favicon) {
+				if (isRetiring(view)) return;
+				if (isStaging(view)) {
+					// 文档一开始就把状态栏高度写上。露出之后再补，用户会看到顶进状态栏再弹回去。
+					if (isSessionUrl(url)) armStagingInsets(view);
+					return;
+				}
 				// DIAG-30s：主帧导航提交点。首包慢（TLS/网关/上游）会体现在
 				// openGateway→onPageStarted 的差值里。
 				// T90：**页面级**数据源随文档一起重置 —— 上一页 hook 推来的连接态一律不许
@@ -2663,6 +3249,13 @@ public class MainActivity extends Activity {
 
 			@Override
 			public void onPageFinished(WebView view, String url) {
+				if (isRetiring(view)) return;
+				if (isStaging(view)) {
+					if (isSessionUrl(url)) armStagingInsets(view);
+					// 资源下完不等于已经画出界面。只在还没开始等首屏时兜底，避免空白页被换上来。
+					if (!switchRevealArmed) onStagingDocumentReady(view, url);
+					return;
+				}
 				if (connectStartMs > 0 && isSessionUrl(url)) {
 					Log.i("dshr-perf", "onPageFinished t+"
 						+ (System.currentTimeMillis() - connectStartMs) + "ms url=" + url);
@@ -2673,11 +3266,18 @@ public class MainActivity extends Activity {
 
 			@Override
 			public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
+				if (isRetiring(view) || isStaging(view)) return;
 				enterSessionPage(view, url);
 			}
 
 			@Override
 			public void onPageCommitVisible(WebView view, String url) {
+				if (isRetiring(view)) return;
+				if (isStaging(view)) {
+					if (isSessionUrl(url)) armStagingInsets(view);
+					onStagingDocumentReady(view, url);
+					return;
+				}
 				// T78：新文档这一刻立即收起横幅并把防抖清零——上一页的"重新连接中"
 				// 一律不许带到新页面（也不许把上一页累计的"连续为真"带过来）。
 				hideReconnectBannerNow();
@@ -2689,6 +3289,7 @@ public class MainActivity extends Activity {
 
 			@Override
 			public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+				if (isRetiring(view)) return;
 				boolean mainFrame = request != null && request.isForMainFrame();
 				if (mainFrame && error != null) {
 					Log.w("dshr-perf", "mainFrame error code=" + error.getErrorCode()
@@ -2702,9 +3303,15 @@ public class MainActivity extends Activity {
 				// 曾让整条失败反馈消失，用户只看到 Chromium 原始错误页（T16 缺陷 1）。
 				// 窗口长度从此不再决定用户看到什么：主框架错误结构性绕过本标志。
 				if (isIgnorableWebError(error)) return;
+				if (isStaging(view)) {
+					String failed = request.getUrl() == null ? "" : request.getUrl().toString();
+					onStagingMainFrameError(view, failed, "网络连接中断，请确认网关和隧道仍在运行。");
+					return;
+				}
 				suppressGatewayErrors = false;
 				if (isActiveGatewayUri(request.getUrl())) {
 					failedMainFrameUrl = request.getUrl().toString();
+					rememberVisibleServerDown();
 					showGatewayFailure("网络连接中断，请确认网关和隧道仍在运行。");
 				}
 			}
@@ -2712,6 +3319,7 @@ public class MainActivity extends Activity {
 			@Override
 			public void onReceivedHttpError(WebView view, WebResourceRequest request,
 					WebResourceResponse response) {
+				if (isRetiring(view)) return;
 				// DIAG-30s：主帧任何 HTTP 错误都打点（含 401——上游会话失效时主帧
 				// 拿 401 纯文本、无自动重试，用户看到的就是"白屏卡住"）。
 				if (request != null && request.isForMainFrame() && response != null) {
@@ -2720,25 +3328,33 @@ public class MainActivity extends Activity {
 				}
 				if (awaitingCertificateDecision || response == null
 					|| request == null || !request.isForMainFrame()) return;
-				if (response.getStatusCode() < 500 || !isActiveGatewayUri(request.getUrl())) return;
+				if (response.getStatusCode() < 500) return;
+				if (isStaging(view)) {
+					onStagingMainFrameError(view, request.getUrl().toString(),
+						"网关已连接，但电脑上的 DSH Web 暂时不可用。");
+					return;
+				}
+				if (!isActiveGatewayUri(request.getUrl())) return;
 				// 同 onReceivedError：主框架 5xx 也不受错误抑制窗口影响。
 				suppressGatewayErrors = false;
 				failedMainFrameUrl = request.getUrl().toString();
+				rememberVisibleServerDown();
 				showGatewayFailure("网关已连接，但电脑上的 DSH Web 暂时不可用。");
 			}
 
 			@Override
 			public void onReceivedHttpAuthRequest(WebView view, HttpAuthHandler handler,
 					String host, String realm) {
-				handleHttpAuthRequest(handler, host, realm);
+				handleHttpAuthRequest(view, handler, host, realm);
 			}
 
 			@Override
 			public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
-				handleSslError(handler, error);
+				handleSslError(view, handler, error);
 			}
-		});
-		webView.setWebChromeClient(new WebChromeClient() {
+		};
+		webView.setWebViewClient(sessionClient);
+		sessionChrome = new WebChromeClient() {
 			@Override
 			public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
 											 FileChooserParams params) {
@@ -2788,8 +3404,9 @@ public class MainActivity extends Activity {
 					return false;
 				}
 			}
-		});
-		webView.setDownloadListener((url, ua, contentDisposition, mime, length) -> {
+		};
+		webView.setWebChromeClient(sessionChrome);
+		sessionDownload = (url, ua, contentDisposition, mime, length) -> {
 			try {
 				DownloadManager.Request r = new DownloadManager.Request(Uri.parse(url));
 				r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
@@ -2801,7 +3418,8 @@ public class MainActivity extends Activity {
 			} catch (Exception e) {
 				Toast.makeText(this, "下载失败：" + e.getMessage(), Toast.LENGTH_SHORT).show();
 			}
-		});
+		};
+		webView.setDownloadListener(sessionDownload);
 		rootLayout.addView(webView,
 			new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 		// T109：`installReconnectBanner()` 已删——根布局里现在只有 WebView 一个子节点
@@ -3633,8 +4251,22 @@ public class MainActivity extends Activity {
 	 */
 	private void applyInsetsToPage(WebView view) {
 		if (view == null) return;
+		if (getWindow().getDecorView().getRootWindowInsets() == null) return;
+		int[] box = readInsetCssPx();
+		writeInsetsToPage(view, box[0], box[1], box[2], box[3]);
+	}
+
+	/** 系统栏还没分发时沿用上一次的顶距，避免切换页把 0 当成「不用让位」先露出来。 */
+	private int rememberedInsetTop = -1;
+
+	/** CSS px，顺序 top、bottom、left、right。系统栏还没分发时顶距用上次的值，其余为 0。 */
+	private int[] readInsetCssPx() {
+		int[] box = new int[4];
 		WindowInsets insets = getWindow().getDecorView().getRootWindowInsets();
-		if (insets == null) return;
+		if (insets == null) {
+			if (rememberedInsetTop > 0) box[0] = rememberedInsetTop;
+			return box;
+		}
 		float density = getResources().getDisplayMetrics().density;
 		int top;
 		int bottom;
@@ -3674,7 +4306,50 @@ public class MainActivity extends Activity {
 			left = Math.round(leftPx / density);
 			right = Math.round(rightPx / density);
 		}
-		writeInsetsToPage(view, top, bottom, left, right);
+		if (top > 0) rememberedInsetTop = top;
+		else if (top == 0 && rememberedInsetTop > 0) top = rememberedInsetTop;
+		box[0] = top;
+		box[1] = bottom;
+		box[2] = left;
+		box[3] = right;
+		return box;
+	}
+
+	/** 切换页在第一次绘制前就拿到状态栏高度。脚本若还在等 documentElement，会在装上时读这份预定值。 */
+	private void armStagingInsets(WebView view) {
+		if (view == null) return;
+		int[] box = readInsetCssPx();
+		try {
+			view.evaluateJavascript("window.__dshrPendingInsets=["
+				+ box[0] + "," + box[1] + "," + box[2] + "," + box[3] + "];", null);
+		} catch (Exception ignored) {
+		}
+		injectMobileAdaptation(view);
+		applyInsetsToPage(view);
+	}
+
+	/**
+	 * 1 = 可以换上；2 = 内容有了但让位还没生效；0 = 还是空白。
+	 * evaluateJavascript 会给数字再加一层引号，调用方两种都认。
+	 */
+	private String switchReadyJs() {
+		int top = readInsetCssPx()[0];
+		return "(function(){try{var b=document.body;if(!b)return 0;"
+			+ "var painted=!!document.querySelector('[data-slot=\"sidebar\"]')"
+			+ "||((b.innerText||'').replace(/\\s+/g,' ').trim().length>24);"
+			+ "if(!painted)return 0;"
+			+ "var want=" + top + ";if(want<=0)return 2;"
+			+ "var got=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--dshr-inset-top'));"
+			+ "if(!(got>=want-0.5))return 2;"
+			+ "function pad(el){return el?(parseFloat(getComputedStyle(el).paddingTop)||0):0;}"
+			+ "var frame=document.querySelector('[data-dshr-frame]');"
+			+ "if(frame&&pad(frame)+0.5>=want)return 1;"
+			+ "var slots=document.querySelectorAll('[data-slot=\"sidebar\"],[data-slot=\"main\"]');"
+			+ "for(var i=0;i<slots.length;i++){var host=slots[i].parentElement;if(host&&pad(host)+0.5>=want)return 1;}"
+			+ "var cols=document.querySelectorAll('[data-dshr-sidebar-col],[data-dshr-main-col]');"
+			+ "for(var j=0;j<cols.length;j++){if(pad(cols[j])+0.5>=want)return 1;}"
+			+ "if(pad(b)+0.5>=want)return 1;"
+			+ "return 2;}catch(e){return 0;}})()";
 	}
 
 	/**
@@ -3733,6 +4408,7 @@ public class MainActivity extends Activity {
 	 */
 	private void syncDeviceModeToPage(WebView view) {
 		applyDeviceModeToPage(view);
+		syncServerPicker(view);
 	}
 
 	/**
@@ -3765,6 +4441,691 @@ public class MainActivity extends Activity {
 		applyDeviceModeToPage(view);
 		view.evaluateJavascript(HOOK_STALE_GUARD_JS, null);
 		view.evaluateJavascript(readMobileAdaptJs(), null);
+		syncServerPicker(view);
+	}
+
+	private void syncServerPicker(WebView view) {
+		if (!pushServerPicker(view)) return;
+		scheduleReachability();
+	}
+
+	/** @return 这次确实把菜单元数据写进了页面 */
+	private boolean pushServerPicker(WebView view) {
+		if (view == null) return false;
+		if (!ServerPicker.authorized(serverPickerCapability, serverPickerCapability,
+			isTabletClass(), uiState == UiState.WEB, view.getUrl(), activeGatewayHost, activeGatewayPort)) {
+			view.evaluateJavascript("(function(){var p=window.__dshRemoteServerPicker;if(p)p.destroy();})()", null);
+			return false;
+		}
+		try {
+			JSONObject snapshot = ServerPicker.snapshot(prefs(), serverPickerCurrent, activeGatewayHost, tunnelReachability);
+			if (serverSwitchInFlight) snapshot.put("switching", true);
+			String origin = new java.net.URI("https", null, activeGatewayHost,
+				activeGatewayPort == 443 ? -1 : activeGatewayPort, null, null, null).toString().toLowerCase(Locale.ROOT);
+			if (serverPickerJs == null) serverPickerJs = readRawTextStrict(R.raw.server_picker);
+			// evaluateJavascript 与导航可能交错：页面再次核对 origin，避免把 capability 注入另一站点。
+			view.evaluateJavascript("(function(){if(!document.body||location.origin!=="
+				+ JSONObject.quote(origin) + ")return;" + serverPickerJs + "(" + snapshot
+				+ ",function(kind,id){DshRemoteApp.switchServer(kind,id,"
+				+ JSONObject.quote(serverPickerCapability) + ");}"
+				+ ",function(op,payload){return DshRemoteApp.editServer(op,JSON.stringify(payload||{}),"
+				+ JSONObject.quote(serverPickerCapability) + ");});})()", null);
+			return true;
+		} catch (IOException | org.json.JSONException | java.net.URISyntaxException error) {
+			throw new IllegalStateException("无法生成服务器选择器元数据", error);
+		}
+	}
+
+	/**
+	 * 还没有结果的隧道和直连，各做一次握手。隧道端口还没挂上就过几秒再看，握不上不再连。
+	 * 切服务器时不探。探测走自己的线程，不占用隧道连接那条单线程。
+	 */
+	private void scheduleReachability() {
+		if (destroyed || serverSwitchInFlight || tunnelDotRunning) return;
+		tunnelDotRetries = 0;
+		probeUnknownReachability();
+	}
+
+	private void cancelTunnelDotProbe() {
+		tunnelDotGeneration += 1;
+		SSLSocket socket = tunnelDotSocket;
+		tunnelDotSocket = null;
+		if (socket != null) {
+			try {
+				socket.close();
+			} catch (IOException ignored) {
+			}
+		}
+	}
+
+	private void rememberTunnelStatus(String id, String status) {
+		if (id == null || id.length() == 0) return;
+		Map<String, String> current = tunnelReachability;
+		if (status.equals(current.get(id))) return;
+		Map<String, String> next = new HashMap<String, String>(current);
+		next.put(id, status);
+		tunnelReachability = next;
+	}
+
+	/** 会话页打开了，这台就是可连接。隧道只认回环地址，直连认当前这条。 */
+	private void rememberOpenedServer(String url) {
+		if (!TextUtils.isEmpty(activeProfileId) && isLoopbackHost(url)) {
+			rememberTunnelStatus(activeProfileId, "up");
+			return;
+		}
+		if (serverPickerCurrent == null) return;
+		for (ProfileStore.DirectNode node : ProfileStore.listDirect(prefs())) {
+			if (serverPickerCurrent.matches(node) && ServerPicker.sameGateway(url, node.url)) {
+				rememberTunnelStatus(node.id, "up");
+				return;
+			}
+		}
+	}
+
+	/** 页面没打开。正在看的这台记成不可用。 */
+	private void rememberVisibleServerDown() {
+		if (serverPickerCurrent != null) {
+			for (ProfileStore.Profile profile : ProfileStore.list(prefs())) {
+				if (serverPickerCurrent.matches(profile)) {
+					rememberTunnelStatus(profile.id, "down");
+					return;
+				}
+			}
+			for (ProfileStore.DirectNode node : ProfileStore.listDirect(prefs())) {
+				if (serverPickerCurrent.matches(node)) {
+					rememberTunnelStatus(node.id, "down");
+					return;
+				}
+			}
+		}
+		if (!TextUtils.isEmpty(activeProfileId)) rememberTunnelStatus(activeProfileId, "down");
+	}
+
+	private void kickSiblingRefresh() {
+		if (destroyed || serverSwitchInFlight || tunnelDotRunning || siblingRefreshTarget == null) return;
+		ProfileStore.Profile target = siblingRefreshTarget;
+		siblingRefreshTarget = null;
+		probeSiblingTunnels(target);
+	}
+
+	private void probeUnknownReachability() {
+		if (destroyed || serverSwitchInFlight || tunnelDotRunning) return;
+		Map<String, String> known = tunnelReachability;
+		List<ProfileStore.Profile> tunnels = new ArrayList<ProfileStore.Profile>();
+		List<ProfileStore.DirectNode> directs = new ArrayList<ProfileStore.DirectNode>();
+		for (ProfileStore.Profile profile : ProfileStore.list(prefs())) {
+			if (!profile.isValid() || ProfileStore.tunnelUnavailable(profile)) continue;
+			String prior = known.get(profile.id);
+			if ("up".equals(prior) || "down".equals(prior)) continue;
+			tunnels.add(profile);
+		}
+		for (ProfileStore.DirectNode node : ProfileStore.listDirect(prefs())) {
+			if (!node.isValid()) continue;
+			String prior = known.get(node.id);
+			if ("up".equals(prior) || "down".equals(prior)) continue;
+			directs.add(node);
+		}
+		if (tunnels.isEmpty() && directs.isEmpty()) return;
+		startReachabilityProbe(tunnels, directs, false);
+	}
+
+	/** 目标页面已经交卷之后，同组其它隧道再握一次。不探目标自己，也不重试。 */
+	private void probeSiblingTunnels(ProfileStore.Profile target) {
+		if (target == null || destroyed || serverSwitchInFlight || tunnelDotRunning) return;
+		String key = VisitorFleet.frpsKey(target);
+		List<ProfileStore.Profile> siblings = new ArrayList<ProfileStore.Profile>();
+		for (ProfileStore.Profile profile : ProfileStore.list(prefs())) {
+			if (target.id.equals(profile.id)) continue;
+			if (!profile.isValid() || ProfileStore.tunnelUnavailable(profile)) continue;
+			if (!key.equals(VisitorFleet.frpsKey(profile))) continue;
+			siblings.add(profile);
+		}
+		if (siblings.isEmpty()) return;
+		startReachabilityProbe(siblings, new ArrayList<ProfileStore.DirectNode>(), true);
+	}
+
+	private void startReachabilityProbe(List<ProfileStore.Profile> tunnels,
+			List<ProfileStore.DirectNode> directs, boolean overwrite) {
+		if (destroyed || serverSwitchInFlight || tunnelDotRunning) return;
+		tunnelDotRunning = true;
+		final int generation = ++tunnelDotGeneration;
+		tunnelDotOwner = generation;
+		final Map<String, String> previous = tunnelReachability;
+		new Thread(() -> {
+			Map<String, String> reach = new HashMap<String, String>();
+			boolean portPending = false;
+			boolean aborted = false;
+			try {
+				for (ProfileStore.Profile profile : tunnels) {
+					if (destroyed || generation != tunnelDotGeneration || serverSwitchInFlight) {
+						aborted = true;
+						return;
+					}
+					String prior = previous.get(profile.id);
+					if (!overwrite && ("up".equals(prior) || "down".equals(prior))) continue;
+					if (profile.bindPort <= 0) {
+						if (!overwrite) portPending = true;
+						continue;
+					}
+					int answer = handshake("127.0.0.1", profile.bindPort, false);
+					if (destroyed || generation != tunnelDotGeneration || serverSwitchInFlight) {
+						aborted = true;
+						return;
+					}
+					if (answer > 0) reach.put(profile.id, "up");
+					else if (answer == 0) reach.put(profile.id, "down");
+					else if (!overwrite) portPending = true;
+				}
+				for (ProfileStore.DirectNode node : directs) {
+					if (destroyed || generation != tunnelDotGeneration || serverSwitchInFlight) {
+						aborted = true;
+						return;
+					}
+					String prior = previous.get(node.id);
+					if (!overwrite && ("up".equals(prior) || "down".equals(prior))) continue;
+					int answer = directAnswer(node);
+					if (destroyed || generation != tunnelDotGeneration || serverSwitchInFlight || answer < 0) {
+						aborted = true;
+						return;
+					}
+					reach.put(node.id, answer > 0 ? "up" : "down");
+				}
+			} finally {
+				final Map<String, String> next = reach;
+				final boolean retry = portPending;
+				final boolean drop = aborted;
+				runOnUiThread(() -> finishReachabilityProbe(generation, previous, next, overwrite, retry, drop));
+			}
+		}, "reach-dots").start();
+	}
+
+	private void finishReachabilityProbe(int generation, Map<String, String> previous,
+			Map<String, String> next, boolean overwrite, boolean portPending, boolean drop) {
+		if (generation != tunnelDotGeneration || tunnelDotOwner != generation) {
+			if (tunnelDotOwner == generation) {
+				tunnelDotRunning = false;
+				tunnelDotOwner = 0;
+				if (!destroyed && !serverSwitchInFlight) kickSiblingRefresh();
+			}
+			return;
+		}
+		tunnelDotRunning = false;
+		tunnelDotOwner = 0;
+		if (!drop && !destroyed && !serverSwitchInFlight) {
+			tunnelDotPortPending = portPending;
+			Map<String, String> merged = new HashMap<String, String>(tunnelReachability);
+			for (Map.Entry<String, String> entry : next.entrySet()) {
+				String live = tunnelReachability.get(entry.getKey());
+				String prior = previous.get(entry.getKey());
+				if (!overwrite && live != null && (prior == null || !live.equals(prior))) continue;
+				merged.put(entry.getKey(), entry.getValue());
+			}
+			if (!merged.equals(tunnelReachability)) {
+				tunnelReachability = merged;
+				if (webView != null && uiState == UiState.WEB) pushServerPicker(webView);
+			}
+		}
+		if (!destroyed && !serverSwitchInFlight && siblingRefreshTarget != null) {
+			kickSiblingRefresh();
+			return;
+		}
+		if (overwrite && !drop && !destroyed && !serverSwitchInFlight && !tunnelDotRunning) {
+			probeUnknownReachability();
+		}
+		if (drop || overwrite || !portPending || destroyed || serverSwitchInFlight) return;
+		if (tunnelDotRetries >= REACH_PORT_WAIT_LIMIT || rootLayout == null) return;
+		tunnelDotRetries += 1;
+		rootLayout.postDelayed(() -> {
+			if (!destroyed && generation == tunnelDotGeneration && !serverSwitchInFlight && !tunnelDotRunning) {
+				probeUnknownReachability();
+			}
+		}, REACH_PORT_WAIT_MS);
+	}
+
+	/** 菜单里保存后要连上。已在会话中就原地切，避免先盖一层连接壳。 */
+	private void connectEditedServer(String kind, String id) {
+		if (serverSwitchInFlight || uiState != UiState.WEB) return;
+		if (ServerPicker.TUNNEL.equals(kind)) {
+			ProfileStore.Profile profile = ProfileStore.get(prefs(), id);
+			if (profile == null || !profile.isValid() || ProfileStore.tunnelUnavailable(profile)) return;
+			if (serverPickerCurrent != null && serverPickerCurrent.matches(profile)) {
+				syncServerPicker(webView);
+				return;
+			}
+			if (canSeamlessSwitch()) switchTunnelSeamlessly(profile);
+			else connectProfile(profile);
+			return;
+		}
+		if (ServerPicker.DIRECT.equals(kind)) {
+			ProfileStore.DirectNode node = ServerPicker.findDirect(prefs(), id);
+			if (node == null || !node.isValid()) return;
+			if (serverPickerCurrent != null && serverPickerCurrent.matches(node)) {
+				syncServerPicker(webView);
+				return;
+			}
+			if (canSeamlessSwitch()) switchDirectSeamlessly(node);
+			else connectDirectNode(node);
+		}
+	}
+
+	private void switchServer(String kind, String id, String capability) {
+		if (!ServerPicker.authorized(capability, serverPickerCapability, isTabletClass(),
+			uiState == UiState.WEB, webView == null ? null : webView.getUrl(), activeGatewayHost, activeGatewayPort)) {
+			rejectServerSwitch("当前页面无权切换服务器，请返回已连接的会话。");
+			return;
+		}
+		if (ServerPicker.TUNNEL.equals(kind)) {
+			ProfileStore.Profile profile = ProfileStore.get(prefs(), id);
+			if (profile == null || !profile.isValid() || ProfileStore.tunnelUnavailable(profile)) {
+				rejectServerSwitch("服务器配置已删除或不可用，请检查连接设置。");
+				return;
+			}
+			if (serverPickerCurrent != null && serverPickerCurrent.matches(profile)) { syncServerPicker(webView); return; }
+			if (serverSwitchInFlight) {
+				rejectServerSwitch("正在切换服务器，请稍候。");
+				return;
+			}
+			if (canSeamlessSwitch()) switchTunnelSeamlessly(profile);
+			else connectProfile(profile);
+			return;
+		}
+		if (ServerPicker.DIRECT.equals(kind)) {
+			ProfileStore.DirectNode node = ServerPicker.findDirect(prefs(), id);
+			if (node == null) {
+				rejectServerSwitch("服务器配置已删除或不可用，请检查连接设置。");
+				return;
+			}
+			if (serverPickerCurrent != null && serverPickerCurrent.matches(node)) { syncServerPicker(webView); return; }
+			if (serverSwitchInFlight) {
+				rejectServerSwitch("正在切换服务器，请稍候。");
+				return;
+			}
+			if (canSeamlessSwitch()) switchDirectSeamlessly(node);
+			else connectDirectNode(node);
+			return;
+		}
+		rejectServerSwitch("不支持的服务器类型。");
+	}
+
+	private void rejectServerSwitch(String message) {
+		Log.w("dshr-server-picker", message);
+		Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+		syncServerPicker(webView);
+	}
+
+	private boolean canSeamlessSwitch() {
+		return uiState == UiState.WEB && webView != null && rootLayout != null && isSessionUrl(webView.getUrl());
+	}
+
+	private void switchTunnelSeamlessly(ProfileStore.Profile profile) {
+		serverSwitchInFlight = true;
+		cancelTunnelDotProbe();
+		siblingRefreshTarget = profile;
+		switchRollbackArmed = true;
+		switchRollbackActiveId = ProfileStore.getActiveId(prefs());
+		switchDisplacedTunnel = false;
+		ProfileStore.setActiveId(prefs(), profile.id);
+		syncServerPicker(webView);
+		beginTunnel(profile, true);
+	}
+
+	private void switchDirectSeamlessly(ProfileStore.DirectNode node) {
+		serverSwitchInFlight = true;
+		cancelTunnelDotProbe();
+		siblingRefreshTarget = null;
+		switchRollbackArmed = false;
+		switchDisplacedTunnel = false;
+		clearResumeSession();
+		syncServerPicker(webView);
+		int generation = ++connectionGeneration;
+		startBackgroundPage(node.url, "", ServerPicker.Current.direct(node), null, node, generation);
+	}
+
+	/** 在当前页下面打开目标主机。页面仍停在现在这台机器上，直到目标文档提交。 */
+	private void startBackgroundPage(String url, String profileId, ServerPicker.Current current,
+			ProfileStore.Profile profile, ProfileStore.DirectNode node, int generation) {
+		if (destroyed) return;
+		if (generation != connectionGeneration || uiState != UiState.WEB || webView == null || rootLayout == null) {
+			abortSeamlessSwitch(uiState == UiState.WEB ? null : "当前不在会话中，已取消切换。");
+			return;
+		}
+		discardStagingWebView();
+		pendingSwitchUrl = url == null ? "" : url.trim();
+		pendingSwitchProfileId = profileId == null ? "" : profileId;
+		pendingSwitchCurrent = current;
+		pendingSwitchProfile = profile;
+		pendingSwitchNode = node;
+		pendingSwitchGeneration = generation;
+		stagingFailedUrl = "";
+		if (pendingSwitchUrl.isEmpty()) {
+			abortSeamlessSwitch("服务器地址无效，已停留在当前主机。");
+			return;
+		}
+		WebView stage = spawnSessionWebView();
+		stagingWebView = stage;
+		rootLayout.addView(stage, 0, sessionLayoutParams());
+		Log.i("dshr-server-picker", "后台打开 " + pendingSwitchUrl);
+		stage.loadUrl(pendingSwitchUrl);
+	}
+
+	private FrameLayout.LayoutParams sessionLayoutParams() {
+		FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+			FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
+		if (webView != null && webView.getLayoutParams() instanceof FrameLayout.LayoutParams) {
+			FrameLayout.LayoutParams src = (FrameLayout.LayoutParams) webView.getLayoutParams();
+			lp.setMargins(src.leftMargin, src.topMargin, src.rightMargin, src.bottomMargin);
+		}
+		return lp;
+	}
+
+	private boolean isStaging(WebView view) {
+		return view != null && (view == stagingWebView || STAGING_TAG.equals(view.getTag()));
+	}
+
+	private boolean isRetiring(WebView view) {
+		return view != null && (view == fadingOutWebView || view == retiringWebView);
+	}
+
+	private void onStagingDocumentReady(WebView view, String url) {
+		if (view != stagingWebView || destroyed || stagingCommitting || switchRevealArmed) return;
+		if (!stagingFailedUrl.isEmpty() && stagingFailedUrl.equals(url)) return;
+		if (!isSessionUrl(url)) return;
+		if (pendingSwitchGeneration != connectionGeneration) {
+			abortSeamlessSwitch(null);
+			return;
+		}
+		if (!ServerPicker.sameGateway(url, pendingSwitchUrl)) {
+			abortSeamlessSwitch("目标服务器跳到了别的地址，已停留在当前主机。");
+			return;
+		}
+		switchRevealArmed = true;
+		switchRevealTries = 0;
+		if (rootLayout != null) rootLayout.post(switchRevealPoll);
+	}
+
+	/** 等目标页真的画出侧栏或正文，再淡入。空白文档不换。 */
+	private void pollStagingReveal() {
+		final WebView stage = stagingWebView;
+		if (stage == null || destroyed || stagingCommitting) return;
+		if (pendingSwitchGeneration != connectionGeneration) {
+			abortSeamlessSwitch(null);
+			return;
+		}
+		stage.evaluateJavascript(switchReadyJs(), value -> {
+			if (stagingWebView != stage || destroyed || stagingCommitting) return;
+			switchRevealTries++;
+			// 2：界面已经有了，但状态栏让位还没落到列上。再写一次，不要先换上去。
+			if ("\"2\"".equals(value) || "2".equals(value)) armStagingInsets(stage);
+			if ("\"1\"".equals(value) || "1".equals(value) || switchRevealTries >= SWITCH_REVEAL_MAX_TRIES) {
+				String shown = stage.getUrl();
+				if (TextUtils.isEmpty(shown)) shown = pendingSwitchUrl;
+				commitStaging(stage, shown);
+			} else if (rootLayout != null) {
+				rootLayout.postDelayed(switchRevealPoll, SWITCH_REVEAL_INTERVAL_MS);
+			}
+		});
+	}
+
+	private void onStagingMainFrameError(WebView view, String url, String message) {
+		if (stagingCommitting || view != stagingWebView) return;
+		stagingFailedUrl = url == null ? "" : url;
+		if (pendingSwitchProfile != null) rememberTunnelStatus(pendingSwitchProfile.id, "down");
+		else if (pendingSwitchNode != null) rememberTunnelStatus(pendingSwitchNode.id, "down");
+		abortSeamlessSwitch(message);
+	}
+
+	private void commitStaging(WebView stage, String url) {
+		if (stage != stagingWebView || stagingCommitting) return;
+		if (!isSessionUrl(url) || !ServerPicker.sameGateway(url, pendingSwitchUrl)) {
+			abortSeamlessSwitch("目标服务器跳到了别的地址，已停留在当前主机。");
+			return;
+		}
+		final int ticket = ++switchPresentationTicket;
+		stagingCommitting = true;
+		switchPresentationDone = false;
+		if (rootLayout != null) rootLayout.removeCallbacks(switchRevealPoll);
+		try {
+			commitSwitchIdentity(url);
+			switchRollbackArmed = false;
+			switchDisplacedTunnel = false;
+			clearPendingSwitchRequest();
+			WebView previous = webView;
+			stagingWebView = null;
+			webView = stage;
+			hookConnState = null;
+			hookConnStateAt = 0L;
+			hookConnStateStaleLogged = false;
+			hideReconnectBannerNow();
+			stuckRescue.onDocumentChanged();
+			hideSettings();
+			if (previous == null || previous == stage) {
+				finishSwitchPresentation(stage, url, null, ticket);
+				return;
+			}
+			// 先把已经画好的新页放到最前，但几乎全透明。等它合成一帧再淡入，
+			// 避免 bringToFront 的第一帧是空白。底色不在这里清掉，淡入期间沿用当前页的颜色。
+			fadingOutWebView = previous;
+			switchVisualLock = true;
+			stage.setAlpha(0.01f);
+			stage.bringToFront();
+			stage.setVisibility(View.VISIBLE);
+			stage.postDelayed(() -> beginCrossfade(stage, url, previous, ticket), SWITCH_PRESENT_DELAY_MS);
+			stage.postDelayed(() -> finishSwitchPresentation(stage, url, previous, ticket),
+				SWITCH_PRESENT_DELAY_MS + SWITCH_FADE_MS + 240L);
+		} catch (RuntimeException e) {
+			stagingCommitting = false;
+			switchVisualLock = false;
+			throw e;
+		}
+	}
+
+	private void beginCrossfade(WebView stage, String url, WebView previous, int ticket) {
+		if (destroyed || switchPresentationDone || ticket != switchPresentationTicket || stage != webView) return;
+		stage.animate().alpha(1f).setDuration(SWITCH_FADE_MS)
+			.setInterpolator(new DecelerateInterpolator())
+			.withEndAction(() -> finishSwitchPresentation(stage, url, previous, ticket));
+	}
+
+	private void finishSwitchPresentation(WebView stage, String url, WebView previous, int ticket) {
+		if (destroyed || switchPresentationDone || ticket != switchPresentationTicket) return;
+		switchPresentationDone = true;
+		try {
+			stage.animate().cancel();
+			stage.setAlpha(1f);
+			stage.setTag(null);
+			stage.bringToFront();
+			stage.setVisibility(View.VISIBLE);
+			stage.requestFocus();
+			fadingOutWebView = null;
+			if (previous != null && previous != stage) {
+				retiringWebView = previous;
+				previous.animate().cancel();
+				previous.post(() -> {
+					if (retiringWebView == previous) retiringWebView = null;
+					destroyWebViewQuietly(previous);
+				});
+			}
+			serverSwitchInFlight = false;
+			switchRevealArmed = false;
+			switchVisualLock = false;
+			sessionHistoryRooted = false;
+			if (switchOverlapTunnel) finishOverlap(true);
+			kickSiblingRefresh();
+			enterSessionPage(stage, url);
+			applySystemBars();
+			Log.i("dshr-server-picker", "已切到 " + url);
+		} finally {
+			stagingCommitting = false;
+		}
+	}
+
+	/** 重叠隧道的收尾。promote 为真时接管备用隧道，否则停掉备用、留下当前这条。 */
+	private void finishOverlap(boolean promote) {
+		if (!switchOverlapTunnel && !(promote && switchOverlapPort > 0)) return;
+		switchOverlapTunnel = false;
+		if (promote && switchOverlapPort > 0) {
+			prefs().edit()
+				.putInt(ProfileStore.KEY_BOUND_PORT, switchOverlapPort)
+				.putString(ProfileStore.KEY_TUNNEL_PROFILE, switchOverlapProfileId)
+				.putString(ProfileStore.KEY_TUNNEL_STRATEGY, switchOverlapStrategy)
+				.apply();
+		}
+		switchOverlapPort = 0;
+		switchOverlapProfileId = "";
+		switchOverlapStrategy = "";
+		Intent svc = new Intent(this, TunnelService.class);
+		svc.setAction(promote ? TunnelService.ACTION_COMMIT_OVERLAP : TunnelService.ACTION_ABORT_OVERLAP);
+		try {
+			startService(svc);
+		} catch (Exception e) {
+			Log.w("dshr-server-picker", "重叠隧道收尾失败：" + e);
+		}
+	}
+
+	/** 把这次选择写成当前连接。调用时待切换字段还在。 */
+	private void commitSwitchIdentity(String documentUrl) {
+		if (pendingSwitchNode != null) {
+			String nodeUrl = pendingSwitchNode.url;
+			prefs().edit().putString(KEY_URL, nodeUrl)
+				.putString(ProfileStore.KEY_DIRECT_ACTIVE, pendingSwitchNode.id).apply();
+			directTarget = nodeUrl;
+			activeProfileId = "";
+			rememberLast(ServerPicker.DIRECT, pendingSwitchNode.id);
+		} else if (pendingSwitchProfile != null) {
+			ProfileStore.setActiveId(prefs(), pendingSwitchProfile.id);
+			rememberLast(ServerPicker.TUNNEL, pendingSwitchProfile.id);
+			directTarget = "";
+			prefs().edit().remove(ProfileStore.KEY_DIRECT_ACTIVE).apply();
+			activeProfileId = pendingSwitchProfile.id;
+		}
+		serverPickerCurrent = pendingSwitchCurrent;
+		String target = TextUtils.isEmpty(pendingSwitchUrl) ? documentUrl : pendingSwitchUrl;
+		armGatewayDocument(target, activeProfileId);
+	}
+
+	/** openGateway 里那些「新一轮连接」的清零，会话内切换也要做，但不能盖上连接壳。 */
+	private void armGatewayDocument(String target, String profileId) {
+		sessionHistoryRooted = false;
+		submittedHttpAuthThisConnection.clear();
+		activeProfileId = profileId == null ? "" : profileId;
+		serverPickerCapability = UUID.randomUUID().toString();
+		Uri targetUri = Uri.parse(target);
+		activeGatewayHost = targetUri.getHost() == null ? "" : targetUri.getHost();
+		activeGatewayPort = targetUri.getPort() == -1
+			? ("http".equals(targetUri.getScheme()) ? 80 : 443)
+			: targetUri.getPort();
+		connectStartMs = System.currentTimeMillis();
+		PinnedFetch.resetStats();
+		StaticDiskCache.resetStats();
+		passthroughMainDoc.set(0);
+		passthroughApi.set(0);
+		passthroughOther.set(0);
+		passthroughNonGet.set(0);
+		passthroughOrigin.set(0);
+		failedMainFrameUrl = "";
+		activeUrl = target;
+		adaptProbeArms = 0;
+		adaptProbeWindowStartMs = 0L;
+		lastAdaptProbeArmMs = 0L;
+		adaptProbeCapLogged = false;
+		Log.i("dshr-perf", "seamlessSwitch target=" + target);
+	}
+
+	private void abortSeamlessSwitch(String message) {
+		if (abortingSeamless || stagingCommitting) return;
+		if (!serverSwitchInFlight && stagingWebView == null && pendingSwitchUrl.isEmpty() && !switchOverlapTunnel) {
+			if (!TextUtils.isEmpty(message)) Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+			return;
+		}
+		abortingSeamless = true;
+		try {
+			if (rootLayout != null) rootLayout.removeCallbacks(switchRevealPoll);
+			switchRevealArmed = false;
+			switchVisualLock = false;
+			discardStagingWebView();
+			finishOverlap(false);
+			boolean displaced = switchDisplacedTunnel;
+			switchDisplacedTunnel = false;
+			boolean keepDeadLoopback = displaced && loopbackSession() && uiState == UiState.WEB && webView != null;
+			if (keepDeadLoopback) {
+				commitSwitchIdentity(pendingSwitchUrl);
+				serverSwitchInFlight = false;
+				switchRollbackArmed = false;
+				clearPendingSwitchRequest();
+				showLocalShell(
+					UiState.CONNECTING,
+					"failed",
+					"无法打开 DSH",
+					TextUtils.isEmpty(message) ? "切换失败。" : message,
+					"dsh-remote://app/retry",
+					"重新连接",
+					"dsh-remote://app/home",
+					"返回服务器列表"
+				);
+				kickSiblingRefresh();
+				return;
+			}
+			if (switchRollbackArmed && uiState == UiState.WEB) {
+				ProfileStore.setActiveId(prefs(), switchRollbackActiveId);
+			}
+			switchRollbackArmed = false;
+			serverSwitchInFlight = false;
+			clearPendingSwitchRequest();
+			if (!TextUtils.isEmpty(message)) Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+			kickSiblingRefresh();
+			if (webView != null && uiState == UiState.WEB) syncServerPicker(webView);
+		} finally {
+			abortingSeamless = false;
+		}
+	}
+
+	private boolean loopbackSession() {
+		String url = webView != null && isSessionUrl(webView.getUrl()) ? webView.getUrl() : activeUrl;
+		if (TextUtils.isEmpty(url)) return false;
+		String host = Uri.parse(url).getHost();
+		if (host == null) return false;
+		return "127.0.0.1".equals(host) || "localhost".equalsIgnoreCase(host)
+			|| "::1".equals(host) || "[::1]".equals(host);
+	}
+
+	private void clearPendingSwitchRequest() {
+		pendingSwitchUrl = "";
+		pendingSwitchProfileId = "";
+		pendingSwitchCurrent = null;
+		pendingSwitchProfile = null;
+		pendingSwitchNode = null;
+		pendingSwitchGeneration = 0;
+		stagingFailedUrl = "";
+	}
+
+	private void discardStagingWebView() {
+		WebView stage = stagingWebView;
+		stagingWebView = null;
+		if (stage == null || stage == webView) return;
+		try {
+			stage.setWebViewClient(null);
+		} catch (Exception ignored) {
+		}
+		stage.post(() -> destroyWebViewQuietly(stage));
+	}
+
+	/** 拆掉一个不再显示的 WebView。不碰进程级定时器，前台页还要继续跑。 */
+	private void destroyWebViewQuietly(WebView view) {
+		if (view == null) return;
+		try {
+			view.removeJavascriptInterface("DshRemoteApp");
+			view.setOnKeyListener(null);
+			view.setWebViewClient(null);
+			view.setWebChromeClient(null);
+			view.setDownloadListener(null);
+			if (rootLayout != null) rootLayout.removeView(view);
+			view.removeAllViews();
+			view.stopLoading();
+			view.clearHistory();
+			view.destroy();
+		} catch (Exception e) {
+			Log.w("dshr-server-picker", "销毁切换页失败：" + e);
+		}
 	}
 
 	/** T72：上次写入 WebView 的让位四向，只为让 dshr-inset 日志在变化时才打。 */
@@ -4281,6 +5642,7 @@ public class MainActivity extends Activity {
 	}
 
 	private void hideSettings() {
+		hideWelcome();
 		if (homeScroll != null) homeScroll.setVisibility(View.GONE);
 		if (setupScroll != null) setupScroll.setVisibility(View.GONE);
 	}
@@ -4347,6 +5709,7 @@ public class MainActivity extends Activity {
 		// 换了 URL 就是另一个文档，重新拿到「未失败」的起点。
 		failedMainFrameUrl = "";
 		activeUrl = url;
+		rememberOpenedServer(url);
 		injectMobileAdaptation(view);
 		if (uiState == UiState.HOME || uiState == UiState.EDIT) return;
 		boolean alreadyInSession = uiState == UiState.WEB && sessionHistoryRooted;
@@ -4358,6 +5721,7 @@ public class MainActivity extends Activity {
 		}
 		hideSettings();
 		setUiState(UiState.WEB);
+		syncServerPicker(view);
 		// T117：**配对成功的落点就是这里** —— 用户在配对页提交一次性码之后，网关用
 		// Set-Cookie 下发 dr_device（HttpOnly）并 302 到会话页，于是本方法在会话文档上被调用。
 		// 此刻立刻 flush 一次 WebView 的 cookie 存储：否则 cookie 只在内存里，
@@ -4497,6 +5861,90 @@ public class MainActivity extends Activity {
 	}
 
 	/**
+	 * 1 握上手，0 连上了但对方不应答，-1 还没连上或这次被取消。
+	 * remoteFailureIsDown 用于直连：连不上也是不可用。隧道端口没挂上仍返回 -1。
+	 */
+	private int handshake(String host, int port, boolean remoteFailureIsDown) {
+		if (serverSwitchInFlight || host == null || port <= 0) return -1;
+		SSLSocket socket = null;
+		boolean accepted = false;
+		try {
+			socket = (SSLSocket) reachabilityFactory().createSocket();
+			tunnelDotSocket = socket;
+			if (sniHost(host)) {
+				SSLParameters params = socket.getSSLParameters();
+				List<SNIServerName> names = new ArrayList<SNIServerName>();
+				names.add(new SNIHostName(host));
+				params.setServerNames(names);
+				socket.setSSLParameters(params);
+			}
+			if (serverSwitchInFlight) return -1;
+			socket.connect(new InetSocketAddress(host, port), REACH_CONNECT_MS);
+			accepted = true;
+			socket.setSoTimeout(REACH_HANDSHAKE_MS);
+			if (serverSwitchInFlight) return -1;
+			socket.startHandshake();
+			return serverSwitchInFlight ? -1 : 1;
+		} catch (Exception ignored) {
+			if (serverSwitchInFlight) return -1;
+			if (remoteFailureIsDown) return 0;
+			return accepted ? 0 : -1;
+		} finally {
+			if (tunnelDotSocket == socket) tunnelDotSocket = null;
+			if (socket != null) {
+				try {
+					socket.close();
+				} catch (IOException ignored) {
+				}
+			}
+		}
+	}
+
+	/** 直连走它自己的 https 地址。握上手是可连接，其它失败是不可用；切换取消返回 -1。 */
+	private int directAnswer(ProfileStore.DirectNode node) {
+		if (node == null || !node.isValid()) return 0;
+		Uri uri = Uri.parse(node.url);
+		String host = uri.getHost();
+		if (host == null || host.length() == 0) return 0;
+		int port = uri.getPort() == -1 ? 443 : uri.getPort();
+		return handshake(host, port, true);
+	}
+
+	private static boolean sniHost(String host) {
+		if (host == null || host.length() == 0 || host.indexOf(':') >= 0) return false;
+		for (int i = 0; i < host.length(); i++) {
+			char c = host.charAt(i);
+			if (c != '.' && (c < '0' || c > '9')) return true;
+		}
+		return false;
+	}
+
+	private static boolean isLoopbackHost(String url) {
+		if (url == null) return false;
+		try {
+			String host = Uri.parse(url).getHost();
+			return "127.0.0.1".equals(host) || "localhost".equalsIgnoreCase(host) || "::1".equals(host);
+		} catch (Exception ignored) {
+			return false;
+		}
+	}
+
+	private static synchronized SSLSocketFactory reachabilityFactory() throws Exception {
+		if (reachabilityFactory != null) return reachabilityFactory;
+		TrustManager[] trust = new TrustManager[] {
+			new X509TrustManager() {
+				public void checkClientTrusted(X509Certificate[] chain, String auth) {}
+				public void checkServerTrusted(X509Certificate[] chain, String auth) {}
+				public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+			}
+		};
+		SSLContext context = SSLContext.getInstance("TLS");
+		context.init(null, trust, null);
+		reachabilityFactory = context.getSocketFactory();
+		return reachabilityFactory;
+	}
+
+	/**
 	 * 「这个 URI 是不是**当前网关自己**」——只按 **主机 + 端口 + 同族协议** 判。
 	 *
 	 * <p><b>T109（P0-3·发布阻塞）</b>：改前这一行的协议判定是
@@ -4518,9 +5966,13 @@ public class MainActivity extends Activity {
 	 * 明文 {@code ws://} 不会因为这条被当成 {@code https://} 网关的同一个端点。
 	 */
 	private boolean isActiveGatewayUri(Uri uri) {
-		if (TextUtils.isEmpty(activeUrl) || uri == null) return false;
+		return isGatewayOf(uri, activeUrl);
+	}
+
+	private boolean isGatewayOf(Uri uri, String baseUrl) {
+		if (TextUtils.isEmpty(baseUrl) || uri == null) return false;
 		try {
-			Uri base = Uri.parse(activeUrl);
+			Uri base = Uri.parse(baseUrl);
 			String scheme = uri.getScheme();
 			return isGatewaySchemeFamily(scheme)
 				&& sameGatewaySecurityLevel(base.getScheme(), scheme)
@@ -4563,9 +6015,13 @@ public class MainActivity extends Activity {
 	}
 
 	private boolean isActiveHttpsGatewayHost(String host) {
-		if (TextUtils.isEmpty(activeUrl) || TextUtils.isEmpty(host)) return false;
+		return isHttpsGatewayHost(activeUrl, host);
+	}
+
+	private boolean isHttpsGatewayHost(String baseUrl, String host) {
+		if (TextUtils.isEmpty(baseUrl) || TextUtils.isEmpty(host)) return false;
 		try {
-			Uri target = Uri.parse(activeUrl);
+			Uri target = Uri.parse(baseUrl);
 			return "https".equalsIgnoreCase(target.getScheme())
 				&& target.getHost() != null
 				&& target.getHost().equalsIgnoreCase(host);
@@ -4574,9 +6030,11 @@ public class MainActivity extends Activity {
 		}
 	}
 
-	private void handleHttpAuthRequest(final HttpAuthHandler handler, String host, String realm) {
+	private void handleHttpAuthRequest(WebView source, final HttpAuthHandler handler, String host, String realm) {
 		// Basic Auth 仅允许用于当前的 HTTPS 网关；不向嵌入的跨站资源泄露凭据。
-		if (!isActiveHttpsGatewayHost(host)) {
+		final boolean staging = isStaging(source);
+		final String gateUrl = staging ? pendingSwitchUrl : activeUrl;
+		if (!isHttpsGatewayHost(gateUrl, host)) {
 			handler.cancel();
 			return;
 		}
@@ -4592,8 +6050,9 @@ public class MainActivity extends Activity {
 		final boolean rememberDefault = !authPrefs.contains(authKey)
 			|| authPrefs.getBoolean(authKey, false);
 		String[] saved = null;
-		if (rememberDefault && webView != null) {
-			saved = webView.getHttpAuthUsernamePassword(authHost, authRealm);
+		final WebView credentialStore = source != null ? source : webView;
+		if (rememberDefault && credentialStore != null) {
+			saved = credentialStore.getHttpAuthUsernamePassword(authHost, authRealm);
 		}
 		boolean hasSaved = saved != null && saved.length >= 2
 			&& !TextUtils.isEmpty(saved[0]) && saved[1] != null;
@@ -4606,12 +6065,12 @@ public class MainActivity extends Activity {
 			handler.proceed(saved[0], saved[1]);
 			return;
 		}
-		if (hasSaved) {
+		if (hasSaved && credentialStore != null) {
 			lastHttpAuthHost = authHost;
 			lastHttpAuthUser = saved[0];
 			// WebViewDatabase 没有按 host+realm 删除的公开 API；覆盖为空值，
 			// 同时保留“记住”选择，用户修正后会写入新凭据。
-			webView.setHttpAuthUsernamePassword(authHost, authRealm, "", "");
+			credentialStore.setHttpAuthUsernamePassword(authHost, authRealm, "", "");
 		}
 
 		float d = getResources().getDisplayMetrics().density;
@@ -4673,7 +6132,8 @@ public class MainActivity extends Activity {
 				String pass = password.getText().toString();
 				if (TextUtils.isEmpty(user)) {
 					cancel.run();
-					showGatewayFailure("未填写 Basic Auth 用户名，已停止连接。");
+					if (staging) abortSeamlessSwitch("未填写 Basic Auth 用户名，已停留在当前主机。");
+					else showGatewayFailure("未填写 Basic Auth 用户名，已停止连接。");
 					return;
 				}
 				if (!settled[0]) {
@@ -4683,8 +6143,8 @@ public class MainActivity extends Activity {
 					lastHttpAuthUser = user;
 					boolean keep = remember.isChecked();
 					prefs().edit().putBoolean(authKey, keep).apply();
-					if (webView != null) {
-						webView.setHttpAuthUsernamePassword(
+					if (credentialStore != null) {
+						credentialStore.setHttpAuthUsernamePassword(
 							authHost, authRealm, keep ? user : "", keep ? pass : "");
 					}
 					if (keep) submittedHttpAuthThisConnection.add(authKey);
@@ -4693,11 +6153,13 @@ public class MainActivity extends Activity {
 			})
 			.setNegativeButton("取消", (ignored, which) -> {
 				cancel.run();
-				showGatewayFailure("已取消网关认证。");
+				if (staging) abortSeamlessSwitch("已取消网关认证，已停留在当前主机。");
+				else showGatewayFailure("已取消网关认证。");
 			})
 			.setOnCancelListener(ignored -> {
 				cancel.run();
-				showGatewayFailure("已取消网关认证。");
+				if (staging) abortSeamlessSwitch("已取消网关认证，已停留在当前主机。");
+				else showGatewayFailure("已取消网关认证。");
 			})
 			.create();
 		httpAuthDialog = dialog;
@@ -4764,7 +6226,7 @@ public class MainActivity extends Activity {
 	 * 变更 → 弹确认并强提示 MITM 风险，用户信任后记录指纹并重载
 	 * （同一 handler 不能二次 proceed）。
 	 */
-	private void handleSslError(SslErrorHandler handler, SslError error) {
+	private void handleSslError(WebView source, SslErrorHandler handler, SslError error) {
 		if (awaitingCertificateDecision) {
 			// T109：**每一次 cancel 都要留痕**。改前这里（以及下面"非网关 URI"那一支）
 			// 是完全静默的——现场只有"连不上"，连"谁把它取消了"都查不出来。
@@ -4774,13 +6236,18 @@ public class MainActivity extends Activity {
 			return;
 		}
 		String errorUrl = error.getUrl();
-		if (TextUtils.isEmpty(errorUrl) || !isActiveGatewayUri(Uri.parse(errorUrl))) {
+		final boolean staging = isStaging(source);
+		final String gateUrl = staging ? pendingSwitchUrl : activeUrl;
+		final String gateProfile = staging ? pendingSwitchProfileId : activeProfileId;
+		final WebView reloadView = source != null ? source : webView;
+		final String reloadUrl = gateUrl;
+		if (TextUtils.isEmpty(errorUrl) || !isGatewayOf(Uri.parse(errorUrl), gateUrl)) {
 			// T109（P0-3 的诊断面）：这条路径改前是**纯静默 cancel**，于是
 			// 「wss:// 被误判成非网关 ⇒ WebSocket 冷握手被取消」在真机上没有任何线索。
 			// 现在把三件事一次说清：被判为非网关的 URL、当前网关 URL、底层错误码，
 			// 事后一条 logcat 就能区分「不是本网关（设计如此）」与「应该是本网关但判错了」。
 			Log.w("dshr-ssl", "SslError cancel：非当前网关 URI ⇒ 不 proceed"
-				+ ", url=" + errorUrl + ", active=" + activeUrl
+				+ ", url=" + errorUrl + ", active=" + activeUrl + ", gate=" + gateUrl
 				+ ", primaryError=" + error.getPrimaryError());
 			handler.cancel();
 			return;
@@ -4796,7 +6263,7 @@ public class MainActivity extends Activity {
 					+ ", primaryError=" + error.getPrimaryError()
 					+ ", api=" + Build.VERSION.SDK_INT);
 				handler.cancel();
-				showCertificateExtractionFailure();
+				showCertificateExtractionFailure(reloadView, gateUrl, staging);
 				return;
 			}
 			byte[] digest = MessageDigest.getInstance("SHA-256").digest(cert.getEncoded());
@@ -4808,22 +6275,23 @@ public class MainActivity extends Activity {
 			Log.w("dshr-ssl", "证书指纹提取失败：" + e
 				+ ", url=" + errorUrl + ", api=" + Build.VERSION.SDK_INT);
 			handler.cancel();
-			showCertificateExtractionFailure();
+			showCertificateExtractionFailure(reloadView, gateUrl, staging);
 			return;
 		}
-		if (TextUtils.isEmpty(activeUrl)) {
+		if (TextUtils.isEmpty(gateUrl)) {
 			handler.cancel();
-			showGatewayFailure("无法确认当前服务器的证书。");
+			if (staging) abortSeamlessSwitch("无法确认目标服务器的证书，已停留在当前主机。");
+			else showGatewayFailure("无法确认当前服务器的证书。");
 			return;
 		}
-		Uri base = Uri.parse(activeUrl);
+		Uri base = Uri.parse(gateUrl);
 		final String fp = fingerprint;
 		// T23-A/T27-A：配置档身份优先，且**只**看该配置档自己的键——没有就 TOFU，
 		// 不回退共享地址键（那是别的配置档/直连语境的信任，读它会误报证书已变更）。
 		// 没有配置档身份（直连/局域网节点）时才走地址键；两处都没有才走 TOFU。
 		final CertPin.Decision decision = CertPin.verify(
 			key -> prefs().getString(key, null),
-			activeProfileId, base.getHost(), effectivePort(base), base.getPort(), fp);
+			gateProfile, base.getHost(), effectivePort(base), base.getPort(), fp);
 		final String key = decision.label;
 		final String stored = decision.stored;
 		final boolean changed = decision.action == CertPin.Action.CHANGED;
@@ -4846,7 +6314,7 @@ public class MainActivity extends Activity {
 			return;
 		}
 		Log.i("dshr-perf", "sslDecision host=" + key + " changed=" + changed
-			+ " profile=" + (activeProfileId.isEmpty() ? "-" : activeProfileId)
+			+ " profile=" + (gateProfile.isEmpty() ? "-" : gateProfile)
 			+ " " + decision.describe());
 		awaitingCertificateDecision = true;
 		handler.cancel();
@@ -4865,15 +6333,17 @@ public class MainActivity extends Activity {
 				// 不再覆盖共享的地址键——否则会把另一个配置档的信任冲掉。
 				prefs().edit().putString(decision.key, fp).apply();
 				Log.i("dshr-perf", "证书信任已记录 " + decision.describe());
-				if (!TextUtils.isEmpty(activeUrl)) webView.loadUrl(activeUrl);
+				if (reloadView != null && !TextUtils.isEmpty(reloadUrl)) reloadView.loadUrl(reloadUrl);
 			})
 			.setNegativeButton("取消", (dialog, which) -> {
 				awaitingCertificateDecision = false;
-				showGatewayFailure("未信任服务器证书，已停止连接。");
+				if (staging) abortSeamlessSwitch("未信任服务器证书，已停留在当前主机。");
+				else showGatewayFailure("未信任服务器证书，已停止连接。");
 			})
 			.setOnCancelListener(dialog -> {
 				awaitingCertificateDecision = false;
-				showGatewayFailure("未信任服务器证书，已停止连接。");
+				if (staging) abortSeamlessSwitch("未信任服务器证书，已停留在当前主机。");
+				else showGatewayFailure("未信任服务器证书，已停止连接。");
 			})
 			.show();
 	}
@@ -4882,16 +6352,22 @@ public class MainActivity extends Activity {
 	 * AND-08：无法从 SslError 提取证书时的明确错误。重试会重新发起加载、
 	 * 再次走证书校验流程；每次重试都需用户显式点击，不会自动循环。
 	 */
-	private void showCertificateExtractionFailure() {
+	private void showCertificateExtractionFailure(WebView reloadView, String reloadUrl, boolean staging) {
 		new AlertDialog.Builder(this)
 			.setTitle("证书校验失败")
 			.setMessage("无法读取该服务器的证书，不能完成指纹核对。\n"
 				+ "可能是系统 WebView 实现的兼容性问题，请重试，或检查系统更新后再试。")
 			.setPositiveButton("重试", (dialog, which) -> {
-				if (webView != null && !TextUtils.isEmpty(activeUrl)) webView.loadUrl(activeUrl);
+				if (reloadView != null && !TextUtils.isEmpty(reloadUrl)) reloadView.loadUrl(reloadUrl);
 			})
-			.setNegativeButton("取消", (dialog, which) -> showGatewayFailure("证书校验失败，已停止连接。"))
-			.setOnCancelListener(dialog -> showGatewayFailure("证书校验失败，已停止连接。"))
+			.setNegativeButton("取消", (dialog, which) -> {
+				if (staging) abortSeamlessSwitch("证书校验失败，已停留在当前主机。");
+				else showGatewayFailure("证书校验失败，已停止连接。");
+			})
+			.setOnCancelListener(dialog -> {
+				if (staging) abortSeamlessSwitch("证书校验失败，已停留在当前主机。");
+				else showGatewayFailure("证书校验失败，已停止连接。");
+			})
 			.show();
 	}
 
@@ -5440,7 +6916,7 @@ public class MainActivity extends Activity {
 		if (uiState == UiState.WEB && webView != null && webView.getVisibility() == View.VISIBLE) {
 			// T102：**返回键不再进 App 连接设置页**（两档一致）。
 			//
-			// 判据只问一件事：**除左抽屉之外**还有没有要收的东西（弹层 / 官方右栏）？
+			// 先收本 App 的服务器菜单，再判断官方弹层 / 右栏；不收平板的官方左栏。
 			//   有 → 走既有桥（与手机档同一条通道，T43/T47「右栏打开态只关右栏」逐字保留）；
 			//   无 → 直接 finishWebBack() ⇒ 会话根落到 moveTaskToBack(true) 退到后台。
 			//
@@ -5449,7 +6925,9 @@ public class MainActivity extends Activity {
 			// 所以"先确认前几个分支都没东西可关 ⇒ 跳过整次调用"与"调用后恰好只走到最后一个分支
 			// 再把它当作什么都没关"在语义上等价，而跳过的代价是**左抽屉保持展开**。
 			if (isTabletClass()) {
-				webView.evaluateJavascript(TABLET_BACK_OVERLAY_PROBE_JS, value -> {
+				webView.evaluateJavascript("(function(){var p=window.__dshRemoteServerPicker;"
+					+ "if(p&&p.closeIfOpen())return 'picker';return " + TABLET_BACK_OVERLAY_PROBE_JS + ";})()", value -> {
+					if (value != null && value.contains("picker")) return;
 					if (value != null && value.contains("none")) {
 						finishWebBack();
 						return;
@@ -5566,12 +7044,48 @@ public class MainActivity extends Activity {
 
 	private final class AppBridge {
 		@JavascriptInterface
+		public void switchServer(String kind, String id, String capability) {
+			if (switchVisualLock) return;
+			runOnUiThread(() -> MainActivity.this.switchServer(kind, id, capability));
+		}
+
+		/** 浮层里的添加、编辑、删除。返回 JSON 字符串，失败原因给菜单自己显示。 */
+		@JavascriptInterface
+		public String editServer(String op, String payload, String capability) {
+			if (!ServerPicker.authorized(capability, serverPickerCapability, isTabletClass(),
+				uiState == UiState.WEB, webView == null ? null : activeUrl, activeGatewayHost, activeGatewayPort)) {
+				return "{\"ok\":false,\"error\":\"当前页面无权修改服务器\"}";
+			}
+			if (serverSwitchInFlight) return "{\"ok\":false,\"error\":\"正在切换服务器，请稍候\"}";
+			if ("stop".equals(op)) {
+				runOnUiThread(() -> { if (!serverSwitchInFlight) stopTunnel(); });
+				return "{\"ok\":true}";
+			}
+			try {
+				JSONObject body = new JSONObject(payload == null || payload.isEmpty() ? "{}" : payload);
+				JSONObject result = ServerPicker.applyEdit(prefs(), op, body, serverPickerCurrent);
+				if (result.optBoolean("ok") && result.optBoolean("connect")) {
+					String kind = result.optString("kind");
+					String id = result.optString("id");
+					runOnUiThread(() -> connectEditedServer(kind, id));
+				} else if (result.optBoolean("ok")) {
+					runOnUiThread(() -> { if (webView != null) syncServerPicker(webView); });
+				}
+				return result.toString();
+			} catch (org.json.JSONException error) {
+				return "{\"ok\":false,\"error\":\"服务器内容无法识别\"}";
+			}
+		}
+
+		@JavascriptInterface
 		public void openSettings() {
+			if (switchVisualLock) return;
 			runOnUiThread(() -> showConnectionSettings());
 		}
 
 		@JavascriptInterface
 		public void setPageDark(boolean dark) {
+			if (switchVisualLock) return;
 			runOnUiThread(() -> {
 				applyPageDark(dark);
 				// T108：页面侧主题**翻转**才会过桥（hook 的 syncPageTheme 自带 lastPageDark 去重）
@@ -5583,6 +7097,7 @@ public class MainActivity extends Activity {
 
 		@JavascriptInterface
 		public void setSessionNotice(String title, String text, boolean running) {
+			if (switchVisualLock) return;
 			TunnelService.updateSessionNotice(getApplicationContext(), title, text, running);
 		}
 
@@ -5594,6 +7109,7 @@ public class MainActivity extends Activity {
 		 */
 		@JavascriptInterface
 		public void setUiDiag(String json) {
+			if (switchVisualLock) return;
 			String summary;
 			try {
 				summary = formatUiDiag(json);
@@ -5643,6 +7159,7 @@ public class MainActivity extends Activity {
 
 		@JavascriptInterface
 		public void imeFocusRect(double topCssPx, double bottomCssPx) {
+			if (switchVisualLock) return;
 			float density = getResources().getDisplayMetrics().density;
 			if (topCssPx < 0 || bottomCssPx < 0) {
 				lastImeFocusTopPx = -1;

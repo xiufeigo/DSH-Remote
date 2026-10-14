@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>服务器菜单审查稿</title>
+<style>
+  :root {
+    --side: #f3f4f6;
+    --line: #e6e6e8;
+    --text: #1c1c1e;
+    --muted: #8a8a8e;
+    --hover: #e8e8ec;
+    --fill: #fff;
+    --ok: #2f9e6b;
+    --danger: #c2413a;
+    --side-w: 292px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--text);
+    background: #e9eaee;
+  }
+  .stage {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    background: #fff;
+  }
+  .status {
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    font-size: 12px;
+    color: #3a3a3c;
+    background: #fff;
+  }
+  .app { flex: 1; display: flex; min-height: 0; }
+  aside {
+    width: var(--side-w);
+    background: var(--side);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border-right: 1px solid #ececee;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 48px;
+    padding: 0 16px;
+    font-size: 13px;
+    letter-spacing: 0.02em;
+  }
+  .brand b { font-weight: 700; }
+  .brand span { color: #6b6b70; font-weight: 650; font-size: 11px; letter-spacing: 0.08em; }
+  .whale { width: 16px; height: 16px; }
+  .trigger-wrap { padding: 0 12px 8px; }
+  .trigger, .menu button.row, .field input, .save, .ghost, .add, .quiet {
+    font: inherit;
+    color: inherit;
+  }
+  .trigger {
+    width: 100%;
+    height: 40px;
+    border-radius: 12px;
+    border: 1px solid var(--line);
+    background: var(--fill);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 12px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .trigger:hover, .row:hover, .add:hover, .quiet:hover, .icon-btn:hover { background: var(--hover); }
+  .trigger svg { width: 16px; height: 16px; flex: none; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); flex: none; }
+  .trigger .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+  .chev { transition: transform 0.15s ease; }
+  .trigger[aria-expanded="true"] .chev { transform: rotate(180deg); }
+  .manager {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 0 12px 12px;
+  }
+  .manager[hidden], .nav[hidden], .form[hidden], .list[hidden] { display: none; }
+  .list, .form { display: block; }
+  .scroll { overflow: visible; }
+  .section {
+    margin: 10px 4px 4px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .row, .add, .quiet {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    border-radius: 10px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 8px 8px 10px;
+  }
+  .row[aria-current="true"] { background: #e7e7eb; }
+  .copy { flex: 1; min-width: 0; }
+  .copy b, .copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .copy b { font-weight: 600; font-size: 14px; }
+  .copy small { margin-top: 2px; color: var(--muted); font-size: 12px; }
+  .check { width: 16px; color: var(--ok); font-size: 14px; text-align: center; }
+  .icon-btn {
+    width: 28px;
+    height: 28px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: #5c5c61;
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+  }
+  .add, .quiet {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 36px;
+    padding: 0 10px;
+    font-size: 14px;
+  }
+  .add { color: var(--text); }
+  .quiet { color: var(--muted); }
+  .foot { padding-top: 8px; border-top: 1px solid #e4e4e7; margin-top: 8px; }
+  .form-head {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: 36px;
+    margin-bottom: 8px;
+  }
+  .back {
+    width: 28px;
+    height: 28px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    cursor: pointer;
+  }
+  .back:hover { background: var(--hover); }
+  .form-head h2 { margin: 0; font-size: 15px; font-weight: 650; }
+  .seg[hidden] { display: none; }
+  .seg {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    padding: 2px;
+    background: #e7e7eb;
+    border-radius: 10px;
+    margin-bottom: 12px;
+  }
+  .seg button {
+    height: 30px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    color: #3a3a3c;
+  }
+  .seg button[aria-pressed="true"] { background: #fff; font-weight: 650; }
+  label { display: block; margin: 0 2px 10px; }
+  label span { display: block; margin: 0 0 4px 2px; font-size: 12px; color: var(--muted); }
+  .pair { display: grid; grid-template-columns: 88px 1fr; gap: 8px; }
+  input {
+    width: 100%;
+    height: 36px;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: #fff;
+    padding: 0 10px;
+    outline: none;
+  }
+  input:focus { border-color: #b9b9bf; }
+  .secret { position: relative; }
+  .secret input { padding-right: 52px; }
+  .reveal {
+    position: absolute;
+    right: 8px;
+    top: 26px;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .choices { display: grid; gap: 6px; margin: 2px 0 12px; }
+  .choice {
+    display: grid;
+    grid-template-columns: 16px 1fr;
+    gap: 8px;
+    align-items: start;
+    padding: 8px 10px;
+    border-radius: 10px;
+    border: 1px solid transparent;
+    background: transparent;
+    text-align: left;
+    font: inherit;
+    cursor: pointer;
+  }
+  .choice[aria-pressed="true"] { background: #fff; border-color: var(--line); }
+  .choice i {
+    width: 14px;
+    height: 14px;
+    margin-top: 2px;
+    border-radius: 50%;
+    border: 1.5px solid #b0b0b6;
+    display: block;
+  }
+  .choice[aria-pressed="true"] i { border: 4px solid var(--text); }
+  .choice b { display: block; font-size: 13px; font-weight: 650; }
+  .choice small { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; line-height: 1.35; }
+  .error { margin: -4px 2px 8px; color: var(--danger); font-size: 12px; }
+  .actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 4px; }
+  .ghost, .save {
+    height: 34px;
+    padding: 0 14px;
+    border-radius: 10px;
+    cursor: pointer;
+  }
+  .ghost { border: 0; background: transparent; }
+  .save { border: 0; background: #1c1c1e; color: #fff; }
+  .save:hover { background: #333; }
+  .danger-link {
+    margin-top: 14px;
+    border: 0;
+    background: transparent;
+    color: var(--danger);
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    padding: 0 2px;
+  }
+  .confirm {
+    margin-top: 12px;
+    padding: 10px;
+    border-radius: 10px;
+    background: #fff;
+    border: 1px solid var(--line);
+    font-size: 13px;
+  }
+  .confirm p { margin: 0 0 8px; }
+  .nav { padding: 4px 12px 12px; }
+  .nav-btn {
+    width: 100%;
+    height: 40px;
+    border: 0;
+    border-radius: 12px;
+    background: #fff;
+    font: inherit;
+    text-align: left;
+    padding: 0 14px;
+    cursor: pointer;
+  }
+  .linkish, .folder {
+    display: block;
+    padding: 8px 14px;
+    color: #3a3a3c;
+    font-size: 14px;
+    text-decoration: none;
+  }
+  .group-label {
+    margin: 14px 14px 4px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .grow { flex: 1; }
+  .side-foot { padding: 8px 14px 16px; color: #3a3a3c; font-size: 14px; }
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; background: #fff; }
+  .top {
+    height: 52px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 20px;
+    border-bottom: 1px solid #f2f2f4;
+    font-size: 14px;
+  }
+  .top .sub { color: var(--muted); font-size: 13px; }
+  .body { flex: 1; }
+  .composer-wrap { padding: 0 18% 22px; }
+  .composer {
+    border: 1px solid #ececef;
+    border-radius: 18px;
+    padding: 14px 14px 10px;
+    color: #b0b0b6;
+    font-size: 14px;
+  }
+  .composer .bar {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 18px;
+    color: #8e8e93;
+    font-size: 13px;
+  }
+  .note {
+    position: fixed;
+    right: 16px;
+    bottom: 14px;
+    font-size: 12px;
+    color: #6b6b70;
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 6px 10px;
+  }
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="status"><span>16:12</span><span>WLAN  86%</span></div>
+  <div class="app">
+    <aside>
+      <div class="brand">
+        <svg class="whale" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 13c2-6 8-8 14-6-2 2-2 4-1 6 2 0 4-1 5-3-1 6-6 9-12 8-2 2-4 2-6 1 2-2 2-4 0-6Z"/></svg>
+        <b>deepseek</b> <span>HARNESS</span>
+      </div>
+      <div class="trigger-wrap">
+        <button class="trigger" id="trigger" type="button" aria-expanded="true" aria-controls="manager">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          <i class="dot" aria-hidden="true"></i>
+          <span class="name" id="currentName">轻凡</span>
+          <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg>
+        </button>
+      </div>
+      <div class="manager" id="manager">
+        <div class="list" id="listView">
+          <div class="scroll" id="list"></div>
+          <div class="foot">
+            <button class="add" id="addBtn" type="button">＋ 添加服务器</button>
+            <button class="quiet" id="stopBtn" type="button">停止隧道</button>
+          </div>
+        </div>
+        <form class="form" id="formView" hidden>
+          <div class="form-head">
+            <button class="back" id="backBtn" type="button" aria-label="返回">←</button>
+            <h2 id="formTitle">添加服务器</h2>
+          </div>
+          <div class="scroll">
+            <div class="seg" id="kindSeg">
+              <button type="button" id="kindTunnel" aria-pressed="true">隧道</button>
+              <button type="button" id="kindDirect" aria-pressed="false">直连</button>
+            </div>
+            <div id="tunnelFields">
+              <label>名称<span class="sr"></span><input id="fName" placeholder="例如 家里的电脑"></label>
+              <label>VPS 地址<input id="fHost" placeholder="与电脑端一致" autocomplete="off"></label>
+              <div class="pair">
+                <label>控制端口<input id="fPort" inputmode="numeric" value="7000"></label>
+                <label>隧道名<input id="fTunnel" value="dsh-remote"></label>
+              </div>
+              <label class="secret">登录密钥<input id="fToken" type="password" placeholder="frps 的 auth.token"><button class="reveal" type="button" data-for="fToken">显示</button></label>
+              <label class="secret">访客密钥<input id="fSk" type="password" placeholder="与电脑插件一致"><button class="reveal" type="button" data-for="fSk">显示</button></label>
+              <div class="section" style="margin-left:2px">连接方式</div>
+              <div class="choices">
+                <button class="choice" id="optP2p" type="button" aria-pressed="true"><i></i><span><b>打洞优先</b><small>先试直连，打不通再经 VPS 中转。</small></span></button>
+                <button class="choice" id="optRelay" type="button" aria-pressed="false"><i></i><span><b>只用中转</b><small>不打洞，建连更稳，流量经过 VPS。</small></span></button>
+              </div>
+            </div>
+            <div id="directFields" hidden>
+              <label>名称<input id="dName" placeholder="例如 公司局域网"></label>
+              <label>网关地址<input id="dUrl" placeholder="https://192.168.1.8:18443"></label>
+            </div>
+            <div class="error" id="formError" hidden></div>
+            <div class="confirm" id="confirmBox" hidden>
+              <p id="confirmText"></p>
+              <div class="actions">
+                <button class="ghost" id="confirmNo" type="button">取消</button>
+                <button class="save" id="confirmYes" type="button">删除</button>
+              </div>
+            </div>
+            <button class="danger-link" id="deleteBtn" type="button" hidden>删除这台服务器</button>
+          </div>
+          <div class="actions">
+            <button class="ghost" id="cancelBtn" type="button">取消</button>
+            <button class="save" id="saveBtn" type="button">保存</button>
+          </div>
+        </form>
+      </div>
+      <div class="nav" id="nav" hidden>
+        <button class="nav-btn" type="button">＋ 新会话</button>
+        <a class="linkish" href="#">插件</a>
+        <div class="group-label">工作区</div>
+        <a class="folder" href="#">Temp</a>
+        <a class="folder" href="#">Anux</a>
+        <a class="folder" href="#">optoolkit</a>
+        <a class="folder" href="#">未分组</a>
+        <div class="grow"></div>
+      </div>
+      <div class="side-foot">设置</div>
+    </aside>
+    <main>
+      <div class="top">
+        <b>Deepseek-harness beta更新亮点</b>
+        <span class="sub">标准模式</span>
+      </div>
+      <div class="body"></div>
+      <div class="composer-wrap">
+        <div class="composer">发消息或创建任务
+          <div class="bar"><span>＋  完全权限</span><span>DeepSeek Flash Max</span></div>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+<script>
+(function () {
+  var servers = [
+    { id: "a", kind: "tunnel", name: "轻凡", host: "8.138.19.15", port: "7180", tunnel: "dsh-remote", token: "token-qingfan", sk: "sk-qingfan", strategy: "p2p", current: true },
+    { id: "b", kind: "tunnel", name: "机械君", host: "8.138.19.15", port: "7180", tunnel: "dsh-remote", token: "token-machine", sk: "sk-machine", strategy: "relay", current: false },
+    { id: "c", kind: "direct", name: "原直连入口", url: "https://deepseek-harness.xiufeigo.xyz", current: false }
+  ];
+  var open = true;
+  var editing = null;
+  var kind = "tunnel";
+
+  var trigger = document.getElementById("trigger");
+  var manager = document.getElementById("manager");
+  var nav = document.getElementById("nav");
+  var listView = document.getElementById("listView");
+  var formView = document.getElementById("formView");
+  var list = document.getElementById("list");
+  var currentName = document.getElementById("currentName");
+
+  function current() { return servers.filter(function (s) { return s.current; })[0]; }
+
+  function paintTrigger() {
+    var item = current();
+    currentName.textContent = item ? item.name : "选择服务器";
+    trigger.setAttribute("aria-expanded", open ? "true" : "false");
+    manager.hidden = !open;
+    nav.hidden = open;
+  }
+
+  function detail(item) {
+    if (item.kind === "direct") return item.url.replace(/^https:\/\//, "");
+    return item.host + ":" + item.port;
+  }
+
+  function row(item) {
+    var el = document.createElement("button");
+    el.type = "button";
+    el.className = "row";
+    if (item.current) el.setAttribute("aria-current", "true");
+    el.innerHTML = '<span class="copy"><b></b><small></small></span><span class="check"></span>';
+    el.querySelector("b").textContent = item.name;
+    el.querySelector("small").textContent = (item.kind === "direct" ? "直连 · " : "隧道 · ") + detail(item);
+    el.querySelector(".check").textContent = item.current ? "✓" : "";
+    var edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "icon-btn";
+    edit.setAttribute("aria-label", "编辑" + item.name);
+    edit.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 20h4l10-10-4-4L4 16v4Z"/><path d="m12 6 4 4"/></svg>';
+    edit.addEventListener("click", function (event) {
+      event.stopPropagation();
+      openForm(item);
+    });
+    el.appendChild(edit);
+    el.addEventListener("click", function () { select(item.id); });
+    return el;
+  }
+
+  function paintList() {
+    list.replaceChildren();
+    ["tunnel", "direct"].forEach(function (group) {
+      var items = servers.filter(function (s) { return s.kind === group; });
+      if (!items.length) return;
+      var title = document.createElement("div");
+      title.className = "section";
+      title.textContent = group === "tunnel" ? "隧道" : "直连";
+      list.appendChild(title);
+      items.forEach(function (item) { list.appendChild(row(item)); });
+    });
+    paintTrigger();
+  }
+
+  function select(id) {
+    servers.forEach(function (s) { s.current = s.id === id; });
+    open = false;
+    paintList();
+  }
+
+  function setKind(next) {
+    kind = next;
+    document.getElementById("kindTunnel").setAttribute("aria-pressed", next === "tunnel" ? "true" : "false");
+    document.getElementById("kindDirect").setAttribute("aria-pressed", next === "direct" ? "true" : "false");
+    document.getElementById("tunnelFields").hidden = next !== "tunnel";
+    document.getElementById("directFields").hidden = next !== "direct";
+    document.getElementById("kindSeg").hidden = !!editing;
+  }
+
+  function setStrategy(value) {
+    document.getElementById("optP2p").setAttribute("aria-pressed", value === "p2p" ? "true" : "false");
+    document.getElementById("optRelay").setAttribute("aria-pressed", value === "relay" ? "true" : "false");
+  }
+
+  function openForm(item) {
+    editing = item;
+    document.getElementById("formError").hidden = true;
+    document.getElementById("confirmBox").hidden = true;
+    document.getElementById("deleteBtn").hidden = !item;
+    document.getElementById("formTitle").textContent = item ? "编辑服务器" : "添加服务器";
+    document.getElementById("saveBtn").textContent = item ? "保存" : "保存并连接";
+    setKind(item ? item.kind : "tunnel");
+    document.getElementById("fName").value = item && item.kind === "tunnel" ? item.name : "";
+    document.getElementById("fHost").value = item && item.kind === "tunnel" ? item.host : "";
+    document.getElementById("fPort").value = item && item.kind === "tunnel" ? item.port : "7000";
+    document.getElementById("fTunnel").value = item && item.kind === "tunnel" ? item.tunnel : "dsh-remote";
+    document.getElementById("fToken").value = item && item.kind === "tunnel" ? item.token : "";
+    document.getElementById("fSk").value = item && item.kind === "tunnel" ? item.sk : "";
+    setStrategy(item && item.strategy === "relay" ? "relay" : "p2p");
+    document.getElementById("dName").value = item && item.kind === "direct" ? item.name : "";
+    document.getElementById("dUrl").value = item && item.kind === "direct" ? item.url : "";
+    listView.hidden = true;
+    formView.hidden = false;
+  }
+
+  function closeForm() {
+    editing = null;
+    formView.hidden = true;
+    listView.hidden = false;
+    paintList();
+  }
+
+  trigger.addEventListener("click", function () {
+    open = !open;
+    if (open) closeForm();
+    paintTrigger();
+  });
+  document.getElementById("addBtn").addEventListener("click", function () { openForm(null); });
+  document.getElementById("backBtn").addEventListener("click", closeForm);
+  document.getElementById("cancelBtn").addEventListener("click", closeForm);
+  document.getElementById("kindTunnel").addEventListener("click", function () { setKind("tunnel"); });
+  document.getElementById("kindDirect").addEventListener("click", function () { setKind("direct"); });
+  document.getElementById("optP2p").addEventListener("click", function () { setStrategy("p2p"); });
+  document.getElementById("optRelay").addEventListener("click", function () { setStrategy("relay"); });
+  document.querySelectorAll(".reveal").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var input = document.getElementById(btn.getAttribute("data-for"));
+      var show = input.type === "password";
+      input.type = show ? "text" : "password";
+      btn.textContent = show ? "隐藏" : "显示";
+    });
+  });
+  document.getElementById("saveBtn").addEventListener("click", function () {
+    var error = document.getElementById("formError");
+    if (kind === "tunnel") {
+      var host = document.getElementById("fHost").value.trim();
+      var port = document.getElementById("fPort").value.trim();
+      if (!host || !/^\d+$/.test(port)) {
+        error.hidden = false;
+        error.textContent = "VPS 地址和控制端口需要与电脑插件一致。";
+        return;
+      }
+      var name = document.getElementById("fName").value.trim() || host;
+      var record = editing || { id: "n" + Date.now(), kind: "tunnel", current: false };
+      record.kind = "tunnel";
+      record.name = name;
+      record.host = host;
+      record.port = port;
+      record.tunnel = document.getElementById("fTunnel").value.trim() || "dsh-remote";
+      record.token = document.getElementById("fToken").value;
+      record.sk = document.getElementById("fSk").value;
+      record.strategy = document.getElementById("optRelay").getAttribute("aria-pressed") === "true" ? "relay" : "p2p";
+      if (!editing) {
+        servers.forEach(function (s) { s.current = false; });
+        record.current = true;
+        servers.push(record);
+      }
+    } else {
+      var url = document.getElementById("dUrl").value.trim();
+      if (!/^https:\/\/.+/i.test(url)) {
+        error.hidden = false;
+        error.textContent = "直连需要一个 https 地址。";
+        return;
+      }
+      var dname = document.getElementById("dName").value.trim() || url;
+      var node = editing || { id: "n" + Date.now(), kind: "direct", current: false };
+      node.kind = "direct";
+      node.name = dname;
+      node.url = url;
+      if (!editing) {
+        servers.forEach(function (s) { s.current = false; });
+        node.current = true;
+        servers.push(node);
+      }
+    }
+    if (!editing) open = false;
+    closeForm();
+  });
+  document.getElementById("deleteBtn").addEventListener("click", function () {
+    document.getElementById("confirmText").textContent = "删除「" + editing.name + "」？不会清除这台电脑上的授权。";
+    document.getElementById("confirmBox").hidden = false;
+  });
+  document.getElementById("confirmNo").addEventListener("click", function () {
+    document.getElementById("confirmBox").hidden = true;
+  });
+  document.getElementById("confirmYes").addEventListener("click", function () {
+    servers = servers.filter(function (s) { return s !== editing; });
+    if (!servers.some(function (s) { return s.current; }) && servers[0]) servers[0].current = true;
+    closeForm();
+  });
+  document.getElementById("stopBtn").addEventListener("click", function () {
+    open = false;
+    paintTrigger();
+  });
+
+  paintList();
+})();
+</script>
+</body>
+</html>
