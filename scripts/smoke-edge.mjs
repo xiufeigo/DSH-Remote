@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { rm } from "node:fs/promises";
 import { test, before, after } from "node:test";
 // PLG-03：公共夹具收敛到 scripts/test-harness.mjs（本文件不再复刻请求/WS/假上游实现）。
-import { startFakeUpstream, requestTls, wsConnect, makeTempHome } from "./test-harness.mjs";
+import { startFakeUpstream, requestTls, wsConnect, makeTempHome, deviceCookieHeader } from "./test-harness.mjs";
 
 // ---------- 测试夹具 ----------
 
@@ -144,11 +144,11 @@ test("正确 Token 登录：自动配对设备并签发长期 Cookie", async () 
 		body: JSON.stringify({ token: ACCESS_TOKEN, name: "测试 iPad" }),
 	});
 	assert.equal(r.status, 200);
-	const cookie = /dr_device=([^;]+)/.exec(r.setCookie)?.[1];
+	const cookie = deviceCookieHeader(r.setCookie);
 	assert.ok(cookie, "应下发 dr_device Cookie");
 	assert.match(r.setCookie, /HttpOnly/i);
 	assert.match(r.setCookie, /Secure/i);
-	fixture.deviceCookie = `dr_device=${cookie}`;
+	fixture.deviceCookie = cookie;
 
 	const { Store } = await import("../packages/gateway/src/store.ts");
 	const devices = (await (await Store.open(fixture.homeDir)).listDevices())

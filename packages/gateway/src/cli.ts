@@ -12,6 +12,7 @@
  */
 
 import { open, readFile, unlink } from "node:fs/promises";
+import https from "node:https";
 import { connect } from "node:net";
 import { join } from "node:path";
 import process from "node:process";
@@ -19,7 +20,7 @@ import { GatewayServer } from "./server.ts";
 import { Store } from "./store.ts";
 import { applyEnvOverrides, type GatewayConfig, normalizeEdgeFrpRole } from "./config.ts";
 import { locateFrBinary, locateFrpcBinary, normalizeFrpMode, normalizeTunnelName, publicEntryEnabled, renderVisitorToml, visitorBindPortOf, visitorConnectionString } from "./frp.ts";
-import { ensureAccessTokenHash, generatePairingCode } from "./auth.ts";
+import { ADMIN_TOKEN_HEADER, ensureAccessTokenHash, generatePairingCode } from "./auth.ts";
 import { ensureCert } from "./cert.ts";
 import { hasDshFingerprint, listLoopbackListeners, resolveUpstreamPort } from "./upstream.ts";
 
@@ -94,6 +95,20 @@ async function main(): Promise<number> {
 			const id = rest[0];
 			if (id === undefined) {
 				console.error("用法：dsh-remote revoke <设备ID>（先 devices 查看）");
+				return 1;
+			}
+			const config = applyEnvOverrides(await store.loadConfig());
+			const via = await revokeViaAdmin(store, config, id);
+			if (via === "ok") {
+				console.log(`已吊销 ${id}`);
+				return 0;
+			}
+			if (via === "missing") {
+				console.log(`未找到在用设备 ${id}`);
+				return 1;
+			}
+			if (via === "error") {
+				console.error("网关正在运行，但管理端点拒绝了吊销。请确认本机密钥后重试，未改设备表。");
 				return 1;
 			}
 			const ok = await store.revokeDevice(id);
@@ -575,6 +590,44 @@ function reportChecks(checks: DoctorCheck[]): number {
 
 function entryUrl(config: GatewayConfig, port: number): string {
 	return `https://${typeof config.frp.serverAddr === "string" && publicEntryEnabled(config.frp) ? config.frp.serverAddr : config.listenHost}:${String(port)}/`;
+}
+
+function revokeViaAdmin(store: Store, config: GatewayConfig, id: string): Promise<"down" | "ok" | "missing" | "error"> {
+	const host = config.listenHost === "0.0.0.0" || config.listenHost === "::" ? "127.0.0.1" : config.listenHost;
+	return probeTcp(host, config.listenPort, 400).then(async (up) => {
+		if (!up) return "down";
+		const adminToken = (await store.ensureSecrets()).adminToken;
+		const body = JSON.stringify({ id });
+		const status = await new Promise<number | undefined>((resolve) => {
+			const req = https.request({
+				host,
+				port: config.listenPort,
+				path: "/__dsh_remote__/admin/revoke",
+				method: "POST",
+				rejectUnauthorized: false,
+				timeout: 4000,
+				headers: {
+					[ADMIN_TOKEN_HEADER]: adminToken,
+					"content-type": "application/json",
+					"content-length": Buffer.byteLength(body),
+				},
+			}, (res) => {
+				res.resume();
+				resolve(res.statusCode);
+			});
+			req.on("error", () => resolve(undefined));
+			req.on("timeout", () => {
+				req.destroy();
+				resolve(undefined);
+			});
+			req.end(body);
+		});
+		if (status === 200) return "ok";
+		if (status === 404) return "missing";
+		// 403 是本网关拒绝了管理密钥，不能改本地设备表。连不上或不是本网关时回落本地吊销。
+		if (status === 403) return "error";
+		return "down";
+	});
 }
 
 function probeTcp(host: string, port: number, timeoutMs = 2000): Promise<boolean> {

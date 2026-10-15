@@ -118,6 +118,9 @@ public final class ProfileStore {
 		 * 指纹，按配置档身份锁定（见 CertPin），切档才不会再互相误报。
 		 */
 		public String fingerprint = "";
+		/** 可选 frps CA 路径。空表示不校验。 */
+		public String tlsCaFile = "";
+		public String tlsServerName = "";
 		/**
 		 * 这台机器在手机上的固定本地端口。0 表示还没分配。
 		 * 同一个 frpc 进程里每台各听一个端口，切换时直接打开对应的 127.0.0.1。
@@ -141,6 +144,8 @@ public final class ProfileStore {
 			c.authToken = authToken;
 			c.bindPort = bindPort >= 1 && bindPort <= 65535 ? bindPort : BIND_PORT;
 			c.fingerprint = CertPin.normalizeFingerprint(fingerprint);
+			c.tlsCaFile = tlsCaFile == null ? "" : tlsCaFile;
+			c.tlsServerName = tlsServerName == null ? "" : tlsServerName;
 			// T104：策略原样带过去；"打洞优先在这台电脑上不成立"时由 VisitorConfig.effectiveStrategy()
 			// 统一落回 relay（判据只有一处，UI 与 toml 不会各说一套）。
 			c.strategy = effectiveStrategy(this);
@@ -162,6 +167,8 @@ public final class ProfileStore {
 				o.put("pcMode", VisitorConfig.normalizePcMode(pcMode));
 				o.put("tunnelName", tunnelName);
 				o.put("fingerprint", fingerprint);
+				if (tlsCaFile != null && tlsCaFile.length() > 0) o.put("tlsCaFile", tlsCaFile);
+				if (tlsServerName != null && tlsServerName.length() > 0) o.put("tlsServerName", tlsServerName);
 				if (bindPort >= 1 && bindPort <= 65535) o.put("bindPort", bindPort);
 			} catch (Exception ignored) {
 			}
@@ -186,6 +193,8 @@ public final class ProfileStore {
 			// 存量配置组没有这个键（optString 兜空），由 toVisitorConfig() 规范化为空串
 			// ⇒ 退化到 TOFU，不会拿旧值误判。
 			p.fingerprint = CertPin.normalizeFingerprint(o.optString("fingerprint", ""));
+			p.tlsCaFile = o.optString("tlsCaFile", "");
+			p.tlsServerName = o.optString("tlsServerName", "");
 			int storedPort = o.optInt("bindPort", 0);
 			p.bindPort = storedPort >= 1 && storedPort <= 65535 ? storedPort : 0;
 			return p;
@@ -430,7 +439,7 @@ public final class ProfileStore {
 		return -1;
 	}
 
-	private static boolean isBindable(int port) {
+	public static boolean isBindable(int port) {
 		ServerSocket socket = null;
 		try {
 			socket = new ServerSocket();

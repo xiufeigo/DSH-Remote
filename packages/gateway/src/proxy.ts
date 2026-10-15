@@ -22,12 +22,18 @@ export interface Upstream {
 	/** 上游是 HTTPS（如隧道对端的 PC 网关自签服务）时按 TLS 连接，证书不校验（指纹可后续加）。 */
 	tls?: boolean;
 	/**
-	 * DSH 0.1.2+ 浏览器会话 cookie（"name=value"，session.ts 铸造缓存）。
-	 * 缺省（旧版宿主 / TLS 上游 / 令牌未就绪）不注入 —— 行为与旧版一致。
+	 * 注入给上游的 Cookie（"name=value"）。
+	 * 本机 DSH 会话由 session.ts 铸造；edge 对端设备凭据由 peer-device.ts 换取。
+	 * 缺省则不注入。浏览器自己的 Cookie 一律不转发。
 	 */
 	sessionCookie?: string;
-	/** 注入了会话 cookie 的请求被上游 401 拒绝时回调（触发 session.ts 重铸）。 */
-	onUnauthorized?: () => void;
+	/**
+	 * 注入的 Cookie 被上游拒绝时回调。
+	 * 返回新 Cookie 时，GET/HEAD 遇到对端登录跳转会用它重试一次。
+	 */
+	onUnauthorized?: () => void | Promise<string | undefined>;
+	/** 对端登录跳转已经重试过，避免来回重放。 */
+	authRetried?: boolean;
 }
 
 /** 上游 HTTPS 自签证书专用 agent（进程级单例，keep-alive 复用）。 */
@@ -92,7 +98,13 @@ export function isApiPath(pathname: string): boolean {
  * 杀后台不丢——二次冷启动直接读盘，不再经隧道全量拉。只在上游无
  * cache-control 时补（尊重上游显式语义）；文件名无哈希的不碰（内容会变）。
  */
-const HASHED_ASSET = /\/[^/]*[.-][0-9A-Za-z_-]{8,}\.(?:js|mjs|css|woff2?|ttf|otf|eot|png|jpe?g|gif|webp|svg|ico)$/;
+/**
+ * 内容寻址文件名。哈希段必须像构建产物，而不是普通单词：
+ * 小写十六进制（deadbeef）、含数字（AbC12345 / CCJJTK99），
+ * 或 Vite 那种大小写混合（BPHePDI_）。纯大写 ABCDEFGH、纯小写单词、main_menu 不算。
+ * 与 pwa.ts 里的 HASHED_NAME 逐字相同。
+ */
+export const HASHED_ASSET = /\/[^/]*[.-](?:[0-9a-f]{8,}|(?=[0-9A-Za-z_-]{8,}\.)(?:(?=[0-9A-Za-z_-]*[0-9])|(?=[0-9A-Za-z_-]*[A-Z])(?=[0-9A-Za-z_-]*[a-z_]))[0-9A-Za-z_-]{8,})\.(?:js|mjs|css|woff2?|ttf|otf|eot|png|jpe?g|gif|webp|svg|ico)$/;
 
 export function applyImmutableCache(
 	req: IncomingMessage,
@@ -287,7 +299,11 @@ export function proxyHttp(
 			method: req.method,
 			path: req.url,
 			headers,
-			...(upstream.tls === true ? { agent: insecureUpstreamAgent, servername: upstream.host } : {}),
+			...(upstream.tls === true ? {
+				agent: insecureUpstreamAgent,
+				// IP 不能当 SNI（RFC 6066）。证书校验本来就是关掉的。
+				...(net.isIP(upstream.host) ? {} : { servername: upstream.host }),
+			} : {}),
 		},
 		(upstreamRes) => {
 			upstreamResponded = true;
@@ -307,9 +323,38 @@ export function proxyHttp(
 					log?.(`upstream-401 ${String(req.method ?? "GET")} ${pathnameOf(req.url)}（有会话cookie=${String(upstream.sessionCookie !== undefined)}）`);
 				} catch { /* 打点绝不影响代理主流程 */ }
 			}
-			if (status === 401 && upstream.sessionCookie !== undefined) {
+			const locationHeader = upstreamRes.headers.location;
+			const peerLogin = status === 302
+				&& !upstream.authRetried
+				&& typeof locationHeader === "string"
+				&& locationHeader.includes("/__dsh_remote__/login");
+			if ((status === 401 || peerLogin) && upstream.sessionCookie !== undefined) {
 				try {
-					upstream.onUnauthorized?.();
+					const renewed = upstream.onUnauthorized?.();
+					if (renewed instanceof Promise && peerLogin && (req.method === "GET" || req.method === "HEAD")) {
+						upstreamRes.resume();
+						void renewed.then((cookie) => {
+							if (res.headersSent || res.destroyed) return;
+							if (typeof cookie !== "string") {
+								res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+								res.end("dsh-remote: 对端网关登录失败");
+								return;
+							}
+							proxyHttp(req, res, {
+								...upstream,
+								sessionCookie: cookie,
+								authRetried: true,
+								onUnauthorized: undefined,
+							}, transformHtml, log);
+						}).catch(() => {
+							if (!res.headersSent) {
+								res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+								res.end("dsh-remote: 对端网关登录失败");
+							}
+						});
+						return;
+					}
+					if (renewed instanceof Promise) renewed.catch(() => {});
 				} catch { /* 回调异常不影响代理主流程 */ }
 			}
 			const outHeaders: Record<string, string | string[]> = {};
@@ -765,7 +810,11 @@ export function proxyUpgrade(
 
 	const connectOptions = { host: upstream.host, port: upstream.port };
 	const upstreamSocket = upstream.tls === true
-		? tls.connect({ ...connectOptions, rejectUnauthorized: false, servername: upstream.host }, () => {
+		? tls.connect({
+			...connectOptions,
+			rejectUnauthorized: false,
+			...(net.isIP(upstream.host) ? {} : { servername: upstream.host }),
+		}, () => {
 			upstreamSocket.write(lines.join("\r\n"));
 			if (head.length > 0) upstreamSocket.write(head);
 			socket.pipe(upstreamSocket);

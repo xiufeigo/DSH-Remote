@@ -32,7 +32,7 @@ import { buildUpstreamHeaders } from "../packages/gateway/src/proxy.ts";
 import { UpstreamSession, DSH_UNAUTHORIZED_MARKER } from "../packages/gateway/src/session.ts";
 import { hasDshFingerprint } from "../packages/gateway/src/upstream.ts";
 import { createLaunchTokenDelivery } from "../packages/plugin/lib/index.js";
-import { requestTls, wsConnect, createTestGateway, waitFor } from "./test-harness.mjs";
+import { requestTls, wsConnect, createTestGateway, waitFor, deviceCookieHeader } from "./test-harness.mjs";
 
 // ---------- Part 1：UpstreamSession 单元（fetch 全注入，无真实网络） ----------
 
@@ -414,9 +414,9 @@ const paired = await requestTls(gwUrl("/__dsh_remote__/pair"), {
 	body: JSON.stringify({ code: "sess-tone", name: "会话测试机" }),
 });
 assert.equal(paired.status, 200, `配对应成功：${paired.body}`);
-const deviceCookie = /dr_device=([^;]+)/.exec(paired.setCookie)?.[1];
+const deviceCookie = deviceCookieHeader(paired.setCookie);
 assert.ok(deviceCookie, "配对应签发 dr_device Cookie");
-const authHeaders = { cookie: `dr_device=${deviceCookie}` };
+const authHeaders = { cookie: deviceCookie };
 
 after(async () => {
 	await gw.destroy();

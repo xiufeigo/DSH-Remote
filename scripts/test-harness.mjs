@@ -142,6 +142,16 @@ export function requestTls(url, { method = "GET", headers = {}, body, timeoutMs 
 }
 
 /**
+ * 从 Set-Cookie 取出本实例的设备 Cookie（必须是 `dr_device_<实例>`），原样作为 Cookie 头的值。
+ * 旧名 `dr_device` 不算成功，避免改名回归被助手函数吞掉。
+ * @param {string | string[] | undefined} setCookie
+ */
+export function deviceCookieHeader(setCookie) {
+	const raw = Array.isArray(setCookie) ? setCookie.join("; ") : String(setCookie ?? "");
+	return /(dr_device_[A-Za-z0-9_-]+=[^;]+)/.exec(raw)?.[1] ?? "";
+}
+
+/**
  * 原始 TLS WebSocket 升级握手：发送最小升级请求，收集响应头文本。
  * - `headersText` 在收到 "\r\n\r\n"（或出错 / 超时）时 settle，语义同原 smoke-edge 的 rawUpgrade；
  * - 需要字节级双向断言时直接使用返回的 `socket`。
@@ -149,13 +159,15 @@ export function requestTls(url, { method = "GET", headers = {}, body, timeoutMs 
  * @param {{ headers?: Record<string, string> | string, timeoutMs?: number }} [options]
  *   headers 传对象则逐条拼为请求头；传字符串则原样作为原始头行（可含多条，行间 \r\n 分隔）。
  */
-export function wsConnect(url, { headers = {}, timeoutMs = 5_000 } = {}) {
+export function wsConnect(url, { headers = {}, timeoutMs = 5_000, origin = true } = {}) {
 	const target = new URL(url);
 	const port = target.port === "" ? 443 : Number(target.port);
 	const path = target.pathname + target.search === "" ? "/" : target.pathname + target.search;
 	const headerLines = typeof headers === "string"
 		? headers
 		: Object.entries(headers).map(([name, value]) => `${name}: ${String(value)}`).join("\r\n");
+	const hasOrigin = /(?:^|\r\n)origin:/i.test(`\r\n${headerLines}`);
+	const originLine = origin && !hasOrigin ? "origin: https://gateway.invalid\r\n" : "";
 
 	const socket = tls.connect({ host: target.hostname, port, rejectUnauthorized: false });
 	let collected = "";
@@ -187,6 +199,7 @@ export function wsConnect(url, { headers = {}, timeoutMs = 5_000 } = {}) {
 			"connection: Upgrade\r\n" +
 			"sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
 			"sec-websocket-version: 13\r\n" +
+			originLine +
 			(headerLines.length > 0 ? `${headerLines}\r\n` : "") +
 			"\r\n",
 		);

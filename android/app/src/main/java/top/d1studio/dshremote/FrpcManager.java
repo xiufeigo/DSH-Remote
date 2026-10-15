@@ -11,6 +11,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Collection;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -48,7 +49,8 @@ public class FrpcManager {
 	private volatile boolean stopping = false;
 	private volatile int startEpoch = 0;
 	private Thread watcher;
-	private long backoffMs = 1000;
+	private volatile long backoffMs = 1000;
+	private volatile long processStartedAt = 0;
 	/** 崩溃重启时重新向调用方要 toml，好让粘性回落写进下一次进程，而不是把旧文件再跑一遍。 */
 	private TomlSource managedSource;
 	private String launchedToml;
@@ -80,7 +82,7 @@ public class FrpcManager {
 
 	public synchronized void start(final VisitorConfig cfg) {
 		managedSource = null;
-		launchToml(cfg.toToml(), cfg.effectiveStrategy(), cfg);
+		launchToml(cfg.toToml(), cfg.effectiveStrategy(), cfg, true);
 	}
 
 	/**
@@ -92,20 +94,30 @@ public class FrpcManager {
 		String toml = source == null ? "" : source.toml();
 		String strategy = source == null ? VisitorConfig.STRATEGY_P2P : source.strategy();
 		if (toml == null || toml.isEmpty()) {
-			managedSource = null;
-			launchedToml = null;
-			stopLocked();
+			stop();
 			return;
 		}
-		launchToml(toml, strategy, null);
+		launchToml(toml, strategy, null, true);
 	}
 
 	public synchronized boolean matchesRunning(String toml) {
 		return toml != null && toml.equals(launchedToml) && !stopping && isProcessAlive(process);
 	}
 
-	private void launchToml(String toml, String strategy, VisitorConfig single) {
+	/**
+	 * 同一份 toml 的崩溃退避还挂在这个对象上（进程还在，或看门狗还在睡）。
+	 * 同步访客集时不要换一个新的 FrpcManager，否则退避会被清成 1 秒。
+	 */
+	public synchronized boolean retainsBackoff(String toml) {
+		boolean watcherAlive = watcher != null && watcher.isAlive();
+		return managedSource != null && !stopping && toml != null && toml.equals(launchedToml)
+			&& (isProcessAlive(process) || watcherAlive);
+	}
+
+	private void launchToml(String toml, String strategy, VisitorConfig single, boolean resetBackoff) {
+		long alive = processStartedAt > 0L ? System.currentTimeMillis() - processStartedAt : 0L;
 		stopLocked();
+		if (resetBackoff || alive >= 60_000L) backoffMs = 1000L;
 		stopping = false;
 		final int epoch = startEpoch;
 		launchedToml = toml;
@@ -127,8 +139,9 @@ public class FrpcManager {
 			ProcessBuilder pb = new ProcessBuilder(binFile.getAbsolutePath(), "-c", conf.getAbsolutePath());
 			pb.redirectErrorStream(true);
 			process = pb.start();
+			processStartedAt = System.currentTimeMillis();
 			log("frpc 启动：-c " + conf.getName());
-			pump(process);
+			pump(process, epoch);
 			if (single != null) watch(single, epoch);
 			else watchManaged(epoch);
 		} catch (Exception e) {
@@ -136,7 +149,7 @@ public class FrpcManager {
 		}
 	}
 
-	private void pump(final Process p) {
+	private void pump(final Process p, final int epoch) {
 		Thread t = new Thread(() -> {
 			InputStream in = p.getInputStream();
 			BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
@@ -145,8 +158,13 @@ public class FrpcManager {
 				// 每次 pump（= 每次 frpc 启动）只发一次就绪信号，避免刷屏；
 				// 崩溃重启后重新 pump，仍能再次触发。
 				boolean signaled = false;
+				boolean wiped = false;
 				while ((line = reader.readLine()) != null) {
 					log(line);
+					if (!wiped && epoch == startEpoch) {
+						wiped = true;
+						wipeConf();
+					}
 					// T104：认"这次到底走了哪条路"的判据只可能是 frpc 自己的话
 					// （打洞成功 / 5s 超时回退），所以每一行都喂给判定器；
 					// 它只认那两条原文，其余行原样忽略，绝不放行任何连接。
@@ -181,10 +199,13 @@ public class FrpcManager {
 			try {
 				int code = p.waitFor();
 				if (stopping || epoch != startEpoch) return;
+				long alive = processStartedAt > 0L ? System.currentTimeMillis() - processStartedAt : 0L;
+				boolean stable = alive >= 60_000L;
+				if (stable) backoffMs = 1000L;
 				log("frpc 退出 code=" + code + "，" + backoffMs + "ms 后重启");
 				Thread.sleep(backoffMs);
 				if (stopping || epoch != startEpoch) return;
-				backoffMs = Math.min(backoffMs * 2, 60000);
+				if (!stable) backoffMs = Math.min(backoffMs * 2, 60000);
 				restartIfCurrent(cfg, epoch);
 			} catch (InterruptedException e) {
 				Thread.currentThread().interrupt();
@@ -196,7 +217,7 @@ public class FrpcManager {
 
 	private synchronized void restartIfCurrent(final VisitorConfig cfg, final int epoch) {
 		if (stopping || epoch != startEpoch) return;
-		start(cfg);
+		launchToml(cfg.toToml(), cfg.effectiveStrategy(), cfg, false);
 	}
 
 	private void watchManaged(final int epoch) {
@@ -206,10 +227,13 @@ public class FrpcManager {
 			try {
 				int code = p.waitFor();
 				if (stopping || epoch != startEpoch) return;
+				long alive = processStartedAt > 0L ? System.currentTimeMillis() - processStartedAt : 0L;
+				boolean stable = alive >= 60_000L;
+				if (stable) backoffMs = 1000L;
 				log("frpc 退出 code=" + code + "，" + backoffMs + "ms 后重启");
 				Thread.sleep(backoffMs);
 				if (stopping || epoch != startEpoch) return;
-				backoffMs = Math.min(backoffMs * 2, 60000);
+				if (!stable) backoffMs = Math.min(backoffMs * 2, 60000);
 				restartManaged(epoch);
 			} catch (InterruptedException e) {
 				Thread.currentThread().interrupt();
@@ -233,10 +257,11 @@ public class FrpcManager {
 			return;
 		}
 		if (toml == null || toml.isEmpty()) return;
-		launchToml(toml, strategy, null);
+		launchToml(toml, strategy, null, false);
 	}
 
 	public synchronized void stop() {
+		backoffMs = 1000L;
 		managedSource = null;
 		launchedToml = null;
 		stopLocked();
@@ -258,7 +283,47 @@ public class FrpcManager {
 				waitExit(p, 1000);
 			}
 		}
-		backoffMs = 1000;
+		wipeConf();
+	}
+
+	private void wipeConf() {
+		File conf = new File(workDir, confName);
+		try {
+			if (!conf.exists()) return;
+			long size = conf.length();
+			if (size > 0) {
+				byte[] zeros = new byte[(int) Math.min(size, 65536)];
+				OutputStream os = new FileOutputStream(conf);
+				os.write(zeros);
+				os.close();
+			}
+			if (!conf.delete() && conf.exists()) Log.w(TAG, "未能删除 " + conf.getName());
+		} catch (Exception e) {
+			Log.w(TAG, "清理隧道配置失败：" + e.getMessage());
+		}
+	}
+
+	/** 删掉已经不在当前分组里的 frpc-fleet-*.toml。 */
+	public static void wipeOrphanFleetFiles(Context context, Collection<String> keepNames) {
+		File dir = context.getFilesDir();
+		File[] files = dir.listFiles();
+		if (files == null) return;
+		for (File file : files) {
+			String name = file.getName();
+			if (!name.startsWith("frpc-fleet-") || !name.endsWith(".toml")) continue;
+			if (keepNames != null && keepNames.contains(name)) continue;
+			try {
+				long size = file.length();
+				if (size > 0) {
+					byte[] zeros = new byte[(int) Math.min(size, 65536)];
+					OutputStream os = new FileOutputStream(file);
+					os.write(zeros);
+					os.close();
+				}
+			} catch (Exception ignored) {
+			}
+			if (!file.delete() && file.exists()) Log.w(TAG, "未能删除残留配置 " + name);
+		}
 	}
 
 	private static boolean isProcessAlive(Process p) {

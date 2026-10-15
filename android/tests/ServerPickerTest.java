@@ -121,8 +121,8 @@ public final class ServerPickerTest {
 		check(created.getBoolean("ok") && created.getBoolean("connect"), "new tunnel is saved and should connect");
 		JSONObject loaded = ServerPicker.applyEdit(prefs, "load", new JSONObject()
 			.put("kind", "tunnel").put("id", created.getString("id")), null);
-		check("picker-login-secret".equals(loaded.getString("token"))
-			&& "8.138.19.15".equals(loaded.getString("host")), "edit form returns the saved tunnel");
+		check("".equals(loaded.getString("token")) && "".equals(loaded.getString("sk"))
+			&& "8.138.19.15".equals(loaded.getString("host")), "edit form does not return secrets");
 		check(!ServerPicker.snapshot(prefs, null, "127.0.0.1").toString().contains("picker-login-secret"),
 			"server list still hides secrets after a menu save");
 		ProfileStore.Profile saved = ProfileStore.get(prefs, created.getString("id"));
@@ -134,6 +134,13 @@ public final class ServerPickerTest {
 			.put("sk", saved.secretKey).put("strategy", "p2p"), live);
 		check(renamed.getBoolean("ok") && !renamed.getBoolean("connect") && live.matches(ProfileStore.get(prefs, saved.id)),
 			"renaming from the menu does not reconnect");
+		JSONObject kept = ServerPicker.applyEdit(prefs, "save", new JSONObject()
+			.put("kind", "tunnel").put("id", saved.id).put("name", "只改显示名")
+			.put("host", saved.serverAddr).put("port", String.valueOf(saved.serverPort))
+			.put("tunnel", saved.tunnelName).put("token", "").put("sk", "").put("strategy", "p2p"), live);
+		ProfileStore.Profile afterBlank = ProfileStore.get(prefs, saved.id);
+		check(kept.getBoolean("ok") && "picker-login-secret".equals(afterBlank.authToken)
+			&& "picker-visitor-secret".equals(afterBlank.secretKey), "blank secrets keep the stored keys");
 		JSONObject rekeyed = ServerPicker.applyEdit(prefs, "save", new JSONObject()
 			.put("kind", "tunnel").put("id", saved.id).put("name", "只改显示名")
 			.put("host", saved.serverAddr).put("port", String.valueOf(saved.serverPort))
@@ -154,6 +161,32 @@ public final class ServerPickerTest {
 			.put("kind", "direct").put("id", https.getString("id")), null);
 		check(removed.getBoolean("ok") && ServerPicker.findDirect(prefs, https.getString("id")) == null,
 			"menu delete removes the direct node");
+		check("\"a\\\"b\\\\\"".equals(VisitorConfig.tomlQuoted("a\"b\\")), "tomlQuoted matches gateway tomlString");
+		VisitorConfig ipv6 = VisitorConfig.parse(
+			"dsh-remote://visitor?mode=stcp&server=2001:db8::1&cport=7000&name=pc&sk=visitor-key-ok!!&token=auth-token-ok!!&bport=18443");
+		check(ipv6 != null && "2001:db8::1".equals(ipv6.serverAddr), "ipv6 frps address imports");
+		StringBuilder longCa = new StringBuilder("dsh-remote://visitor?mode=stcp&server=vps.example&cport=7000&name=pc&sk=visitor-key-ok!!&token=auth-token-ok!!&bport=18443&ca=");
+		for (int i = 0; i < 1025; i++) longCa.append('a');
+		VisitorConfig dropped = VisitorConfig.parse(longCa.toString());
+		check(dropped != null && (dropped.tlsCaFile == null || dropped.tlsCaFile.isEmpty()), "overlong ca does not reject the link");
+		VisitorConfig pinned = VisitorConfig.parse(
+			"dsh-remote://visitor?mode=stcp&server=vps.example&cport=7000&name=pc&sk=visitor-key-ok!!&token=auth-token-ok!!&bport=18443&ca=/etc/frp/ca.crt&sni=frps.example");
+		check(pinned != null && "/etc/frp/ca.crt".equals(pinned.tlsCaFile) && "frps.example".equals(pinned.tlsServerName),
+			"legal ca and sni are kept");
+		String pinnedToml = pinned.toToml();
+		check(pinnedToml.contains("transport.tls.trustedCaFile = \"/etc/frp/ca.crt\""), "legal ca is written into toml");
+		check(pinnedToml.contains("transport.tls.serverName = \"frps.example\""), "legal sni is written into toml");
+		VisitorConfig xtcp = new VisitorConfig();
+		xtcp.mode = "xtcp";
+		xtcp.serverAddr = "vps.example";
+		xtcp.serverPort = 7000;
+		xtcp.serverName = "pc";
+		xtcp.secretKey = "a\"b\\c";
+		xtcp.authToken = "tok";
+		xtcp.bindPort = 18443;
+		String rendered = xtcp.toToml();
+		check(rendered.contains("secretKey = \"a\\\"b\\\\c\""), "visitor secret is toml-quoted");
+		check(rendered.contains("fallbackTo = \"pc-stcp-visitor\""), "fallbackTo is toml-quoted");
 		System.out.println("Server picker tests passed: " + checks);
 	}
 }

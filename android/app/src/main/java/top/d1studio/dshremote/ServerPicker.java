@@ -146,8 +146,7 @@ final class ServerPicker {
 		return new JSONObject().put("ok", true).put("kind", TUNNEL).put("id", profile.id)
 			.put("name", profile.name).put("host", profile.serverAddr)
 			.put("port", String.valueOf(profile.serverPort > 0 ? profile.serverPort : 7000))
-			.put("tunnel", profile.tunnelName).put("token", profile.authToken)
-			.put("sk", profile.secretKey)
+			.put("tunnel", profile.tunnelName).put("token", "").put("sk", "")
 			.put("strategy", ProfileStore.effectiveStrategy(profile))
 			.put("p2pEnabled", hole).put("relayEnabled", relay).put("note", note);
 	}
@@ -185,8 +184,13 @@ final class ServerPicker {
 			return error("隧道名须以字母开头，仅含字母数字和 - _，最长 32 位");
 		}
 		profile.tunnelName = ProfileStore.normalizeTunnelName(tunnel);
-		profile.authToken = body.optString("token", "").trim();
-		profile.secretKey = body.optString("sk", "").trim();
+		String token = body.optString("token", "").trim();
+		String sk = body.optString("sk", "").trim();
+		if (!token.isEmpty()) profile.authToken = token;
+		if (!sk.isEmpty()) profile.secretKey = sk;
+		if (isNew && (profile.authToken.isEmpty() || profile.secretKey.isEmpty())) {
+			return error("请填写完整：VPS 地址、控制端口、登录密钥、访客密钥");
+		}
 		profile.mode = ProfileStore.modeForPcMode(profile.pcMode);
 		profile.strategy = ProfileStore.coerceStrategy(profile, body.optString("strategy", ""));
 		if (profile.name.isEmpty()) profile.name = profile.serverAddr;

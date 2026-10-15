@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { DEFAULT_CONFIG } from "../packages/gateway/src/config.ts";
-import { visitorKeyAdmits } from "../packages/gateway/src/auth.ts";
 import { publicEntryEnabled, renderFrpcToml } from "../packages/gateway/src/frp.ts";
 import { GatewayServer } from "../packages/gateway/src/server.ts";
 import { Store } from "../packages/gateway/src/store.ts";
@@ -22,9 +21,11 @@ test("附加公网映射保留访客名称与 fallback，使用独立本地端�
 		assert.match(entry, /name = "pc-entry"/);
 		assert.match(entry, /localPort = 19443/);
 		assert.match(entry, /remotePort = 9443/);
+		assert.match(entry, /transport\.proxyProtocolVersion = "v2"/);
 		for (const block of blocks.filter(block => block !== entry)) {
 			assert.match(block, /localPort = 18443/);
 			assert.ok(!block.includes("remotePort"));
+			assert.ok(!block.includes("proxyProtocolVersion"));
 		}
 		if (mode === "xtcp") assert.match(toml, /name = "pc-stcp"/);
 		assert.match(toml, /name = "pc"/);
@@ -41,7 +42,11 @@ test("禁用附加映射维持原拓扑；legacy entry 只有一个 TCP 代理",
 	const legacy = renderFrpcToml({ ...options, mode: "entry" });
 	assert.equal((legacy.match(/\[\[proxies\]\]/g) ?? []).length, 1);
 	assert.match(legacy, /name = "pc"/);
-	assert.match(legacy, /localPort = 18443/);
+	assert.match(legacy, /localPort = 19443/);
+	assert.match(legacy, /transport\.proxyProtocolVersion = "v2"/);
+	const bare = renderFrpcToml({ ...options, mode: "entry", entryLocalPort: undefined });
+	assert.match(bare, /localPort = 18443/);
+	assert.ok(!bare.includes("proxyProtocolVersion"));
 });
 
 test("拒绝将公网 proxy 指向访客免配对端口，以及非法公网端口", () => {
@@ -51,12 +56,9 @@ test("拒绝将公网 proxy 指向访客免配对端口，以及非法公网端�
 	}
 });
 
-test("公网和 edge 不能复用访客密钥准入，附加入口默认关闭", () => {
+test("公网入口开关与隧道形态一致", () => {
 	for (const mode of ["stcp", "xtcp"]) {
 		const config = { ...DEFAULT_CONFIG, frp: { ...DEFAULT_CONFIG.frp, enabled: true, mode, entryEnabled: true } };
-		assert.equal(visitorKeyAdmits(config), true);
-		assert.equal(visitorKeyAdmits(config, true), false);
-		assert.equal(visitorKeyAdmits({ ...config, role: "edge" }), false);
 		assert.equal(publicEntryEnabled(config.frp), true);
 		assert.equal(publicEntryEnabled({ ...config.frp, entryEnabled: false }), false);
 		assert.equal(publicEntryEnabled({ ...config.frp, enabled: false }), false);

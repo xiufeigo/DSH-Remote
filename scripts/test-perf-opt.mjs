@@ -34,6 +34,7 @@ import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
 import {
 	acceptedEncodings,
+	HASHED_ASSET,
 	applyImmutableCache,
 	buildUpstreamHeaders,
 	isApiPath,
@@ -383,6 +384,29 @@ test("applyImmutableCache：只给无缓存头的哈希静态补一年", () => {
 	const unhashed = { "content-type": "application/javascript" };
 	applyImmutableCache(fakeReq({ url: "/assets/app.js" }), 200, unhashed);
 	assert.equal(unhashed["cache-control"], undefined);
+
+	const lettersOnly = { "content-type": "application/javascript" };
+	applyImmutableCache(fakeReq({ url: "/assets/index-abcdefgh.js" }), 200, lettersOnly);
+	assert.equal(lettersOnly["cache-control"], undefined, "纯小写单词不算内容哈希");
+
+	const hex = { "content-type": "application/javascript" };
+	applyImmutableCache(fakeReq({ url: "/assets/index-deadbeef.js" }), 200, hex);
+	assert.equal(hex["cache-control"], "public, max-age=31536000, immutable", "小写十六进制哈希仍是内容寻址");
+
+	const upper = { "content-type": "application/javascript" };
+	applyImmutableCache(fakeReq({ url: "/assets/index-ABCDEFGH.js" }), 200, upper);
+	assert.equal(upper["cache-control"], undefined, "纯大写字母不算内容哈希");
+
+	const word = { "content-type": "application/javascript" };
+	applyImmutableCache(fakeReq({ url: "/a/b-main_menu.js" }), 200, word);
+	assert.equal(word["cache-control"], undefined, "带下划线的单词不算内容哈希");
+
+	const vite = { "content-type": "application/javascript" };
+	applyImmutableCache(fakeReq({ url: "/assets/index-BPHePDI_.js" }), 200, vite);
+	assert.equal(vite["cache-control"], "public, max-age=31536000, immutable", "Vite 哈希文件名仍是内容寻址");
+
+	const hashedName = /var HASHED_NAME = (\/[\s\S]*\/);/.exec(renderServiceWorker())?.[1];
+	assert.equal(hashedName, HASHED_ASSET.toString(), "SW 与网关的内容寻址正则必须逐字相同");
 
 	const respected = { "content-type": "text/css", "cache-control": "no-cache" };
 	applyImmutableCache(fakeReq({ url: "/assets/app-AbC12345.css" }), 200, respected);

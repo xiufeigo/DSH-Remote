@@ -313,8 +313,13 @@ export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {})
     if (busy !== null) return
     setMessage(null)
     if (form.frp.enabled) {
-      if (!authToken.trim() || !visitorKey.trim() || !String(form.frp.serverAddr ?? '').trim()) {
+      const key = visitorKey.trim()
+      if (!authToken.trim() || !key || !String(form.frp.serverAddr ?? '').trim()) {
         setMessage({ kind: 'err', text: '请填写 VPS 地址、登录密钥和访客密钥' })
+        return
+      }
+      if (!/^[\x21-\x7E]{16,512}$/.test(key)) {
+        setMessage({ kind: 'err', text: '访客密钥至少 16 位，且只能使用可见 ASCII 字符' })
         return
       }
     }
@@ -324,8 +329,8 @@ export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {})
       const payload: Record<string, unknown> = {
         autoStart: form.autoStart,
         autoFixUpstreamPort: true,
-        listenHost: '127.0.0.1',
-        listenPort: 18443,
+        listenHost: form.listenHost,
+        listenPort: form.listenPort,
         frp: {
           enabled: form.frp.enabled,
           serverAddr: String(form.frp.serverAddr ?? '').trim(),
@@ -334,6 +339,8 @@ export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {})
           entryEnabled: form.frp.entryEnabled,
           remotePort: form.frp.remotePort,
           name: String(form.frp.name ?? '').trim() || 'dsh-remote',
+          tlsTrustedCaFile: String(form.frp.tlsTrustedCaFile ?? '').trim(),
+          tlsServerName: String(form.frp.tlsServerName ?? '').trim(),
         },
       }
       if (form.frp.enabled) {
@@ -480,7 +487,19 @@ export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {})
                     password
                     value={visitorKey}
                     onChange={setVisitorKey}
-                    hint="可自定义，建议使用较长的随机密钥。Android 和公网网页使用同一密钥；修改并保存后，浏览器需重新验证，Android 也需更新密钥。"
+                    hint="至少 16 位可见 ASCII。Android 和公网网页使用同一密钥；修改并保存后，浏览器需重新验证，Android 也需更新密钥。"
+                  />
+                  <TextField
+                    label="frps CA 文件（可选）"
+                    value={String(form.frp.tlsTrustedCaFile ?? '')}
+                    onChange={v => { patchForm({ frp: { ...form.frp, tlsTrustedCaFile: v } }) }}
+                    hint="填写后 frpc 才校验 frps 证书。留空则只加密不校验。路径是电脑上的 CA 文件。"
+                  />
+                  <TextField
+                    label="frps 证书名称（可选）"
+                    value={String(form.frp.tlsServerName ?? '')}
+                    onChange={v => { patchForm({ frp: { ...form.frp, tlsServerName: v } }) }}
+                    hint="与 frps 证书的使用者名称一致，和 CA 文件一起填。"
                   />
                   {tunnel !== null
                     ? (

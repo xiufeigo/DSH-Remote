@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import { rm, readFile } from "node:fs/promises";
 import { test, before, after } from "node:test";
 // PLG-03：公共夹具收敛到 scripts/test-harness.mjs（本文件不再复刻请求/WS/假上游实现）。
-import { startFakeUpstream, requestTls, wsConnect, makeTempHome } from "./test-harness.mjs";
+import { startFakeUpstream, requestTls, wsConnect, makeTempHome, deviceCookieHeader } from "./test-harness.mjs";
 
 // ---------- 测试夹具状态 ----------
 
@@ -177,10 +177,10 @@ test("正确一次性配对码签发设备 Cookie", async () => {
 		body: JSON.stringify({ code: "abcd-efgh", name: "冒烟手机" }),
 	});
 	assert.equal(response.status, 200);
-	const cookie = /dr_device=([^;]+)/.exec(response.setCookie)?.[1];
+	const cookie = deviceCookieHeader(response.setCookie);
 	assert.ok(cookie, "应下发 dr_device Cookie");
 	assert.match(response.setCookie, /HttpOnly/i);
-	fixture.deviceCookie = `dr_device=${cookie}`;
+	fixture.deviceCookie = cookie;
 });
 
 test("同一配对码不可复用", async () => {
@@ -252,7 +252,7 @@ test("RateLimiter：窗口限流与失败锁定", async () => {
 	assert.equal(limiter.notePairFail("ip-c"), true);
 	assert.equal(limiter.notePairFail("ip-c"), false, "达到阈值应锁定");
 	assert.equal(limiter.isLocked("ip-c"), true);
-	assert.equal(limiter.allow("ip-c"), false, "锁定期间全部拒绝");
+	assert.equal(limiter.allow("ip-c"), true, "锁定只拦登录/配对，不拦普通配额");
 });
 
 // ---------- 7. 配对失败锁定（放最后，会锁住回环 IP） ----------
@@ -346,29 +346,7 @@ test("renderVisitorToml：访客配置与 proxy 通过 serverName+secretKey 关�
 	assert.match(toml, /auth\.token = "tok"/, "visitor 也要登录 frps");
 });
 
-test("visitorKeyAdmits：仅启用的 stcp/xtcp 跳过配对", async () => {
-	const { visitorKeyAdmits } = await import("../packages/gateway/src/auth.ts");
-	const { DEFAULT_CONFIG } = await import("../packages/gateway/src/config.ts");
-	assert.equal(visitorKeyAdmits(DEFAULT_CONFIG), false);
-	assert.equal(visitorKeyAdmits({
-		...DEFAULT_CONFIG,
-		frp: { ...DEFAULT_CONFIG.frp, enabled: true, mode: "entry" },
-	}), false);
-	assert.equal(visitorKeyAdmits({
-		...DEFAULT_CONFIG,
-		frp: { ...DEFAULT_CONFIG.frp, enabled: true, mode: "xtcp" },
-	}), true);
-	assert.equal(visitorKeyAdmits({
-		...DEFAULT_CONFIG,
-		frp: { ...DEFAULT_CONFIG.frp, enabled: true, mode: "stcp" },
-	}), true);
-	assert.equal(visitorKeyAdmits({
-		...DEFAULT_CONFIG,
-		frp: { ...DEFAULT_CONFIG.frp, enabled: false, mode: "xtcp" },
-	}), false);
-});
-
-test("xtcp 形态未配对即可访问上游（访客密钥即准入）", async () => {
+test("xtcp 形态未登录进入访客密钥页", async () => {
 	const { Store } = await import("../packages/gateway/src/store.ts");
 	const { DEFAULT_CONFIG } = await import("../packages/gateway/src/config.ts");
 	const { GatewayServer } = await import("../packages/gateway/src/server.ts");
@@ -390,9 +368,8 @@ test("xtcp 形态未配对即可访问上游（访客密钥即准入）", async 
 		const response = await requestTls(`https://127.0.0.1:${String(port)}/`, {
 			headers: { accept: "text/html" },
 		});
-		assert.equal(response.status, 200, "不应再 302 到配对页");
-		assert.equal(response.headers.location ?? "", "");
-		assert.match(response.body, /__dsh_boot__/);
+		assert.equal(response.status, 302, "未登录应进入访客密钥页");
+		assert.match(response.headers.location ?? "", /\/__dsh_remote__\/login/);
 	} finally {
 		await gateway.stop();
 		await rm(homeDir, { recursive: true, force: true });

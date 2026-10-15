@@ -12,7 +12,7 @@
  */
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { chmod, mkdir, readFile, rename, appendFile, stat as statFile, unlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readFile, rename, appendFile, stat as statFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
 	DEFAULT_CONFIG,
@@ -49,6 +49,8 @@ interface SecretsFile {
 	 * 此密钥；同机消费方读出后经 x-dshr-admin-token 头回传，公网侧无从获取。
 	 */
 	adminToken: string;
+	/** 设备 Cookie 名后缀。127.0.0.1 不区分端口，多台电脑必须靠它隔离。 */
+	instanceId: string;
 	/** edge 前置门禁 Token 的 SHA-256（hex）；由 DSHR_ACCESS_TOKEN 首启时写入，只存哈希 */
 	accessTokenHash?: string;
 }
@@ -141,17 +143,41 @@ export class Store {
 	// ---------- 机密 ----------
 
 	async ensureSecrets(): Promise<SecretsFile> {
-		const existing = await this.readJson<SecretsFile>("state/secrets.json");
-		if (existing?.frpAuthToken && existing?.frpVisitorKey && existing?.adminToken) return existing;
-		// 兼容旧版 secrets.json（缺哪个补哪个，其余保留）
+		const existing = await this.readSecretsFile();
+		if (existing?.frpAuthToken && existing?.frpVisitorKey && existing?.adminToken && existing?.instanceId) {
+			return existing;
+		}
+		// 兼容旧版 secrets.json（缺哪个补哪个，其余保留）。损坏文件不在这里重生。
 		const fresh: SecretsFile = {
 			frpAuthToken: existing?.frpAuthToken ?? randomBytes(32).toString("base64url"),
 			frpVisitorKey: existing?.frpVisitorKey ?? randomBytes(32).toString("base64url"),
 			adminToken: existing?.adminToken ?? randomBytes(32).toString("base64url"),
+			instanceId: existing?.instanceId ?? randomBytes(8).toString("hex"),
 			...(existing?.accessTokenHash ? { accessTokenHash: existing.accessTokenHash } : {}),
 		};
 		await this.writeAtomic("state/secrets.json", `${JSON.stringify(fresh, null, "\t")}\n`);
 		return fresh;
+	}
+
+	/** 缺失当没有；JSON 损坏则留备份并抛错，禁止静默换掉全部密钥。 */
+	private async readSecretsFile(): Promise<SecretsFile | undefined> {
+		const relPath = "state/secrets.json";
+		let text: string;
+		try {
+			text = await readFile(this.path(relPath), "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}
+		try {
+			return JSON.parse(text) as SecretsFile;
+		} catch (error) {
+			if (!(error instanceof SyntaxError)) throw error;
+			const src = this.path(relPath);
+			const backup = `${src}.corrupt-${Date.now()}`;
+			await copyFile(src, backup).catch(() => {});
+			throw new Error(`state/secrets.json 已损坏，已备份到 ${backup}，拒绝重新生成密钥`);
+		}
 	}
 
 	/** 写入（或轮换）edge 门禁 Token 哈希；相同值跳过落盘。 */
@@ -190,42 +216,79 @@ export class Store {
 		);
 	}
 
-	async addDevice(name: string, credentialHash?: string): Promise<{ device: DeviceRecord; token: string }> {
-		const token = randomBytes(32).toString("base64url");
-		const now = new Date().toISOString();
-		const device: DeviceRecord = {
-			id: `dev-${randomBytes(4).toString("hex")}`,
-			name: name.trim().length > 0 ? name.trim().slice(0, 64) : "未命名设备",
-			tokenHash: hashToken(token),
-			...(credentialHash === undefined ? {} : { credentialHash }),
-			createdAt: now,
-			lastSeenAt: now,
-		};
-		const devices = await this.listDevices();
-		devices.push(device);
-		await this.saveDevices(devices);
-		await this.audit("device_paired", { id: device.id, name: device.name });
-		return { device, token };
+	private deviceWriteChain: Promise<unknown> = Promise.resolve();
+
+	private enqueueDeviceWrite<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.deviceWriteChain.then(fn, fn);
+		this.deviceWriteChain = run.then(() => undefined, () => undefined);
+		return run;
+	}
+
+	private async readDevicesFresh(): Promise<DeviceRecord[]> {
+		this.devicesCache = undefined;
+		return this.listDevices();
+	}
+
+	async addDevice(name: string, credentialHash?: string, reuseMatching = false): Promise<{ device: DeviceRecord; token: string }> {
+		return this.enqueueDeviceWrite(async () => {
+			const token = randomBytes(32).toString("base64url");
+			const now = new Date().toISOString();
+			const deviceName = name.trim().length > 0 ? name.trim().slice(0, 64) : "未命名设备";
+			const devices = await this.readDevicesFresh();
+			if (reuseMatching && credentialHash !== undefined) {
+				const existing = devices.find((candidate) => !candidate.revokedAt
+					&& candidate.credentialHash === credentialHash
+					&& candidate.name === deviceName);
+				if (existing !== undefined) {
+					existing.tokenHash = hashToken(token);
+					existing.lastSeenAt = now;
+					await this.saveDevices(devices);
+					await this.audit("device_reused", { id: existing.id, name: existing.name });
+					return { device: existing, token };
+				}
+			}
+			const device: DeviceRecord = {
+				id: `dev-${randomBytes(4).toString("hex")}`,
+				name: deviceName,
+				tokenHash: hashToken(token),
+				...(credentialHash === undefined ? {} : { credentialHash }),
+				createdAt: now,
+				lastSeenAt: now,
+			};
+			devices.push(device);
+			await this.saveDevices(devices);
+			await this.audit("device_paired", { id: device.id, name: device.name });
+			return { device, token };
+		});
 	}
 
 	async touchDevice(id: string): Promise<void> {
-		const devices = await this.listDevices();
-		const device = devices.find((candidate) => candidate.id === id);
-		if (device === undefined) return;
-		// 节流：最近 60 秒内已刷新过则跳过落盘
-		if (Date.now() - new Date(device.lastSeenAt).getTime() < 60_000) return;
-		device.lastSeenAt = new Date().toISOString();
-		await this.saveDevices(devices);
+		const cached = this.devicesCache?.devices.find((candidate) => candidate.id === id);
+		if (cached !== undefined) {
+			const seen = Date.parse(cached.lastSeenAt);
+			if (Number.isFinite(seen) && Date.now() - seen < 60_000) return;
+		}
+		return this.enqueueDeviceWrite(async () => {
+			const devices = await this.readDevicesFresh();
+			const device = devices.find((candidate) => candidate.id === id);
+			if (device === undefined) return;
+			// 节流：最近 60 秒内已刷新过则跳过落盘。判定用上面的缓存；只有要写时才重读。
+			if (Date.now() - new Date(device.lastSeenAt).getTime() < 60_000) return;
+			device.lastSeenAt = new Date().toISOString();
+			await this.saveDevices(devices);
+		});
 	}
 
 	async revokeDevice(id: string): Promise<boolean> {
-		const devices = await this.listDevices();
-		const device = devices.find((candidate) => candidate.id === id && !candidate.revokedAt);
-		if (device === undefined) return false;
-		device.revokedAt = new Date().toISOString();
-		await this.saveDevices(devices);
-		await this.audit("device_revoked", { id });
-		return true;
+		return this.enqueueDeviceWrite(async () => {
+			const devices = await this.readDevicesFresh();
+			const device = devices.find((candidate) => candidate.id === id && !candidate.revokedAt);
+			if (device === undefined) return false;
+			device.revokedAt = new Date().toISOString();
+			await this.saveDevices(devices);
+			await this.audit("device_revoked", { id });
+			return true;
+		});
 	}
 
 	// ---------- 一次性配对码（CLI 写入 / 守护进程消费） ----------

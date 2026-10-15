@@ -9,9 +9,20 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { GatewayConfig } from "./config.ts";
+import { proxyClientIpOf } from "./proxyproto.ts";
 import type { Store } from "./store.ts";
 
+/** 无实例标识时的旧名。多实例必须用 {@link deviceCookieName}，避免 127.0.0.1 互相覆盖。 */
 export const COOKIE_NAME = "dr_device";
+const INSTANCE_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+
+export function deviceCookieName(instanceId: string | undefined): string {
+	if (typeof instanceId !== "string" || !INSTANCE_ID_RE.test(instanceId)) return COOKIE_NAME;
+	return `dr_device_${instanceId}`;
+}
+
+/** 带实例后缀的设备 Cookie 名。edge 换票只收这个形态，旧名 `dr_device` 不算。 */
+export const DEVICE_COOKIE_NAME_RE = /^dr_device_[A-Za-z0-9_-]+$/;
 export const PAIR_PAGE = "/__dsh_remote__/pair";
 export const LOGIN_PAGE = "/__dsh_remote__/login";
 export const INTERNAL_PREFIX = "/__dsh_remote__/";
@@ -24,6 +35,8 @@ export interface AuthDeps {
 	config: GatewayConfig;
 	/** 桌面公网会话绑定当前访客密钥；轮换后旧 Cookie 必须失效。 */
 	credentialHash?: string;
+	/** 本网关实例 id，决定设备 Cookie 名。 */
+	instanceId?: string;
 }
 
 // ---------- Cookie ----------
@@ -34,13 +47,17 @@ export function parseCookies(header: string | undefined): Map<string, string> {
 	for (const part of header.split(";")) {
 		const eq = part.indexOf("=");
 		if (eq <= 0) continue;
-		map.set(part.slice(0, eq).trim(), decodeURIComponent(part.slice(eq + 1).trim()));
+		try {
+			map.set(part.slice(0, eq).trim(), decodeURIComponent(part.slice(eq + 1).trim()));
+		} catch {
+			// 畸形百分号编码跳过这一段，不能让整次请求把网关打崩。
+		}
 	}
 	return map;
 }
 
-function deviceTokenOf(req: IncomingMessage): string | undefined {
-	return parseCookies(req.headers.cookie).get(COOKIE_NAME);
+function deviceTokenOf(req: IncomingMessage, instanceId?: string): string | undefined {
+	return parseCookies(req.headers.cookie).get(deviceCookieName(instanceId));
 }
 
 // ---------- 限流 / 锁定 ----------
@@ -124,7 +141,7 @@ export class RateLimiter {
 	allow(ip: string): boolean {
 		const now = Date.now();
 		const bucket = this.bucket(ip);
-		if (bucket.lockedUntil > now) return false;
+		// 锁定只拦登录/配对（isLocked）。已持有设备 Cookie 的流量不因锁定被 429。
 		bucket.hits = bucket.hits.filter((at) => now - at < 60_000);
 		if (bucket.hits.length >= this.perMinute) return false;
 		bucket.hits.push(now);
@@ -217,6 +234,8 @@ function isTrustedProxy(normalizedIp: string, cidrs: string[]): boolean {
  * `config` 缺省时行为退回纯 socket 地址（与旧调用兼容）。
  */
 export function clientIp(req: IncomingMessage, config?: GatewayConfig): string {
+	const proxied = proxyClientIpOf(req.socket);
+	if (proxied !== undefined) return normalizeIp(proxied);
 	const remote = req.socket.remoteAddress ?? "unknown";
 	if (config?.auth?.trustProxyXff === true) {
 		const normalizedRemote = normalizeIp(remote);
@@ -241,7 +260,7 @@ export async function checkRequest(
 	req: IncomingMessage,
 	deps: AuthDeps,
 ): Promise<{ ok: true; deviceId: string } | { ok: false; status: number; reason: string }> {
-	const token = deviceTokenOf(req);
+	const token = deviceTokenOf(req, deps.instanceId);
 	if (token === undefined || token.length === 0) return { ok: false, status: 401, reason: "no-device-token" };
 	const device = await deps.store.deviceByToken(token, deps.credentialHash);
 	if (device === undefined) return { ok: false, status: 401, reason: "invalid-device-token" };
@@ -262,26 +281,50 @@ export function generatePairingCode(): string {
 	return `${code.slice(0, 4)}-${code.slice(4)}`;
 }
 
-export async function issueDeviceCookie(res: ServerResponse, token: string, days: number): Promise<void> {
+export async function issueDeviceCookie(
+	res: ServerResponse,
+	token: string,
+	days: number,
+	instanceId?: string,
+): Promise<void> {
 	const maxAge = Math.floor(days * 24 * 3600);
+	const name = deviceCookieName(instanceId);
 	res.setHeader(
 		"Set-Cookie",
-		`${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`,
+		`${name}=${encodeURIComponent(token)}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`,
 	);
 }
 
-export function clearDeviceCookie(res: ServerResponse): void {
-	res.setHeader("Set-Cookie", `${COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`);
+export function clearDeviceCookie(res: ServerResponse, instanceId?: string): void {
+	const name = deviceCookieName(instanceId);
+	res.setHeader("Set-Cookie", `${name}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`);
 }
 
 /**
- * 仅桌面访客监听口可依赖 stcp/xtcp 密钥准入；公网监听口和 edge 必须设备认证。
- * publicEntry 由服务端监听接线决定，不能由请求头或 URL 指定。
+ * 状态变更与 WebSocket 的同源判定：Origin 的 host:port 必须等于请求的 Host。
+ * 无 Origin、Origin 非法、或指向别的站点，一律不是同源。GET 导航不走这条。
  */
-export function visitorKeyAdmits(config: GatewayConfig, publicEntry = false): boolean {
-	if (publicEntry || config.role === "edge" || config.frp.enabled !== true) return false;
-	const mode = config.frp.mode;
-	return mode === "stcp" || mode === "xtcp";
+export function sameOriginAsHost(req: IncomingMessage): boolean {
+	const originHeader = req.headers.origin;
+	if (typeof originHeader !== "string" || originHeader.length === 0) return false;
+	const hostHeader = req.headers.host;
+	const host = Array.isArray(hostHeader) ? hostHeader[0] : hostHeader;
+	if (typeof host !== "string" || host.trim().length === 0) return false;
+	let parsed: URL;
+	try {
+		parsed = new URL(originHeader);
+	} catch {
+		return false;
+	}
+	if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
+	const left = parsed.host.toLowerCase();
+	const right = host.trim().toLowerCase();
+	if (left === right) return true;
+	const defaultPort = parsed.protocol === "https:" ? "443" : "80";
+	const strip = (value: string) => (
+		value.endsWith(`:${defaultPort}`) ? value.slice(0, -(defaultPort.length + 1)) : value
+	);
+	return strip(left) === strip(right);
 }
 
 // ---------- edge 前置 Token 门禁 ----------

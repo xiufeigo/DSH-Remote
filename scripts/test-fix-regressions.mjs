@@ -31,7 +31,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import tls from "node:tls";
 import { test, after } from "node:test";
-import { requestTls, createTestGateway, makeTempHome } from "./test-harness.mjs";
+import { requestTls, createTestGateway, makeTempHome, deviceCookieHeader } from "./test-harness.mjs";
 
 // ---------- 单元夹具：行为可编排的假上游 ----------
 
@@ -134,9 +134,9 @@ const paired = await requestTls(gwUrl("/__dsh_remote__/pair"), {
 	body: JSON.stringify({ code: "regs-tone", name: "回归测试机" }),
 });
 assert.equal(paired.status, 200, `配对应成功：${paired.body}`);
-const cookie = /dr_device=([^;]+)/.exec(paired.setCookie)?.[1];
+const cookie = deviceCookieHeader(paired.setCookie);
 assert.ok(cookie, "配对应签发 dr_device Cookie");
-const authHeaders = { cookie: `dr_device=${cookie}` };
+const authHeaders = { cookie };
 
 after(async () => {
 	await gw.destroy();
@@ -166,7 +166,7 @@ test("GW-02：窗口限流、失败锁定、容量淘汰与锁定桶保留", asy
 		assert.ok(limiter.notePairFail("9.9.9.2"), "1 次失败未达阈值");
 		assert.ok(!limiter.notePairFail("9.9.9.2"), "2 次失败应锁定");
 		assert.ok(limiter.isLocked("9.9.9.2"), "锁定状态可查询");
-		assert.ok(!limiter.allow("9.9.9.2"), "锁定期内 allow 必须拒绝");
+		assert.ok(limiter.allow("9.9.9.2"), "锁定只拦登录/配对，不拦普通配额");
 		// 容量灌满：超限后桶数封顶、锁定桶不被淘汰
 		for (let i = 0; i < RateLimiter.MAX_BUCKETS + 800; i++) limiter.allow(`10.${String((i >> 8) & 0xff)}.${String(i & 0xff)}.${String(i % 7 + 1)}`);
 		assert.ok(limiter.size <= RateLimiter.MAX_BUCKETS, `桶数 ${String(limiter.size)} 必须封顶于 ${String(RateLimiter.MAX_BUCKETS)}`);
@@ -380,7 +380,8 @@ test("0.1.3+ 流式 POST：官方原始文件上传边收边转（不缓冲）�
 	socket.write(
 		"POST /api/stream-upload HTTP/1.1\r\n" +
 			"host: gateway.invalid\r\n" +
-			`cookie: dr_device=${cookie}\r\n` +
+			"origin: https://gateway.invalid\r\n" +
+			`cookie: ${cookie}\r\n` +
 			"content-type: application/octet-stream\r\n" +
 			"transfer-encoding: chunked\r\n" +
 			"connection: close\r\n\r\n",
@@ -428,7 +429,8 @@ test("P3-10：WS 升级 head > 4KB 回 413（不再裸断连）", async () => {
 			"connection: Upgrade\r\n" +
 			"sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
 			"sec-websocket-version: 13\r\n" +
-			`cookie: dr_device=${cookie}\r\n` +
+			"origin: https://gateway.invalid\r\n" +
+			`cookie: ${cookie}\r\n` +
 			"\r\n" +
 			"0".repeat(8192),
 	);

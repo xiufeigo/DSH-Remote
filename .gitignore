@@ -1,4 +1,7 @@
 node_modules/
+
+# Cursor 本地计划与会话状态，不入库
+.cursor/
 dist/
 *.log
 .DS_Store

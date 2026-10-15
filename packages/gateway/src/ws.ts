@@ -1,12 +1,11 @@
 /**
- * WebSocket 升级入口：认证门与 HTTP 路径同一判定（edge 一律设备 Cookie，
- * desktop 保留访客密钥直通），随后交 proxyUpgrade 按原始字节管道直通上游
- * （只改写寻址头 + 注入 0.1.2+ 会话 cookie，帧层不动）。
+ * WebSocket 升级入口：先要求 Origin 与 Host 同源，再走设备 Cookie（不再凭访客密钥直通），
+ * 随后交 proxyUpgrade 按原始字节管道直通上游。
  */
 
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
-import { INTERNAL_PREFIX, checkRequest, visitorKeyAdmits } from "./auth.ts";
+import { INTERNAL_PREFIX, checkRequest, sameOriginAsHost } from "./auth.ts";
 import { wsPingIntervalMs, type GatewayConfig } from "./config.ts";
 import { proxyUpgrade, type Upstream } from "./proxy.ts";
 import type { Store } from "./store.ts";
@@ -18,8 +17,12 @@ export interface UpgradeDeps {
 	publicEntry?: boolean;
 	/** 与 HTTP 相同的当前登录凭据绑定。 */
 	credentialHash?: string;
-	/** 生效上游地址（含 0.1.2+ 浏览器会话 cookie 接线）。 */
-	resolveUpstream: () => Upstream;
+	/** 本实例设备 Cookie 名后缀。 */
+	instanceId?: string;
+	/** 生效上游地址（含会话 Cookie / edge 对端设备 Cookie）。 */
+	resolveUpstream: () => Upstream | Promise<Upstream>;
+	/** edge 反代电脑端时，没有对端设备 Cookie 就不要把升级请求打过去。 */
+	peerCookieRequired?: boolean;
 }
 
 export async function handleGatewayUpgrade(
@@ -38,11 +41,12 @@ export async function handleGatewayUpgrade(
 		socket.destroy();
 		return;
 	}
-	// edge 一律要求设备 Cookie；desktop 保留访客密钥直通（与 HTTP 路径同一判定）
-	const tunnelAdmits = visitorKeyAdmits(deps.config, deps.publicEntry);
-	const verdict = tunnelAdmits
-		? { ok: true as const, deviceId: "visitor-key" }
-		: await checkRequest(req, deps);
+	if (!sameOriginAsHost(req)) {
+		socket.write("HTTP/1.1 403 Forbidden\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
+		socket.destroy();
+		return;
+	}
+	const verdict = await checkRequest(req, deps);
 	if (!verdict.ok) {
 		socket.write("HTTP/1.1 401 Unauthorized\r\nconnection: close\r\n\r\n");
 		socket.destroy();
@@ -54,7 +58,13 @@ export async function handleGatewayUpgrade(
 		socket.end("HTTP/1.1 413 Payload Too Large\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
 		return;
 	}
-	proxyUpgrade(req, socket as never, head, deps.resolveUpstream(), {
+	const upstream = await deps.resolveUpstream();
+	if (deps.peerCookieRequired === true && upstream.sessionCookie === undefined) {
+		socket.write("HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
+		socket.destroy();
+		return;
+	}
+	proxyUpgrade(req, socket as never, head, upstream, {
 		wsPingIntervalMs: wsPingIntervalMs(deps.config),
 	});
 }

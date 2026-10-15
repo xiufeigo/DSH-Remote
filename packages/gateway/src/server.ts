@@ -16,27 +16,29 @@
 
 import https from "node:https";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import net from "node:net";
 import type { Duplex } from "node:stream";
 import {
 	ADMIN_TOKEN_HEADER,
-	COOKIE_NAME,
 	INTERNAL_PREFIX,
 	LOGIN_PAGE,
 	PAIR_PAGE,
 	RateLimiter,
 	checkRequest,
 	clientIp,
+	deviceCookieName,
 	ensureAccessTokenHash,
 	generatePairingCode,
 	hashAccessToken,
 	isLoopback,
 	issueDeviceCookie,
 	parseCookies,
+	sameOriginAsHost,
 	verifyLoginSecret,
 	verifyAdminToken,
-	visitorKeyAdmits,
 	type LoginKind,
 } from "./auth.ts";
+import { PeerDeviceSession, edgeNeedsPeerDeviceCookie } from "./peer-device.ts";
 import { readJsonBody, respondInvalidBody } from "./body.ts";
 import { ensureCert, loadManualCert, type GatewayCert } from "./cert.ts";
 import {
@@ -75,6 +77,7 @@ import {
 	renderLoginPage,
 	safeNext,
 } from "./views.ts";
+import { parseProxyV2, proxyClientIpOf, setProxyClientIp } from "./proxyproto.ts";
 import { handleGatewayUpgrade } from "./ws.ts";
 
 /**
@@ -97,10 +100,13 @@ export class GatewayServer {
 	readonly store: Store;
 	readonly config: GatewayConfig;
 	private readonly limiter: RateLimiter;
+	private readonly entryLimiter: RateLimiter;
 	private readonly log: (line: string) => void;
 	private readonly env: NodeJS.ProcessEnv;
 	private server?: https.Server;
 	private entryServer?: https.Server;
+	private entryNet?: net.Server;
+	private instanceId?: string;
 	private startPromise?: Promise<void>;
 	private stopPromise?: Promise<void>;
 	private frp?: FrpSupervisor;
@@ -116,6 +122,9 @@ export class GatewayServer {
 	 * 旧版宿主（≤0.1.1-rc.2）无浏览器认证，令牌永不 arrive，注入自然缺席。
 	 */
 	private readonly session: UpstreamSession;
+	/** edge → 电脑端隧道：用访客密钥换来的对端设备 Cookie。 */
+	private readonly peerDevices = new PeerDeviceSession((line) => this.log(line));
+	private peerVisitorKey = "";
 
 	constructor(options: GatewayServerOptions) {
 		this.store = options.store;
@@ -128,10 +137,24 @@ export class GatewayServer {
 			options.config.pairingFailLockThreshold,
 			options.config.pairingFailLockMinutes,
 		);
+		this.entryLimiter = new RateLimiter(
+			options.config.rateLimitPerMinute,
+			options.config.pairingFailLockThreshold,
+			options.config.pairingFailLockMinutes,
+		);
+	}
+
+	private limiterFor(publicEntry: boolean): RateLimiter {
+		return publicEntry ? this.entryLimiter : this.limiter;
 	}
 
 	get actualPort(): number | undefined {
 		const address = this.server?.address();
+		return typeof address === "object" && address !== null ? address.port : undefined;
+	}
+
+	get publicEntryPort(): number | undefined {
+		const address = this.entryNet?.address();
 		return typeof address === "object" && address !== null ? address.port : undefined;
 	}
 
@@ -198,6 +221,25 @@ export class GatewayServer {
 		return { ...base, sessionCookie, onUnauthorized: () => this.session.invalidate(base) };
 	}
 
+	/**
+	 * 反代用的上游。edge 打到电脑端网关时，先换好对端设备 Cookie 再注入。
+	 * 换不到就保持无 Cookie，调用方应回 502，不能把电脑端登录页透给浏览器。
+	 */
+	private async upstreamForProxy(): Promise<Upstream> {
+		const upstream = this.upstreamAddress();
+		if (!edgeNeedsPeerDeviceCookie(this.config)) return upstream;
+		const cookie = await this.peerDevices.ensure(upstream, this.peerVisitorKey);
+		if (cookie === undefined) return upstream;
+		return {
+			...upstream,
+			sessionCookie: cookie,
+			onUnauthorized: () => {
+				this.peerDevices.invalidate(upstream);
+				return this.peerDevices.ensure(upstream, this.peerVisitorKey);
+			},
+		};
+	}
+
 	start(): Promise<void> {
 		if (this.stopPromise !== undefined) return Promise.reject(new Error("网关已关闭，请创建新的实例"));
 		this.startPromise ??= this.startInternal().catch(async (error: unknown) => {
@@ -211,9 +253,17 @@ export class GatewayServer {
 		// P0-2：admin 门禁密钥（ensureSecrets 对旧 secrets.json 自动补齐 adminToken）
 		const secrets = await this.store.ensureSecrets();
 		this.adminToken = secrets.adminToken;
-		if (this.config.role !== "edge" && publicEntryEnabled(this.config.frp)) {
-			// 与 frpc 使用同一来源；不新增另一份浏览器密码配置。
+		this.instanceId = secrets.instanceId;
+		this.peerVisitorKey = secrets.frpVisitorKey;
+		const mode = normalizeFrpMode(this.config.frp.mode);
+		const desktopTunnel = this.config.role !== "edge" && this.config.frp.enabled === true
+			&& (mode === "stcp" || mode === "xtcp");
+		if (desktopTunnel || (this.config.role !== "edge" && publicEntryEnabled(this.config.frp))) {
+			// 主隧道口和公网入口都用访客密钥换设备 Cookie，不再凭隧道密钥直通。
 			this.loginCredential = { kind: "visitor-key", hash: hashAccessToken(secrets.frpVisitorKey) };
+			if (secrets.frpVisitorKey.trim().length < 16) {
+				this.log("警告：访客密钥短于 16 位。面板只接受至少 16 位可见 ASCII；已保存的短密钥仍可登录，避免把现有隧道锁在外面。");
+			}
 		} else {
 			const hash = await ensureAccessTokenHash(this.store, this.env);
 			if (hash !== undefined) this.loginCredential = { kind: "access-token", hash };
@@ -239,11 +289,11 @@ export class GatewayServer {
 		this.server = this.createHttpsServer(false);
 		await this.listen(this.server, this.config.listenPort, this.config.listenHost);
 		this.log(`网关监听 https://${this.config.listenHost}:${String(this.actualPort)}`);
-		if (this.config.role !== "edge" && publicEntryEnabled(this.config.frp)
-			&& normalizeFrpMode(this.config.frp.mode) !== "entry") {
-			// OS 分配回环端口；只有附加 TCP proxy 使用此口，禁止访客免配对准入。
+		if (this.config.role !== "edge" && publicEntryEnabled(this.config.frp)) {
+			// OS 分配回环端口。stcp/xtcp 的附加入口和旧的 mode=entry 都把公网流量打到这里，
+			// 先吃 PROXY v2 再进 HTTPS，这样限流键是真实来源而不是 127.0.0.1。
 			this.entryServer = this.createHttpsServer(true);
-			await this.listen(this.entryServer, 0, "127.0.0.1");
+			await this.listenEntry(this.entryServer);
 		}
 		await this.startFrpIfNeeded();
 	}
@@ -265,10 +315,62 @@ export class GatewayServer {
 				store: this.store,
 				publicEntry,
 				credentialHash: this.credentialHash,
-				resolveUpstream: () => this.upstreamAddress(),
+				instanceId: this.instanceId,
+				resolveUpstream: () => this.upstreamForProxy(),
+				peerCookieRequired: edgeNeedsPeerDeviceCookie(this.config),
 			}).catch(() => socket.destroy());
 		});
+		server.on("secureConnection", (tlsSocket) => {
+			const ip = proxyClientIpOf(tlsSocket);
+			if (ip !== undefined) setProxyClientIp(tlsSocket, ip);
+		});
 		return server;
+	}
+
+	/**
+	 * 公网入口先吃 PROXY v2，再把剩下的字节交给未 listen 的 HTTPS 服务。
+	 * 必须 pauseOnConnect：流式 data 监听会把字节从原生句柄拿走，TLS 握手看不到。
+	 */
+	private listenEntry(httpsServer: https.Server): Promise<void> {
+		const entryNet = net.createServer({ pauseOnConnect: true }, (socket) => {
+			this.acceptEntryConnection(socket, httpsServer);
+		});
+		this.entryNet = entryNet;
+		return new Promise<void>((resolve, reject) => {
+			entryNet.once("error", reject);
+			entryNet.listen(0, "127.0.0.1", () => {
+				entryNet.removeListener("error", reject);
+				resolve();
+			});
+		});
+	}
+
+	private acceptEntryConnection(socket: net.Socket, httpsServer: https.Server): void {
+		let buf = Buffer.alloc(0);
+		const onReadable = () => {
+			let chunk: Buffer | null;
+			while ((chunk = socket.read() as Buffer | null) !== null) buf = Buffer.concat([buf, chunk]);
+			if (buf.length > 4096) {
+				socket.destroy();
+				return;
+			}
+			const parsed = parseProxyV2(buf);
+			if (!parsed.ok) {
+				if (parsed.needMore) return;
+				socket.destroy();
+				return;
+			}
+			socket.off("readable", onReadable);
+			if (parsed.info.srcAddr.length === 0) {
+				socket.destroy();
+				return;
+			}
+			setProxyClientIp(socket, parsed.info.srcAddr);
+			if (parsed.info.rest.length > 0) socket.unshift(parsed.info.rest);
+			httpsServer.emit("connection", socket);
+		};
+		socket.on("readable", onReadable);
+		socket.on("error", () => socket.destroy());
 	}
 
 	private listen(server: https.Server, port: number, host: string): Promise<void> {
@@ -313,8 +415,7 @@ export class GatewayServer {
 		}
 		const secrets = await this.store.ensureSecrets();
 		const mode = normalizeFrpMode(frp.mode);
-		const entryAddress = this.entryServer?.address();
-		const entryLocalPort = typeof entryAddress === "object" && entryAddress !== null ? entryAddress.port : undefined;
+		const entryLocalPort = this.publicEntryPort;
 		const toml = renderFrpcToml({
 			serverAddr: frp.serverAddr,
 			serverPort: frp.serverPort,
@@ -326,6 +427,8 @@ export class GatewayServer {
 			secretKey: secrets.frpVisitorKey,
 			name: frp.name,
 			heartbeat: frpHeartbeatOf(frp),
+			trustedCaFile: frp.tlsTrustedCaFile,
+			tlsServerName: frp.tlsServerName,
 		});
 		const configPath = this.store.path("frp", "frpc.toml");
 		await this.store.writeAtomic("frp/frpc.toml", toml);
@@ -411,6 +514,8 @@ export class GatewayServer {
 			bindAddr: "127.0.0.1",
 			bindPort,
 			heartbeat: frpHeartbeatOf(frp),
+			trustedCaFile: frp.tlsTrustedCaFile,
+			tlsServerName: frp.tlsServerName,
 		});
 		const configPath = this.store.path("frp", role === "frps" ? "frpc-edge-visitor.toml" : "frpc-visitor.toml");
 		await this.store.writeAtomic(role === "frps" ? "frp/frpc-edge-visitor.toml" : "frp/frpc-visitor.toml", visitorToml);
@@ -432,17 +537,20 @@ export class GatewayServer {
 		if (this.frp !== undefined) await this.frp.stop();
 		if (this.visitor !== undefined) await this.visitor.stop();
 		if (this.frps !== undefined) await this.frps.stop();
-		this.limiter.stop(); // GW-02：停止限流桶后台清理定时器
+		this.limiter.stop();
+		this.entryLimiter.stop();
 		await this.closeHttpServer();
 	}
 
 	private async closeHttpServer(): Promise<void> {
 		const servers = [this.server, this.entryServer];
+		const nets = [this.entryNet];
 		this.server = undefined;
 		this.entryServer = undefined;
+		this.entryNet = undefined;
 		// 从未 start（或句柄已被接管）：原先 `this.server?.close(...)` 短路后
 		// resolve 永不被调用 → stop() 悬挂；这里直接视为已关闭
-		await Promise.all(servers.map((server) => {
+		const closeOne = (server: { close: (cb: (error?: Error) => void) => void } | undefined) => {
 			if (server === undefined) return Promise.resolve();
 			return new Promise<void>((resolve, reject) => {
 				server.close((error) => {
@@ -450,7 +558,8 @@ export class GatewayServer {
 					else resolve();
 				});
 			});
-		}));
+		};
+		await Promise.all([...servers.map(closeOne), ...nets.map(closeOne)]);
 	}
 
 	frpStatus() {
@@ -489,7 +598,10 @@ export class GatewayServer {
 				}
 				switch (`${req.method} ${pathname}`) {
 					case "GET /__dsh_remote__/health":
-						res.writeHead(200, { "content-type": "application/json" }).end('{"ok":true}');
+						res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+							ok: true,
+							fingerprint: this.cert?.fingerprintSha256 ?? "",
+						}));
 						return;
 					case "GET /__dsh_remote__/sw.js":
 						// WEB-01（web-pwa）：Service Worker 白名单缓存的 SW 源码。
@@ -516,16 +628,16 @@ export class GatewayServer {
 						res.end(iconPng(192));
 						return;
 					case "GET /__dsh_remote__/pair":
-						await this.handlePairPage(req, res);
+						await this.handlePairPage(req, res, publicEntry);
 						return;
 					case "POST /__dsh_remote__/pair":
-						await this.handlePairSubmit(req, res);
+						await this.handlePairSubmit(req, res, publicEntry);
 						return;
 					case "GET /__dsh_remote__/login":
-						await this.handleLoginPage(req, res, url);
+						await this.handleLoginPage(req, res, url, publicEntry);
 						return;
 					case "POST /__dsh_remote__/login":
-						await this.handleLoginSubmit(req, res);
+						await this.handleLoginSubmit(req, res, publicEntry);
 						return;
 					case "GET /__dsh_remote__/mobile.js":
 						await this.handleMobileScript(req, res);
@@ -540,23 +652,25 @@ export class GatewayServer {
 				}
 			}
 
-			// —— 限流 ——
-			// GW-03：传入 config，edge 反代拓扑下按真实客户端 IP 限流
+			// —— 限流 + 认证 ——
+			// 设备凭据是已认证流量的唯一闸门：Cookie 通过之后没有次数上界。
+			// 未认证才 429。不要改成「超限一律 429」，否则正常会话会被自己的桶掐断。
+			// 锁定只在登录/配对里生效，不在这里。
+			const limiter = this.limiterFor(publicEntry);
 			const ip = clientIp(req, this.config);
-			if (!this.limiter.allow(ip)) {
+			const withinRate = limiter.allow(ip);
+			const verdict = await checkRequest(req, {
+				store: this.store,
+				config: this.config,
+				credentialHash: this.credentialHash,
+				instanceId: this.instanceId,
+			});
+			if (!withinRate && !verdict.ok) {
 				this.store.audit("rate_limited", { ip, path: pathname }).catch(() => {});
 				res.writeHead(429, { "content-type": "text/plain; charset=utf-8" });
 				res.end("dsh-remote: 请求过于频繁");
 				return;
 			}
-
-			// —— 认证门 ——
-			// desktop：stcp/xtcp 形态下访客密钥已挡在隧道外，可免配对码；
-			// edge：本身是公网入口，一律要求设备 Cookie（登录页 / 配对页二选一）。
-			const tunnelAdmits = visitorKeyAdmits(this.config, publicEntry);
-			const verdict = tunnelAdmits
-				? { ok: true as const, deviceId: "visitor-key" }
-				: await checkRequest(req, { store: this.store, config: this.config, credentialHash: this.credentialHash });
 			if (!verdict.ok) {
 				const acceptsHtml = String(req.headers.accept ?? "").includes("text/html");
 				if (acceptsHtml) {
@@ -570,9 +684,21 @@ export class GatewayServer {
 				}
 				return;
 			}
+			// GET/HEAD 导航可以没有 Origin。其余方法必须与 Host 同源，挡住跨站提交。
+			if (req.method !== "GET" && req.method !== "HEAD" && !sameOriginAsHost(req)) {
+				res.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
+				res.end("dsh-remote: 跨站请求已拒绝");
+				return;
+			}
 
 			// —— 反向代理 ——
-			proxyHttp(req, res, this.upstreamAddress(), this.htmlInjector, this.log);
+			const upstream = await this.upstreamForProxy();
+			if (edgeNeedsPeerDeviceCookie(this.config) && upstream.sessionCookie === undefined) {
+				res.writeHead(502, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+				res.end("dsh-remote: 对端网关尚未就绪");
+				return;
+			}
+			proxyHttp(req, res, upstream, this.htmlInjector, this.log);
 		} catch (error) {
 			// P0-1：URL 解析失败按 400（请求行畸形），其余内部错误按 500
 			const malformedUrl = (error as NodeJS.ErrnoException)?.code === "ERR_INVALID_URL";
@@ -587,12 +713,13 @@ export class GatewayServer {
 
 	// ---------- 配对 ----------
 
-	private async handlePairPage(req: IncomingMessage, res: ServerResponse): Promise<void> {
-		if (await this.store.deviceByToken(parseCookies(req.headers.cookie).get(COOKIE_NAME) ?? "", this.credentialHash)) {
+	private async handlePairPage(req: IncomingMessage, res: ServerResponse, publicEntry: boolean): Promise<void> {
+		const limiter = this.limiterFor(publicEntry);
+		if (await this.store.deviceByToken(parseCookies(req.headers.cookie).get(deviceCookieName(this.instanceId)) ?? "", this.credentialHash)) {
 			res.writeHead(302, { location: "/" }).end();
 			return;
 		}
-		const locked = this.limiter.isLocked(clientIp(req, this.config));
+		const locked = limiter.isLocked(clientIp(req, this.config));
 		const next = safeNext(new URL(req.url ?? "/", "https://gateway.invalid").searchParams.get("next"));
 		const html = isDshRemoteAndroid(req)
 			? renderAndroidPairPage(next, locked)
@@ -601,9 +728,10 @@ export class GatewayServer {
 		res.end(html);
 	}
 
-	private async handlePairSubmit(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	private async handlePairSubmit(req: IncomingMessage, res: ServerResponse, publicEntry: boolean): Promise<void> {
+		const limiter = this.limiterFor(publicEntry);
 		const ip = clientIp(req, this.config);
-		if (this.limiter.isLocked(ip)) {
+		if (limiter.isLocked(ip)) {
 			res.writeHead(429, { "content-type": "application/json" });
 			res.end(JSON.stringify({ message: "失败次数过多，已临时锁定" }));
 			return;
@@ -617,14 +745,14 @@ export class GatewayServer {
 		const code = String(payload.code ?? "").toUpperCase().trim();
 		const consumed = await this.store.consumePendingCode(code);
 		if (!consumed) {
-			const stillAllowed = this.limiter.notePairFail(ip);
+			const stillAllowed = limiter.notePairFail(ip);
 			await this.store.audit("pair_failed", { ip });
 			res.writeHead(stillAllowed ? 403 : 429, { "content-type": "application/json" });
 			res.end(JSON.stringify({ message: stillAllowed ? "配对码无效或已过期" : "失败次数过多，已临时锁定" }));
 			return;
 		}
 		const { token } = await this.store.addDevice(String(payload.name ?? ""), this.credentialHash);
-		await issueDeviceCookie(res, token, this.config.deviceTokenDays);
+		await issueDeviceCookie(res, token, this.config.deviceTokenDays, this.instanceId);
 		await this.store.audit("pair_success", { ip });
 		res.writeHead(200, { "content-type": "application/json" });
 		res.end(JSON.stringify({ ok: true }));
@@ -632,8 +760,9 @@ export class GatewayServer {
 
 	// ---------- 访客密钥 / edge 访问 Token 登录 ----------
 
-	private async handleLoginPage(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
-		if (await this.store.deviceByToken(parseCookies(req.headers.cookie).get(COOKIE_NAME) ?? "", this.credentialHash)) {
+	private async handleLoginPage(req: IncomingMessage, res: ServerResponse, url: URL, publicEntry: boolean): Promise<void> {
+		const limiter = this.limiterFor(publicEntry);
+		if (await this.store.deviceByToken(parseCookies(req.headers.cookie).get(deviceCookieName(this.instanceId)) ?? "", this.credentialHash)) {
 			const next = safeNext(new URL(req.url ?? "/", "https://gateway.invalid").searchParams.get("next"));
 			res.writeHead(302, { location: next }).end();
 			return;
@@ -643,15 +772,16 @@ export class GatewayServer {
 			res.writeHead(302, { location: PAIR_PAGE }).end();
 			return;
 		}
-		const locked = this.limiter.isLocked(clientIp(req, this.config));
+		const locked = limiter.isLocked(clientIp(req, this.config));
 		const next = safeNext(url.searchParams.get("next"));
 		res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
 		res.end(renderLoginPage(next, locked, this.loginCredential.kind));
 	}
 
-	private async handleLoginSubmit(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	private async handleLoginSubmit(req: IncomingMessage, res: ServerResponse, publicEntry: boolean): Promise<void> {
+		const limiter = this.limiterFor(publicEntry);
 		const ip = clientIp(req, this.config);
-		if (this.limiter.isLocked(ip)) {
+		if (limiter.isLocked(ip)) {
 			res.writeHead(429, { "content-type": "application/json" });
 			res.end(JSON.stringify({ message: "失败次数过多，已临时锁定" }));
 			return;
@@ -666,7 +796,7 @@ export class GatewayServer {
 		const visitor = this.loginCredential?.kind === "visitor-key";
 		const ok = verifyLoginSecret(submitted, this.loginCredential?.hash, this.loginCredential?.kind ?? "access-token");
 		if (!ok) {
-			const stillAllowed = this.limiter.notePairFail(ip);
+			const stillAllowed = limiter.notePairFail(ip);
 			await this.store.audit(visitor ? "visitor_key_failed" : "token_failed", { ip });
 			res.writeHead(stillAllowed ? 403 : 429, { "content-type": "application/json" });
 			res.end(JSON.stringify({ message: stillAllowed ? `${visitor ? "访客密钥" : "访问 Token"}无效` : "失败次数过多，已临时锁定" }));
@@ -674,10 +804,10 @@ export class GatewayServer {
 		}
 		const requested = String(payload.name ?? "").trim();
 		const deviceName = (requested || deriveDeviceName(req)).slice(0, 64);
-		const { token } = await this.store.addDevice(deviceName, this.credentialHash);
+		const { token } = await this.store.addDevice(deviceName, this.credentialHash, true);
 		const days = visitor ? this.config.deviceTokenDays
 			: typeof this.config.auth?.tokenLoginDays === "number" ? this.config.auth.tokenLoginDays : 30;
-		await issueDeviceCookie(res, token, days);
+		await issueDeviceCookie(res, token, days, this.instanceId);
 		await this.store.audit(visitor ? "visitor_key_login" : "token_login", { ip, device: deviceName });
 		res.writeHead(200, { "content-type": "application/json" });
 		res.end(JSON.stringify({ ok: true }));
@@ -686,7 +816,12 @@ export class GatewayServer {
 	// ---------- 移动 hook 资产（需设备认证，缩小公网指纹面） ----------
 
 	private async handleMobileScript(req: IncomingMessage, res: ServerResponse): Promise<void> {
-		const verdict = await checkRequest(req, { store: this.store, config: this.config, credentialHash: this.credentialHash });
+		const verdict = await checkRequest(req, {
+			store: this.store,
+			config: this.config,
+			credentialHash: this.credentialHash,
+			instanceId: this.instanceId,
+		});
 		if (!verdict.ok) {
 			res.writeHead(401, { "content-type": "application/json" });
 			res.end(JSON.stringify({ error: "unpaired-device", reason: verdict.reason }));

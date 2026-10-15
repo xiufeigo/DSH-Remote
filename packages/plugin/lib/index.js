@@ -20,6 +20,12 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DISPLAY_DEFAULTS, mergeConfigFile, validateConfigPatch } from "./config-schema.js";
 
+/** 网关反代必带这两项。出现即视为经网关转发，设置接口不对外。 */
+export function forwardedGatewayRequest(headers) {
+	if (headers == null || typeof headers !== "object") return false;
+	return headers["x-forwarded-host"] !== undefined || headers["x-forwarded-proto"] !== undefined;
+}
+
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
 
@@ -663,6 +669,10 @@ var plugin_default = {
 						kind: "exact",
 						path,
 						handler: (req, res) => {
+							if (forwardedGatewayRequest(req.headers)) {
+								res.writeHead(403).end();
+								return;
+							}
 							// 同源闸门：拒绝来自非本机页面的跨站请求（含远程经代理的伪造 Origin）
 							const origin = req.headers.origin;
 							if (origin !== undefined) {

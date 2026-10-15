@@ -205,7 +205,7 @@ var FINGERPRINTED_PATH = /^\\/plugins\\/?$/;
 // HASHED_NAME 与 proxy.ts 的 HASHED_ASSET **逐字同形**：网关标 immutable 的
 // 那些文件名，SW 一定也认成内容寻址 ⇒ 两边判定不会漂移。
 var REV_QUERY = /[?&]rev=[0-9A-Za-z_.-]+/;
-var HASHED_NAME = /\\/[^/]*[.-][0-9A-Za-z_-]{8,}\\.(?:js|mjs|css|woff2?|ttf|otf|eot|png|jpe?g|gif|webp|svg|ico)$/;
+var HASHED_NAME = /\\/[^/]*[.-](?:[0-9a-f]{8,}|(?=[0-9A-Za-z_-]{8,}\\.)(?:(?=[0-9A-Za-z_-]*[0-9])|(?=[0-9A-Za-z_-]*[A-Z])(?=[0-9A-Za-z_-]*[a-z_]))[0-9A-Za-z_-]{8,})\\.(?:js|mjs|css|woff2?|ttf|otf|eot|png|jpe?g|gif|webp|svg|ico)$/;
 
 /** 内容寻址 ⇒ 后台重验 100% 拿回同一份字节，纯浪费流量 ⇒ 绝不重验。 */
 function isContentAddressed(url) {

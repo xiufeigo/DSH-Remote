@@ -216,6 +216,7 @@ public class TunnelService extends Service {
 				Log.i(TAG, "访客集 " + scope + "：" + groups.size() + " 个 frpc 进程");
 				if (groups.isEmpty()) {
 					stopFleetLocked();
+					FrpcManager.wipeOrphanFleetFiles(TunnelService.this, new ArrayList<String>());
 					mainHandler.post(() -> {
 						if (generation == fleetGeneration && instance == TunnelService.this) {
 							stopSelfHonoringForegroundContract();
@@ -236,6 +237,7 @@ public class TunnelService extends Service {
 					keep.add(group.key);
 					FrpcManager existing = fleet.get(group.key);
 					if (existing != null && existing.matchesRunning(group.toml)) continue;
+					if (existing != null && existing.retainsBackoff(group.toml)) continue;
 					if (existing != null) existing.stop();
 					FrpcManager manager = new FrpcManager(TunnelService.this, group.fileName);
 					final String key = group.key;
@@ -252,6 +254,9 @@ public class TunnelService extends Service {
 					entry.getValue().stop();
 					it.remove();
 				}
+				java.util.ArrayList<String> keepNames = new java.util.ArrayList<>();
+				for (VisitorFleet.Group group : groups) keepNames.add(group.fileName);
+				FrpcManager.wipeOrphanFleetFiles(TunnelService.this, keepNames);
 			}
 		}, "frpc-fleet").start();
 		watchTunnelEnvironment();
@@ -612,8 +617,17 @@ public class TunnelService extends Service {
 			b.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
 		}
 		if (Build.VERSION.SDK_INT >= 21) {
-			b.setVisibility(running ? Notification.VISIBILITY_PUBLIC : Notification.VISIBILITY_SECRET);
-			if (running) b.setCategory(Notification.CATEGORY_PROGRESS);
+			b.setVisibility(running ? Notification.VISIBILITY_PRIVATE : Notification.VISIBILITY_SECRET);
+			if (running) {
+				b.setCategory(Notification.CATEGORY_PROGRESS);
+				Notification.Builder pub = Build.VERSION.SDK_INT >= 26
+					? new Notification.Builder(this, channel)
+					: new Notification.Builder(this);
+				pub.setSmallIcon(R.drawable.ic_stat_tunnel)
+					.setContentTitle("DSH Remote")
+					.setContentText("会话进行中");
+				b.setPublicVersion(pub.build());
+			}
 		}
 		// 静音由渠道保证（onCreate 里两渠道均 setSound(null,null)、无振动无灯光）。
 		// framework Notification.Builder 没有 setSilent(boolean)——那是 androidx 的 API。

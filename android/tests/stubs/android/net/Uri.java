@@ -25,11 +25,13 @@ public final class Uri {
 	private final String scheme;
 	private final String host;
 	private final int port;
+	private final String query;
 
-	private Uri(String scheme, String host, int port) {
+	private Uri(String scheme, String host, int port, String query) {
 		this.scheme = scheme;
 		this.host = host;
 		this.port = port;
+		this.query = query;
 	}
 
 	/** `scheme://host[:port][/path…]`；非层级形态（如 `data:…`）按 Android 语义给 host=null。 */
@@ -42,7 +44,7 @@ public final class Uri {
 			// 自然返回 false —— 这里若抛异常，测的就变成"替身实现"而不是被测判据了。
 			int colon = s.indexOf(':');
 			if (colon <= 0) throw new IllegalArgumentException("no scheme: " + s);
-			return new Uri(s.substring(0, colon), null, -1);
+			return new Uri(s.substring(0, colon), null, -1, null);
 		}
 		String scheme = s.substring(0, sep);
 		String rest = s.substring(sep + 3);
@@ -52,6 +54,12 @@ public final class Uri {
 			if (c == '/' || c == '?' || c == '#') { cut = i; break; }
 		}
 		String authority = rest.substring(0, cut);
+		String query = null;
+		int qmark = rest.indexOf('?');
+		if (qmark >= 0) {
+			int hash = rest.indexOf('#', qmark);
+			query = rest.substring(qmark + 1, hash < 0 ? rest.length() : hash);
+		}
 		String host = authority;
 		int port = -1;
 		int colon = authority.lastIndexOf(':');
@@ -61,7 +69,18 @@ public final class Uri {
 			port = p.isEmpty() ? -1 : Integer.parseInt(p);
 		}
 		if (host.isEmpty()) host = null;
-		return new Uri(scheme, host, port);
+		return new Uri(scheme, host, port, query);
+	}
+
+	public String getQueryParameter(String key) {
+		if (query == null || key == null) return null;
+		for (String part : query.split("&")) {
+			int eq = part.indexOf('=');
+			String name = eq < 0 ? part : part.substring(0, eq);
+			if (!key.equals(name)) continue;
+			return eq < 0 ? "" : part.substring(eq + 1);
+		}
+		return null;
 	}
 
 	public String getScheme() {

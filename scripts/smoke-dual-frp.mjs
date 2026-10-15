@@ -72,17 +72,17 @@ async function checkMode(mode) {
 		const publicCall = (path, options) => requestTls(`https://127.0.0.1:${remotePort}${path}`, { timeoutMs: 3000, ...options });
 		await waitFor(`${mode} 公网入口`, async () => (await publicCall("/__dsh_remote__/health")).status === 200);
 		await waitFor(`${mode} 访客链路`, async () => {
-			const res = await requestTls(`https://127.0.0.1:${visitorPort}/`, { timeoutMs: 4000 });
-			return res.status === 200 && res.body.includes("__dsh_boot__");
+			const res = await requestTls(`https://127.0.0.1:${visitorPort}/`, { timeoutMs: 4000, headers: { accept: "text/html" } });
+			return res.status === 302 && /login/.test(res.headers.location ?? "");
 		}, 25000);
-		await assertUpgrade(visitorPort, undefined, 101);
+		await assertUpgrade(visitorPort, undefined, 401);
 		const redirect = await publicCall("/", { headers: { accept: "text/html" } });
 		assert.equal(redirect.status, 302);
 		assert.match(redirect.headers.location, /^\/__dsh_remote__\/login/);
 		const loginPage = await publicCall(redirect.headers.location);
 		assert.match(loginPage.body, /aria-label="访客密钥"/);
 		assert.ok(!loginPage.body.includes(secretKey));
-		assert.equal((await publicCall("/api/test", { headers: { "x-forwarded-for": "127.0.0.1", "x-dshr-public-entry": "false" } })).status, 401);
+		assert.equal((await publicCall("/api/test", { headers: { "x-forwarded-for": "127.0.0.1" } })).status, 401);
 		assert.equal((await publicCall("/__dsh_remote__/admin/pair-code", { method: "POST" })).status, 403);
 		await assertUpgrade(remotePort, undefined, 401);
 		const login = token => publicCall("/__dsh_remote__/login", { method: "POST", headers: { "content-type": "application/json" },
@@ -93,11 +93,11 @@ async function checkMode(mode) {
 		const cookie = loggedIn.setCookie.split(";")[0];
 		assert.match((await publicCall("/", { headers: { cookie } })).body, /__dsh_boot__/);
 		await assertUpgrade(remotePort, cookie, 101);
+		await assertUpgrade(visitorPort, cookie, 101);
 		const [device] = await store.listDevices();
 		await store.revokeDevice(device.id);
 		assert.equal((await publicCall("/", { headers: { cookie } })).status, 401);
 		await assertUpgrade(remotePort, cookie, 401);
-		assert.equal((await requestTls(`https://127.0.0.1:${visitorPort}/`, { timeoutMs: 4000 })).status, 200);
 		await visitor.stop();
 		await gateway.stop();
 		await gateway.stop();
@@ -120,3 +120,79 @@ async function checkMode(mode) {
 }
 
 for (const mode of ["stcp", "xtcp"]) await checkMode(mode);
+
+async function checkEntry() {
+	const home = await makeTempHome("dshr-dual-entry-");
+	const controlPort = await freePort();
+	const remotePort = await freePort();
+	const token = "isolated-frp-auth-token";
+	const secretKey = "isolated-frp-visitor-key";
+	const name = "dual-entry";
+	const logs = [];
+	const log = (line) => logs.push(line);
+	const upstream = await startFakeUpstream();
+	const store = await Store.open(home);
+	await mkdir(join(home, "state"), { recursive: true });
+	await writeFile(join(home, "state", "secrets.json"), JSON.stringify({ frpAuthToken: token, frpVisitorKey: secretKey }));
+	const frpsPath = join(home, "frps.toml");
+	await writeFile(frpsPath, renderFrpsToml({
+		bindAddr: "127.0.0.1",
+		bindPort: controlPort,
+		authToken: token,
+		allowPorts: [{ start: remotePort, end: remotePort }],
+	}));
+	const frps = new FrpSupervisor(binary("frps"), frpsPath, log);
+	const gateway = new GatewayServer({
+		store,
+		log,
+		env: {},
+		config: {
+			...structuredClone(DEFAULT_CONFIG),
+			listenPort: 0,
+			upstreamPort: upstream.port,
+			autoFixUpstreamPort: false,
+			rateLimitPerMinute: 3,
+			frp: {
+				...DEFAULT_CONFIG.frp,
+				enabled: true,
+				mode: "entry",
+				entryEnabled: true,
+				remotePort,
+				serverAddr: "127.0.0.1",
+				serverPort: controlPort,
+				name,
+				binaryPath: binary("frpc"),
+			},
+		},
+	});
+	try {
+		frps.start();
+		await gateway.start();
+		const pcPath = join(home, "frp", "frpc.toml");
+		const verify = spawnSync(binary("frpc"), ["verify", "-c", pcPath], { encoding: "utf8", windowsHide: true });
+		assert.equal(verify.status, 0, verify.stderr || verify.stdout);
+		const text = await readFile(pcPath, "utf8");
+		const entryBlock = text.split("[[proxies]]").slice(1).find((block) => block.includes('type = "tcp"'));
+		assert.ok(entryBlock, text);
+		const entryLocalPort = Number(/localPort = (\d+)/.exec(entryBlock)[1]);
+		assert.equal(entryLocalPort, gateway.publicEntryPort);
+		assert.notEqual(entryLocalPort, gateway.actualPort);
+		assert.match(entryBlock, /proxyProtocolVersion = "v2"/);
+		const publicCall = (path, options) => requestTls(`https://127.0.0.1:${remotePort}${path}`, { timeoutMs: 4000, ...options });
+		await waitFor("entry 公网入口", async () => (await publicCall("/__dsh_remote__/health")).status === 200, 25000);
+		const statuses = [];
+		for (let i = 0; i < 4; i++) statuses.push((await publicCall("/", { headers: { accept: "text/html" } })).status);
+		assert.deepEqual(statuses, [302, 302, 302, 429]);
+		console.log("✓ entry + 公网 TCP：PROXY v2 入口口、health 与限流通过");
+	} catch (error) {
+		console.error(logs.join("\n"));
+		throw error;
+	} finally {
+		await gateway.stop();
+		await frps.stop();
+		await upstream.close();
+		await rm(home, { recursive: true, force: true });
+	}
+}
+
+await checkEntry();

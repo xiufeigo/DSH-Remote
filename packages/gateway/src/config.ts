@@ -71,6 +71,13 @@ export interface FrpConfig {
 	heartbeatInterval?: number;
 	/** T31-1：frpc 控制连接心跳超时（秒）。缺省 90；写 0/负数则不写该行。 */
 	heartbeatTimeout?: number;
+	/**
+	 * 可选：frps 证书的 CA 文件路径。写了之后 frpc 才校验对端证书，
+	 * 同时需要 {@link tlsServerName}。不写则只加密不校验（历史行为）。
+	 */
+	tlsTrustedCaFile?: string;
+	/** 与 frps 证书的使用者名称一致，配合 tlsTrustedCaFile。 */
+	tlsServerName?: string;
 }
 
 /** 前置 Token 门禁配置（edge 公网入口）。 */

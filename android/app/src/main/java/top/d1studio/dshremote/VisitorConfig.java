@@ -48,6 +48,10 @@ public final class VisitorConfig {
 	public String authToken = "";     // frpc↔frps 登录密钥
 	public int bindPort = 18443;      // 与电脑端网关 listenPort 对齐，App 不让用户改
 	public String fingerprint = "";   // 网关自签证书 SHA-256（hex 小写无冒号；空 = 退化为 TOFU 确认）
+	/** 可选：校验 frps 证书的 CA 文件路径。空 = 只加密不校验。 */
+	public String tlsCaFile = "";
+	/** 与 frps 证书使用者名称一致，配合 tlsCaFile。 */
+	public String tlsServerName = "";
 
 	/**
 	 * frpc 控制连接心跳（秒）。40 秒仍低于常见蜂窝网络的空闲回收，超时保持 90 秒。
@@ -108,13 +112,60 @@ public final class VisitorConfig {
 		if (!TextUtils.isEmpty(v)) c.bindPort = parseInt(v, c.bindPort);
 		v = uri.getQueryParameter("fp");
 		if (!TextUtils.isEmpty(v)) c.fingerprint = v.toLowerCase(Locale.US).replace(":", "");
+		c.tlsCaFile = optionalImportText(nz(uri.getQueryParameter("ca")));
+		c.tlsServerName = optionalImportText(nz(uri.getQueryParameter("sni")));
 		return c.isValid() ? c : null;
 	}
 
 	public boolean isValid() {
-		return serverAddr.length() > 0 && serverPort >= 1 && serverPort <= 65535
-			&& serverName.length() > 0 && secretKey.length() > 0 && authToken.length() > 0
-			&& bindPort >= 1 && bindPort <= 65535;
+		return isHostOrIp(serverAddr) && serverPort >= 1 && serverPort <= 65535
+			&& isNameField(serverName) && isSecretField(secretKey) && isSecretField(authToken)
+			&& bindPort >= 1 && bindPort <= 65535
+			&& isOptionalText(tlsCaFile) && isOptionalText(tlsServerName);
+	}
+
+	static String tomlQuoted(String value) {
+		String raw = value == null ? "" : value;
+		return "\"" + raw.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+	}
+
+	/** 域名 / IPv4 / IPv6（可带方括号）/ 字母类域名。与面板 isHostOrIp 同一套。 */
+	static boolean isHostOrIp(String value) {
+		if (value == null || value.length() == 0 || value.length() > 253) return false;
+		for (int i = 0; i < value.length(); i++) {
+			char c = value.charAt(i);
+			if (c < 0x20 || c == 0x7f || c == ' ' || c == '"' || c == '\'' || c == '\\' || c == '/') return false;
+		}
+		if (value.matches("[\\p{L}0-9.\\-_]+")) return true;
+		String bare = value;
+		if (value.charAt(0) == '[' && value.charAt(value.length() - 1) == ']') {
+			bare = value.substring(1, value.length() - 1);
+		}
+		return bare.indexOf(':') >= 0 && bare.matches("[0-9A-Fa-f:.]+");
+	}
+
+	/** 可选 CA/SNI 超长或含控制字符时丢掉这一项，不让整条导入失败。 */
+	private static String optionalImportText(String value) {
+		if (value == null || value.length() == 0 || value.length() > 1024) return "";
+		return isNameField(value) ? value : "";
+	}
+
+	private static boolean isSecretField(String value) {
+		return isNameField(value) && value.length() <= 512;
+	}
+
+	private static boolean isNameField(String value) {
+		if (value == null || value.length() == 0 || value.length() > 1024) return false;
+		for (int i = 0; i < value.length(); i++) {
+			char c = value.charAt(i);
+			if (c < 0x20 || c == 0x7f) return false;
+		}
+		return true;
+	}
+
+	private static boolean isOptionalText(String value) {
+		if (value == null || value.length() == 0) return true;
+		return value.length() <= 1024 && isNameField(value);
 	}
 
 	/** 渲染访客侧 frpc.toml —— 与网关 renderVisitorToml 同构。 */
@@ -128,10 +179,17 @@ public final class VisitorConfig {
 	/** 控制连接头。同一台 frps 上的多台访客共用这一段，只能写一次。 */
 	public void appendHeader(StringBuilder b) {
 		b.append("# 由 DSH Remote App 自动生成\n");
-		b.append("serverAddr = \"").append(serverAddr).append("\"\n");
+		b.append("serverAddr = ").append(tomlQuoted(serverAddr)).append("\n");
 		b.append("serverPort = ").append(serverPort).append("\n\n");
-		b.append("auth.token = \"").append(authToken).append("\"\n");
+		b.append("auth.token = ").append(tomlQuoted(authToken)).append("\n");
+		b.append("loginFailExit = false\n");
 		b.append("transport.tls.enable = true\n");
+		if (tlsCaFile != null && tlsCaFile.length() > 0) {
+			b.append("transport.tls.trustedCaFile = ").append(tomlQuoted(tlsCaFile)).append("\n");
+		}
+		if (tlsServerName != null && tlsServerName.length() > 0) {
+			b.append("transport.tls.serverName = ").append(tomlQuoted(tlsServerName)).append("\n");
+		}
 		if (heartbeatIntervalSec > 0) {
 			b.append("transport.heartbeatInterval = ").append(heartbeatIntervalSec).append("\n");
 			// 与网关 resolveFrpHeartbeat 同策略：超时必须严格大于周期，否则抬成周期的 2 倍
@@ -154,20 +212,20 @@ public final class VisitorConfig {
 			// fallbackTo 那条 stcp 访客走中转。
 			String stcpVisitor = serverName + "-stcp-visitor" + suffix;
 			b.append("[[visitors]]\n");
-			b.append("name = \"").append(stcpVisitor).append("\"\n");
+			b.append("name = ").append(tomlQuoted(stcpVisitor)).append("\n");
 			b.append("type = \"stcp\"\n");
-			b.append("serverName = \"").append(serverName).append("-stcp\"\n");
-			b.append("secretKey = \"").append(secretKey).append("\"\n");
+			b.append("serverName = ").append(tomlQuoted(serverName + "-stcp")).append("\n");
+			b.append("secretKey = ").append(tomlQuoted(secretKey)).append("\n");
 			b.append("bindPort = -1\n\n");
 			b.append("[[visitors]]\n");
-			b.append("name = \"").append(serverName).append("-visitor").append(suffix).append("\"\n");
+			b.append("name = ").append(tomlQuoted(serverName + "-visitor" + suffix)).append("\n");
 			b.append("type = \"xtcp\"\n");
-			b.append("serverName = \"").append(serverName).append("\"\n");
-			b.append("secretKey = \"").append(secretKey).append("\"\n");
+			b.append("serverName = ").append(tomlQuoted(serverName)).append("\n");
+			b.append("secretKey = ").append(tomlQuoted(secretKey)).append("\n");
 			b.append("bindAddr = \"127.0.0.1\"\n");
 			b.append("bindPort = ").append(bindPort).append("\n");
 			b.append("keepTunnelOpen = true\n");
-			b.append("fallbackTo = \"").append(stcpVisitor).append("\"\n");
+			b.append("fallbackTo = ").append(tomlQuoted(stcpVisitor)).append("\n");
 			// T113：5000 → FALLBACK_TIMEOUT_MS（缺省 800）。语义与写法一字未新：
 			// 仍是同一条 fallbackTo 关系上的同一个 toml 键，只改数值。
 			b.append("fallbackTimeoutMs = ").append(FALLBACK_TIMEOUT_MS).append("\n");
@@ -181,20 +239,20 @@ public final class VisitorConfig {
 			// 名字与 serverName 保持与 fallback 访客**逐字相同**（`<名>-stcp-visitor` /
 			// `<名>-stcp`）：那是网关侧唯一注册过的 stcp 代理名，自己发明名字会连不上。
 			b.append("[[visitors]]\n");
-			b.append("name = \"").append(serverName).append("-stcp-visitor").append(suffix).append("\"\n");
+			b.append("name = ").append(tomlQuoted(serverName + "-stcp-visitor" + suffix)).append("\n");
 			b.append("type = \"stcp\"\n");
-			b.append("serverName = \"").append(serverName).append("-stcp\"\n");
-			b.append("secretKey = \"").append(secretKey).append("\"\n");
+			b.append("serverName = ").append(tomlQuoted(serverName + "-stcp")).append("\n");
+			b.append("secretKey = ").append(tomlQuoted(secretKey)).append("\n");
 			b.append("bindAddr = \"127.0.0.1\"\n");
 			b.append("bindPort = ").append(bindPort).append("\n");
 			return;
 		}
 		// ── 电脑端=stcp / 策略=只用中转：与 T104 之前**逐字相同**的 stcp 访客 ──
 		b.append("[[visitors]]\n");
-		b.append("name = \"").append(serverName).append("-visitor").append(suffix).append("\"\n");
+		b.append("name = ").append(tomlQuoted(serverName + "-visitor" + suffix)).append("\n");
 		b.append("type = \"stcp\"\n");
-		b.append("serverName = \"").append(serverName).append("\"\n");
-		b.append("secretKey = \"").append(secretKey).append("\"\n");
+		b.append("serverName = ").append(tomlQuoted(serverName)).append("\n");
+		b.append("secretKey = ").append(tomlQuoted(secretKey)).append("\n");
 		b.append("bindAddr = \"127.0.0.1\"\n");
 		b.append("bindPort = ").append(bindPort).append("\n");
 	}

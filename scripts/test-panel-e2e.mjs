@@ -93,6 +93,11 @@ function fakeRes() {
 	};
 }
 
+const forwardedStatus = routes.get("/dsh-remote/status");
+const forwardedDenied = fakeRes();
+forwardedStatus({ headers: { "x-forwarded-host": "phone.example" }, method: "GET" }, forwardedDenied);
+assert.equal(forwardedDenied.state.status, 403, "经网关转发的设置请求必须 403");
+
 function parseBody(res, label) {
 	try {
 		return JSON.parse(res.state.body);

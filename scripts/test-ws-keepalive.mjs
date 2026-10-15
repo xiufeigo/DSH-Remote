@@ -21,7 +21,7 @@ import net from "node:net";
 import tls from "node:tls";
 import { test, after } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
-import { createTestGateway, requestTls } from "./test-harness.mjs";
+import { createTestGateway, requestTls, deviceCookieHeader } from "./test-harness.mjs";
 
 const {
 	encodePingFrame,
@@ -292,7 +292,8 @@ async function collectThroughGateway(gatewayPort, cookie, ms) {
 		"connection: Upgrade\r\n" +
 		"sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
 		"sec-websocket-version: 13\r\n" +
-		`cookie: dr_device=${cookie}\r\n` +
+		"origin: https://gateway.invalid\r\n" +
+		`cookie: ${cookie}\r\n` +
 		"\r\n",
 	);
 	await sleep(ms);
@@ -341,7 +342,7 @@ async function pairCookie(gw) {
 		body: JSON.stringify({ code: "t31keep", name: "t31-keepalive" }),
 	});
 	assert.equal(r.status, 200, `配对应成功：${r.body}`);
-	return /dr_device=([^;]+)/.exec(r.setCookie)?.[1];
+	return deviceCookieHeader(r.setCookie);
 }
 
 test("T31-2/集成：开启 PING 时浏览器侧周期性收到 0x89，且 mux 数据帧逐条完整", async () => {
@@ -419,7 +420,7 @@ test("T31-2/集成：上游回非 101 时网关不注入任何控制帧（纯管
 	try {
 		const cookie = await pairCookie(gw);
 		const { wsConnect } = await import("./test-harness.mjs");
-		const conn = wsConnect(`wss://127.0.0.1:${String(gw.port)}/api/remote.mux`, { headers: { cookie: `dr_device=${cookie}` } });
+		const conn = wsConnect(`wss://127.0.0.1:${String(gw.port)}/api/remote.mux`, { headers: { cookie } });
 		const head = await conn.headersText;
 		const raw = [];
 		conn.socket.on("data", (c) => raw.push(c));
@@ -499,7 +500,8 @@ async function observeThroughIdleProxy(proxyPort, gatewayPort, cookie, observeMs
 		"connection: Upgrade\r\n" +
 		"sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
 		"sec-websocket-version: 13\r\n" +
-		`cookie: dr_device=${cookie}\r\n` +
+		"origin: https://gateway.invalid\r\n" +
+		`cookie: ${cookie}\r\n` +
 		"\r\n",
 	);
 	await sleep(observeMs);

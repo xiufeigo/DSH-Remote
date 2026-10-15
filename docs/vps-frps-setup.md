@@ -169,7 +169,9 @@ node packages/gateway/src/cli.ts visitor --mode xtcp
 
 1. **Android 壳 App**（推荐）：任意扫码器扫描二维码 → 系统弹出 DSH Remote 接管
    `dsh-remote://visitor?...` 链接 → 点「启动隧道并进入」。证书指纹随码下发，
-   连接前自动锁定，全程无告警。
+   连接前自动锁定，全程无告警。系统信任库已经接受的证书优先于指纹：换成同一
+   主机名下的新 CA 证书后不必重新扫码。自签证书对不上系统信任时，仍以指纹为准，
+   登录也会校验主机名。
 2. **其他设备**：把 `frpc-visitor.toml` 拷过去跑 `frpc -c frpc-visitor.toml`，
    之后访问 `https://127.0.0.1:<bindPort>`。
 
@@ -194,6 +196,16 @@ node packages/gateway/src/cli.ts visitor --mode xtcp
 **访客模式**：手机装壳 App（见 android/README.md）→ 扫 `dsh-remote visitor`
 的二维码 → 启动隧道。浏览器验证不适用于此形态——公网上根本没有入口端口，
 这正是它的意义。
+
+## 5.1 可选：用自己的 CA 校验 frps，以及公网入口的真实 IP
+
+默认 frpc 只加密、不校验 frps 证书。要校验时：
+
+1. 用私有 CA 签发 frps 证书，在 `frps.toml` 写上 `transport.tls.certFile` 和 `transport.tls.keyFile`。
+2. 电脑端插件填写「frps CA 文件」和「frps 证书名称」。这两项会写进 frpc 的 `transport.tls.trustedCaFile` 和 `transport.tls.serverName`。
+3. 手机导入的连接串若带 `ca` / `sni`，壳 App 会写进同一对配置。
+
+公网入口的限流 IP 不是浏览器请求头。电脑上的 frpc 在连本地入口口时带 PROXY protocol v2，网关从中取真实客户端地址。stcp/xtcp 的附加入口和旧的 `mode: entry` 都走这只本地口。frps 0.61 会把连到公网端口的原始地址传给这条本地连接。不要在公网客户端上加 PROXY 头。
 
 ## 6. 故障排查速查
 

@@ -49,6 +49,8 @@ public final class VisitorFleet {
 		List<Integer> used = new ArrayList<>();
 		for (ProfileStore.Profile profile : profiles) {
 			if (!eligible(profile)) continue;
+			// 已记下的合法端口不再用 isBindable 复查：本进程的 frpc 正占着它，
+			// 复查会把正在用的端口判成占用并换端口。端口死活交给连接前的 health 探针。
 			if (legalPort(profile.bindPort) && !used.contains(profile.bindPort)) {
 				used.add(profile.bindPort);
 			} else if (profile.bindPort != 0) {
@@ -164,11 +166,18 @@ public final class VisitorFleet {
 		return suffix.toString();
 	}
 
+	/**
+	 * 只给还没有端口的配置组挑新口，并且要 {@link ProfileStore#isBindable}。
+	 * 已经记下的合法端口不走这里，也不在 {@link #assignPorts} 里探测；
+	 * 那个口可能正被本进程的 frpc 占着，死活交给连接前的 health 探针。
+	 */
 	private static int pick(List<Integer> used, int preferred) {
-		if (legalPort(preferred) && !used.contains(preferred)) return preferred;
-		if (!used.contains(ProfileStore.BIND_PORT)) return ProfileStore.BIND_PORT;
+		if (legalPort(preferred) && !used.contains(preferred) && ProfileStore.isBindable(preferred)) return preferred;
+		if (!used.contains(ProfileStore.BIND_PORT) && ProfileStore.isBindable(ProfileStore.BIND_PORT)) {
+			return ProfileStore.BIND_PORT;
+		}
 		for (int port = ProfileStore.PORT_RANGE_MIN; port <= PORT_MAX; port++) {
-			if (!used.contains(port)) return port;
+			if (!used.contains(port) && ProfileStore.isBindable(port)) return port;
 		}
 		return -1;
 	}

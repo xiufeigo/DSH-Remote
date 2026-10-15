@@ -1,26 +1,37 @@
 package top.d1studio.dshremote;
 
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.webkit.CookieManager;
+import android.webkit.ValueCallback;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.GZIPInputStream;
 
+import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
 
 /**
@@ -220,7 +231,7 @@ final class PinnedFetch {
 
 	/**
 	 * 网关侧**免认证**的公开探针路径。证据：{@code packages/gateway/src/server.ts:441}
-	 * 在认证闸门**之前** `return 200`，响应体固定 {@code {"ok":true}}，无信息泄露。
+	 * 响应体是 {@code {"ok":true,"fingerprint":"..."}}。指纹给端口复用确认用，不泄露密钥。
 	 *
 	 * <p>为什么单独列它：它是 tier2 救援探针的目标（{@code MainActivity} 链路探针）。
 	 * 对**公开**路径，「cookie 为空」不是鉴权缺陷，失败关闭会把「网关其实活着」判成
@@ -364,6 +375,7 @@ final class PinnedFetch {
 				new SecureRandom());
 			conn = (HttpsURLConnection) parsed.openConnection();
 			conn.setSSLSocketFactory(ctx.getSocketFactory());
+			conn.setHostnameVerifier(pinnedHostnameVerifier());
 			conn.setRequestMethod("GET");
 			conn.setConnectTimeout(8000);
 			conn.setReadTimeout(READ_TIMEOUT_MS);
@@ -551,7 +563,28 @@ final class PinnedFetch {
 		}
 	}
 
-	/** 握手当场的指纹判定：只有与已存锁定一致才放行。 */
+	private static final ThreadLocal<Boolean> PIN_MATCHED = new ThreadLocal<>();
+	private static X509TrustManager systemTrust;
+
+	private static HostnameVerifier pinnedHostnameVerifier() {
+		final HostnameVerifier fallback = HttpsURLConnection.getDefaultHostnameVerifier();
+		return (hostname, session) -> fallback.verify(hostname, session) || Boolean.TRUE.equals(PIN_MATCHED.get());
+	}
+
+	private static X509TrustManager systemTrustManager() throws Exception {
+		if (systemTrust != null) return systemTrust;
+		TrustManagerFactory factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+		factory.init((KeyStore) null);
+		for (TrustManager manager : factory.getTrustManagers()) {
+			if (manager instanceof X509TrustManager) {
+				systemTrust = (X509TrustManager) manager;
+				return systemTrust;
+			}
+		}
+		throw new CertificateException("系统信任库不可用");
+	}
+
+	/** 握手当场的指纹判定：系统 CA 优先，对不上再看已锁定指纹。 */
 	private static X509TrustManager pinningTrustManager(final CertPin.Store store,
 			final String profileId, final String host, final int port, final String tag) {
 		return new X509TrustManager() {
@@ -561,14 +594,25 @@ final class PinnedFetch {
 
 			@Override
 			public X509Certificate[] getAcceptedIssuers() {
-				return new X509Certificate[0];
+				try {
+					return systemTrustManager().getAcceptedIssuers();
+				} catch (Exception e) {
+					return new X509Certificate[0];
+				}
 			}
 
 			@Override
 			public void checkServerTrusted(X509Certificate[] chain, String authType)
 					throws CertificateException {
+				PIN_MATCHED.set(Boolean.FALSE);
 				if (chain == null || chain.length == 0) {
 					throw new CertificateException("pinnedFetch: 空证书链");
+				}
+				try {
+					systemTrustManager().checkServerTrusted(chain, authType);
+					Log.i("dshr-perf", "pinnedFetch 系统信任 " + tag);
+					return;
+				} catch (Exception ignored) {
 				}
 				String fp = CertPin.normalizeFingerprint(sha256Hex(chain[0].getEncoded()));
 				if (fp.isEmpty()) {
@@ -579,9 +623,208 @@ final class PinnedFetch {
 					Log.w("dshr-perf", "pinnedFetch 证书判定未通过（不放行）：" + d.describe());
 					throw new CertificateException("pinnedFetch: 证书未受信 " + d.describe());
 				}
+				PIN_MATCHED.set(Boolean.TRUE);
 				Log.i("dshr-perf", "pinnedFetch 证书受信 " + tag + " " + d.describe());
 			}
 		};
+	}
+
+	enum LoginKind { OK, MISMATCH, LOCKED, FAILED }
+
+	static final class LoginResult {
+		final LoginKind kind;
+		final String detail;
+
+		LoginResult(LoginKind kind, String detail) {
+			this.kind = kind;
+			this.detail = detail;
+		}
+	}
+
+	static final class Health {
+		boolean ok;
+		String fingerprint = "";
+		String certFingerprint = "";
+
+		boolean confirms(String expected) {
+			if (!ok) return false;
+			String want = CertPin.normalizeFingerprint(expected == null ? "" : expected);
+			String cert = CertPin.normalizeFingerprint(certFingerprint);
+			String bodyFp = CertPin.normalizeFingerprint(fingerprint);
+			if (want.length() == 64) return want.equals(cert) || want.equals(bodyFp);
+			// 配置组没有指纹：旧网关只回 {"ok":true}，没有 64 位指纹也算这台还活着。
+			// 有指纹的配置组仍走上面的严格比较。
+			return true;
+		}
+	}
+
+	/** 隧道端口上是不是这台网关。这次握手不写入信任，也不拿来拉业务数据。 */
+	static Health probeHealth(int port) {
+		Health health = new Health();
+		HttpsURLConnection conn = null;
+		try {
+			URL parsed = new URL("https://127.0.0.1:" + port + PUBLIC_HEALTH_PATH);
+			final String[] certFp = new String[] { "" };
+			TrustManager trust = new X509TrustManager() {
+				@Override public void checkClientTrusted(X509Certificate[] chain, String authType) {}
+				@Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+				@Override public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+					if (chain == null || chain.length == 0) throw new CertificateException("空证书");
+					certFp[0] = CertPin.normalizeFingerprint(sha256Hex(chain[0].getEncoded()));
+				}
+			};
+			SSLContext ctx = SSLContext.getInstance("TLS");
+			ctx.init(null, new TrustManager[] { trust }, new SecureRandom());
+			conn = (HttpsURLConnection) parsed.openConnection();
+			conn.setSSLSocketFactory(ctx.getSocketFactory());
+			conn.setHostnameVerifier((hostname, session) -> true);
+			conn.setConnectTimeout(1500);
+			conn.setReadTimeout(1500);
+			conn.setInstanceFollowRedirects(false);
+			conn.setUseCaches(false);
+			if (conn.getResponseCode() != 200) return health;
+			InputStream in = conn.getInputStream();
+			byte[] buf = new byte[4096];
+			int n = in.read(buf);
+			in.close();
+			String body = n > 0 ? new String(buf, 0, n, StandardCharsets.UTF_8) : "";
+			health.certFingerprint = certFp[0];
+			health.ok = body.contains("\"ok\":true");
+			int marker = body.indexOf("\"fingerprint\":\"");
+			if (marker >= 0) {
+				int start = marker + "\"fingerprint\":\"".length();
+				int end = body.indexOf('"', start);
+				if (end > start) health.fingerprint = body.substring(start, end);
+			}
+			return health;
+		} catch (Exception e) {
+			return health;
+		} finally {
+			if (conn != null) conn.disconnect();
+		}
+	}
+
+	/** 用访客密钥换设备 Cookie。401/403 表示密钥不一致，调用方不得重试循环。 */
+	static LoginResult exchangeVisitorKey(String url, int port, String profileId, CertPin.Store store,
+			String secretKey, String expectedFingerprint, String deviceName) {
+		HttpsURLConnection conn = null;
+		try {
+			if (secretKey == null || secretKey.isEmpty()) {
+				return new LoginResult(LoginKind.FAILED, "缺少访客密钥");
+			}
+			URL parsed = new URL(url);
+			SSLContext ctx = SSLContext.getInstance("TLS");
+			ctx.init(null, new TrustManager[] {
+				loginTrustManager(store, profileId, port, expectedFingerprint)
+			}, new SecureRandom());
+			conn = (HttpsURLConnection) parsed.openConnection();
+			conn.setSSLSocketFactory(ctx.getSocketFactory());
+			conn.setHostnameVerifier(pinnedHostnameVerifier());
+			conn.setRequestMethod("POST");
+			conn.setConnectTimeout(8000);
+			conn.setReadTimeout(8000);
+			conn.setInstanceFollowRedirects(false);
+			conn.setUseCaches(false);
+			conn.setDoOutput(true);
+			conn.setRequestProperty("Content-Type", "application/json");
+			String name = deviceName == null ? "" : deviceName.trim();
+			if (name.isEmpty()) name = "Android";
+			byte[] body = ("{\"token\":" + jsonString(secretKey) + ",\"name\":" + jsonString(name) + "}")
+				.getBytes(StandardCharsets.UTF_8);
+			conn.setFixedLengthStreamingMode(body.length);
+			OutputStream out = conn.getOutputStream();
+			out.write(body);
+			out.close();
+			int status = conn.getResponseCode();
+			if (status == 200) {
+				applySetCookies("https://127.0.0.1:" + port + "/", conn);
+				return new LoginResult(LoginKind.OK, "");
+			}
+			if (status == 401 || status == 403) return new LoginResult(LoginKind.MISMATCH, "访客密钥与电脑端不一致");
+			if (status == 429) return new LoginResult(LoginKind.LOCKED, "失败次数过多");
+			return new LoginResult(LoginKind.FAILED, "登录状态 " + status);
+		} catch (Exception e) {
+			String message = e.getMessage() == null ? "自动登录失败" : e.getMessage();
+			Log.w("dshr-login", "自动登录失败：" + e.getClass().getSimpleName() + "：" + message);
+			return new LoginResult(LoginKind.FAILED, message);
+		} finally {
+			if (conn != null) conn.disconnect();
+		}
+	}
+
+	private static X509TrustManager loginTrustManager(final CertPin.Store store, final String profileId,
+			final int port, final String expectedFingerprint) {
+		return new X509TrustManager() {
+			@Override public void checkClientTrusted(X509Certificate[] chain, String authType) {}
+			@Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+			@Override public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+				PIN_MATCHED.set(Boolean.FALSE);
+				if (chain == null || chain.length == 0) throw new CertificateException("登录：空证书链");
+				try {
+					systemTrustManager().checkServerTrusted(chain, authType);
+					return;
+				} catch (Exception ignored) {
+				}
+				String fp = CertPin.normalizeFingerprint(sha256Hex(chain[0].getEncoded()));
+				CertPin.Decision d = CertPin.verify(store, profileId, "127.0.0.1", port, port, fp);
+				String want = CertPin.normalizeFingerprint(expectedFingerprint == null ? "" : expectedFingerprint);
+				if (d.action == CertPin.Action.TRUSTED
+						|| (d.action == CertPin.Action.TOFU && (want.isEmpty() || want.equals(fp)))) {
+					// 自签证书对不上系统主机名校验。指纹已经对上时，登录腿与拉页面同一条放行。
+					PIN_MATCHED.set(Boolean.TRUE);
+					return;
+				}
+				throw new CertificateException("证书未受信 " + d.describe());
+			}
+		};
+	}
+
+	private static void applySetCookies(String url, HttpsURLConnection conn) throws InterruptedException, IOException {
+		Map<String, List<String>> fields = conn.getHeaderFields();
+		if (fields == null) return;
+		int pending = 0;
+		for (Map.Entry<String, List<String>> entry : fields.entrySet()) {
+			if (entry.getKey() == null || !"set-cookie".equalsIgnoreCase(entry.getKey())) continue;
+			for (String cookie : entry.getValue()) {
+				if (cookie != null && cookie.length() > 0) pending++;
+			}
+		}
+		if (pending == 0) return;
+		CountDownLatch latch = new CountDownLatch(pending);
+		Runnable write = () -> {
+			CookieManager cm = CookieManager.getInstance();
+			cm.setAcceptCookie(true);
+			ValueCallback<Boolean> done = value -> latch.countDown();
+			for (Map.Entry<String, List<String>> entry : fields.entrySet()) {
+				if (entry.getKey() == null || !"set-cookie".equalsIgnoreCase(entry.getKey())) continue;
+				for (String cookie : entry.getValue()) {
+					if (cookie != null && cookie.length() > 0) cm.setCookie(url, cookie, done);
+				}
+			}
+		};
+		// setCookie(url, value, callback) 要求调用线程有 Looper，回调也回到主线程。
+		// 自动登录只从 device-login 后台线程进来：把写入 post 到主线程，再在后台等回调。
+		// 若改在主线程调用，write 之后的 await 会占住主线程，回调永远排不上，2 秒后必然超时。
+		if (Looper.myLooper() == Looper.getMainLooper()) {
+			throw new IllegalStateException("设备 Cookie 不能在主线程等待写入");
+		}
+		new Handler(Looper.getMainLooper()).post(write);
+		if (!latch.await(2, TimeUnit.SECONDS)) {
+			throw new IOException("设备 Cookie 尚未写入");
+		}
+		CookieManager.getInstance().flush();
+	}
+
+	private static String jsonString(String value) {
+		StringBuilder sb = new StringBuilder("\"");
+		for (int i = 0; i < value.length(); i++) {
+			char c = value.charAt(i);
+			if (c == '\\' || c == '"') sb.append('\\').append(c);
+			else if (c == '\n') sb.append("\\n");
+			else if (c < 0x20) sb.append(String.format(Locale.US, "\\u%04x", (int) c));
+			else sb.append(c);
+		}
+		return sb.append('"').toString();
 	}
 
 	private static String sha256Hex(byte[] data) {

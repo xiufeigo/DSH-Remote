@@ -69,8 +69,8 @@ export function visitorBindPortOf(config: FrpConfig): number {
 		: DEFAULT_VISITOR_BIND_PORT;
 }
 
-/** TOML 基础字符串转义（token 等生成值虽是 base64url，仍防御手工注入）。 */
-function tomlString(value: string): string {
+/** TOML 基础字符串转义（地址、密钥等手工值防御注入）。 */
+export function tomlString(value: string): string {
 	return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
@@ -178,6 +178,9 @@ interface FrpcTomlOptions {
 	name?: string;
 	/** T31-1：控制连接心跳；undefined = 缺省 25/90，false = 不写 */
 	heartbeat?: FrpHeartbeatInput;
+	/** 可选 frps CA。与 tlsServerName 同时填写才校验对端证书。 */
+	trustedCaFile?: string;
+	tlsServerName?: string;
 }
 
 /** 共享同一控制连接；公网 proxy 与访客 proxy 使用不同的本地认证入口。 */
@@ -186,7 +189,9 @@ export function renderFrpcToml(options: FrpcTomlOptions): string {
 	const name = normalizeTunnelName(options.name);
 	const proxies: string[] = [];
 	if (mode === "entry") {
-		proxies.push(renderTcpProxy(name, options.localPort, options.remotePort));
+		const entryPort = options.entryLocalPort;
+		const useProxy = entryPort !== undefined && entryPort !== options.localPort;
+		proxies.push(renderTcpProxy(name, useProxy ? entryPort : options.localPort, options.remotePort, useProxy));
 	} else {
 		if (mode === "xtcp") proxies.push(renderSecretProxy(`${name}-stcp`, "stcp", options));
 		proxies.push(renderSecretProxy(name, mode, options));
@@ -194,7 +199,7 @@ export function renderFrpcToml(options: FrpcTomlOptions): string {
 			if (options.entryLocalPort === options.localPort) {
 				throw new Error("公网入口必须使用独立的配对认证监听口");
 			}
-			proxies.push(renderTcpProxy(`${name}-entry`, options.entryLocalPort, options.remotePort));
+			proxies.push(renderTcpProxy(`${name}-entry`, options.entryLocalPort, options.remotePort, true));
 		}
 	}
 	return `# 由 dsh-remote 自动生成，手工修改会在下次 start 时被覆盖
@@ -202,29 +207,40 @@ serverAddr = ${tomlString(options.serverAddr)}
 serverPort = ${options.serverPort}
 
 auth.token = ${tomlString(options.authToken)}
-transport.tls.enable = true
+${tlsClientBlock(options)}
 ${heartbeatBlock(options.heartbeat)}
 ${proxies.join("\n")}`;
 }
 
-function renderTcpProxy(name: string, localPort: number, remotePort: number | undefined): string {
+function tlsClientBlock(options: { trustedCaFile?: string; tlsServerName?: string }): string {
+	const lines = ["loginFailExit = false", "transport.tls.enable = true"];
+	if (typeof options.trustedCaFile === "string" && options.trustedCaFile.length > 0) {
+		lines.push(`transport.tls.trustedCaFile = ${tomlString(options.trustedCaFile)}`);
+	}
+	if (typeof options.tlsServerName === "string" && options.tlsServerName.length > 0) {
+		lines.push(`transport.tls.serverName = ${tomlString(options.tlsServerName)}`);
+	}
+	return lines.join("\n");
+}
+
+function renderTcpProxy(name: string, localPort: number, remotePort: number | undefined, proxyProtocol = false): string {
 	if (!Number.isInteger(remotePort) || remotePort === undefined || remotePort < 1 || remotePort > 65535) {
 		throw new Error("公网入口 remotePort 必须是 1-65535 的整数");
 	}
 	return `[[proxies]]
-name = "${name}"
+name = ${tomlString(name)}
 type = "tcp"
 localIP = "127.0.0.1"
 localPort = ${localPort}
 remotePort = ${remotePort}
 transport.useEncryption = false
 transport.useCompression = false
-`;
+${proxyProtocol ? "transport.proxyProtocolVersion = \"v2\"\n" : ""}`;
 }
 
 function renderSecretProxy(name: string, mode: "stcp" | "xtcp", options: FrpcTomlOptions): string {
 	return `[[proxies]]
-name = "${name}"
+name = ${tomlString(name)}
 type = "${mode}"
 secretKey = ${tomlString(options.secretKey ?? "")}
 localIP = "127.0.0.1"
@@ -251,47 +267,50 @@ export function renderVisitorToml(options: {
 	name?: string;
 	/** T31-1：visitor 侧控制连接心跳；undefined = 缺省 25/90，false = 不写 */
 	heartbeat?: FrpHeartbeatInput;
+	trustedCaFile?: string;
+	tlsServerName?: string;
 }): string {
 	const mode = normalizeFrpMode(options.mode);
 	const serverName = normalizeTunnelName(options.serverName);
 	const visitorName = options.name ?? `${serverName}-visitor`;
+	const bindAddr = options.bindAddr ?? "127.0.0.1";
 	const common = `# 由 dsh-remote visitor 自动生成 —— 访客侧 frpc 配置
 # 用法：frpc -c frpc-visitor.toml 之后访问 https://127.0.0.1:${String(options.bindPort)}
-serverAddr = "${options.serverAddr}"
+serverAddr = ${tomlString(options.serverAddr)}
 serverPort = ${options.serverPort}
 
 auth.token = ${tomlString(options.authToken)}
-transport.tls.enable = true
+${tlsClientBlock(options)}
 ${heartbeatBlock(options.heartbeat)}`;
 	if (mode !== "xtcp") {
 		return `${common}
 [[visitors]]
-name = "${visitorName}"
+name = ${tomlString(visitorName)}
 type = "stcp"
-serverName = "${serverName}"
+serverName = ${tomlString(serverName)}
 secretKey = ${tomlString(options.secretKey ?? "")}
-bindAddr = "${options.bindAddr ?? "127.0.0.1"}"
+bindAddr = ${tomlString(bindAddr)}
 bindPort = ${options.bindPort}
 `;
 	}
 	const stcpVisitor = `${serverName}-stcp-visitor`;
 	return `${common}
 [[visitors]]
-name = "${stcpVisitor}"
+name = ${tomlString(stcpVisitor)}
 type = "stcp"
-serverName = "${serverName}-stcp"
+serverName = ${tomlString(`${serverName}-stcp`)}
 secretKey = ${tomlString(options.secretKey ?? "")}
 bindPort = -1
 
 [[visitors]]
-name = "${visitorName}"
+name = ${tomlString(visitorName)}
 type = "xtcp"
-serverName = "${serverName}"
+serverName = ${tomlString(serverName)}
 secretKey = ${tomlString(options.secretKey ?? "")}
-bindAddr = "${options.bindAddr ?? "127.0.0.1"}"
+bindAddr = ${tomlString(bindAddr)}
 bindPort = ${options.bindPort}
 keepTunnelOpen = true
-fallbackTo = "${stcpVisitor}"
+fallbackTo = ${tomlString(stcpVisitor)}
 # T113：打洞尝试的超时预算。原为 frp 缺省的 5000 —— 实测**每一条新建 TCP 连接**都要付一次
 # （5057–5162ms，与资源体积无关），稳态首屏两段就白等 10.37s（T111 report §3.3）。
 # 800ms 与 Android 侧 VisitorConfig.FALLBACK_TIMEOUT_MS 必须同值（cross-end.mjs 逐行对齐）。
@@ -313,6 +332,8 @@ export function visitorConnectionString(options: {
 	bindPort: number;
 	/** 网关自签证书 SHA-256 指纹（hex）；提供后 App 端启用证书锁定 */
 	fingerprint?: string;
+	trustedCaFile?: string;
+	tlsServerName?: string;
 }): string {
 	const params = new URLSearchParams({
 		v: "1",
@@ -326,6 +347,12 @@ export function visitorConnectionString(options: {
 	});
 	if (typeof options.fingerprint === "string" && options.fingerprint.length > 0) {
 		params.set("fp", options.fingerprint.replace(/:/g, "").toLowerCase());
+	}
+	if (typeof options.trustedCaFile === "string" && options.trustedCaFile.length > 0) {
+		params.set("ca", options.trustedCaFile);
+	}
+	if (typeof options.tlsServerName === "string" && options.tlsServerName.length > 0) {
+		params.set("sni", options.tlsServerName);
 	}
 	return `dsh-remote://visitor?${params.toString()}`;
 }

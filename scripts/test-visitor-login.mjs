@@ -105,7 +105,9 @@ test("改访客密钥并重启后：旧密钥和旧/未绑定 Cookie 失效，�
 	try {
 		const legacy = await f.store.addDevice("历史配对设备");
 		const legacyCookie = `dr_device=${legacy.token}`;
-		assert.equal((await f.call("/api/test", { headers: { cookie: legacyCookie } })).status, 401);
+		assert.equal((await f.call("/api/test", { headers: { cookie: legacyCookie } })).status, 401, "旧名 dr_device 不得再被认成设备凭据");
+		const wrongInstance = `dr_device_${"0".repeat(16)}=${legacy.token}`;
+		assert.equal((await f.call("/api/test", { headers: { cookie: wrongInstance } })).status, 401, "别的实例后缀不得认本机设备");
 		const first = await login(f, visitorKey);
 		assert.equal(first.status, 200);
 		const cookie = first.setCookie.split(";")[0];

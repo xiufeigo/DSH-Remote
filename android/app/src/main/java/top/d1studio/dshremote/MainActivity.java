@@ -10,6 +10,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.content.res.Configuration;
 import android.database.Cursor;
 import android.graphics.Bitmap;
@@ -87,6 +88,7 @@ import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
+import java.security.SecureRandom;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -117,6 +119,8 @@ import org.json.JSONObject;
 public class MainActivity extends Activity {
 
 	public static final String PREFS = "dsh_remote";
+	/** 登录用的设备名。首次安装写入，之后重连沿用，避免两台手机互相挤掉对方的 Cookie。 */
+	private static final String KEY_DEVICE_LOGIN_NAME = "device_login_name";
 
 	/**
 	 * 隧道常驻通知「连接设置」动作的 Intent action（D6）。
@@ -2045,6 +2049,7 @@ public class MainActivity extends Activity {
 			.setPositiveButton("删除", (d, w) -> {
 				ProfileStore.delete(prefs(), editingProfileId);
 				leaveEditor();
+				requestFleet(false);
 			})
 			.setNegativeButton("取消", null)
 			.show();
@@ -2084,37 +2089,46 @@ public class MainActivity extends Activity {
 		Uri data = i.getData();
 		if (!"dsh-remote".equals(data.getScheme()) || !"visitor".equals(data.getHost())) return false;
 		VisitorConfig c = VisitorConfig.parse(data.toString());
+		i.setData(null);
 		if (c == null) {
 			Toast.makeText(this, "无法识别的导入链接", Toast.LENGTH_LONG).show();
 			showHome();
 			return true;
 		}
+		String fp = CertPin.normalizeFingerprint(c.fingerprint);
+		String fpShort = fp.length() >= 8 ? fp.substring(0, 8) : (fp.isEmpty() ? "未提供" : fp);
+		new AlertDialog.Builder(this)
+			.setTitle("导入隧道配置")
+			.setMessage("服务器：" + c.serverAddr + ":" + c.serverPort
+				+ "\n隧道名：" + c.serverName
+				+ "\n证书指纹：" + fpShort
+				+ "\n\n确认后才会保存并连接。")
+			.setNegativeButton("取消", (dialog, which) -> showHome())
+			.setPositiveButton("导入并连接", (dialog, which) -> applyImportedProfile(c))
+			.setCancelable(false)
+			.show();
+		return true;
+	}
+
+	private void applyImportedProfile(VisitorConfig c) {
 		ProfileStore.Profile p = ProfileStore.newProfile();
 		p.name = c.serverAddr;
 		p.serverAddr = c.serverAddr;
 		p.serverPort = c.serverPort;
 		p.authToken = c.authToken;
 		p.secretKey = c.secretKey;
-		// T104：链接里的 mode 就是**电脑端形态**。stcp 形态下访客也必须用 stcp
-		// （否则会拿着 xtcp 访客去找一条不存在的 xtcp 代理）；entry/未知沿用历史 xtcp。
 		p.pcMode = VisitorConfig.normalizePcMode(c.pcMode);
 		p.mode = ProfileStore.modeForPcMode(p.pcMode);
-		// T104：新导入的配置组默认「打洞优先」（与改前行为逐字一致）；若电脑端是 stcp 形态，
-		// 编辑器/连接时的可用性矩阵会把它如实收敛成「只用中转」。
 		p.strategy = VisitorConfig.STRATEGY_P2P;
 		p.tunnelName = ProfileStore.normalizeTunnelName(c.serverName);
-		// T23-A：二维码里的网关自签指纹必须随配置组一起存下来。改前这里没拷，
-		// Profile 也没有该字段 ⇒ 指纹在导入那一刻就被丢弃，后续首连前的「预置指纹」
-		// 分支永远不成立（每次都退回 TOFU）。
 		p.fingerprint = CertPin.normalizeFingerprint(c.fingerprint);
+		p.tlsCaFile = c.tlsCaFile == null ? "" : c.tlsCaFile;
+		p.tlsServerName = c.tlsServerName == null ? "" : c.tlsServerName;
 		ProfileStore.upsert(prefs(), p);
 		ProfileStore.setActiveId(prefs(), p.id);
 		rememberLast(ServerPicker.TUNNEL, p.id);
-		// T117：导入/扫码成功 = 一次**授权数据写入**，顺手把 cookie 存储刷盘
-		// （同一个洞口：写完就 force-stop 不该丢东西）。日志理由见 flushDeviceCookies。
 		flushDeviceCookies("importLink");
 		beginTunnel(p);
-		return true;
 	}
 
 	/**
@@ -2225,10 +2239,26 @@ public class MainActivity extends Activity {
 			for (ProfileStore.Profile item : all) {
 				if (profile.id.equals(item.id)) assigned = item;
 			}
+			int candidate = assigned.bindPort;
+			cfg.bindPort = candidate > 0 ? candidate : cfg.bindPort;
+			boolean reuse = candidate > 0 && isLocalPortOpen(candidate);
+			if (reuse && !PinnedFetch.probeHealth(candidate).confirms(cfg.fingerprint)) {
+				Log.w("dshr-frpc", "端口 " + candidate + " 上不是这台电脑的网关，重新分配");
+				for (ProfileStore.Profile item : all) {
+					if (profile.id.equals(item.id)) item.bindPort = 0;
+				}
+				VisitorFleet.assignPorts(all, profile.id, 0);
+				ProfileStore.saveAll(prefs(), all);
+				for (ProfileStore.Profile item : all) {
+					if (profile.id.equals(item.id)) assigned = item;
+				}
+				candidate = assigned.bindPort;
+				cfg.bindPort = candidate > 0 ? candidate : cfg.bindPort;
+				reuse = false;
+			}
 			final ProfileStore.Profile readyProfile = assigned;
-			final int port = readyProfile.bindPort;
-			cfg.bindPort = port > 0 ? port : cfg.bindPort;
-			final boolean open = port > 0 && isLocalPortOpen(port);
+			final int port = candidate;
+			final boolean open = reuse;
 			runOnUiThread(() -> {
 				if (destroyed) return;
 				if (generation != connectionGeneration) {
@@ -2247,17 +2277,10 @@ public class MainActivity extends Activity {
 				}
 				// 同一份 toml 已经在跑时服务侧不会重启，当前页的连接留着。
 				requestFleet(false);
-				String target = "https://127.0.0.1:" + port + "/";
 				if (open) {
 					seedTunnelFingerprint(profile.id, port, cfg.fingerprint);
-					setTunnelState("隧道已在运行，正在打开会话…");
-					if (seamless) {
-						startBackgroundPage(target, profile.id, ServerPicker.Current.tunnel(readyProfile),
-							readyProfile, null, generation);
-						return;
-					}
-					if (resumeLiveSession(target)) return;
-					openGateway(target, profile.id);
+					finishTunnelOpen("https://127.0.0.1:" + port + "/", profile.id, cfg.secretKey,
+						port, cfg.fingerprint, seamless, generation, readyProfile);
 					return;
 				}
 				setTunnelState("正在启动隧道（端口 " + port + "）…");
@@ -2289,7 +2312,10 @@ public class MainActivity extends Activity {
 				break;
 			}
 		}
-		if (!any) return;
+		if (!any && !TunnelService.isRunning()) {
+			FrpcManager.wipeOrphanFleetFiles(this, new ArrayList<String>());
+			return;
+		}
 		if (activeOnly && !TunnelService.isRunning()) return;
 		boolean sameFrps = !activeOnly && ProfileStore.preconnectSameFrps(prefs());
 		Intent svc = new Intent(this, TunnelService.class);
@@ -2311,8 +2337,83 @@ public class MainActivity extends Activity {
 		for (String key : CertPin.seedKeys(profileId, "127.0.0.1", port)) {
 			seed.putString(key, seedFp);
 		}
-		seed.apply();
+		seed.commit();
 		Log.i("dshr-perf", "预置网关证书指纹 profile=" + profileId + " 端口=" + port);
+	}
+
+	/**
+	 * 登录上报的设备名。厂商和型号相同的两台手机会撞车，所以首次安装再拼一段随机后缀并记住。
+	 * 同一台手机重连沿用这个名字，网关才会把重复登录收成同一行。
+	 */
+	private String deviceLoginName() {
+		SharedPreferences prefs = prefs();
+		String saved = prefs.getString(KEY_DEVICE_LOGIN_NAME, "");
+		if (!TextUtils.isEmpty(saved)) return saved;
+		String raw = (Build.MANUFACTURER + " " + Build.MODEL).replaceAll("[\\p{Cntrl}]", " ").trim();
+		raw = raw.replaceAll(" {2,}", " ");
+		if (raw.length() > 48) raw = raw.substring(0, 48).trim();
+		if (raw.isEmpty()) raw = "Android";
+		byte[] bytes = new byte[5];
+		new SecureRandom().nextBytes(bytes);
+		StringBuilder suffix = new StringBuilder(5);
+		for (byte value : bytes) suffix.append("abcdefghijkmnpqrstuvwxyz23456789".charAt((value & 0xff) % 32));
+		String name = raw + "-" + suffix;
+		prefs.edit().putString(KEY_DEVICE_LOGIN_NAME, name).commit();
+		return name;
+	}
+
+	private void finishTunnelOpen(final String target, final String profileId, final String secretKey,
+			final int port, final String fingerprint, final boolean seamless, final int generation,
+			final ProfileStore.Profile readyProfile) {
+		runInBackground("device-login", () -> {
+			PinnedFetch.LoginResult login = PinnedFetch.exchangeVisitorKey(
+				"https://127.0.0.1:" + port + "/__dsh_remote__/login",
+				port, profileId, certPinStore(), secretKey, fingerprint, deviceLoginName());
+			runOnUiThread(() -> {
+				if (destroyed) return;
+				if (generation != connectionGeneration) {
+					if (seamless) abortSeamlessSwitch(null);
+					return;
+				}
+				if (login.kind != PinnedFetch.LoginKind.OK) {
+					String message = login.kind == PinnedFetch.LoginKind.MISMATCH
+						? "访客密钥与电脑端不一致。"
+						: (login.kind == PinnedFetch.LoginKind.LOCKED
+							? "失败次数过多，请稍后再试。"
+							: (login.detail != null && login.detail.contains("证书")
+								? "网关证书与已保存的指纹不一致。"
+								: "自动登录失败，请重试。"));
+					if (seamless) {
+						abortSeamlessSwitch(message);
+						return;
+					}
+					setTunnelState(message);
+					showLocalShell(
+						UiState.CONNECTING,
+						"failed",
+						"无法登录",
+						message,
+						"dsh-remote://app/retry",
+						"重新连接",
+						"dsh-remote://app/home",
+						"返回服务器列表"
+					);
+					return;
+				}
+				if (seamless) {
+					ProfileStore.Profile ready = readyProfile != null ? readyProfile : ProfileStore.get(prefs(), profileId);
+					if (ready == null) {
+						abortSeamlessSwitch("服务器配置已删除或不可用，请检查连接设置。");
+						return;
+					}
+					startBackgroundPage(target, profileId, ServerPicker.Current.tunnel(ready), ready, null, generation);
+					return;
+				}
+				setTunnelState("隧道已就绪，正在打开 DSH…");
+				if (resumeLiveSession(target)) return;
+				openGateway(target, profileId);
+			});
+		});
 	}
 
 	/**
@@ -2418,18 +2519,8 @@ public class MainActivity extends Activity {
 				// 两个信任语境彻底分开（不再互回退），此时写共享地址键对本档毫无用处，
 				// 反而会把这份信任泄漏给同一 host:port 上的直连/局域网节点。
 				seedTunnelFingerprint(profileId, cfg.bindPort, cfg.fingerprint);
-				if (seamless) {
-					ProfileStore.Profile ready = ProfileStore.get(prefs(), profileId);
-					if (ready == null) {
-						abortSeamlessSwitch("服务器配置已删除或不可用，请检查连接设置。");
-						return;
-					}
-					startBackgroundPage("https://127.0.0.1:" + cfg.bindPort + "/", profileId,
-						ServerPicker.Current.tunnel(ready), ready, null, generation);
-					return;
-				}
-				setTunnelState("隧道已就绪，正在打开 DSH…");
-				openGateway("https://127.0.0.1:" + cfg.bindPort + "/", profileId);
+				finishTunnelOpen("https://127.0.0.1:" + cfg.bindPort + "/", profileId, cfg.secretKey,
+					cfg.bindPort, cfg.fingerprint, seamless, generation, null);
 			});
 		});
 	}
@@ -3198,18 +3289,29 @@ public class MainActivity extends Activity {
 			@Override
 			public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
 				Uri uri = request.getUrl();
-				if (isStaging(view)) {
-					String scheme = uri.getScheme();
-					if ("http".equals(scheme) || "https".equals(scheme)) return false;
-					if (view == stagingWebView) {
-						abortSeamlessSwitch("目标服务器跳到了不支持的地址，已停留在当前主机。");
-					}
+				if (uri == null) return false;
+				if (!request.isForMainFrame()) {
+					String frameScheme = uri.getScheme();
+					if ("http".equalsIgnoreCase(frameScheme) || "https".equalsIgnoreCase(frameScheme)) return false;
 					return true;
 				}
-				if (handleAppAction(uri)) return true;
+				if (handleAppAction(uri, view)) return true;
 				String scheme = uri.getScheme();
 				boolean web = "http".equals(scheme) || "https".equals(scheme);
-				if (web) return false;
+				if (web) {
+					if (isStaging(view)) {
+						if (isGatewayOf(uri, pendingSwitchUrl)) return false;
+						if (view == stagingWebView) {
+							abortSeamlessSwitch("目标服务器跳到了不支持的地址，已停留在当前主机。");
+						}
+						return true;
+					}
+					if (!isActiveGatewayUri(uri)) {
+						openExternal(uri);
+						return true;
+					}
+					return false;
+				}
 				if ("dsh-remote".equals(scheme)) return true;
 				try {
 					startActivity(new Intent(Intent.ACTION_VIEW, uri));
@@ -5648,7 +5750,7 @@ public class MainActivity extends Activity {
 	}
 
 	private boolean isLocalShellUrl(String url) {
-		if (TextUtils.isEmpty(url)) return true;
+		if (TextUtils.isEmpty(url)) return false;
 		String u = url.toLowerCase(Locale.US);
 		return u.startsWith("https://dsh-remote.local")
 			|| u.startsWith("http://dsh-remote.local")
@@ -5698,6 +5800,13 @@ public class MainActivity extends Activity {
 	 */
 	private void enterSessionPage(WebView view, String url) {
 		if (view == null || !isSessionUrl(url)) return;
+		Uri pageUri;
+		try {
+			pageUri = Uri.parse(url);
+		} catch (Exception e) {
+			return;
+		}
+		if (!isActiveGatewayUri(pageUri)) return;
 		// 错误页不是会话页：主框架失败后 Chromium 仍用【原 URL】回调这三个入口，
 		// 若照常判成会话页就会 ①给错误页注入 hook、②置 uiState=WEB、③clearHistory()，
 		// 于是之后所有网关失败被 showGatewayFailure 永久降级成 Toast、
@@ -5780,8 +5889,9 @@ public class MainActivity extends Activity {
 		return true;
 	}
 
-	private boolean handleAppAction(Uri uri) {
+	private boolean handleAppAction(Uri uri, WebView source) {
 		if (!"dsh-remote".equals(uri.getScheme()) || !"app".equals(uri.getHost())) return false;
+		if (!appActionAllowed(source)) return true;
 		String path = uri.getPath();
 		if ("/settings".equals(path)) {
 			showConnectionSettings();
@@ -5795,15 +5905,45 @@ public class MainActivity extends Activity {
 			showHome();
 			return true;
 		}
-		if ("/disconnect".equals(path)) {
-			stopTunnel();
-			return true;
-		}
-		if ("/clear".equals(path)) {
-			clearDeviceData();
-			return true;
-		}
 		return true;
+	}
+
+	private boolean appActionAllowed(WebView source) {
+		WebView pageView = source != null ? source : webView;
+		String page = pageView == null ? null : pageView.getUrl();
+		if (page != null) {
+			try {
+				Uri parsed = Uri.parse(page);
+				if (parsed != null && "dsh-remote.local".equalsIgnoreCase(parsed.getHost())) return true;
+				if (isActiveGatewayUri(parsed)) return true;
+			} catch (Exception ignored) {
+			}
+		}
+		return uiState != UiState.WEB && isLocalShellUrl(page);
+	}
+
+	private void openExternal(Uri uri) {
+		Intent view = new Intent(Intent.ACTION_VIEW, uri);
+		try {
+			Intent probe = new Intent("android.support.customtabs.action.CustomTabsService");
+			probe.setPackage("com.android.chrome");
+			if (getPackageManager().resolveService(probe, 0) == null) {
+				probe.setPackage(null);
+				ResolveInfo info = getPackageManager().resolveService(probe, 0);
+				if (info != null && info.serviceInfo != null) view.setPackage(info.serviceInfo.packageName);
+			} else {
+				view.setPackage("com.android.chrome");
+			}
+			Bundle extras = new Bundle();
+			extras.putBinder("android.support.customtabs.extra.SESSION", null);
+			view.putExtras(extras);
+			startActivity(view);
+		} catch (ActivityNotFoundException e) {
+			try {
+				startActivity(new Intent(Intent.ACTION_VIEW, uri));
+			} catch (ActivityNotFoundException ignored) {
+			}
+		}
 	}
 
 	/**

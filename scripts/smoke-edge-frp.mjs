@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { access, constants, copyFile, mkdir, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 // PLG-03：公共夹具收敛到 scripts/test-harness.mjs。
-import { startFakeUpstream, requestTls, waitFor, makeTempHome } from "./test-harness.mjs";
+import { startFakeUpstream, requestTls, waitFor, makeTempHome, deviceCookieHeader } from "./test-harness.mjs";
 
 const VENDOR_SRC = join(process.env.USERPROFILE ?? process.env.HOME ?? "", ".dsh-remote", "vendor", "frp");
 
@@ -29,6 +29,10 @@ async function haveBinaries() {
 }
 
 if (!(await haveBinaries())) {
+	if (process.env.DSHR_REQUIRE_FRP === "1") {
+		console.error("smoke-edge-frp：要求 frp 二进制（~/.dsh-remote/vendor/frp），但没找到");
+		process.exit(1);
+	}
 	console.log("smoke-edge-frp：未找到本机 frp 二进制（~/.dsh-remote/vendor/frp），跳过全链路测试");
 	process.exit(0);
 }
@@ -166,7 +170,7 @@ try {
 		body: JSON.stringify({ token: AUTH_TOKEN, name: "链路测试机" }),
 	});
 	assert.equal(submit.status, 200, `Token 登录应成功：${submit.body}`);
-	fixture.cookie = `dr_device=${/dr_device=([^;]+)/.exec(submit.setCookie)?.[1]}`;
+	fixture.cookie = deviceCookieHeader(submit.setCookie);
 
 	// 等隧道真正打通（frpc 注册 + visitor 就绪需要数秒），期间 502 属预期
 	let proxied;

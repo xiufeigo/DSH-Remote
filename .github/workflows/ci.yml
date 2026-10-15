@@ -1,5 +1,7 @@
-# 最小 Node 测试 CI：push/PR 到 main 时跑类型检查 + 快测七件套。
-# 不跑重链路（panel/mobile/frp 全链路需浏览器或 frp 二进制，留本地）。
+# 最小 Node 测试 CI：push/PR 到 main 时跑类型检查和快测。
+# 会安装 frp，并真正跑 smoke:edge:frp 与 smoke:dual:frp（含 mode entry）。
+# 没有二进制时 smoke:edge:frp 在 DSHR_REQUIRE_FRP=1 下失败，不再静默跳过。
+# panel / mobile 仍留在本地。
 name: ci
 
 on:
@@ -38,10 +40,45 @@ jobs:
           pnpm -C packages/plugin build
           git diff --exit-code -- packages/plugin/lib/
 
-      - name: 快测（smoke / edge / routes / session / fixes / perf / desktop-compat）
+      - name: 读取 frp 版本
+        id: frp
+        run: echo "version=$(node -p "require('./package.json').frpVersion")" >> "$GITHUB_OUTPUT"
+
+      - name: 缓存 frp
+        id: frp-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.dsh-remote/vendor/frp
+          key: frp-${{ steps.frp.outputs.version }}-linux-amd64
+
+      - name: 安装 frp
+        run: |
+          version="${{ steps.frp.outputs.version }}"
+          dest="$HOME/.dsh-remote/vendor/frp"
+          mkdir -p "$dest"
+          if [ "${{ steps.frp-cache.outputs.cache-hit }}" = "true" ]; then
+            chmod +x "$dest/frpc" "$dest/frps"
+          else
+            echo "缓存未命中，从 GitHub Releases 下载 frp ${version}"
+            if ! curl -fsSL -o /tmp/frp.tgz "https://github.com/fatedier/frp/releases/download/v${version}/frp_${version}_linux_amd64.tar.gz"; then
+              echo "下载 frp ${version} 失败。GitHub Releases 不可达，或 package.json 的 frpVersion 与发布包不一致。" >&2
+              exit 1
+            fi
+            tar -xzf /tmp/frp.tgz -C /tmp
+            cp "/tmp/frp_${version}_linux_amd64/frpc" "/tmp/frp_${version}_linux_amd64/frps" "$dest/"
+            chmod +x "$dest/frpc" "$dest/frps"
+          fi
+          test -x "$dest/frpc"
+          test -x "$dest/frps"
+
+      - name: 快测（smoke / edge / frp 全链路 / routes / session / fixes / perf / desktop-compat / security）
+        env:
+          DSHR_REQUIRE_FRP: "1"
         run: |
           pnpm smoke
           pnpm smoke:edge
+          pnpm smoke:edge:frp
+          pnpm smoke:dual:frp
           pnpm test:routes
           pnpm test:frp
           pnpm test:visitor
@@ -49,3 +86,4 @@ jobs:
           pnpm test:fixes
           pnpm test:perf
           pnpm test:desktop
+          pnpm test:security

@@ -66,7 +66,7 @@ try {
 		body: JSON.stringify({ code, name: "ws-probe" }),
 	});
 	if (submit.status !== 200) throw new Error(`配对失败：${String(submit.status)} ${submit.body}`);
-	const cookie = /dr_device=[^;]+/.exec(submit.headers["set-cookie"]?.join("; ") ?? "")?.[0];
+	const cookie = /(dr_device(?:_[A-Za-z0-9_-]+)?=[^;]+)/.exec(submit.headers["set-cookie"]?.join("; ") ?? "")?.[1];
 	if (cookie === undefined) throw new Error("未拿到设备 Cookie");
 	console.log("配对成功，Cookie 就绪");
 
@@ -76,6 +76,7 @@ try {
 				socket.write([
 					`GET ${wsPath} HTTP/1.1`,
 					`host: ${GW_HOST}:${String(GW_PORT)}`,
+					`origin: https://${GW_HOST}:${String(GW_PORT)}`,
 					"upgrade: websocket",
 					"connection: Upgrade",
 					"sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==",

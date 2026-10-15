@@ -51,19 +51,20 @@ test("validateConfigPatch：白名单与类型校验", () => {
 test("validateConfigPatch：登录密钥与访客密钥进 secrets 不进 config", () => {
 	const ok = validateConfigPatch({
 		authToken: "frps-token",
-		visitorKey: "visitor-sk",
+		visitorKey: "visitor-secret-key1",
 		frp: { enabled: true, serverAddr: "1.2.3.4", serverPort: 7000, mode: "xtcp" },
 	});
 	assert.equal(ok.ok, true);
 	assert.equal(ok.patch.frp.mode, "xtcp");
-	assert.deepEqual(ok.secrets, { authToken: "frps-token", visitorKey: "visitor-sk" });
+	assert.deepEqual(ok.secrets, { authToken: "frps-token", visitorKey: "visitor-secret-key1" });
 	assert.equal(ok.patch.authToken, undefined);
 
 	const bad = validateConfigPatch({ authToken: "has\nnewline" });
 	assert.equal(bad.ok, false);
 	assert.equal(validateConfigPatch({ visitorKey: "   " }).ok, false);
 	assert.equal(validateConfigPatch({ visitorKey: "visit-key\n" }).ok, false);
-	assert.deepEqual(validateConfigPatch({ visitorKey: " visit-key " }).secrets, { visitorKey: "visit-key" });
+	assert.equal(validateConfigPatch({ visitorKey: " visit-key " }).ok, false);
+	assert.deepEqual(validateConfigPatch({ visitorKey: " visitor-key-ok!! " }).secrets, { visitorKey: "visitor-key-ok!!" });
 });
 
 test("validateConfigPatch：frp.mode 白名单", () => {
@@ -172,7 +173,7 @@ test("handleConfigPost：仅公网模式也保存自定义访客密钥，密钥�
 		fakeReq(JSON.stringify({
 			frp: { enabled: true, serverAddr: "9.9.9.9", serverPort: 7000, mode: "entry" },
 			authToken: "login-key",
-			visitorKey: "visit-key",
+			visitorKey: "visitor-key-ok!!",
 		})),
 		res,
 	);
@@ -180,7 +181,7 @@ test("handleConfigPost：仅公网模式也保存自定义访客密钥，密钥�
 	assert.equal(writtenConfig.frp.enabled, true);
 	assert.equal(writtenConfig.frp.serverAddr, "9.9.9.9");
 	assert.equal(writtenConfig.authToken, undefined);
-	assert.deepEqual(writtenSecrets, { frpAuthToken: "login-key", frpVisitorKey: "visit-key" });
+	assert.deepEqual(writtenSecrets, { frpAuthToken: "login-key", frpVisitorKey: "visitor-key-ok!!" });
 });
 
 test("handleConfigPost：写密钥时保留 secrets.json 的未知字段（adminToken/accessTokenHash）", async () => {
@@ -208,13 +209,13 @@ test("handleConfigPost：写密钥时保留 secrets.json 的未知字段（admin
 		fakeReq(JSON.stringify({
 			frp: { enabled: true, serverAddr: "9.9.9.9", serverPort: 7000, mode: "xtcp" },
 			authToken: "login-key",
-			visitorKey: "visit-key",
+			visitorKey: "visitor-key-ok!!",
 		})),
 		res,
 	);
 	assert.equal(res.calls.status, 200);
 	assert.equal(writtenSecrets.frpAuthToken, "login-key", "提交的登录密钥生效");
-	assert.equal(writtenSecrets.frpVisitorKey, "visit-key", "提交的访客密钥生效");
+	assert.equal(writtenSecrets.frpVisitorKey, "visitor-key-ok!!", "提交的访客密钥生效");
 	assert.equal(writtenSecrets.adminToken, "gw-admin-shared-secret",
 		"P0-2 adminToken 必须原样保留（整体重写会抹掉网关门禁密钥 → 保存后插件请求全 403）");
 	assert.equal(writtenSecrets.accessTokenHash, "sha256hex", "accessTokenHash 必须原样保留（edge 门禁哈希）");

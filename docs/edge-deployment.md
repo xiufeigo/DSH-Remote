@@ -193,8 +193,13 @@ docker exec dsh-remote-gateway node src/cli.ts devices
 - 未配置 Token 时 edge 会退化为配对码认证（兼容），但 doctor 会告警——
   公网入口请务必配置 Token。
 
-> 与 desktop 角色的关键差别：edge **不复用**「访客密钥即准入」的捷径
-> （`visitorKeyAdmits`），因为 edge 本身就是公网页面入口，人人必须过门禁。
+> 与 desktop 角色的差别只在登录凭据：edge 用访问 Token，desktop 的 stcp/xtcp
+> 和公网入口用访客密钥。两边都不再凭隧道密钥直通，未登录一律先换设备 Cookie。
+> edge 把请求转到电脑端隧道时，用同一把访客密钥向电脑端换一张设备 Cookie，
+> 只缓存在 edge 进程里再注入上游；浏览器拿不到电脑端的 Cookie，电脑端也看不到
+> 浏览器在 edge 上的 Cookie。这条隧道上的对端证书不校验，认证靠两边相同的
+> stcp 访客密钥。密钥不一致或电脑端把 `127.0.0.1` 登录桶锁住时，edge 只试一次
+> 就停，并在日志里写明原因；改密钥或重启 edge 之后才会再试，避免把手机的自动登录一起锁 15 分钟。
 
 ## 6. 移动 hook 布局说明
 
@@ -236,7 +241,7 @@ env 覆盖 config.json；两者都缺省时回落内置默认值。
 
 | 现象 | 排查 |
 |---|---|
-| 登录页能开、登录后一直 502 | 隧道没通：`logs` 找 `[frpc]`/`[frps]`/`[frpc-visitor]` 行。常见：token 不一致、`DSHR_FRP_NAME` 与 PC 端 `frp.name` 不同、PC 用了 xtcp 而 edge 在等 stcp 代理名（见 §1 提示） |
+| 登录页能开、登录后一直 502 | 隧道没通：`logs` 找 `[frpc]`/`[frps]`/`[frpc-visitor]` 行。常见：token 不一致、`DSHR_FRP_NAME` 与 PC 端 `frp.name` 不同、PC 用了 xtcp 而 edge 在等 stcp 代理名（见 §1 提示）。若日志是「拒绝访客密钥」或「已锁定来自隧道的登录」，edge 已停止重试：核对两边的访客密钥，或等电脑端锁定过期，然后重启 edge |
 | frps 反复打印 `register visitor conn error … doesn't exist` | PC 侧还没注册上来（刚启动属正常）；持续出现则检查 PC frpc 是否在跑、token 是否一致 |
 | health 通但手机打不开域名 | Caddy 证书未签发成功：`docker compose logs caddy`；确认域名解析与 80/443 放行 |
 | 错 Token 提示「已临时锁定」 | 5 次失败锁 15 分钟，等或重启网关清内存桶 |

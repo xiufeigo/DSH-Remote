@@ -41,17 +41,15 @@ function isPort(value) {
 }
 
 /**
- * 域名/IPv4 字符集校验（IPv6 走字面量白名单外场景暂不支持）。
- * 网关侧不对 frp.serverAddr 做校验（直接写进 frpc.toml 由 frpc 解释），
- * 这里是面板层的输入护栏：拒绝空白与控制字符，避免把换行注入 toml。
+ * 域名、IPv4、IPv6（可带方括号）和字母类域名（含 IDN）。
+ * 与 Android VisitorConfig.isHostOrIp 同一套：拒绝空白、引号和控制字符。
  */
 function isHostOrIp(value) {
-	return (
-		typeof value === "string"
-		&& value.length > 0
-		&& value.length <= 253
-		&& /^[A-Za-z0-9.\-_]+$/.test(value)
-	);
+	if (typeof value !== "string" || value.length === 0 || value.length > 253) return false;
+	if (/[\u0000-\u001F\u007F\s"'\\/]/.test(value)) return false;
+	if (/^[\p{L}0-9.\-_]+$/u.test(value)) return true;
+	const bare = value.startsWith("[") && value.endsWith("]") ? value.slice(1, -1) : value;
+	return bare.includes(":") && /^[0-9A-Fa-f:.]+$/.test(bare);
 }
 
 /**
@@ -59,7 +57,14 @@ function isHostOrIp(value) {
  * 访客密钥上限与网关 auth.ts MAX_VISITOR_KEY_LENGTH 一致（512）。
  */
 function isSecret(value) {
-	return typeof value === "string" && value.trim().length > 0 && value.length <= 512 && !/[\r\n\0]/.test(value);
+	return typeof value === "string" && value.trim().length > 0 && value.length <= 512 && !/[\u0000-\u001F\u007F]/.test(value);
+}
+
+/** 自定义访客密钥：至少 16 位可见 ASCII，拒绝空格和控制字符。 */
+function isVisitorKey(value) {
+	if (typeof value !== "string") return false;
+	const trimmed = value.trim();
+	return trimmed.length >= 16 && trimmed.length <= 512 && /^[\x21-\x7E]+$/.test(trimmed);
 }
 
 /**
@@ -88,8 +93,11 @@ export function validateConfigPatch(input) {
 		const value = input[key];
 		switch (key) {
 			case "authToken":
+				if (!isSecret(value)) errors.push("登录密钥必须是 1-512 位且不含控制字符");
+				else secrets[key] = value.trim();
+				break;
 			case "visitorKey":
-				if (!isSecret(value)) errors.push(`${key === "authToken" ? "登录密钥" : "访客密钥"}必须是 1-512 位且不含换行`);
+				if (!isVisitorKey(value)) errors.push("访客密钥至少 16 位、最长 512 位，且只能使用可见 ASCII 字符");
 				else secrets[key] = value.trim();
 				break;
 			case "autoFixUpstreamPort":
@@ -115,7 +123,10 @@ export function validateConfigPatch(input) {
 					break;
 				}
 				const frpPatch = {};
-				const frpAllowed = new Set(["enabled", "entryEnabled", "serverAddr", "serverPort", "remotePort", "mode", "name"]);
+				const frpAllowed = new Set([
+					"enabled", "entryEnabled", "serverAddr", "serverPort", "remotePort", "mode", "name",
+					"tlsTrustedCaFile", "tlsServerName",
+				]);
 				for (const frpKey of Object.keys(value)) {
 					if (!frpAllowed.has(frpKey)) {
 						errors.push(`未知 frp 配置项：${frpKey}`);
@@ -150,6 +161,12 @@ export function validateConfigPatch(input) {
 						if (frpValue === "") frpPatch.serverAddr = "";
 						else if (!isHostOrIp(frpValue)) errors.push("frp.serverAddr 必须是合法域名或 IP");
 						else frpPatch.serverAddr = frpValue;
+					} else if (frpKey === "tlsTrustedCaFile" || frpKey === "tlsServerName") {
+						if (typeof frpValue !== "string" || frpValue.length > 1024 || /[\u0000-\u001F\u007F]/.test(frpValue)) {
+							errors.push(`frp.${frpKey} 只能是不含控制字符的路径或名称（最长 1024）`);
+						} else {
+							frpPatch[frpKey] = frpValue.trim();
+						}
 					} else {
 						if (!isPort(frpValue)) errors.push(`frp.${frpKey} 必须是 1-65535 的整数`);
 						else frpPatch[frpKey] = frpValue;

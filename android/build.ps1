@@ -156,7 +156,7 @@ if ($DebugBuild) {
 & "$Bt/aapt2$exe" link -o "$OutDir/base.apk" -I $PlatformJar `
 	--manifest (Join-Path $AppDir "src/main/AndroidManifest.xml") `
 	--java "$OutDir/gen" `
-	--min-sdk-version 24 --target-sdk-version 34 `
+	--min-sdk-version 24 --target-sdk-version 35 `
 	--version-code $VersionCode --version-name $ApkVersionName `
 	@LinkDebugArgs `
 	"$OutDir/res.zip"
