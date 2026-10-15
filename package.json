@@ -1,7 +1,7 @@
 {
   "name": "dsh-remote",
   "private": true,
-  "version": "0.2.0-rc.2.23",
+  "version": "0.2.0-rc.2.24",
   "dshVersion": "0.2.0-rc.2",
   "config": {
     "frpVersion": "0.61.1"
@@ -32,6 +32,7 @@
     "test:security": "node --test scripts/test-security-hardening.mjs",
     "test:perf": "node --test scripts/test-perf-opt.mjs",
     "test:mobile": "node scripts/test-mobile-chrome.mjs",
+    "test:terminal": "node scripts/test-terminal-focus.mjs",
     "test:device": "node scripts/test-device-class.mjs",
     "typecheck": "pnpm -C packages/gateway typecheck && pnpm -C packages/plugin typecheck",
     "start": "node packages/gateway/src/cli.ts start"

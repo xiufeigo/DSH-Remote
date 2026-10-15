@@ -1290,15 +1290,72 @@
 		return true;
 	}
 
+	// ── T-终端：xterm 输入面（手机档「终端弹出来后点击没反应」的根因）──────────────
+	//
+	// 症状（用户口径）：手机上打开终端后，点终端没有任何反应（点不动、软键盘不弹、
+	// 打字没有回显）。
+	//
+	// 根因：DSH 的工作区终端是 xterm.js。它的落点是 `.xterm-screen`（div，**不是**
+	// 可编辑元素），真正的输入面是它内部那个 CSS 上 0×0 且 `left:-9999em` 的
+	// `.xterm-helper-textarea`（见 xterm.css），xterm 在抬手之后自己 `focus()` 它。
+	// 而本守卫只放行「落指就在可编辑元素内」的聚焦（isEditablePoint ⇒ 假），
+	// 于是这次聚焦被判成「非用户手势造成的偷焦点」，focusin 捕获阶段当场 `blur()`
+	// ⇒ 终端永远拿不到焦点；反复点还会升级成粘性持续收回（revokeStealthFocus）。
+	//
+	// 判据必须认**终端宿主**（`.xterm`）而不是可编辑元素本身：那个 textarea 在页面上
+	// 摸不到（0×0、且在屏幕外），用户永远不可能直接点到它。
+	var TERMINAL_HOST_SELECTOR = '.xterm';
+	var TERMINAL_INPUT_SELECTOR = 'textarea.xterm-helper-textarea, textarea';
+
+	/** 落点是否在某个终端宿主内（`.xterm`）；不在则返回 null。 */
+	function terminalHostOf(node) {
+		if (!isElement(node) || !node.closest) return null;
+		try { return node.closest(TERMINAL_HOST_SELECTOR); } catch (ignoredTerminalHost) { return null; }
+	}
+
+	/**
+	 * 终端里「这一次落指真正要聚焦的输入面」。
+	 * 拿不到 textarea 时退化成宿主本身 —— 放行窗口按祖先链匹配（inIntentScope），
+	 * xterm 随后聚焦它的 textarea 仍落在窗口内。
+	 */
+	function terminalFocusTarget(node) {
+		var host = terminalHostOf(node);
+		if (!host) return null;
+		var input = null;
+		try { input = host.querySelector(TERMINAL_INPUT_SELECTOR); } catch (ignoredTerminalInput) { input = null; }
+		return input || host;
+	}
+
+	/** 终端光标行（xterm 的 DOM 渲染器把光标画成 `.xterm-cursor`，失焦时是 outline 态，仍在 DOM 里）。 */
+	function terminalCursorRow(host) {
+		if (!isElement(host)) return null;
+		try {
+			var cursor = host.querySelector('.xterm-cursor');
+			if (cursor) {
+				var rect = cursor.getBoundingClientRect();
+				if (rect.height > 0) return cursor;
+			}
+		} catch (ignoredTerminalCursor) { /* ignore */ }
+		return null;
+	}
+
 	/**
 	 * 键盘抬起的目标元素：焦点落在输入卡里时，取整块输入区
 	 * （[data-composer-seat] 含底栏与底部统计；退化到 [data-composer-card]）。
 	 * 官方输入卡是「文本框在上、四键底栏在下」，只报 textarea 的矩形时原生
 	 * 恰好抬到「文本框底边高于键盘」，底栏与统计仍留在键盘后面——用户看到
 	 * 的就是「键盘遮住输入框」。按整块输入区算，输入框整体高于键盘。
+	 *
+	 * T-终端：终端要报的是**光标那一行**。helper textarea 是 0×0 且在屏幕外，
+	 * 拿它算出来的矩形是 (0,0) ⇒ 原生 computeImeShift 的 needed ≤ 0 ⇒ 平移量恒 0
+	 * ⇒ 键盘盖住终端下半屏（用户看不到自己在打什么）。报光标行则只抬「必须的量」，
+	 * 且不会把第 0 行的提示符顶出屏幕。取不到光标时退化成宿主本身（平移量 0，
+	 * 与改动前等价，不引入新位移）。
 	 */
 	function imeLiftElement(el) {
 		if (!isElement(el) || !el.closest) return el;
+		var terminal = terminalHostOf(el);
+		if (terminal) return terminalCursorRow(terminal) || terminal;
 		return el.closest('[data-composer-seat]') || el.closest('[data-composer-card]') || el;
 	}
 
@@ -2187,6 +2244,21 @@
 			// 或摘除被节流），在浏览器按节点决定 showSoftInput 之前先摘掉。
 			sweepResidualInputMode();
 			if (!isEditablePoint(target)) {
+				// T-终端：终端屏幕面 = 用户主动聚焦输入面（根因见 terminalFocusTarget 上方注释）。
+				// 必须先于 isInsideOpenPanel 判定，并且**直接 return**：
+				//   ① 窄屏下终端所在的右栏是**全屏固定面板**，若走浮层分支，官方那次
+				//      聚焦只会被 mutePanelIme() 打上 inputmode="none"（放行焦点、压住键盘）
+				//      ⇒ 键盘不弹，用户看到的同样是「点了没反应」；
+				//   ② 终端里的 textarea 是 0×0、屏幕外的隐藏输入面，落点永远解析不出
+				//      可编辑宿主，所以 isEditablePoint 这条路对它恒为假，只能在这里放行。
+				var terminalTarget = terminalFocusTarget(target);
+				if (terminalTarget) {
+					markUserFocusIntent(terminalTarget);
+					// 之前若被粘性抑制过（点了没反应那几次留下的），这里一并解除。
+					clearFocusSticky(terminalTarget);
+					releasePanelIme();
+					return;
+				}
 				// T135：落点在**已经打开的官方浮层**里（模型菜单/命令面板及其子面板）⇒
 				// 开「浮层内手势」窗口（只对浮层内元素生效）。官方会在这类浮层内部自行
 				// 搬焦点（点「模型」行 ⇒ 子面板搜索框自动聚焦），收回就会让浮层 dismiss。
@@ -3015,6 +3087,8 @@
 		var root = document.documentElement;
 		if (!on && isStrictOff()) {
 			// 平板档：官方布局零改动，直接走拆除路径（不写 dshr-official-inset）。
+			// 收敛诊断由 `boot()` 的 strictOff 分支上报（见 boot() 注释：
+			// 「平板档：…但状态仍要报给原生（on=false）」）——这里不必重复补报。
 			teardownHookTraces();
 			return;
 		}

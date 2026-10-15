@@ -27,6 +27,35 @@ const SW_PATH = "/__dsh_remote__/sw.js";
 const OWNS_HOST_MARK = "__DSHR_OWNS_HOST__";
 /** apple-touch-icon（iOS 只认 PNG，不读 manifest 图标）。 */
 export const APPLE_TOUCH_ICON_PATH = "/__dsh_remote__/icon-192.png";
+/** 大图标：安装型 PWA 的 manifest 里给 512 一档（Chrome 的安装 UI 用）。 */
+export const APP_ICON_LARGE_PATH = "/__dsh_remote__/icon-512.png";
+
+/**
+ * **未带设备凭据**时由网关自己回的壳 manifest（PWA 修复）。
+ *
+ * 为什么需要：浏览器取 `<link rel="manifest">` 的那条请求按规范**不带凭据**
+ *（实测 initiator=parser、请求头里没有 Cookie），必然落到设备门禁的未认证分支
+ * ⇒ 每次冷加载控制台两行红字，且「添加到主屏幕」永远拿不到 manifest。
+ *
+ * 这份壳 manifest **不含任何会话 / 设备 / 令牌字段**（只有应用名、起始地址与网关
+ * 自产的图标），所以免凭据下发不扩大数据暴露面。带凭据的请求仍照原样反代官方那份，
+ * 保留官方的 file handler 等能力。
+ */
+export function renderShellManifest(): string {
+	return JSON.stringify({
+		name: "DSH Remote",
+		short_name: "DSH Remote",
+		start_url: "/",
+		scope: "/",
+		display: "standalone",
+		background_color: "#ffffff",
+		theme_color: "#1b66ff",
+		icons: [
+			{ src: APPLE_TOUCH_ICON_PATH, sizes: "192x192", type: "image/png", purpose: "any" },
+			{ src: APP_ICON_LARGE_PATH, sizes: "512x512", type: "image/png", purpose: "any" },
+		],
+	});
+}
 
 /** Android 配对页使用的轻量 DSH 鲸鱼标记；不携带配置、会话或认证信息。 */
 export const BRAND_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">

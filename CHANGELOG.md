@@ -4,6 +4,69 @@
 
 ---
 
+## v0.2.0-rc.2.24（手机档终端「弹出来后点击没反应」修复）
+
+- **现象（用户口径）**：手机上打开工作区终端后，点终端没有任何反应——点不动、软键盘不弹、打字没有回显。
+- **根因**：DSH 的工作区终端是 xterm.js。它的落点是 `.xterm-screen`（`div`，**不是**可编辑元素），
+  真正的输入面是它内部那个 CSS 上 `0×0` 且 `left:-9999em` 的 `.xterm-helper-textarea`（见 `xterm.css`），
+  xterm 在**抬手之后自己 `focus()`** 它。
+  而 `mobile-web.js` 的焦点守卫（T21/T42/T48/T51/T135 那一套，`bindFocusGuard` 的 `onDown` + `focusin`）
+  只放行「落指就在可编辑元素内」的聚焦（`isEditablePoint()` 对 `.xterm-screen` 恒为假），
+  于是这次聚焦被判成「非用户手势造成的偷焦点」⇒ `revokeStealthFocus()` 当场 `blur()`
+  ⇒ 终端永远拿不到焦点；反复点还会升级成**粘性持续收回**（同一签名 5s 内持续 blur）。
+  次级缺陷：即便焦点留住，`imeLiftElement()` 也会把那个 `0×0` 的 textarea 矩形（`≈(0,0)`）上报给原生，
+  原生 `computeImeShift()` 的 `needed = fieldBottom + pad - keyboardTop ≤ 0` ⇒ **平移量恒 0**
+  ⇒ 键盘盖住终端下半屏（看不到自己在打什么）。
+- **修复**（`packages/gateway/assets/mobile-web.js`，单一源；`android/.../res/raw/mobile.js` 字节同步）：
+  1. 新增 `terminalHostOf()` / `terminalFocusTarget()` / `terminalCursorRow()`：认 `.xterm` 宿主。
+  2. `bindFocusGuard.onDown` 的「非可编辑落点」分支最前面新增终端分支：
+     `markUserFocusIntent(helper textarea)` + `clearFocusSticky()` + `releasePanelIme()` 后**直接 return**。
+     必须先于 `isInsideOpenPanel()`：窄屏下终端所在的右栏是**全屏固定面板**，走浮层分支只会
+     `mutePanelIme()`（放行焦点但 `inputmode="none"`）——键盘不弹，症状同样是「点了没反应」。
+  3. `imeLiftElement()` 对终端改报**光标行**（`.xterm-cursor`）矩形：只抬「必须的量」，
+     既不会把第 0 行的提示符顶出屏幕，也不会让键盘盖住终端下半屏；取不到光标时退化成宿主本身（平移量 0，与改前等价）。
+- **证据（A/B，真 Chrome 里跑真实 hook + 真 CDP 触摸）**：`scripts/test-terminal-focus.mjs`（`pnpm test:terminal`）。
+  合成 xterm 形态（`.xterm` / `.xterm-screen` / `.xterm-cursor` / `0×0` 的 helper textarea + 抬手 `focus()`）
+  跑 11 条断言：**修复前 9/11**（红的两条正是本缺陷：「真触摸终端后焦点留在 helper textarea」实测 `active:false`、
+  「抬起矩形=光标行」实测 `[-1,-1]`）；**修复后 11/11**（`active:true`、未被压 `inputmode`、上报 `[55,75]`；
+  另 3 条钉住平板档严格 OFF 与收敛诊断契约）。另外两条回归钉桩证明没有过度修正：非手势的程序化聚焦
+  **照样被收回**（守卫本职），composer 真触摸**照常聚焦**。`pnpm test:mobile` 全绿（含 T135 浮层 IME 压制等既有钉桩）。
+- **真终端 A/B（最强证据）**：`scratch/qa/lib/e2e-terminal.mjs` 在真实 DSH 页面 + 网关 18443 上真触摸
+  `.xterm-screen`：修复前 `activeElement=BODY`（被守卫 blur）、`echo` **一字未变**；修复后
+  `activeElement=TEXTAREA.xterm-helper-textarea`、`echo QA-phone` **真回显**。
+- **为什么最初用合成终端钉桩**：DSH 的终端池按 Session 计（`maxTerminals=8`，**已退出的也占名额**，
+  只有关标签页才释放）。QA 期间换页未关标签把用户当前 Session 的名额占满（错误原文
+  「终端数量已达上限，请关闭不用的终端后重试。已退出的终端也计入数量。」）；名额释放后已补真终端 E2E。
+  **这不是本仓库的 bug**（官方终端控制器行为 + 测试用法），但后续测终端一律「测完真触摸关标签」。
+
+### 同版本附带修复：PWA manifest 冷加载 401 + 平板档「零痕迹」判据澄清
+
+#### ① 未带凭据的 `/manifest.webmanifest` 恒 401（手机/平板两个 QA 独立复现，8/8 轮）
+- **现象**：冷加载 `https://<网关>/` 时控制台必现两行
+  `Failed to load resource: 401 … /manifest.webmanifest` + `Manifest fetch … failed, code 401`；
+  「添加到主屏幕」永远拿不到 manifest（PWA 装不出）。
+- **根因**：浏览器取 `<link rel="manifest">` 的那条请求**按规范不带凭据**（实测 initiator=parser、请求头无 Cookie），
+  必然落到设备门禁的未认证分支；而同一路径用 `fetch(..., {credentials:'include'})` 是 200 —— 所以不是 manifest 坏了。
+- **修复**：`server.ts` 未认证分支对 `GET /manifest.webmanifest` 回**网关自产壳 manifest**
+  （`pwa.ts: renderShellManifest()`：应用名 / `start_url` / `scope` / 图标，**不含任何会话、设备、令牌字段**）；
+  带凭据的请求仍原样反代官方那份（保留官方 file handler 等能力）。新增 `GET /__dsh_remote__/icon-512.png`
+  （安装型 PWA 要求 ≥512 图标；`iconPng()` 进程内缓存，只生成一次）。
+- **钉桩**：`pnpm test:fixes` 新增 **WEB-09**（无凭据 200 + `manifest+json` + nosniff + 192/512 图标均 200
+  且是真 PNG + 载荷无会话字段 + 带凭据仍透传上游）。全仓 `test:fixes` **18/18**。
+- ⚠️ **生效条件**：网关是长驻进程，**需重启网关**才生效（当前 18443 上的实例仍是旧代码）。
+
+#### ② 平板档「零痕迹」判据澄清（`android/README.md`）
+- **现象（QA 判红）**：平板档注入 hook 后 `outerHTML` 与「完全不注入」不等（657 565 B vs 632 013 B，
+  差 25 552 B）——多一个惰性 `<style data-dshr-mobile-css>`，且 `viewport` meta 被改写为
+  `…viewport-fit=cover, interactive-widget=overlays-content`。
+- **结论：不是 bug，是判据写法错**。逐条扫 102 条 CSS：平板档只有 T115 的 **2 条**让位规则命中官方列容器
+  （让位的输入，设计内例外），其余 100 条（`html.dshr-mobile*` / `html.dshr-official-inset*` / 4 个 hook 自有 ID）
+  一条都不命中；meta 改写是平台级 edge-to-edge/IME 机制，`teardownHookTraces()` 明文不还原。
+- **动作**：`android/README.md` 的平板档零痕迹条目补上「判据是**语义级**（DOM 标记/节点/几何/绘制），
+  不是 `outerHTML` 逐字节相等」与两类允许残留，避免后续 QA 反复产出假红。
+
+---
+
 ## v0.2.0-rc.2.23（安全加固，待发布）
 
 相对 `0.2.0-rc.2.22` 的行为变化。包版本号已对齐到 `0.2.0-rc.2.23`，待打 tag 发布。

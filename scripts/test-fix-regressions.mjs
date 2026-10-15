@@ -20,6 +20,8 @@
  *   - SEC-02/GW-15 畸形 JSON → 400（不再 500）
  *   - WEB-01  sw.js 内部路由：免认证 200 + service-worker-allowed + no-cache
  *   - WEB-02  mobile.js 静态资源 200 + ETag + javascript 类型
+ *   - WEB-09  未带凭据的 /manifest.webmanifest 返回网关壳 manifest（不再 401）+ 图标可取；
+ *             带凭据时仍原样透传上游官方 manifest
  *   - GW-17   逐跳响应头不转发：客户端 connection: close 语义生效
  *   - 0.1.3+ /api 流式 POST（官方原始文件上传）：边收边转、不设体积上限
  *
@@ -267,6 +269,28 @@ test("WEB-02：mobile.js 静态资源 200 + ETag + javascript 类型", async () 
 	assert.equal(r.status, 200);
 	assert.match(String(r.headers["content-type"]), /javascript/);
 	assert.ok(String(r.headers.etag ?? "").length > 0, "mobile.js 必须带 ETag");
+});
+
+test("WEB-09：未带凭据的 manifest 返回网关壳 manifest（不再 401），带凭据仍走上游", async () => {
+	// 浏览器取 <link rel="manifest"> 的请求不带 Cookie（initiator=parser）——冷加载必现 401。
+	const r = await requestTls(gwUrl("/manifest.webmanifest"));
+	assert.equal(r.status, 200, "manifest 冷请求必须 200，否则控制台两行红字 + PWA 装不出");
+	assert.match(String(r.headers["content-type"]), /manifest\+json/);
+	assert.equal(r.headers["x-content-type-options"], "nosniff");
+	const manifest = JSON.parse(r.body);
+	assert.equal(manifest.start_url, "/");
+	assert.ok(Array.isArray(manifest.icons) && manifest.icons.length >= 2, "壳 manifest 必须给 192/512 两档图标");
+	for (const icon of manifest.icons) {
+		const iconRes = await requestTls(gwUrl(icon.src));
+		assert.equal(iconRes.status, 200, `图标必须可取：${icon.src}`);
+		assert.equal(iconRes.raw.subarray(0, 4).toString("latin1"), "\u0089PNG", `图标必须是 PNG：${icon.src}`);
+	}
+	// 壳 manifest 是免凭据下发的，绝不允许夹带任何会话/设备/令牌字段。
+	assert.ok(!/session|cookie|token|device|secret/i.test(r.body), "壳 manifest 不得含会话/设备字段");
+	// 带凭据时仍照原样反代官方那份（本套件的行为上游对所有非特判路径回 HTML）。
+	const authed = await requestTls(gwUrl("/manifest.webmanifest"), { headers: authHeaders });
+	assert.equal(authed.status, 200);
+	assert.match(String(authed.headers["content-type"]), /text\/html/, "带凭据必须原样透传上游 manifest");
 });
 
 test("安全边界：设备 Cookie 不外泄上游", async () => {

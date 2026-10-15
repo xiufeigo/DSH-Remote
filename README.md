@@ -236,6 +236,7 @@ pnpm smoke:edge      # Edge 角色功能冒烟测试
 pnpm test:fixes      # 历史缺陷回归防护钉桩
 pnpm test:desktop    # DSH 宿主兼容性测试
 pnpm test:mobile     # 移动布局与 Hook 自测（需 Chrome）
+pnpm test:terminal   # 手机档终端输入面（焦点守卫 / IME 抬起矩形）行为钉桩（需 Chrome）
 pnpm test:device     # 设备档位自适应全真测试（基于真实 DSH 页面 CDP）
 ```
 

@@ -64,7 +64,7 @@ import {
 	type FrpHeartbeatInput,
 } from "./frp.ts";
 import { loadMobileScript } from "./mobile.ts";
-import { BRAND_SVG, iconPng, injectIntoHtml, makeHtmlInjector, renderServiceWorker } from "./pwa.ts";
+import { BRAND_SVG, iconPng, injectIntoHtml, makeHtmlInjector, renderServiceWorker, renderShellManifest } from "./pwa.ts";
 import { proxyHttp, type Upstream } from "./proxy.ts";
 import { UpstreamSession } from "./session.ts";
 import type { Store } from "./store.ts";
@@ -627,6 +627,12 @@ export class GatewayServer {
 						res.writeHead(200, { "content-type": "image/png", "cache-control": "public, max-age=604800" });
 						res.end(iconPng(192));
 						return;
+					case "GET /__dsh_remote__/icon-512.png":
+						// 512 一档给安装型 PWA 的 manifest（Chrome 安装 UI 要求 ≥512 的图标）。
+						// 生成一次进 iconPng 的进程内缓存，后续请求只是拷贝。
+						res.writeHead(200, { "content-type": "image/png", "cache-control": "public, max-age=604800" });
+						res.end(iconPng(512));
+						return;
 					case "GET /__dsh_remote__/pair":
 						await this.handlePairPage(req, res, publicEntry);
 						return;
@@ -672,6 +678,20 @@ export class GatewayServer {
 				return;
 			}
 			if (!verdict.ok) {
+				// PWA 壳资源（manifest）：浏览器取 `<link rel="manifest">` 的那条请求按规范
+				// **不带凭据**（实测 initiator=parser、头里没有 Cookie），必然落到这条未认证
+				// 分支 ⇒ 每次冷加载两行控制台红字，且「添加到主屏幕」拿不到 manifest。
+				// 未带凭据时由网关自己回一份**不含任何会话/设备数据**的壳 manifest；
+				// 带凭据的请求走下面的原路（照原样反代官方那份，保留官方 file handler 等）。
+				if (req.method === "GET" && pathname === "/manifest.webmanifest") {
+					res.writeHead(200, {
+						"content-type": "application/manifest+json; charset=utf-8",
+						"cache-control": "no-cache",
+						"x-content-type-options": "nosniff",
+					});
+					res.end(renderShellManifest());
+					return;
+				}
 				const acceptsHtml = String(req.headers.accept ?? "").includes("text/html");
 				if (acceptsHtml) {
 					const authPage = this.loginCredential !== undefined

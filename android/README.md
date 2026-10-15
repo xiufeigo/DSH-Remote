@@ -437,6 +437,10 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
 
   - **判定源唯一**是原生 `smallestScreenWidthDp`；**JS 不得用视口宽度反推档位**（部分机型 layout viewport 虚高，WEB-02 既有结论）。原生在注入 `mobile.js` **之前**把档位写进 `window.__DSHR_MOBILE__.device`（`phone` / `tablet` / `auto`），hook 只消费该值。
   - **平板档零痕迹**：`<html>` 上无 `data-dshr-*` 属性、无 hook 根类（含 `dshr-official-inset`），页面上无 hook 创建的可见节点（悬浮鲸鱼、drag handle、抽屉遮罩、状态栏挡板）。
+    > **判据是语义级，不是 `outerHTML` 逐字节相等**（QA 断言请照此写，否则必然假红）。平板档下**允许保留**两类惰性残留：
+    > ① `<head>` 里那个 `<style data-dshr-mobile-css>`——其中只有 T115 的 2 条让位规则会命中官方列容器（`sidebarCol` / `centerCol`），其余 100 条都以 `html.dshr-mobile*` / `html.dshr-official-inset*` / 4 个 hook 自有 ID 开头，平板档无宿主、一条都不命中；
+    > ② `<meta name="viewport">` 上的 `viewport-fit=cover` 与 `interactive-widget=overlays-content` 改写——平台级 edge-to-edge/IME 机制，与档位无关（`teardownHookTraces()` 明确不还原，见 `packages/gateway/assets/mobile-web.js` 该函数注释）。
+    > 证据与逐条 CSS 命中扫描：`scratch/qa/pad/report.md` §PAD-01、`scratch/qa/pad/raw/cssmatch.json`。
   - 🔴 **契约变更（rc.2.8，T97，用户明确授权）**：平板档由「hook **严格 OFF** / 零痕迹」改为
     **「允许最小 hook，但不得新增 DOM 节点 / 属性 / 类名 / 样式」**。触发变更的是平板档
     长按品牌区呼出连接设置页——那个手势只能由页面侧监听，原生接不到。**新判据**：
