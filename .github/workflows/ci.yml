@@ -42,7 +42,11 @@ jobs:
 
       - name: 读取 frp 版本
         id: frp
-        run: echo "version=$(node -p "require('./package.json').frpVersion")" >> "$GITHUB_OUTPUT"
+        # OPS-05：单一来源是根 package.json 的 **config.frpVersion**（docs/versioning.md）。
+        # 原写作 `require('./package.json').frpVersion`（顶层）——字段挪进 config 之后这里恒为
+        # undefined，缓存键变成 frp-undefined，安装步骤去下载 frp_undefined_linux_amd64.tar.gz
+        # 拿到 404 ⇒ CI 从 rc.2.23 那次 push 起一直红（rc.2.22 及以前是绿的）。
+        run: echo "version=$(node -p "require('./package.json').config.frpVersion")" >> "$GITHUB_OUTPUT"
 
       - name: 缓存 frp
         id: frp-cache
