@@ -62,16 +62,57 @@ export const BRAND_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 6
   <path fill="#111318" d="M56.1 15.5c-2.4 1.9-5 2.8-7.8 2.7-3.1-5.1-8.6-8.4-14.9-8.4-7.4 0-13.7 4.5-16.4 10.9-5.3.7-9.4 4.2-10.9 9.2-2.1 7 1.9 14.5 9 16.6 2.5.7 5.1.7 7.4.1 3.2 4.7 8.6 7.7 14.6 7.7 9.8 0 17.8-8 17.8-17.8 0-2.2-.4-4.3-1.1-6.2 2.2-3.5 3.1-8.1 2.3-14.8ZM19.3 35.8a2.8 2.8 0 1 1 0-5.6 2.8 2.8 0 0 1 0 5.6Zm23.7 8.8c-4.1 2.9-9.6 3.2-14 .8 4.4-.8 8.2-3.1 10.9-6.4 1.1 2.1 2.2 3.9 3.1 5.6Zm-4.9-17.2c-2.6 0-4.8-2.1-4.8-4.8s2.2-4.8 4.8-4.8 4.8 2.1 4.8 4.8-2.2 4.8-4.8 4.8Z"/>
 </svg>`;
 
+/**
+ * iPad / iPhone「添加到主屏幕」后独立打开：状态栏仍叠在页面上。
+ * iPadOS 把 `black` 也画成全屏叠层，不会把 WebView 往下推，所以必须
+ * `black-translucent` + `viewport-fit=cover` + 安全区让位——顶栏字让开，
+ * 磨砂只糊到列自己的纯色底上。Safari 标签页不是 standalone，这段不生效。
+ *
+ * 公网映射走 PC 网关，desktop 角色不注入 mobile.js，让位必须写在主屏标记里。
+ */
+const STANDALONE_INSET_CSS = [
+	"html.dshr-ios-standalone div:has(> [data-slot=\"sidebar\"]),",
+	"html.dshr-ios-standalone div:has(> [data-slot=\"main\"]),",
+	"html.dshr-ios-standalone div:has(> [data-slot=\"rightbar\"]),",
+	"html.dshr-ios-standalone div:has(> [data-sidebar-right-panel]){",
+	"box-sizing:border-box!important;",
+	"padding-top:env(safe-area-inset-top,0px)!important;",
+	"padding-bottom:env(safe-area-inset-bottom,0px)!important;",
+	"padding-left:env(safe-area-inset-left,0px)!important;",
+	"padding-right:env(safe-area-inset-right,0px)!important;",
+	"}",
+	"html.dshr-ios-standalone div:has(> [data-slot=\"sidebar\"]){",
+	"background:var(--dsw-specific-sidebar-fill,var(--dsw-alias-bg-base,#f5f5f6))!important;",
+	"}",
+	"html.dshr-ios-standalone div:has(> [data-slot=\"main\"]),",
+	"html.dshr-ios-standalone div:has(> [data-slot=\"rightbar\"]),",
+	"html.dshr-ios-standalone div:has(> [data-sidebar-right-panel]){",
+	"background:var(--dsw-alias-bg-base,var(--dsw-specific-background,#ffffff))!important;",
+	"}",
+	"html.dshr-ios-standalone [data-sidebar-right-panel=\"push\"]{",
+	"top:env(safe-area-inset-top,0px)!important;",
+	"bottom:env(safe-area-inset-bottom,0px)!important;",
+	"right:env(safe-area-inset-right,0px)!important;",
+	"}",
+	"html.dshr-ios-standalone [data-sidebar-right-panel=\"fullscreen\"]{",
+	"box-sizing:border-box!important;",
+	"padding-top:env(safe-area-inset-top,0px)!important;",
+	"padding-bottom:env(safe-area-inset-bottom,0px)!important;",
+	"}",
+].join("");
+
 /** 生成注入到上游 HTML <head> 的标记块（官方 manifest 之外的补充项）。 */
 export function homeScreenHeadTags(): string {
 	return [
-		`<meta name="theme-color" content="#1b66ff">`,
+		`<meta name="theme-color" content="#111318">`,
+		`<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">`,
+		`<meta name="theme-color" content="#111318" media="(prefers-color-scheme: dark)">`,
 		`<meta name="mobile-web-app-capable" content="yes">`,
 		`<meta name="apple-mobile-web-app-capable" content="yes">`,
-		// 主屏幕图标打开仍是独立全屏（无 Safari 工具栏）。状态栏必须不透明：
-		// black-translucent 会把页面铺到状态栏后面，iPad 再盖一层磨砂，顶栏发糊。
-		`<meta name="apple-mobile-web-app-status-bar-style" content="black">`,
+		`<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">`,
 		`<meta name="apple-mobile-web-app-title" content="DSH">`,
+		`<script>(function(){var s=navigator.standalone===true;try{s=s||window.matchMedia("(display-mode:standalone),(display-mode:fullscreen)").matches}catch(e){}if(s)document.documentElement.classList.add("dshr-ios-standalone")})();</script>`,
+		`<style id="dshr-standalone-inset">${STANDALONE_INSET_CSS}</style>`,
 		`<link rel="apple-touch-icon" href="${APPLE_TOUCH_ICON_PATH}">`,
 		// WEB-01：注册网关 Service Worker（白名单缓存策略，源码见 renderServiceWorker）。
 		// SW 文件位于 /__dsh_remote__/sw.js（server.ts 内部路由，响应需带
@@ -118,35 +159,65 @@ export interface HtmlInjectOptions {
  * 响应里可能已有它注入的主屏标记——此时只补移动 hook 块，不重复注。
  * ownsHost 引导同样单独幂等：旧网关只有主屏标记时仍要补上，已有则不重复。
  *
- * WEB-08：补写的 viewport meta 一次性带上目标值（`viewport-fit=cover` +
- * 浏览器缺省的 `interactive-widget=resizes-content`）。iOS 对 JS 动态改
- * viewport meta 的生效时机不稳，能在网关侧给到位就不留给运行时——
- * mobile-web.js 里的动态修改因此只作兜底：页面自带 viewport meta 但缺
- * 关键项时补齐，以及 Android 壳把 interactive-widget 换成 overlays-content
- * 的平台适配。
+ * WEB-08：viewport 一律在网关侧写成带 `viewport-fit=cover`（官方页面已有
+ * viewport、只缺这一项时也要改，不能只在「完全没有 viewport」时才补）。
+ * iOS 对 JS 事后改 viewport 经常不认，`env(safe-area-inset-top)` 会一直是 0。
+ * 缺整个 viewport 标签时，edge 一次性带上 `interactive-widget=resizes-content`；
+ * 已有标签只追加 cover，interactive-widget 仍由 mobile.js 运行时兜底。
  */
 export function makeHtmlInjector(options: HtmlInjectOptions = {}): (body: Buffer) => Buffer {
 	const extraTags = options.mobile?.enabled === true ? mobileHeadTags(options.mobile.breakpointPx) : "";
+	const insertViewport = extraTags === ""
+		? "width=device-width, initial-scale=1, viewport-fit=cover"
+		: "width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content";
 	return function inject(body: Buffer): Buffer {
 		const text = body.toString("utf8");
 		const needHome = !text.includes(SW_PATH);
 		const needMobile = extraTags !== "" && !text.includes("/__dsh_remote__/mobile.js");
 		const needOwnsHost = !text.includes(OWNS_HOST_MARK);
-		if (!needHome && !needMobile && !needOwnsHost) return body;
-		const payload =
-			(needOwnsHost ? ownsHostHeadTag() : "")
-			+ (needHome ? homeScreenHeadTags() : "")
-			+ (needMobile
-				? extraTags
-					+ (!/name=["']viewport["']/i.test(text)
-						? '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">'
-						: "")
-				: "");
-		const headOpen = /<head(?:\s[^>]*)?>/i.exec(text);
-		if (headOpen === null) return Buffer.from(payload + text, "utf8");
-		const at = headOpen.index + headOpen[0].length;
-		return Buffer.from(text.slice(0, at) + payload + text.slice(at), "utf8");
+		let html = text;
+		if (needHome || needMobile || needOwnsHost) {
+			const payload =
+				(needOwnsHost ? ownsHostHeadTag() : "")
+				+ (needHome ? homeScreenHeadTags() : "")
+				+ (needMobile ? extraTags : "");
+			const headOpen = /<head(?:\s[^>]*)?>/i.exec(html);
+			if (headOpen === null) html = payload + html;
+			else {
+				const at = headOpen.index + headOpen[0].length;
+				html = html.slice(0, at) + payload + html.slice(at);
+			}
+		}
+		const covered = withViewportFitCover(html, insertViewport);
+		if (covered === text) return body;
+		return Buffer.from(covered, "utf8");
 	};
+}
+
+const VIEWPORT_TAG = /<meta\b[^>]*\bname=["']viewport["'][^>]*>/gi;
+
+/** 已有 viewport 补上 `viewport-fit=cover`；没有则插入 `insertContent` 这一份。 */
+export function withViewportFitCover(html: string, insertContent: string): string {
+	VIEWPORT_TAG.lastIndex = 0;
+	let found = false;
+	const next = html.replace(VIEWPORT_TAG, (tag) => {
+		found = true;
+		if (/viewport-fit\s*=\s*cover/i.test(tag)) return tag;
+		if (!/\bcontent=/i.test(tag)) {
+			return tag.replace(/\/?>$/, ` content="${insertContent}">`);
+		}
+		return tag.replace(/\bcontent=(["'])([\s\S]*?)\1/i, (_all, quote: string, content: string) => {
+			const trimmed = content.trim();
+			const value = trimmed.length === 0 ? "viewport-fit=cover" : `${trimmed}, viewport-fit=cover`;
+			return `content=${quote}${value}${quote}`;
+		});
+	});
+	if (found) return next;
+	const tag = `<meta name="viewport" content="${insertContent}">`;
+	const headOpen = /<head(?:\s[^>]*)?>/i.exec(next);
+	if (headOpen === null) return tag + next;
+	const at = headOpen.index + headOpen[0].length;
+	return next.slice(0, at) + tag + next.slice(at);
 }
 
 /**

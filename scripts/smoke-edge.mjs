@@ -331,8 +331,11 @@ test("双网关链路：上游已注入主屏标记时 edge 仍补移动 hook �
 	assert.match(once, /mobile\.js/);
 	assert.match(once, /__DSHR_OWNS_HOST__/);
 	assert.match(once, /apple-mobile-web-app-capable" content="yes"/);
-	assert.match(once, /apple-mobile-web-app-status-bar-style" content="black"/);
-	assert.doesNotMatch(once, /black-translucent/);
+	assert.match(once, /apple-mobile-web-app-status-bar-style" content="black-translucent"/);
+	assert.match(once, /dshr-ios-standalone/);
+	assert.match(once, /env\(safe-area-inset-top/);
+	assert.match(once, /viewport-fit=cover/);
+	assert.equal((once.match(/name=["']viewport["']/g) || []).length, 1, "viewport 只能有一份");
 	const ownsAt = once.indexOf("__DSHR_OWNS_HOST__");
 	const swAt = once.indexOf("/__dsh_remote__/sw.js");
 	assert.ok(ownsAt >= 0 && ownsAt < swAt, "ownsHost 必须排在官方脚本之前");
@@ -345,6 +348,25 @@ test("双网关链路：上游已注入主屏标记时 edge 仍补移动 hook �
 	const upgraded = edgeInject(Buffer.from(legacy)).toString();
 	assert.match(upgraded, /__DSHR_OWNS_HOST__/);
 	assert.equal(upgraded.split("/__dsh_remote__/sw.js").length - 1, 1);
+});
+
+test("PC 网关主屏注入：已有 viewport 合并 viewport-fit=cover，iPad 独立窗口让开状态栏", async () => {
+	const { makeHtmlInjector } = await import("../packages/gateway/src/pwa.ts");
+	const inject = makeHtmlInjector();
+	const html = inject(Buffer.from(
+		'<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body>__dsh_boot__</body></html>',
+	)).toString();
+	assert.equal((html.match(/name=["']viewport["']/g) || []).length, 1, "不得再插第二份 viewport");
+	assert.match(html, /content="width=device-width, initial-scale=1, viewport-fit=cover"/);
+	assert.doesNotMatch(html, /interactive-widget/, "desktop 角色不在已有 viewport 上写 interactive-widget");
+	assert.match(html, /apple-mobile-web-app-status-bar-style" content="black-translucent"/);
+	assert.match(html, /id="dshr-standalone-inset"/);
+	assert.match(html, /data-slot="sidebar"/);
+	assert.match(html, /env\(safe-area-inset-top/);
+
+	const again = inject(Buffer.from(html)).toString();
+	assert.equal((again.match(/viewport-fit=cover/g) || []).length, 1, "cover 幂等，不重复追加");
+	assert.equal((again.match(/id="dshr-standalone-inset"/g) || []).length, 1);
 });
 
 test("公网入口：注入的 ownsHost 让官方 isLoopback 判定为真", async () => {
