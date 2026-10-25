@@ -177,6 +177,10 @@ __METHODS__
 $armBMethods = (
 	(Get-JavaBlock $mainSrcText 'private boolean isActiveGatewayUri(Uri uri)').Replace(
 		'private boolean isActiveGatewayUri(', 'public boolean isActiveGatewayUri(') + "`n" +
+	# T118：isActiveGatewayUri 的**实现体**已抽成 isGatewayOf(uri, baseUrl)（rc.2.24 起），
+	# 臂 B 不抽它就编译不过（"找不到符号 isGatewayOf"）⇒ 这条回归在 rc.2.24 一直是红的。
+	# 这里把它的方法体一并抽出来，臂 B 仍是"MainActivity 判据原文真跑"。
+	(Get-JavaBlock $mainSrcText 'private boolean isGatewayOf(') + "`n" +
 	(Get-JavaBlock $mainSrcText 'private static boolean isGatewaySchemeFamily(') + "`n" +
 	(Get-JavaBlock $mainSrcText 'private static boolean isSecureGatewayScheme(') + "`n" +
 	(Get-JavaBlock $mainSrcText 'private static boolean sameGatewaySecurityLevel(') + "`n" +

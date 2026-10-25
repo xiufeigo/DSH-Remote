@@ -9,7 +9,6 @@ import android.webkit.ValueCallback;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
@@ -123,8 +122,8 @@ final class PinnedFetch {
 	 *
 	 * <p>为什么必须总量上界：{@code setReadTimeout} 是<b>每次 read 的空闲超时</b>，
 	 * 读循环里每读到一段就重新计时，所以「慢速滴流」下总时长是 N × readTimeout，
-	 * <b>理论无上界</b>。45 s 与 {@link #QUEUE_WAIT_MS} 20 s 相加约束住
-	 * 「排队 + 传输」这条后台线程被占用的最长时间。
+	 * <b>理论无上界</b>。排队、连接、响应头和正文共用 45 s 截止时间；
+	 * {@link #QUEUE_WAIT_MS} 的 20 s 排队时间也计入其中。
 	 */
 	private static final long TOTAL_DEADLINE_MS = 45000L;
 
@@ -310,33 +309,42 @@ final class PinnedFetch {
 	 */
 	static Result get(String url, String host, int port, String profileId,
 			CertPin.Store store, String tag) {
+		return fetch(url, host, port, profileId, store, tag, new FetchRequest(TOTAL_DEADLINE_MS), false);
+	}
+
+	/** 救援只检查 HTTP 响应，不下载正文、不占静态资源的三个下载名额。 */
+	static Result probe(String url, String host, int port, String profileId,
+			CertPin.Store store, FetchRequest request) {
+		return fetch(url, host, port, profileId, store, "rescue", request, true);
+	}
+
+	private static Result fetch(String url, String host, int port, String profileId,
+			CertPin.Store store, String tag, FetchRequest request, boolean headersOnly) {
 		HttpsURLConnection conn = null;
-		final long t0 = System.currentTimeMillis();
+		InputStream bodyStream = null;
 		boolean held = false;
 		try {
+			request.begin();
 			// ---- T60 并发闸门：排队，不拒绝 ----
 			// tryAcquire 拿不到就等 QUEUE_WAIT_MS；等满仍拿不到才返回 null，
 			// 并且必须记账 + 打日志（悄悄降级 = 白屏查不到原因）。
-			if (!GATE.tryAcquire(QUEUE_WAIT_MS, TimeUnit.MILLISECONDS)) {
+			if (!headersOnly && !GATE.tryAcquire(Math.min(QUEUE_WAIT_MS, request.remainingMillis()), TimeUnit.MILLISECONDS)) {
 				shed.incrementAndGet();
 				Log.w("dshr-perf", "pinnedFetch 排队超时（闸门=" + MAX_INFLIGHT
 					+ "，等满 " + QUEUE_WAIT_MS + "ms）→ 不放行 url=" + url);
 				return null;
 			}
-			held = true;
-			final int inflightNow = inFlight.incrementAndGet();
-			// 峰值只在**刷新峰值的那一刻**打一行：T60 验收要的就是这个数，
-			// 事后无法从 ok 行反推（ok 行里的 inflight 是完成时刻的瞬时值）。
-			if (inflightNow > inFlightPeak.get()) {
-				inFlightPeak.set(inflightNow);
-				Log.i("dshr-perf", "pinnedFetch 并发峰值=" + inflightNow + "/" + MAX_INFLIGHT + " url=" + url);
+			held = !headersOnly;
+			if (held) {
+				final int inflightNow = inFlight.incrementAndGet();
+				// 峰值只在刷新峰值时记录，结算行无法反推完成前的并发峰值。
+				if (inflightNow > inFlightPeak.get()) {
+					inFlightPeak.set(inflightNow);
+					Log.i("dshr-perf", "pinnedFetch 并发峰值=" + inflightNow + "/" + MAX_INFLIGHT + " url=" + url);
+				}
+				if (inflightNow > 1) queuedWaits.incrementAndGet();
 			}
-			if (inflightNow > 1) {
-				// 真正发生了排队：公平信号量的排队是 FIFO 等，20 s 上限远大于实测 1.5 s。
-				queuedWaits.incrementAndGet();
-			}
-			// 排队占用也算进总量预算，否则「排队 20 s + 传输 45 s」会叠成 65 s。
-			final long transportBudgetMs = Math.max(1000L, TOTAL_DEADLINE_MS - (System.currentTimeMillis() - t0));
+			request.check();
 
 			URL parsed = new URL(url);
 			// ---- T114：设备凭据只发同源；缺凭据失败关闭 ----
@@ -374,11 +382,12 @@ final class PinnedFetch {
 			ctx.init(null, new TrustManager[]{pinningTrustManager(store, profileId, host, port, tag)},
 				new SecureRandom());
 			conn = (HttpsURLConnection) parsed.openConnection();
-			conn.setSSLSocketFactory(ctx.getSocketFactory());
+			request.attach(conn);
+			conn.setSSLSocketFactory(request.socketFactory(ctx.getSocketFactory()));
 			conn.setHostnameVerifier(pinnedHostnameVerifier());
 			conn.setRequestMethod("GET");
-			conn.setConnectTimeout(8000);
-			conn.setReadTimeout(READ_TIMEOUT_MS);
+			conn.setConnectTimeout(Math.min(8000, request.remainingMillis()));
+			conn.setReadTimeout(Math.min(READ_TIMEOUT_MS, request.remainingMillis()));
 			conn.setInstanceFollowRedirects(false);
 			conn.setUseCaches(false);
 			// 网关会按 accept-encoding 压缩；这里显式声明并**自行解压**，
@@ -390,7 +399,10 @@ final class PinnedFetch {
 			conn.setRequestProperty("User-Agent", "DSHRemoteAndroid/pinned-fetch");
 			// T114：只在同源目标上带凭据（cookie==null 表示「不该带」，不是「没取到」）。
 			if (cookie != null) conn.setRequestProperty("Cookie", cookie);
+			conn.connect();
+			conn.setReadTimeout(Math.min(READ_TIMEOUT_MS, request.remainingMillis()));
 			int status = conn.getResponseCode();
+			request.check();
 			if (status != 200) {
 				if (status == 401) {
 					// T114：401 一律**不返回字节** ⇒ 调用点拿不到 Result ⇒ 走不到
@@ -403,16 +415,17 @@ final class PinnedFetch {
 				}
 				return null;
 			}
+			if (headersOnly) return new Result(status, conn.getContentType(), conn.getHeaderField("cache-control"), new byte[0]);
 			String encoding = conn.getContentEncoding();
-			InputStream in = conn.getInputStream();
+			bodyStream = conn.getInputStream();
 			String enc = encoding == null ? "" : encoding.trim().toLowerCase(Locale.US);
 			boolean compressed = enc.contains("gzip") || enc.contains("deflate");
 			if (enc.contains("gzip")) {
-				in = new GZIPInputStream(in);
+				bodyStream = new GZIPInputStream(bodyStream);
 			} else if (enc.contains("deflate")) {
 				// deflate 有 zlib 包裹（RFC 1950）与裸流（RFC 1951）两种，
 				// 嗅探首字节：0x78 / 0x9C / 0x01 等是 zlib 头，否则按裸流解。
-				in = new DeflateSniffingStream(in);
+				bodyStream = new DeflateSniffingStream(bodyStream);
 			} else if (!enc.isEmpty() && !"identity".equals(enc)) {
 				// 声明之外/未知的编码：绝不能把压缩字节当正文交出去。
 				// （T60：内容损坏比一次显式失败更难发现——SW 会把垃圾缓存下来。）
@@ -428,8 +441,7 @@ final class PinnedFetch {
 					+ " cap=" + MAX_BODY_BYTES + " url=" + url);
 				return null;
 			}
-			byte[] body = readBody(in, declared, compressed, transportBudgetMs, url);
-			in.close();
+			byte[] body = readBody(bodyStream, declared, compressed, request, conn);
 			bytesTotal.addAndGet(body.length);
 			// 结算行带峰值/排队/拒绝/累计四项 —— 验收的四个指标一次 logcat 读全。
 			Log.i("dshr-perf", "pinnedFetch ok bytes=" + body.length + " enc=" + encoding
@@ -443,11 +455,22 @@ final class PinnedFetch {
 			Log.w("dshr-perf", "pinnedFetch 失败（不放行）：" + e + " url=" + url);
 			return null;
 		} finally {
-			if (held) {
-				inFlight.decrementAndGet();
-				GATE.release();
+			try {
+				if (bodyStream != null) {
+					try { bodyStream.close(); }
+					catch (IOException e) { Log.w("dshr-perf", "pinnedFetch 关闭响应流失败：" + e); }
+				}
+			} finally {
+				try {
+					if (conn != null) conn.disconnect();
+				} finally {
+					request.close();
+					if (held) {
+						inFlight.decrementAndGet();
+						GATE.release();
+					}
+				}
 			}
-			if (conn != null) conn.disconnect();
 		}
 	}
 
@@ -464,7 +487,7 @@ final class PinnedFetch {
 	 * 少几十次扩容复制。
 	 */
 	private static byte[] readBody(InputStream in, int declared, boolean compressed,
-			long budgetMs, String url) throws IOException {
+			FetchRequest request, HttpsURLConnection conn) throws IOException {
 		// 未压缩时 declared 就是解压后长度，直接开满（后续写满即零复制交出）。
 		// 压缩时 declared 只是压缩后长度，给 3× 经验值起步再按需增长。
 		long hint = declared > 0 ? (declared * (compressed ? 3L : 1L)) : 0L;
@@ -472,16 +495,13 @@ final class PinnedFetch {
 		if (cap < 0 || (long) cap > MAX_BODY_BYTES) cap = PREALLOC_MIN;
 		byte[] buf = new byte[cap];
 		int used = 0;
-		long deadline = System.currentTimeMillis() + budgetMs;
 		byte[] chunk = new byte[64 * 1024];
-		int n;
-		while ((n = in.read(chunk)) > 0) {
-			// 总量上界：readTimeout 只是空闲超时，慢速滴流下总时长无上界。
-			if (System.currentTimeMillis() > deadline) {
-				shed.incrementAndGet();
-				throw new SocketTimeoutException("pinnedFetch 传输超总量预算 " + budgetMs
-					+ "ms（已读 " + used + "B）");
-			}
+		while (true) {
+			conn.setReadTimeout(Math.min(READ_TIMEOUT_MS, request.remainingMillis()));
+			int n = in.read(chunk);
+			request.check();
+			if (n < 0) break;
+			if (n == 0) continue;
 			if (used + n > MAX_BODY_BYTES) {
 				shed.incrementAndGet();
 				throw new IOException("pinnedFetch 响应体超上限 " + MAX_BODY_BYTES
@@ -510,56 +530,36 @@ final class PinnedFetch {
 	 * {@code ZipException}。这里先看首字节决定用哪种（RFC 1950 的 CMF 低 4 位
 	 * 是 8 且 (CMF<<8|FLG) % 31 == 0 ⇒ zlib，否则按裸流）。
 	 */
-	private static final class DeflateSniffingStream extends InputStream {
-		private final InputStream src;
-		private final boolean zlibWrapped;
-		private InputStream delegate;
-		private boolean sniffed;
+	private static final class DeflateSniffingStream extends java.util.zip.InflaterInputStream {
+		private final java.util.zip.Inflater decoder;
 
 		DeflateSniffingStream(InputStream src) throws IOException {
-			this.src = src;
-			this.zlibWrapped = looksZlib(src);
+			this(new java.io.PushbackInputStream(src, 2));
 		}
 
-		private static boolean looksZlib(InputStream in) throws IOException {
-			in.mark(2);
+		private DeflateSniffingStream(java.io.PushbackInputStream src) throws IOException {
+			this(src, new java.util.zip.Inflater(!looksZlib(src)));
+		}
+
+		private DeflateSniffingStream(InputStream src, java.util.zip.Inflater decoder) {
+			super(src, decoder);
+			this.decoder = decoder;
+		}
+
+		private static boolean looksZlib(java.io.PushbackInputStream in) throws IOException {
 			int b0 = in.read();
 			int b1 = in.read();
-			in.reset();
+			if (b1 >= 0) in.unread(b1);
+			if (b0 >= 0) in.unread(b0);
 			if (b0 < 0 || b1 < 0) return true;
 			if ((b0 & 0x0f) != 8) return false;
 			return ((b0 << 8) | b1) % 31 == 0;
 		}
 
-		private InputStream out() throws IOException {
-			if (delegate == null && sniffed) {
-				// nowrap=true 表示按**裸流**（RFC 1951）解；zlib 包裹（RFC 1950）时 nowrap=false。
-				delegate = new java.util.zip.InflaterInputStream(src,
-					new java.util.zip.Inflater(!zlibWrapped));
-			}
-			return delegate;
-		}
-
-		@Override
-		public int read() throws IOException {
-			if (!sniffed) sniffed = true;
-			return out().read();
-		}
-
-		@Override
-		public int read(byte[] b, int off, int len) throws IOException {
-			if (!sniffed) sniffed = true;
-			return out().read(b, off, len);
-		}
-
-		@Override
-		public int available() throws IOException {
-			return sniffed ? out().available() : 0;
-		}
-
 		@Override
 		public void close() throws IOException {
-			src.close();
+			try { super.close(); }
+			finally { decoder.end(); }
 		}
 	}
 

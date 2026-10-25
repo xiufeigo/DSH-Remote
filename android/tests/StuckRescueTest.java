@@ -243,10 +243,22 @@ public final class StuckRescueTest {
 				main.contains("rescueReloadArmed = true;") && main.contains("startRescueLinkProbe();")
 					&& main.contains("private void startRescueLinkProbe()")
 					&& main.contains("private void onRescueLinkProbe(boolean ok, int status)"), "");
-			ok("接线：链路探针走既有 PinnedFetch（不新开网络栈、继承 pin 与并发闸门）",
-				main.contains("PinnedFetch.get(healthUrl, host") && main.contains("/__dsh_remote__/health"), "");
+			ok("接线：链路探针走 PinnedFetch.probe（共用 pin，独立取消与截止时间）",
+				main.contains("PinnedFetch.probe(healthUrl, host") && main.contains("/__dsh_remote__/health")
+					&& main.contains("rescueLinkRequest != request") && main.contains("request.cancel();"), "");
 			ok("接线：链路不通时撤回（abortReload）而不是硬重载",
 				main.contains("stuckRescue.abortReload();"), "");
+			// ── T118 接线契约 ──
+			ok("接线(T118)：回前台发快速升级许可 armForegroundFastPath()",
+				main.contains("stuckRescue.armForegroundFastPath();"), "");
+			ok("接线(T118)：许可只在「确实退过后台够久」时发（后台时长闸）",
+				main.contains("FOREGROUND_FAST_PATH_MIN_BG_MS")
+					&& main.contains("backgroundedAtMs = System.currentTimeMillis();")
+					&& main.contains("System.currentTimeMillis() - backgroundedAtMs >= FOREGROUND_FAST_PATH_MIN_BG_MS"), "");
+			ok("接线(T118)：onForeground() 本身**不**发许可（冷启动不许自造重载）",
+				main.contains("stuckRescue.onForeground();"), "");
+			ok("接线(T118)：重载前有一次性可见提示（Toast，不是常驻横幅）",
+				main.contains("toast(\"正在恢复连接…\")"), "");
 			// 反向：受控重载的方法体里**不许**出现换地址/清历史/清存储这类动作
 			{
 				int at = main.indexOf("private void runStuckReload()");
@@ -261,6 +273,75 @@ public final class StuckRescueTest {
 				ok("runStuckReload 方法体过了链路闸才动手",
 					body.contains("if (!rescueLinkOk)") && body.indexOf("if (!rescueLinkOk)") < body.indexOf("webView.reload()"), "");
 			}
+		}
+
+		// ── ⑬ T118：回前台快速升级许可（平板档收短 12s；手机档不动；健康页作废；一次性）──
+		{
+			// ⑬-A 平板档 + 许可已开：0s NUDGE → 下一拍（500ms）就 RELOAD
+			StuckRescue.Decider d = new StuckRescue.Decider();
+			long t0 = 50_000_000L;
+			d.onForeground();
+			d.armForegroundFastPath();
+			ok("⑬-A 许可已开", d.foregroundFastPathArmed(), "");
+			eq("⑬-A 第一拍 ⇒ NUDGE（温和层仍先给一次廉价机会）",
+				StuckRescue.Action.NUDGE, d.observe(StuckRescue.Observed.RECONNECTING, t0, false));
+			eq("⑬-A 第二拍（+500ms）⇒ RELOAD（不再等满 12s）",
+				StuckRescue.Action.RELOAD, d.observe(StuckRescue.Observed.RECONNECTING, t0 + 500, false));
+			eq("⑬-A 升级后配额用掉 1", 1, d.reloads());
+			ok("⑬-A 许可一次性：用掉即作废", !d.foregroundFastPathArmed(), "");
+
+			// ⑬-B 许可**未**开（冷启动那条路）：老时序一字不变，绝不自造重载
+			StuckRescue.Decider d2 = new StuckRescue.Decider();
+			long t1 = 51_000_000L;
+			d2.onForeground();
+			ok("⑬-B onForeground 之后许可默认未开（冷启动安全）", !d2.foregroundFastPathArmed(), "");
+			eq("⑬-B 第一拍 ⇒ NUDGE", StuckRescue.Action.NUDGE, d2.observe(StuckRescue.Observed.RECONNECTING, t1, false));
+			eq("⑬-B +500ms ⇒ NONE（没许可就不许提前升级）",
+				StuckRescue.Action.NONE, d2.observe(StuckRescue.Observed.RECONNECTING, t1 + 500, false));
+			eq("⑬-B +8s ⇒ NUDGE（温和层第二次，老时序）",
+				StuckRescue.Action.NUDGE, d2.observe(StuckRescue.Observed.RECONNECTING, t1 + 8_000, false));
+			eq("⑬-B +12s ⇒ RELOAD（老门槛仍是 12s）",
+				StuckRescue.Action.RELOAD, d2.observe(StuckRescue.Observed.RECONNECTING, t1 + 12_000, false));
+
+			// ⑬-C 手机档（hookLive=true）：许可**不**生效，仍走 25s 门槛（让位给 hook）
+			StuckRescue.Decider d3 = new StuckRescue.Decider();
+			long t2 = 52_000_000L;
+			d3.onForeground();
+			d3.armForegroundFastPath();
+			boolean phoneReloadEarly = false;
+			for (int i = 0; i <= 40; i++) {   // 0..20s，逐 500ms
+				if (d3.observe(StuckRescue.Observed.RECONNECTING, t2 + i * 500L, true) == StuckRescue.Action.RELOAD) {
+					phoneReloadEarly = true;
+				}
+			}
+			ok("⑬-C 手机档 20s 内**绝不**升级（25s 门槛让位给 hook，快捷路径对手机档无效）",
+				!phoneReloadEarly, "reloads=" + d3.reloads());
+
+			// ⑬-D 许可已开但页面第一拍就健康 ⇒ 许可作废，走老时序
+			StuckRescue.Decider d4 = new StuckRescue.Decider();
+			long t3 = 53_000_000L;
+			d4.onForeground();
+			d4.armForegroundFastPath();
+			eq("⑬-D 健康页第一拍 ⇒ NONE", StuckRescue.Action.NONE, d4.observe(StuckRescue.Observed.OK, t3, false));
+			ok("⑬-D 健康 ⇒ 许可作废", !d4.foregroundFastPathArmed(), "");
+			eq("⑬-D 之后若再断 ⇒ NUDGE（老路）",
+				StuckRescue.Action.NUDGE, d4.observe(StuckRescue.Observed.RECONNECTING, t3 + 1_000, false));
+			eq("⑬-D 再一拍 ⇒ NONE（没许可，不提前升级）",
+				StuckRescue.Action.NONE, d4.observe(StuckRescue.Observed.RECONNECTING, t3 + 1_500, false));
+
+			// ⑬-E 新文档（重载后）⇒ 许可作废，不会连着重载
+			StuckRescue.Decider d5 = new StuckRescue.Decider();
+			long t4 = 54_000_000L;
+			d5.onForeground();
+			d5.armForegroundFastPath();
+			d5.observe(StuckRescue.Observed.RECONNECTING, t4, false);
+			d5.observe(StuckRescue.Observed.RECONNECTING, t4 + 500, false);
+			d5.onDocumentChanged();
+			ok("⑬-E 新文档 ⇒ 许可作废（不会连着重载）", !d5.foregroundFastPathArmed(), "");
+			eq("⑬-E 新文档首拍 ⇒ NUDGE（不是又 reload）",
+				StuckRescue.Action.NUDGE, d5.observe(StuckRescue.Observed.RECONNECTING, t4 + 1_000, false));
+			eq("⑬-E 新文档次拍 ⇒ NONE（老门槛）",
+				StuckRescue.Action.NONE, d5.observe(StuckRescue.Observed.RECONNECTING, t4 + 1_500, false));
 		}
 
 		System.out.println("\nStuckRescueTest: " + (checks - failed) + "/" + checks + " passed");

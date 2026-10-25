@@ -1,18 +1,14 @@
 package top.d1studio.dshremote;
 
 import android.content.Context;
-import android.os.Build;
 import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
-import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Collection;
-import java.util.concurrent.TimeUnit;
 
 /**
  * frpc visitor 子进程托管：写 toml → exec 打包在 jniLibs 里的 libfrpc.so
@@ -45,7 +41,7 @@ public class FrpcManager {
 	private final File workDir;
 	private final File binFile;
 	private final String confName;
-	private Process process;
+	private ChildProcess process;
 	private volatile boolean stopping = false;
 	private volatile int startEpoch = 0;
 	private Thread watcher;
@@ -136,9 +132,7 @@ public class FrpcManager {
 			TunnelPath.reset(strategy == null || strategy.isEmpty()
 				? VisitorConfig.STRATEGY_P2P : strategy);
 
-			ProcessBuilder pb = new ProcessBuilder(binFile.getAbsolutePath(), "-c", conf.getAbsolutePath());
-			pb.redirectErrorStream(true);
-			process = pb.start();
+			process = ChildProcess.start(binFile.getAbsolutePath(), "-c", conf.getAbsolutePath());
 			processStartedAt = System.currentTimeMillis();
 			log("frpc 启动：-c " + conf.getName());
 			pump(process, epoch);
@@ -149,11 +143,9 @@ public class FrpcManager {
 		}
 	}
 
-	private void pump(final Process p, final int epoch) {
+	private void pump(final ChildProcess p, final int epoch) {
 		Thread t = new Thread(() -> {
-			InputStream in = p.getInputStream();
-			BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
-			try {
+			try (BufferedReader reader = p.output) {
 				String line;
 				// 每次 pump（= 每次 frpc 启动）只发一次就绪信号，避免刷屏；
 				// 崩溃重启后重新 pump，仍能再次触发。
@@ -161,6 +153,7 @@ public class FrpcManager {
 				boolean wiped = false;
 				while ((line = reader.readLine()) != null) {
 					log(line);
+					if (stopping || epoch != startEpoch) continue;
 					if (!wiped && epoch == startEpoch) {
 						wiped = true;
 						wipeConf();
@@ -176,7 +169,8 @@ public class FrpcManager {
 						notifyReady();
 					}
 				}
-			} catch (Exception ignored) {
+			} catch (java.io.IOException e) {
+				if (!stopping && epoch == startEpoch) Log.w(TAG, "读取 frpc 日志失败", e);
 			}
 		}, "frpc-log");
 		t.setDaemon(true);
@@ -193,7 +187,7 @@ public class FrpcManager {
 	}
 
 	private void watch(final VisitorConfig cfg, final int epoch) {
-		final Process p = process;
+		final ChildProcess p = process;
 		if (p == null) return;
 		watcher = new Thread(() -> {
 			try {
@@ -221,7 +215,7 @@ public class FrpcManager {
 	}
 
 	private void watchManaged(final int epoch) {
-		final Process p = process;
+		final ChildProcess p = process;
 		if (p == null) return;
 		watcher = new Thread(() -> {
 			try {
@@ -273,15 +267,11 @@ public class FrpcManager {
 		Thread w = watcher;
 		watcher = null;
 		if (w != null && w != Thread.currentThread()) w.interrupt();
-		Process p = process;
-		process = null;
+		ChildProcess p = process;
 		if (p != null) {
-			p.destroy();
-			waitExit(p, 1500);
-			if (isProcessAlive(p) && Build.VERSION.SDK_INT >= 26) {
-				p.destroyForcibly();
-				waitExit(p, 1000);
-			}
+			try { p.stop(); }
+			catch (java.io.IOException e) { throw new IllegalStateException("frpc 停止失败，保留进程状态", e); }
+			process = null;
 		}
 		wipeConf();
 	}
@@ -326,36 +316,8 @@ public class FrpcManager {
 		}
 	}
 
-	private static boolean isProcessAlive(Process p) {
-		if (p == null) return false;
-		try {
-			p.exitValue();
-			return false;
-		} catch (IllegalThreadStateException e) {
-			return true;
-		}
-	}
-
-	private static void waitExit(Process p, long timeoutMs) {
-		if (p == null) return;
-		if (Build.VERSION.SDK_INT >= 26) {
-			try {
-				p.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-			}
-			return;
-		}
-		long deadline = System.currentTimeMillis() + timeoutMs;
-		while (System.currentTimeMillis() < deadline) {
-			if (!isProcessAlive(p)) return;
-			try {
-				Thread.sleep(50);
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-				return;
-			}
-		}
+	private static boolean isProcessAlive(ChildProcess p) {
+		return p != null && p.isAlive();
 	}
 
 	private void log(String line) {

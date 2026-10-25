@@ -236,14 +236,19 @@ public class MainActivity extends Activity {
 	private final StuckRescue.Decider stuckRescue = new StuckRescue.Decider();
 	/** T96：升级层（受控重载）**必须先过链路闸**——网关 HTTP 侧通不通。 */
 	private volatile boolean rescueLinkOk = false;
-	/** T96：链路探针是否在飞（一次只发一条，绝不叠加）。 */
-	private volatile boolean rescueLinkProbeInFlight = false;
+	// 单个执行槽跨 Activity 共用；取消旧请求后，新请求也不能与尚未退出的旧线程叠加。
+	private static final java.util.concurrent.ThreadPoolExecutor RESCUE_QUEUE = new java.util.concurrent.ThreadPoolExecutor(
+		1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS, new java.util.concurrent.ArrayBlockingQueue<>(1), r -> {
+			Thread thread = new Thread(r, "dshr-rescue-link");
+			thread.setDaemon(true);
+			return thread;
+		});
+	private FetchRequest rescueLinkRequest;
+	private java.util.concurrent.FutureTask<Void> rescueLinkTask;
 	/** T96：判定器已要求重载、正在等链路探针回话。 */
 	private boolean rescueReloadArmed = false;
 	/** T96：升级意图发起的时刻（看门狗用）。 */
 	private long rescueReloadArmedAt = 0;
-	/** T96：链路探针发起时刻（探针自己也要有超时，否则一次卡住会把后续升级全挡掉）。 */
-	private volatile long rescueLinkProbeAt = 0;
 	/** T96：等链路回话的最长时间；超时即撤回本次升级（配额回滚），绝不留"静默挡死"这条路。 */
 	private static final long RELOAD_ARM_TIMEOUT_MS = 15000L;
 	/** T78：轮询是否在推进（onResume 起、onPause 停）。 */
@@ -353,13 +358,15 @@ public class MainActivity extends Activity {
 	private volatile boolean tunnelDotRunning;
 	/** 正在给状态点握手的套接字。切服务器时关掉，避免这只握手把整组 frpc 挂住。 */
 	private volatile SSLSocket tunnelDotSocket;
+	private final Object tunnelDotLock = new Object();
+	private Runnable reachabilityRetry;
 	private static SSLSocketFactory reachabilityFactory;
 	private static final int REACH_CONNECT_MS = 800;
 	private static final int REACH_HANDSHAKE_MS = 1200;
 	private static final int REACH_PORT_WAIT_MS = 2500;
 	private static final int REACH_PORT_WAIT_LIMIT = 8;
 	private volatile int tunnelDotGeneration;
-	/** 当前这轮探活持有的代次。取消只把代次加一，由这轮自己清掉运行标记。 */
+	/** 当前这轮探活持有的代次；取消立即释放运行标记，旧回调不能清掉新一轮状态。 */
 	private volatile int tunnelDotOwner;
 	private int tunnelDotRetries;
 	/** 切到一台 frpc 之后，同组其它服务器要再探一次。切换完成前只排队，不握手。 */
@@ -442,6 +449,22 @@ public class MainActivity extends Activity {
 	 * 进程级全局态归零；正确性不依赖它——onResume 无条件 resumeTimers 才是结构不变量。
 	 */
 	private static volatile boolean appInForeground = false;
+	/**
+	 * T118：最近一次退后台的时刻（0 = 本次进程还没退过后台）。
+	 *
+	 * <p>用来判定"回前台"这条路上该不该发**快速升级许可**：
+	 * 只有确实退过后台（且退得够久）才发，冷启动那条 onResume 不发
+	 * （冷启动时页面正在建 WS，官方那条指示器本来就在显示「正在重连」，
+	 * 发了许可就会在冷启后约 1s 内把自己重载一遍）。
+	 */
+	private long backgroundedAtMs = 0L;
+	/**
+	 * T118：退后台多久才算"确实退过、页面可能已半死"（ms）。
+	 *
+	 * <p>取 5s：短于此的（锁屏秒开、弹个通知、误触）一律不发许可；
+	 * 长于此的（切别的 App、锁屏、接电话）才发。
+	 */
+	private static final long FOREGROUND_FAST_PATH_MIN_BG_MS = 5000L;
 	/**
 	 * DIAG-30s：本次连接起点（openGateway 落点）。onPageStarted/onPageFinished/
 	 * 首次进入会话三处打 t+xxms，用户复现时抓 `adb logcat -s dshr-perf` 即可
@@ -527,6 +550,13 @@ public class MainActivity extends Activity {
 	@Override
 	protected void onPause() {
 		super.onPause();
+		appInForeground = false;
+		// T118：记下退后台时刻（供 onResume 判定该不该发快速升级许可）。
+		backgroundedAtMs = System.currentTimeMillis();
+		cancelTunnelDotProbe();
+		cancelRescueLinkProbe();
+		rescueReloadArmed = false;
+		stuckRescue.abortReload();
 		// T78：退后台即停轮询并立即收起横幅——后台不该留一条"重新连接中"，
 		// 也不该继续每 500ms 往页面里跑只读探针。
 		stopReconnectPolling();
@@ -554,7 +584,6 @@ public class MainActivity extends Activity {
 				}
 			}
 		}
-		appInForeground = false;
 		if (rootLayout != null) rootLayout.postDelayed(trimFleet, FLEET_TRIM_DELAY_MS);
 	}
 
@@ -565,6 +594,8 @@ public class MainActivity extends Activity {
 		if (rootLayout != null) rootLayout.removeCallbacks(trimFleet);
 		// 会话还在，或者隧道进程没停：把退后台时拆掉的访客补回来。停在服务器列表上时不冷启动。
 		if (uiState == UiState.WEB || TunnelService.isRunning()) requestFleet(false);
+		kickSiblingRefresh();
+		scheduleReachability();
 		// T72：平板档系统栏让位的最后一层兜底。insets listener（2342 附近）已覆盖
 		// 任务栏显隐/导航模式/旋转，但「冷启动 + 后台期间状态变化」这条路上未必有新 insets
 		// 事件；这里 post 一次重算（幂等，成本一次 setPadding），保证冷启动首帧就避让。
@@ -575,6 +606,26 @@ public class MainActivity extends Activity {
 		// 所以回前台后第一次读到「正在重连」就允许温和层**立刻**动作，不等 TIER1_AFTER_MS，
 		// 更不等 hook 那条（平板档根本没有 hook 自愈）。判据合并在 stuckRescue 里。
 		stuckRescue.onForeground();
+		// T118：确实退过后台（且退得够久）⇒ 发一次"快速升级许可"。
+		//
+		// 为什么要有：平板档的温和层在"半死 socket"上**实测无效**（T96 §1.2：
+		// 派发后 40s 仍 phase=[connecting]），那 12s 升级门槛等的是一个已被证伪的动作。
+		// 真机实测（scratch/t118）：回前台 → 整页重载 ≈ 17.3s，期间页面一直卡死、零提示
+		// ⇒ 用户观感是"莫名其妙闪一下"。发了本许可后，平板档的回前台路径变成
+		// 「第一拍 nudge → 第二拍就升级」，回前台后很快就有确定结果。
+		//
+		// 为什么**不在** onForeground() 里无条件发：冷启动也走 onResume，
+		// 而冷启动时页面正在建 WS ⇒ 官方那条指示器本来就在显示「正在重连」
+		// ⇒ 探针第一拍读到的就是 RECONNECTING ⇒ 会造成"冷启后 1s 内把自己重载一遍"。
+		// 故必须由这里按"确实退过后台够久"来发。
+		if (backgroundedAtMs > 0L
+			&& System.currentTimeMillis() - backgroundedAtMs >= FOREGROUND_FAST_PATH_MIN_BG_MS) {
+			stuckRescue.armForegroundFastPath();
+			Log.i("dshr-rescue", "回前台：后台 "
+				+ (System.currentTimeMillis() - backgroundedAtMs) + "ms ≥ "
+				+ FOREGROUND_FAST_PATH_MIN_BG_MS + "ms ⇒ 开快速升级许可（平板档不再等满 12s）");
+		}
+		backgroundedAtMs = 0L;
 		// T90：顺便**补读一次** hook 的连接态（只读、一次性）：后台期间 pauseTimers 冻住了
 		// 页面侧 JS，翻转事件未必推得过来（见 refreshHookConnState 注释）。放在
 		// startReconnectPolling 之后：先让轮询恢复，再补这一读，横幅下一拍就能用上新值。
@@ -633,6 +684,8 @@ public class MainActivity extends Activity {
 		// AND-03/AND-06：先关统一线程池——中断在途的隧道就绪轮询与返回会话探测，
 		// 等待轮询线程不再持有 Activity 空转。
 		destroyed = true;
+		cancelTunnelDotProbe();
+		cancelRescueLinkProbe();
 		// T78：停掉重连状态轮询（rootLayout 随 Activity 一起销毁）。
 		stopReconnectPolling();
 		bgExecutor.shutdownNow();
@@ -3328,6 +3381,9 @@ public class MainActivity extends Activity {
 					if (isSessionUrl(url)) armStagingInsets(view);
 					return;
 				}
+				cancelRescueLinkProbe();
+				rescueReloadArmed = false;
+				stuckRescue.abortReload();
 				// DIAG-30s：主帧导航提交点。首包慢（TLS/网关/上游）会体现在
 				// openGateway→onPageStarted 的差值里。
 				// T90：**页面级**数据源随文档一起重置 —— 上一页 hook 推来的连接态一律不许
@@ -3386,6 +3442,8 @@ public class MainActivity extends Activity {
 				// T96：新文档也是自救判定的新起点（断开 episode 重开；**重载配额跨文档保留**，
 				// 所以受控重载本身不会被自己的新文档洗掉计数 ⇒ 不会变成无限重载）。
 				stuckRescue.onDocumentChanged();
+				cancelRescueLinkProbe();
+				rescueReloadArmed = false;
 				if (Build.VERSION.SDK_INT >= 23) enterSessionPage(view, url);
 			}
 
@@ -3645,9 +3703,16 @@ public class MainActivity extends Activity {
 	 *   <li>hook 说正在重连（新鲜度上界内）；</li>
 	 *   <li>防抖器已判"仍在断开态"（与改前一样保持 500ms）。</li>
 	 * </ol>
-	 * <p>T117：其余（健康态）**只有一档 5s**（{@link #PROBE_IDLE_MS}）——改前按
-	 * "有没有推送通道"分成 5s / 1s 两档，那条 1s 档是所有平板的常态、也是本任务要解决的耗电点。
+	 * <p>T117：其余（健康态）**只有一档 60s**（{@link #PROBE_IDLE_MS}）——改前按
+	 * "有没有推送通道"分成 5s / 1s 两档，那条 1s 档是所有平板的常态、也是本任务要解决的耗电点；
+	 * 先并成一档 5s，随后按用户口径进一步放宽到**按分钟计**（见 {@link #PROBE_IDLE_MS} 的账）。
 	 * 探针的**采样链、判据、防抖、自救喂数**一个字未改，改的只有"多久跑一拍"。
+	 *
+	 * <p>⚠️ T118 补注：这一档只决定"**在页面里干等时**多久发现断开"。
+	 * 真机实测（scratch/t118）：平板档"回前台 → 整页重载"实测 ≈ <b>17.3s</b>，
+	 * 其中 12s 是升级门槛（见 {@link StuckRescue#TIER2_AFTER_MS}），
+	 * 余下的是探针发现延迟 + 温和层那两次**实测无效**的 nudge。
+	 * 故 T118 把回前台那条路径的升级门槛单独收短（见 {@link StuckRescue.Decider#onForeground()}）。
 	 */
 	private long probeIntervalMs() {
 		if (System.currentTimeMillis() < probeFastUntil) return ReconnectBanner.POLL_INTERVAL_MS;
@@ -3848,7 +3913,7 @@ public class MainActivity extends Activity {
 		// 等链路探针回来就在健康页上打出一发 WebView.reload()。
 		if (o != StuckRescue.Observed.RECONNECTING && rescueReloadArmed) {
 			rescueReloadArmed = false;
-			rescueLinkProbeInFlight = false;
+			cancelRescueLinkProbe();
 			stuckRescue.abortReload();
 			Log.i("dshr-rescue", "tier2 取消武装（页面已"
 				+ (o == StuckRescue.Observed.OK ? "恢复" : "不可读")
@@ -3856,12 +3921,12 @@ public class MainActivity extends Activity {
 		}
 		StuckRescue.Action action = stuckRescue.observe(o, System.currentTimeMillis(), hookSelfHealLive());
 		// T96：**升级层全程必须留痕**——实测踩过"一声不响"的坑：链路探针线程若因闸门/回调丢失
-		// 迟迟不回来，`rescueLinkProbeInFlight` 一直为 true，后面每次升级都被静默挡掉，
+		// 迟迟不回来，后面每次升级都被静默挡掉，
 		// 现场只有"什么都没发生"（见 report §3.4 的真机时间线）。加看门狗 + 逐条日志后，
 		// 这条路要么动手、要么在 logcat 里说清楚为什么不动手。
 		if (rescueReloadArmed && System.currentTimeMillis() - rescueReloadArmedAt > RELOAD_ARM_TIMEOUT_MS) {
 			rescueReloadArmed = false;
-			rescueLinkProbeInFlight = false;
+			cancelRescueLinkProbe();
 			stuckRescue.abortReload();
 			Log.w("dshr-rescue", "tier2 看门狗：链路探针 " + RELOAD_ARM_TIMEOUT_MS
 				+ "ms 未回话 ⇒ 放弃本次升级（撤回配额，等下一轮）");
@@ -3875,6 +3940,16 @@ public class MainActivity extends Activity {
 			rescueLinkOk = false;
 			Log.i("dshr-rescue", "tier2 升级意图（stuckFor=" + stuckRescue.stuckForMs(rescueReloadArmedAt)
 				+ "ms reloads=" + stuckRescue.reloads() + "/" + StuckRescue.MAX_RELOADS + "）⇒ 先查链路");
+			// T118：把"马上要整页重载"这件事**说破**。
+			//
+			// 改前用户只看到一次莫名其妙的闪（真机实测 scroll 2500→0、整页重载），
+			// 前面 12~17 秒里页面一直卡着、零提示 ⇒ 观感是"App 抽风"。
+			// 改后：先看到"正在恢复连接…"，紧接着页面重载 ⇒ 闪有了前因。
+			//
+			// 为什么用 Toast 而不是横幅：T109 删横幅是**为了省电**（持续可见的覆盖条要一直画），
+			// 而这里是**一次性动作的前摇**——只在真的要动手重载的那一刻打一次，
+			// 不新增任何常驻 View、不新增任何定时器 ⇒ 不违背 T109 的口径。
+			toast("正在恢复连接…");
 			startRescueLinkProbe();
 		}
 	}
@@ -3933,6 +4008,7 @@ public class MainActivity extends Activity {
 		// 重载后旧观测一律作废：横幅不许活过这次动作（新文档 onPageCommitVisible 还会再清一次）。
 		hideReconnectBannerNow();
 		stuckRescue.onDocumentChanged();
+		cancelRescueLinkProbe();
 		try {
 			webView.reload();
 		} catch (Exception e) {
@@ -3944,26 +4020,16 @@ public class MainActivity extends Activity {
 	 * T96：链路探针 —— 网关的 HTTP 侧现在通不通（**纯原生、零页面痕迹**）。
 	 *
 	 * <p>为什么不能靠页面：平板档 hook 严格 OFF、页面侧没有任何可写的地方（零痕迹契约），
-	 * 而"能不能重载"必须由原生自己判断。这里用 {@link PinnedFetch}（既有可信链 + pin 语义 +
-	 * 并发闸门）在**后台线程**取一次 {@code /__dsh_remote__/health}：
-	 * 只判"服务器有没有回话"，任何状态码（含 404/405）都算通 —— 我们要证明的是
-	 * HTTP 链路活着，不是这个端点存在。
+	 * 而"能不能重载"必须由原生自己判断。这里用 {@link PinnedFetch}（既有可信链 + pin
+	 * 语义）在**后台线程**检查 {@code /__dsh_remote__/health} 的 200 响应头，
+	 * 不下载正文，也不占静态资源下载名额。
 	 *
 	 * <p>开销：只在**升级层已被判定器要求重载**的那一刻发一次（卡住态下最多每 12s 一次），
 	 * 健康态一次都不发。
 	 */
 	private void startRescueLinkProbe() {
-		long now = System.currentTimeMillis();
-		if (rescueLinkProbeInFlight) {
-			// 看门狗（第二次防线）：只在探针**确实在飞**时挡；超时的一律当死掉重发。
-			if (now - rescueLinkProbeAt > RELOAD_ARM_TIMEOUT_MS) {
-				rescueLinkProbeInFlight = false;
-				Log.w("dshr-rescue", "链路探针超时 " + RELOAD_ARM_TIMEOUT_MS + "ms ⇒ 重发一次");
-			} else {
-				return;
-			}
-		}
-		if (destroyed || webView == null) {
+		if (rescueLinkRequest != null) return;
+		if (destroyed || !appInForeground || webView == null) {
 			Log.w("dshr-rescue", "链路探针跳过：destroyed 或 webView 为空");
 			return;
 		}
@@ -3987,34 +4053,43 @@ public class MainActivity extends Activity {
 			return;
 		}
 		final String healthUrl = scheme + "://" + host + (port > 0 ? ":" + port : "") + "/__dsh_remote__/health";
-		rescueLinkProbeInFlight = true;
-		rescueLinkProbeAt = now;
 		final String profileId = activeProfileId;
+		final FetchRequest request = new FetchRequest(RELOAD_ARM_TIMEOUT_MS);
+		rescueLinkRequest = request;
 		Log.i("dshr-rescue", "链路探针发起 " + healthUrl);
-		Thread t = new Thread(() -> {
-			boolean ok = false;
-			int status = 0;
-			try {
-				PinnedFetch.Result r = PinnedFetch.get(healthUrl, host, port > 0 ? port : 443,
-					profileId, certPinStore(), "rescue");
-				if (r != null && r.status > 0) {
-					ok = true;
-					status = r.status;
-				}
-			} catch (Throwable ignored) {
-				ok = false;
-			}
-			final boolean okF = ok;
-			final int statusF = status;
-			if (rootLayout != null) rootLayout.post(() -> onRescueLinkProbe(okF, statusF));
-		}, "dshr-rescue-link");
-		t.setDaemon(true);
-		t.start();
+		rescueLinkTask = new java.util.concurrent.FutureTask<>(() -> {
+			PinnedFetch.Result r = PinnedFetch.probe(healthUrl, host, port > 0 ? port : 443,
+				profileId, certPinStore(), request);
+			if (rootLayout != null) rootLayout.post(() -> {
+				if (rescueLinkRequest != request || destroyed || !appInForeground) return;
+				rescueLinkRequest = null;
+				rescueLinkTask = null;
+				onRescueLinkProbe(r != null && r.status > 0, r == null ? 0 : r.status);
+			});
+		}, null);
+		try {
+			RESCUE_QUEUE.execute(rescueLinkTask);
+		} catch (RejectedExecutionException e) {
+			cancelRescueLinkProbe();
+			rescueReloadArmed = false;
+			stuckRescue.abortReload();
+			Log.w("dshr-rescue", "链路探针队列仍被旧请求占用，本次升级撤回：" + e);
+		}
+	}
+
+	private void cancelRescueLinkProbe() {
+		FetchRequest request = rescueLinkRequest;
+		rescueLinkRequest = null;
+		if (request != null) request.cancel();
+		if (rescueLinkTask != null) {
+			rescueLinkTask.cancel(true);
+			RESCUE_QUEUE.remove(rescueLinkTask);
+			rescueLinkTask = null;
+		}
 	}
 
 	/** 链路探针回话（主线程）：通了才真重载，不通就撤回这次重载意图。 */
 	private void onRescueLinkProbe(boolean ok, int status) {
-		rescueLinkProbeInFlight = false;
 		rescueLinkOk = ok;
 		Log.i("dshr-rescue", "链路探针 " + (ok ? "通" : "不通") + " status=" + status
 			+ " armed=" + rescueReloadArmed);
@@ -4110,11 +4185,15 @@ public class MainActivity extends Activity {
 				detail = (detail.isEmpty() ? "" : detail + " ") + "hook=reconnecting";
 			}
 		}
-		// T108：探针自己看到「正在重连」⇒ 立刻切快档。兜底周期（T117 起统一 5s）只负责"发现"，
-		// 一旦发现就回到 500ms，把 SHOW_STREAK=2 的第二拍缩短到 500ms ——
-		// 于是"发现并确认断开态"的时延 = 一拍兜底 + 一拍快档（最坏 5.5s），
-		// 而不是"两拍兜底"（10s）。改前平板档是 1s 兜底 ⇒ 最坏 1.5s，
-		// 那 4s 的发现延迟就是 T117 用 12 拍/分换来的代价，见 {@link #PROBE_IDLE_MS} 的账。
+		// T108：探针自己看到「正在重连」⇒ 立刻切快档。兜底周期（T117 起统一，**后按用户口径
+		// 放宽到 60s／按分钟计**）只负责"发现"，一旦发现就回到 500ms，
+		// 把 SHOW_STREAK=2 的第二拍缩短到 500ms。
+		// 于是"发现并确认断开态"的时延 = 一拍兜底（**最坏 60s**）+ 一拍快档（0.5s）。
+		// ⚠️ T118 补注：这 60s 就是"在页面里干等"时的**发现延迟上限**——
+		// 真机实测（scratch/t118）平板档"回前台 → 整页重载"≈ 17.3s，
+		// 之所以没到 60s，是因为回前台会开 8s 快档窗口（onResume → armProbeFastWindow），
+		// **"切后台再回来"这条主场景不受 60s 影响**；真正吃 60s 的是"页面里干等断线"那条。
+		// 见 {@link #PROBE_IDLE_MS} 的账。
 		if (pageReconnecting || observed == ReconnectBanner.Observed.RECONNECTING) {
 			armProbeFastWindow(PROBE_FAST_WINDOW_MS);
 		}
@@ -4583,15 +4662,22 @@ public class MainActivity extends Activity {
 	 * 切服务器时不探。探测走自己的线程，不占用隧道连接那条单线程。
 	 */
 	private void scheduleReachability() {
-		if (destroyed || serverSwitchInFlight || tunnelDotRunning) return;
+		if (destroyed || !appInForeground || serverSwitchInFlight || tunnelDotRunning) return;
 		tunnelDotRetries = 0;
 		probeUnknownReachability();
 	}
 
 	private void cancelTunnelDotProbe() {
-		tunnelDotGeneration += 1;
-		SSLSocket socket = tunnelDotSocket;
-		tunnelDotSocket = null;
+		if (rootLayout != null && reachabilityRetry != null) rootLayout.removeCallbacks(reachabilityRetry);
+		reachabilityRetry = null;
+		SSLSocket socket;
+		synchronized (tunnelDotLock) {
+			tunnelDotGeneration += 1;
+			tunnelDotRunning = false;
+			tunnelDotOwner = 0;
+			socket = tunnelDotSocket;
+			tunnelDotSocket = null;
+		}
 		if (socket != null) {
 			try {
 				socket.close();
@@ -4644,14 +4730,14 @@ public class MainActivity extends Activity {
 	}
 
 	private void kickSiblingRefresh() {
-		if (destroyed || serverSwitchInFlight || tunnelDotRunning || siblingRefreshTarget == null) return;
+		if (destroyed || !appInForeground || serverSwitchInFlight || tunnelDotRunning || siblingRefreshTarget == null) return;
 		ProfileStore.Profile target = siblingRefreshTarget;
 		siblingRefreshTarget = null;
 		probeSiblingTunnels(target);
 	}
 
 	private void probeUnknownReachability() {
-		if (destroyed || serverSwitchInFlight || tunnelDotRunning) return;
+		if (destroyed || !appInForeground || serverSwitchInFlight || tunnelDotRunning) return;
 		Map<String, String> known = tunnelReachability;
 		List<ProfileStore.Profile> tunnels = new ArrayList<ProfileStore.Profile>();
 		List<ProfileStore.DirectNode> directs = new ArrayList<ProfileStore.DirectNode>();
@@ -4673,7 +4759,7 @@ public class MainActivity extends Activity {
 
 	/** 目标页面已经交卷之后，同组其它隧道再握一次。不探目标自己，也不重试。 */
 	private void probeSiblingTunnels(ProfileStore.Profile target) {
-		if (target == null || destroyed || serverSwitchInFlight || tunnelDotRunning) return;
+		if (target == null || destroyed || !appInForeground || serverSwitchInFlight || tunnelDotRunning) return;
 		String key = VisitorFleet.frpsKey(target);
 		List<ProfileStore.Profile> siblings = new ArrayList<ProfileStore.Profile>();
 		for (ProfileStore.Profile profile : ProfileStore.list(prefs())) {
@@ -4688,7 +4774,7 @@ public class MainActivity extends Activity {
 
 	private void startReachabilityProbe(List<ProfileStore.Profile> tunnels,
 			List<ProfileStore.DirectNode> directs, boolean overwrite) {
-		if (destroyed || serverSwitchInFlight || tunnelDotRunning) return;
+		if (destroyed || !appInForeground || serverSwitchInFlight || tunnelDotRunning) return;
 		tunnelDotRunning = true;
 		final int generation = ++tunnelDotGeneration;
 		tunnelDotOwner = generation;
@@ -4699,7 +4785,7 @@ public class MainActivity extends Activity {
 			boolean aborted = false;
 			try {
 				for (ProfileStore.Profile profile : tunnels) {
-					if (destroyed || generation != tunnelDotGeneration || serverSwitchInFlight) {
+					if (reachabilityCancelled(generation)) {
 						aborted = true;
 						return;
 					}
@@ -4709,8 +4795,8 @@ public class MainActivity extends Activity {
 						if (!overwrite) portPending = true;
 						continue;
 					}
-					int answer = handshake("127.0.0.1", profile.bindPort, false);
-					if (destroyed || generation != tunnelDotGeneration || serverSwitchInFlight) {
+					int answer = handshake("127.0.0.1", profile.bindPort, false, generation);
+					if (reachabilityCancelled(generation)) {
 						aborted = true;
 						return;
 					}
@@ -4719,14 +4805,14 @@ public class MainActivity extends Activity {
 					else if (!overwrite) portPending = true;
 				}
 				for (ProfileStore.DirectNode node : directs) {
-					if (destroyed || generation != tunnelDotGeneration || serverSwitchInFlight) {
+					if (reachabilityCancelled(generation)) {
 						aborted = true;
 						return;
 					}
 					String prior = previous.get(node.id);
 					if (!overwrite && ("up".equals(prior) || "down".equals(prior))) continue;
-					int answer = directAnswer(node);
-					if (destroyed || generation != tunnelDotGeneration || serverSwitchInFlight || answer < 0) {
+					int answer = directAnswer(node, generation);
+					if (reachabilityCancelled(generation) || answer < 0) {
 						aborted = true;
 						return;
 					}
@@ -4753,6 +4839,7 @@ public class MainActivity extends Activity {
 		}
 		tunnelDotRunning = false;
 		tunnelDotOwner = 0;
+		if (reachabilityCancelled(generation)) return;
 		if (!drop && !destroyed && !serverSwitchInFlight) {
 			tunnelDotPortPending = portPending;
 			Map<String, String> merged = new HashMap<String, String>(tunnelReachability);
@@ -4777,11 +4864,17 @@ public class MainActivity extends Activity {
 		if (drop || overwrite || !portPending || destroyed || serverSwitchInFlight) return;
 		if (tunnelDotRetries >= REACH_PORT_WAIT_LIMIT || rootLayout == null) return;
 		tunnelDotRetries += 1;
-		rootLayout.postDelayed(() -> {
-			if (!destroyed && generation == tunnelDotGeneration && !serverSwitchInFlight && !tunnelDotRunning) {
+		reachabilityRetry = () -> {
+			reachabilityRetry = null;
+			if (!reachabilityCancelled(generation) && !tunnelDotRunning) {
 				probeUnknownReachability();
 			}
-		}, REACH_PORT_WAIT_MS);
+		};
+		rootLayout.postDelayed(reachabilityRetry, REACH_PORT_WAIT_MS);
+	}
+
+	private boolean reachabilityCancelled(int generation) {
+		return destroyed || !appInForeground || serverSwitchInFlight || generation != tunnelDotGeneration;
 	}
 
 	/** 菜单里保存后要连上。已在会话中就原地切，避免先盖一层连接壳。 */
@@ -4999,6 +5092,8 @@ public class MainActivity extends Activity {
 			hookConnStateStaleLogged = false;
 			hideReconnectBannerNow();
 			stuckRescue.onDocumentChanged();
+			cancelRescueLinkProbe();
+			rescueReloadArmed = false;
 			hideSettings();
 			if (previous == null || previous == stage) {
 				finishSwitchPresentation(stage, url, null, ticket);
@@ -6004,13 +6099,16 @@ public class MainActivity extends Activity {
 	 * 1 握上手，0 连上了但对方不应答，-1 还没连上或这次被取消。
 	 * remoteFailureIsDown 用于直连：连不上也是不可用。隧道端口没挂上仍返回 -1。
 	 */
-	private int handshake(String host, int port, boolean remoteFailureIsDown) {
-		if (serverSwitchInFlight || host == null || port <= 0) return -1;
+	private int handshake(String host, int port, boolean remoteFailureIsDown, int generation) {
+		if (reachabilityCancelled(generation) || host == null || port <= 0) return -1;
 		SSLSocket socket = null;
 		boolean accepted = false;
 		try {
 			socket = (SSLSocket) reachabilityFactory().createSocket();
-			tunnelDotSocket = socket;
+			synchronized (tunnelDotLock) {
+				if (reachabilityCancelled(generation)) return -1;
+				tunnelDotSocket = socket;
+			}
 			if (sniHost(host)) {
 				SSLParameters params = socket.getSSLParameters();
 				List<SNIServerName> names = new ArrayList<SNIServerName>();
@@ -6018,19 +6116,21 @@ public class MainActivity extends Activity {
 				params.setServerNames(names);
 				socket.setSSLParameters(params);
 			}
-			if (serverSwitchInFlight) return -1;
+			if (reachabilityCancelled(generation)) return -1;
 			socket.connect(new InetSocketAddress(host, port), REACH_CONNECT_MS);
 			accepted = true;
 			socket.setSoTimeout(REACH_HANDSHAKE_MS);
-			if (serverSwitchInFlight) return -1;
+			if (reachabilityCancelled(generation)) return -1;
 			socket.startHandshake();
-			return serverSwitchInFlight ? -1 : 1;
+			return reachabilityCancelled(generation) ? -1 : 1;
 		} catch (Exception ignored) {
-			if (serverSwitchInFlight) return -1;
+			if (reachabilityCancelled(generation)) return -1;
 			if (remoteFailureIsDown) return 0;
 			return accepted ? 0 : -1;
 		} finally {
-			if (tunnelDotSocket == socket) tunnelDotSocket = null;
+			synchronized (tunnelDotLock) {
+				if (tunnelDotSocket == socket) tunnelDotSocket = null;
+			}
 			if (socket != null) {
 				try {
 					socket.close();
@@ -6041,13 +6141,13 @@ public class MainActivity extends Activity {
 	}
 
 	/** 直连走它自己的 https 地址。握上手是可连接，其它失败是不可用；切换取消返回 -1。 */
-	private int directAnswer(ProfileStore.DirectNode node) {
+	private int directAnswer(ProfileStore.DirectNode node, int generation) {
 		if (node == null || !node.isValid()) return 0;
 		Uri uri = Uri.parse(node.url);
 		String host = uri.getHost();
 		if (host == null || host.length() == 0) return 0;
 		int port = uri.getPort() == -1 ? 443 : uri.getPort();
-		return handshake(host, port, true);
+		return handshake(host, port, true, generation);
 	}
 
 	private static boolean sniHost(String host) {

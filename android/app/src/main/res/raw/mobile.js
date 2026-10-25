@@ -51,6 +51,12 @@
  *     1919 px = 75.0% 与页面差 ΔRGB=(6,5,4)）。让页面自己画这两条带，ΔRGB=0 是构造性的。
  *     T97 的事件监听器、T115 的四个变量与一组规则就是平板档的**全部** hook 痕迹
  *     （T101 的 2 条圆角规则已删，见下）。
+ *   - 平板档第四处例外（T136，用户实机 bug「安卓端右侧栏没留状态栏安全空间」）：
+ *     T115 的「列 padding 让位」对** docked（push）态右栏面板无效**——官方面板是
+ *     `position:absolute; top:0; bottom:0; right:0`（包含块 = 右栏列的 padding box），
+ *     绝对定位按 padding box 定位 ⇒ 列的 padding 挪不动它 ⇒ 面板顶边永远在 y=0，
+ *     标题行被状态栏盖住。T136 让面板**自身**按四向 inset 偏移（见 MOBILE_CSS
+ *     「T136」一段）。仍然是「只改绘制/布局、不写节点/属性/类名」，零痕迹契约不变。
  *   - 手机档「长按 = 进 App 连接设置页」的两处入口（T103，用户口径「进连接设置只保留
  *     长按这一条路」，取消返回键入口由 T102 完成）：
  *     ① **悬浮鲸鱼长按**（既有 650ms 行为，T103 补两处防误触：长按触发后那次
@@ -419,10 +425,9 @@
 		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
 		'}',
 		// ── 官方右侧栏（文件树 / 文档预览）──
-		// [data-sidebar-right-panel=fullscreen] 是 position:fixed;inset:0（绝对定位不吃
-		// frame 的 padding），面板标题行会直接顶到状态栏上、底部压住导航栏。
+		// [data-sidebar-right-panel=fullscreen] 是绝对定位（不吃 frame 的 padding），
+		// 面板标题行会直接顶到状态栏上、底部压住导航栏。
 		// 面板自己垫出两侧系统栏高度：背景画进 padding，状态栏后面颜色一致。
-		// push（停靠）态不垫——那一列在 frame 的 padding 之内，垫了反而多一条空白。
 		// 平板档同样要垫：syncDom 在严格 OFF 下直接返回（无 data-dshr-* 标记），
 		// 所以平板这条走纯结构选择器（官方自己的 =fullscreen 值，不依赖任何 hook 标记）；
 		// 背景走同一个官方 token，深浅色由 token 自己跟随（平板不挂 data-dshr-dark）。
@@ -434,6 +439,36 @@
 		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
 		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
 		'  background: var(--dsw-alias-bg-base, var(--dsw-specific-background, #ffffff)) !important;',
+		'}',
+		// ── T136：docked（push）态的右栏面板也必须让开系统栏（本轮用户实机 bug）──
+		//
+		// 官方布局实测（DSH 0.2.0-rc.2 / @deepseek-ai/dsh-client-ui-sidebar-right）：
+		//   面板 = div[data-sidebar-right-panel="push"|"fullscreen"]，
+		//   官方 CSS 是 position:absolute; top:0; bottom:0; right:0，
+		//   包含块 = 右栏列 div[data-rightbar-col]（官方 CSS position:relative）。
+		//
+		// 关键一条：**绝对定位的包含块是包含块的 padding box**，而 top/bottom 取的是
+		// padding box 的边 ⇒ 列的 padding-top 落在**包含块内部**，挪不动绝对定位的面板。
+		// T115 之前让位由「原生给 WebView 留外边距」承担（整页一起缩，面板自然在内），
+		// T115 改成「页面自己让位（列 padding）」之后，push 态面板的顶边就永远停在 y=0
+		// ⇒ 标题行（文件 tab + 路径行）被状态栏盖住、底部压住导航栏。
+		// 这就是「旧结论『push 态不垫』在新模型下失效」的根因。
+		//
+		// 修法：把面板**自身**按四向 inset 挪开，而不是给列加 padding。
+		// ① 用 top/bottom/right 而不是 padding：面板是绝对定位，top/bottom 直接决定它
+		//    自己的盒子位置，不必碰内部布局（面板内部的 dock 布局零改动）。
+		// ② 官方若哪天把面板改成 static，top/bottom 自动失效，退回「列 padding 让位」，
+		//    不会出现「列 padding + 面板 padding」双份让位。
+		// ③ right 侧同时把宽度收窄同样的量（官方面板宽度与 --dsh-sidebar-width 同步，
+		//    收窄后右缘与列的内容盒对齐，又不会向左溢出压到主栏）。
+		// 作用域仍限平板档（html:not(.dshr-mobile):not(.dshr-official-inset)）：
+		// 手机横屏（official-inset）由 body padding 整页下移 already 覆盖，
+		// 手机竖屏是右抽屉卡片态（另一套规则），都不该吃这条。
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) [data-sidebar-right-panel="push"] {',
+		'  top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
+		'  bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
+		'  right: var(--dshr-inset-right, env(safe-area-inset-right, 0px)) !important;',
+		'  width: calc(var(--dsh-sidebar-width, 100%) - var(--dshr-inset-right, env(safe-area-inset-right, 0px))) !important;',
 		'}',
 		'html.' + ROOT_CLASS + '[data-dshr-dark="1"] [data-sidebar-right-panel] {',
 		'  background: var(--dsw-alias-bg-base, #111318) !important;',
@@ -2996,6 +3031,10 @@
 	 *      写入，非档位相关，契约 3.6 要求手机模式 edge-to-edge 机制不变。
 	 */
 	function teardownHookTraces() {
+		if (localChromeTimer) window.clearTimeout(localChromeTimer);
+		localChromeTimer = 0;
+		if (localChromeRoots) localChromeRoots.clear();
+		observedMainColumn = null;
 		var root = document.documentElement;
 		// 1) <html>：根类 + 全部 data-dshr-* 标记 + 本脚本写过的行内变量。
 		root.classList.remove(ROOT_CLASS);
@@ -5241,8 +5280,10 @@
 	 *   - 带「复制」图标按钮的回复操作行 → data-dshr-msg-actions / data-dshr-msg-time；
 	 *   - 输入卡片下方「N 轮 · M 步 | …」统计 → data-dshr-stats-line。
 	 */
-	function markChatChrome() {
-		var copyButtons = document.querySelectorAll('button[aria-label]');
+	function markChatChrome(scope) {
+		var root = scope || document;
+		var copyButtons = Array.from(root.querySelectorAll('button[aria-label]'));
+		if (scope && scope.matches('button[aria-label]')) copyButtons.unshift(scope);
 		for (var i = 0; i < copyButtons.length; i++) {
 			var copyButton = copyButtons[i];
 			if (!isCopyActionButton(copyButton)) continue;
@@ -5256,13 +5297,13 @@
 			markTimingSpans(row);
 		}
 
-		var cards = document.querySelectorAll('[data-composer-card]');
+		var cards = root.querySelectorAll('[data-composer-card]');
 		for (var c = 0; c < cards.length; c++) {
 			var statsHost = cards[c].nextElementSibling;
 			if (isElement(statsHost) && looksLikeStatsText(statsHost.textContent)) markStatsHost(statsHost);
 		}
 
-		if (document.querySelector('[data-dshr-stats-line]') === null) markStatsLineFallback();
+		if (!scope && document.querySelector('[data-dshr-stats-line]') === null) markStatsLineFallback();
 	}
 
 	var TITLE_SKIP = /^(对话|轨迹|子代理|Chat|Trajectory|Sub-?agents?|Session log|标准模式|计划模式|设置)$/i;
@@ -5274,13 +5315,8 @@
 	}
 
 	function isAgentRunning() {
-		var buttons = document.querySelectorAll('button[aria-label]');
-		for (var i = 0; i < buttons.length; i++) {
-			var label = (buttons[i].getAttribute('aria-label') || '').trim();
-			if (label === '停止生成' || label === 'Stop generating') return true;
-			if (label === '停止响应' || label === 'Stop responding') return true;
-		}
-		return false;
+		return document.querySelector('button[aria-label="停止生成"], button[aria-label="Stop generating"], '
+			+ 'button[aria-label="停止响应"], button[aria-label="Stop responding"]') !== null;
 	}
 
 	function readSessionTitle() {
@@ -5437,6 +5473,9 @@
 		// 严格 OFF（平板档）：观察器保留但立即返回——契约 3.5 允许的「早退的
 		// observer」。这里必须早于任何标记/建节点动作，否则会重新留下痕迹。
 		if (isStrictOff()) return;
+		if (localChromeTimer) window.clearTimeout(localChromeTimer);
+		localChromeTimer = 0;
+		localChromeRoots.clear();
 		var root = document.documentElement;
 		var frame = findFrame();
 		if (frame) {
@@ -5452,6 +5491,7 @@
 			mark(sidebarColumn, 'data-dshr-sidebar-col');
 			var mainColumn = findMainCol(frame);
 			mark(mainColumn, 'data-dshr-main-col');
+			observedMainColumn = mainColumn;
 			var officialToggle = findToggleControl();
 			if (officialToggle && sidebarColumn && sidebarColumn.contains(officialToggle)) {
 				mark(officialToggle, 'data-dshr-official-toggle');
@@ -5472,6 +5512,7 @@
 				root.removeAttribute('data-dshr-rightbar-fullscreen');
 			}
 		} else {
+			observedMainColumn = null;
 			// frame 未找到：保持 body 兜底 padding 生效，内容不顶进状态栏。
 			root.removeAttribute('data-dshr-ready');
 			root.setAttribute('data-dshr-expanded', '0');
@@ -5584,6 +5625,61 @@
 	// 注入可能早于 body/React 首帧。观察器必须在 body 出现后补装，不能只在
 	// 脚本首次执行时尝试一次；否则初始标记虽能由 boot 补齐，后续展开状态无人同步。
 	var observer = null;
+	var observedMainColumn = null;
+	var localChromeRoots = new Set();
+	var localChromeTimer = 0;
+	var STRUCTURAL_CHROME = 'header, nav, [data-composer-card], [data-composer-seat], textarea, '
+		+ '[role="dialog"], [aria-modal="true"], [data-slot="sidebar"], [data-sidebar-right-panel]';
+
+	function scheduleLocalChrome(node) {
+		if (!isElement(node) || syncQueued) return;
+		localChromeRoots.add(node);
+		if (localChromeTimer) return;
+		localChromeTimer = window.setTimeout(function () {
+			localChromeTimer = 0;
+			if (!isStrictOff()) localChromeRoots.forEach(function (root) {
+				if (root.isConnected) markChatChrome(root);
+			});
+			localChromeRoots.clear();
+		}, 50);
+	}
+
+	function onDomMutations(records) {
+		if (isStrictOff()) return;
+		for (var i = 0; i < records.length; i++) {
+			var record = records[i];
+			var target = isElement(record.target) ? record.target : record.target.parentElement;
+			// 只有已识别的消息区域可走局部路径。列替换、弹窗、输入框和抽屉仍做结构同步。
+			if (!observedMainColumn || !observedMainColumn.isConnected || !isElement(target)
+				|| target === observedMainColumn || !observedMainColumn.contains(target)
+				|| target.closest(STRUCTURAL_CHROME)) {
+				scheduleSyncDom();
+				return;
+			}
+			if (record.type === 'attributes') {
+				if (record.attributeName !== 'aria-label') {
+					scheduleSyncDom();
+					return;
+				}
+				scheduleLocalChrome(target.parentElement);
+				continue;
+			}
+			var nodes = Array.from(record.addedNodes).concat(Array.from(record.removedNodes));
+			for (var j = 0; j < nodes.length; j++) {
+				var node = nodes[j];
+				if (!isElement(node)) continue;
+				if (node.matches(STRUCTURAL_CHROME) || node.querySelector(STRUCTURAL_CHROME)) {
+					scheduleSyncDom();
+					return;
+				}
+				if (node.isConnected) scheduleLocalChrome(node);
+			}
+			var actions = target.closest('[data-turn-tail], [data-dshr-msg-actions]');
+			if (actions) scheduleLocalChrome(actions);
+		}
+		// 文本流不重做布局标记；通知保持原有节流和状态翻转检查。
+		scheduleSessionNotice();
+	}
 	// DIAG-30s：首屏 React 水合是 mutation 风暴，每批全量 syncDom 会把主线程
 	// 打满（querySelectorAll 全文档）。合并到 50ms 一次；不用 rAF——后台页
 	// rAF 不触发，会连带拖住 running 翻转通知。直接调用处（boot/resize/桥）
@@ -5617,7 +5713,7 @@
 		// 切回 phone 档时由 recomputeDeviceScope 补装。
 		if (isStrictOff()) return false;
 		if (typeof MutationObserver === 'undefined' || !document.body) return false;
-		observer = new MutationObserver(scheduleSyncDom);
+		observer = new MutationObserver(onDomMutations);
 		// T135：右栏开合落到 `data-sidebar-right-open`（+ `aria-hidden`）上。两者原先**不在**
 		// 过滤名单里，右栏属性翻转能否被及时同步，全靠官方那次提交**恰好**带了 childList
 		// 变更 —— 一旦某次提交只有属性变化，syncDom 就要等下一次任意 DOM 变更才跑：

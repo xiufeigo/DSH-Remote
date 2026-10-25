@@ -1148,6 +1148,24 @@ function assertSourceContracts() {
 	if (!src.includes("[data-sidebar-right-panel]") || !src.includes("html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen=\"1\"] #dshr-mobile-whale")) {
 		throw new Error("源码契约：官方右侧栏全屏态必须垫出系统栏 inset（[data-sidebar-right-panel]）并收起悬浮控件");
 	}
+	// ── T136：docked(push) 态右栏面板也必须自己让开系统栏（用户实机 bug）──
+	// 官方布局实测（DSH 0.2.0-rc.2 / @deepseek-ai/dsh-client-ui-sidebar-right）：
+	//   面板 div[data-sidebar-right-panel="push"] 官方 CSS 是
+	//   position:absolute; top:0; bottom:0; right:0，包含块 = 右栏列 div[data-rightbar-col]
+	//   （position:relative）。**绝对定位按包含块的 padding box 定位** ⇒ T115 的
+	//   「列 padding 让位」落在包含块**内部**，挪不动面板 ⇒ 面板顶边恒为 y=0，
+	//   文件树标题行（tab 条 + 路径行）被安卓状态栏盖住。
+	// 契约：平板作用域里必须有一条针对 [data-sidebar-right-panel="push"] 的
+	// top/bottom 偏移规则（面板自己挪，不是列加 padding）。
+	if (!/\[data-sidebar-right-panel="push"\]/.test(src)) {
+		throw new Error("源码契约：缺少 docked(push) 态右栏面板的让位规则（顶边会被状态栏盖住）");
+	}
+	if (!/\[data-sidebar-right-panel="push"\][\s\S]{0,400}?top: var\(--dshr-inset-top/.test(src)) {
+		throw new Error("源码契约：docked(push) 态右栏面板必须按 --dshr-inset-top 下移");
+	}
+	if (!/\[data-sidebar-right-panel="push"\][\s\S]{0,400}?bottom: var\(--dshr-inset-bottom/.test(src)) {
+		throw new Error("源码契约：docked(push) 态右栏面板必须按 --dshr-inset-bottom 上收");
+	}
 	if (!src.includes("rightPanel.getAttribute('aria-hidden') !== 'true'")) {
 		throw new Error("源码契约：返回键必须以 aria-hidden 判定右侧栏展开态，收起后不得再拦截（否则退不到后台）");
 	}
@@ -1719,6 +1737,62 @@ async function assertDrawerPerformance(call, url) {
 	console.log("  ok  CDP 真实触摸开合与拖动中旋转清理");
 }
 
+async function assertMessageMutationPerformance(call, url) {
+	await call("Page.navigate", { url: `${url}?manual=1` });
+	await wait(2200);
+	const result = await call("Runtime.evaluate", {
+		awaitPromise: true, returnByValue: true,
+		expression: `(async () => {
+			const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+			const history = document.createElement('section');
+			document.querySelector('#chat-column').appendChild(history);
+			history.innerHTML = Array.from({length:1000}, (_, i) => '<article><p>Reply ' + i + '</p><div data-turn-tail><div><button aria-label="Copy"><svg></svg></button><span>Ran for 1s</span></div></div></article>').join('');
+			window.__dshRemoteAndroidMobile.syncNow();
+			await pause(300);
+			let scans = 0;
+			const originalQuery = Document.prototype.querySelectorAll;
+			Document.prototype.querySelectorAll = function(selector) {
+				if (selector === 'button[aria-label]') scans++;
+				return originalQuery.call(this, selector);
+			};
+			try {
+				for (let i = 0; i < 8; i++) {
+					history.firstElementChild.querySelector('p').textContent = 'Streamed token ' + i;
+					await pause(70);
+				}
+				const textScans = scans;
+				const article = history.firstElementChild.cloneNode(true);
+				article.querySelectorAll('[data-dshr-msg-actions], [data-dshr-msg-time]').forEach(node => {
+					node.removeAttribute('data-dshr-msg-actions'); node.removeAttribute('data-dshr-msg-time');
+				});
+				history.appendChild(article);
+				await pause(150);
+				const insertedMarked = !!article.querySelector('[data-dshr-msg-actions] [data-dshr-msg-time]');
+				article.querySelector('button').setAttribute('aria-label', 'Copied');
+				const replacementTime = Object.assign(document.createElement('span'), {textContent:'Ran for 2s'});
+				article.querySelector('span').replaceWith(replacementTime);
+				await pause(150);
+				const changedMarked = replacementTime.hasAttribute('data-dshr-msg-time');
+				const messageScans = scans;
+				const header = document.querySelector('header');
+				const replacement = header.cloneNode(true);
+				replacement.removeAttribute('data-dshr-session-header');
+				header.replaceWith(replacement);
+				await pause(150);
+				return {textScans, messageScans, insertedMarked, changedMarked,
+					structuralScans:scans - messageScans, headerMarked:replacement.hasAttribute('data-dshr-session-header')};
+			} finally { Document.prototype.querySelectorAll = originalQuery; }
+		})()`,
+	});
+	if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
+	const evidence = result.result.value;
+	if (evidence.textScans !== 0 || evidence.messageScans !== 0 || !evidence.insertedMarked
+		|| !evidence.changedMarked || !evidence.headerMarked || evidence.structuralScans < 1) {
+		throw new Error(`消息区局部同步回归失败：${JSON.stringify(evidence)}`);
+	}
+	console.log(`  ok  1000 条历史消息局部同步：${JSON.stringify(evidence)}`);
+}
+
 assertSourceContracts();
 
 const server = createServer((req, res) => {
@@ -1801,6 +1875,7 @@ try {
 	const shot = await call("Page.captureScreenshot", { format: "png" });
 	writeFileSync(SCREENSHOT, Buffer.from(shot.data, "base64"));
 	await assertDrawerPerformance(call, pageUrl);
+	await assertMessageMutationPerformance(call, pageUrl);
 
 	await call("Emulation.setUserAgentOverride", {
 		userAgent:

@@ -218,7 +218,13 @@ pwsh -File android\test-immersive.ps1         # T94+T115 系统栏沉浸契约�
 pwsh -File android\test-reconnect-banner.ps1  # 探针/防抖 131 + StuckRescue 79 + 探针 DOM 桩 32
                                               #   + T109 判据臂：静态白名单 14 + 本网关协议族 13
 pwsh -File android\test-backkey.ps1           # 返回键探针 66 + DOM 桩 18
+pwsh -File android\test-performance.ps1       # 请求取消、截止时间、真实 HTTPS 与救援生命周期
 ```
+
+Android 子进程停止需要设备侧验证，桌面 JVM 的强制终止行为不能代表 Android：
+`pwsh -File android/test-process-device.ps1 -Serial emulator-5588`。测试使用独立的短命子进程，
+验证参数传递、普通退出、SIGSTOP 后强制终止、带中断清理及重复停止。生产端通过 shell 报告自身 PID 后
+原位 exec frpc，普通终止超时后显式发送 SIGKILL；只有确认退出后才释放管理状态，API 24 起共用此路径。
 
 > **T109 起 `test-reconnect-banner.ps1` 的构成变了**（横幅显示层删除）：
 > 与「画出来」有关的臂（`isOnScreen` / `bandHeightPx` / `shouldSuppress` / `TEXT`）已删，
@@ -785,7 +791,8 @@ D6 ② 已在运行态验证（`scratch/avd-dsh/e2e/notification-actions.md`）�
      直接用「只用中转」toml。**打洞成功立刻解除**；**换网络 / 换配置组 / 换档位**与**进程退出**清零；
      **「停隧道」不清零**。
    - **绝不主动重启 frpc**（会掐断在途连接 ⇒ 用户看到断线闪烁）：粘性只在「反正要重启」的时刻
-     （新隧道启动 / frpc 崩溃自重启）生效；`TunnelService.watchTunnelEnvironment()` 每 3 s 巡检网络变化。
+     （新隧道启动 / frpc 崩溃自重启）生效；`TunnelService.watchTunnelEnvironment()` 接收系统网络变化通知，
+     在后台核对网卡快照，不再每 3 s 唤醒主线程。`ACCESS_NETWORK_STATE` 为普通权限，无运行时弹窗。
    - 诊断行（设备 UI dump 原文）：`打洞策略（配置）：打洞优先（先试 P2P，0.8 秒打不通自动回退中转）· 电脑端形态 xtcp` /
      `本次隧道：打洞优先 · 已粘性回落中转（连续 2 次打洞超时后不再等；换网络或重开 App 自动重试打洞）`。
    - 真值：稳态「点连接→可交互」**13,573/14,206 ms → 5,562/5,399/6,396/5,094 ms**；

@@ -159,9 +159,18 @@ public final class T94ImmersiveTest {
 			"T115: the page write carries all four directions (left/right added for cutout/landscape)");
 		// 两个写点必须同源：平板档 applyInsetsToPage 也用 readSystemBarInsetsPx()，
 		// 否则「谁后跑谁赢」——实测抓到过 statusBars(24px) 覆盖并集(36px)。
-		String insetsToPage = methodBody(src, "private void applyInsetsToPage(");
+		//
+		// T118：取值本体已被抽进 readInsetCssPx()（applyInsetsToPage 现在只委派给它），
+		// 断言仍按老位置找字面量 ⇒ 这条闸在 rc.2.24 起一直是红的（不变量本身没坏，只是搬家了）。
+		// 这里把探针指到真正持有该逻辑的方法，**并补一条委派断言**——
+		// 否则将来有人把 applyInsetsToPage 的委派删掉，探针仍会在 helper 里读到字面量而误绿。
+		String insetsToPage = methodBody(src, "private int[] readInsetCssPx(");
 		check(insetsToPage.contains("if (isTabletClass())") && insetsToPage.contains("readSystemBarInsetsPx()"),
 			"T115: applyInsetsToPage uses the SAME source as the avoidance for the tablet class (no race between two writers)");
+		String applyInsetsToPage = methodBody(src, "private void applyInsetsToPage(");
+		check(applyInsetsToPage.contains("readInsetCssPx()")
+				&& applyInsetsToPage.contains("writeInsetsToPage(view"),
+			"T118: applyInsetsToPage still routes through readInsetCssPx() → writeInsetsToPage (the probe above must not be orphaned)");
 		check(insetsToPage.contains("getInsets(WindowInsets.Type.statusBars())")
 			&& insetsToPage.contains("getInsets(WindowInsets.Type.navigationBars())"),
 			"phone insets consume statusBars/navigationBars");

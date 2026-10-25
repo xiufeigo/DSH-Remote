@@ -146,6 +146,24 @@ try {
   await check(`document.querySelector('#dshr-server-picker')!==null`, 'late sidebar mount is observed without polling');
   await evaluate(`document.querySelector('#dshr-server-picker button').click()`);
   await check(`document.querySelector('#dshr-server-menu').textContent==='尚未保存服务器'`, 'empty saved list has an explicit state');
+
+  await evaluate(`__dshRemoteServerPicker.closeIfOpen();window.pickerReads=0;window.originalRect=Element.prototype.getBoundingClientRect;Element.prototype.getBoundingClientRect=function(){if(this.matches('.new'))pickerReads++;return originalRect.call(this)};window.messages=document.createElement('main');document.body.appendChild(messages)`);
+  await evaluate(settle);
+  await evaluate(`window.pickerReads=0;messages.innerHTML='<p>流式回复</p>'`);
+  await evaluate(settle);
+  await evaluate(`messages.firstChild.textContent='新的流式回复'`);
+  await evaluate(settle);
+  await check(`pickerReads===0`, 'message updates do not measure or synchronize the server picker');
+  await evaluate(`Element.prototype.getBoundingClientRect=originalRect;__dshRemoteServerPicker.destroy()`);
+  const windowId = (await call('Runtime.evaluate', { expression: 'window' })).result.objectId;
+  const scrollCount = async () => (await call('DOMDebugger.getEventListeners', { objectId: windowId })).listeners.filter(item => item.type === 'scroll').length;
+  const scrollBefore = await scrollCount();
+  for (let cycle = 0; cycle < 3; cycle++) {
+    await evaluate(inject());
+    await evaluate(`__dshRemoteServerPicker.destroy()`);
+  }
+  assert.equal(await scrollCount(), scrollBefore, 'install/destroy must release the actual scroll callback');
+  checks++;
   console.log(`Server picker browser tests passed: ${checks}`);
 } finally {
   clearTimeout(deadline);

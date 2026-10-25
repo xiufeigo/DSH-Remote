@@ -5,6 +5,8 @@
 	     推导，构建时经 aapt2 link 注入（规则见 docs/versioning.md）。 -->
 
 	<uses-permission android:name="android.permission.INTERNET" />
+	<!-- 接收网络变化通知，替代后台每 3 秒枚举网卡；普通权限，无运行时弹窗。 -->
+	<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 	<!-- frpc visitor 前台服务（stcp/xtcp 隧道保活）。
 	     AND-02：类型由 dataSync 改为 specialUse（dataSync 在 Android 14+ 有累计时长限制）。 -->
 	<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

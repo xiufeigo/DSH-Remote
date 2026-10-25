@@ -537,6 +537,34 @@ html[data-dshr-dark="1"] #dshr-server-menu .dshr-server-mark,body[data-ds-dark-t
 	function scheduleSync() {
 		if (!frame && !destroyed) frame = requestAnimationFrame(sync);
 	}
+	function onMutations(records) {
+		for (var i = 0; i < records.length; i++) {
+			var record = records[i];
+			var target = record.target;
+			if (root.contains(target) || menu.contains(target)) continue;
+			if (target.nodeType === 1 && target.closest('[data-slot="sidebar"]')) {
+				scheduleSync();
+				return;
+			}
+			if (record.type === 'attributes') {
+				if (anchor && target.contains(anchor)) scheduleSync();
+				continue;
+			}
+			var nodes = Array.from(record.addedNodes).concat(Array.from(record.removedNodes));
+			for (var j = 0; j < nodes.length; j++) {
+				var node = nodes[j];
+				if (node.nodeType !== 1 || node === root || node === menu) continue;
+				if ((anchor && node.contains(anchor)) || node.matches('[data-slot="sidebar"]')
+					|| node.querySelector('[data-slot="sidebar"]')) {
+					scheduleSync();
+					return;
+				}
+			}
+		}
+	}
+	function onScroll(event) {
+		if (!menu.hidden && !menu.contains(event.target)) scheduleSync();
+	}
 	function outside(event) {
 		if (!menu.contains(event.target) && !root.contains(event.target)) closeIfOpen();
 	}
@@ -578,22 +606,19 @@ html[data-dshr-dark="1"] #dshr-server-menu .dshr-server-mark,body[data-ds-dark-t
 		document.removeEventListener('pointerdown', outside, true);
 		document.removeEventListener('keydown', keydown);
 		window.removeEventListener('resize', scheduleSync);
-		window.removeEventListener('scroll', scheduleSync, true);
+		window.removeEventListener('scroll', onScroll, true);
 		root.remove();
 		menu.remove();
 		style.remove();
 		delete window.__dshRemoteServerPicker;
 	}
-	var observer = new MutationObserver(scheduleSync);
+	var observer = new MutationObserver(onMutations);
 	var resize = new ResizeObserver(scheduleSync);
 	trigger.addEventListener('click', function () { if (!closeIfOpen()) openMenu(); });
 	document.addEventListener('pointerdown', outside, true);
 	document.addEventListener('keydown', keydown);
 	window.addEventListener('resize', scheduleSync);
-	window.addEventListener('scroll', function (event) {
-		if (menu.contains(event.target)) return;
-		scheduleSync();
-	}, true);
+	window.addEventListener('scroll', onScroll, true);
 	(document.head || document.documentElement).appendChild(style);
 	document.body.appendChild(menu);
 	observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-sidebar-collapsed'] });

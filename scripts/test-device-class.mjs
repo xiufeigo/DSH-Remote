@@ -2660,6 +2660,69 @@ try {
 		info(scenario, `逐项像素差：${JSON.stringify(baseline.geometryDeltas)}`);
 	}
 
+	// ══════════════════ F 平板档：系统栏让位对 docked 右栏面板生效（T136）══════════════════
+	// 用户实机 bug（安卓端右侧栏）：文件树面板的标题行（文件 tab 条 + 路径行）被状态栏盖住。
+	// 根因（真实页面实测，见 mobile-web.js MOBILE_CSS「T136」一段）：
+	//   官方面板 div[data-sidebar-right-panel="push"] 是 position:absolute; top:0; bottom:0;
+	//   right:0，包含块 = 右栏列 div[data-rightbar-col]（position:relative）。
+	//   **绝对定位按包含块的 padding box 定位** ⇒ T115 的「列 padding 让位」落在包含块
+	//   **内部**，挪不动面板 ⇒ 面板顶边永远停在 y=0（tab 条自身只有 10px 上 padding，
+	//   于是标题行正好落在状态栏那一带）。
+	// 本场景在真实页面上模拟原生写入 --dshr-inset-*（平板档原生写的就是这三个值），
+	// 然后量面板几何：顶边必须下移整整一个 inset-top、底边必须上移一个 inset-bottom。
+	// 反向对照：把面板 top/bottom 钉回 0（= 修复前的样子）必须复现「顶边 = 0」——
+	// 这一条是「上面那条断言真能抓住这个 bug」的证据（否则可能是一条恒真的断言）。
+	console.log("\n[场景 F] 平板 1280×800  device=tablet → 系统栏让位对 docked 右栏面板生效（T136）");
+	await setViewport(1280, 800);
+	await loadRealPage();
+	await injectHook("tablet");
+	const fInsetWritten = await evaluate(`(function(){
+		var r = document.documentElement;
+		r.style.setProperty('--dshr-inset-top','28px');
+		r.style.setProperty('--dshr-inset-bottom','16px');
+		r.style.setProperty('--dshr-inset-right','0px');
+		return true;
+	})()`);
+	record("F", "已在真实页面模拟原生写入系统栏 inset", fInsetWritten === true, "--dshr-inset-top=28px / bottom=16px / right=0px");
+	await wait(400);
+	const fGeom = await evaluate(`(function(){
+		var p = document.querySelector('[data-sidebar-right-panel]');
+		var col = document.querySelector('[data-rightbar-col]');
+		var b = p ? p.getBoundingClientRect() : null;
+		return { mode: p ? p.getAttribute('data-sidebar-right-panel') : null,
+			top: b ? Math.round(b.top) : -1, bottom: b ? Math.round(b.bottom) : -1,
+			left: b ? Math.round(b.left) : -1, right: b ? Math.round(b.right) : -1,
+			position: p ? getComputedStyle(p).position : null,
+			colPadTop: col ? getComputedStyle(col).paddingTop : null,
+			innerH: window.innerHeight, innerW: window.innerWidth };
+	})()`);
+	record("F", "右栏面板存在且为 docked(push) 绝对定位态", fGeom.mode === "push" && fGeom.position === "absolute",
+		`data-sidebar-right-panel=${fGeom.mode} position=${fGeom.position}`);
+	record("F", "docked 右栏面板顶边让开状态栏（= --dshr-inset-top）", fGeom.top >= 28 - 1,
+		`面板顶边=${fGeom.top}px（修复前恒为 0，整条标题行压在状态栏下）`);
+	record("F", "docked 右栏面板底边让开导航栏（= --dshr-inset-bottom）", fGeom.bottom <= fGeom.innerH - 16 + 1,
+		`面板底边=${fGeom.bottom}px 视口高=${fGeom.innerH}px`);
+	record("F", "右栏列本身仍由 T115 的列 padding 让位（两处让位口径一致）", fGeom.colPadTop === "28px",
+		`列 padding-top=${fGeom.colPadTop}`);
+	// 反向对照：钉回 top/bottom=0 必须复现「顶边 = 0」——证明上面那条断言抓得住这个 bug。
+	const fPinned = await evaluate(`(function(){
+		var p = document.querySelector('[data-sidebar-right-panel]');
+		if (!p) return null;
+		p.style.setProperty('top','0','important');
+		p.style.setProperty('bottom','0','important');
+		var b = p.getBoundingClientRect();
+		var out = { top: Math.round(b.top), bottom: Math.round(b.bottom) };
+		p.style.removeProperty('top');
+		p.style.removeProperty('bottom');
+		return out;
+	})()`);
+	record("F", "反向对照：钉回 top:0 复现「面板顶边=0」（证明上面那条断言抓得住这个 bug）",
+		!!fPinned && fPinned.top === 0, `钉回后顶边=${fPinned && fPinned.top}px`);
+	// 收尾：摘掉模拟的 inset，别把状态漏给后面的场景。
+	await evaluate(`(function(){var r=document.documentElement;
+		r.style.removeProperty('--dshr-inset-top'); r.style.removeProperty('--dshr-inset-bottom');
+		r.style.removeProperty('--dshr-inset-right'); return true;})()`);
+
 	// ══════════════════ E 运行中切换 412×915 ══════════════════
 	console.log("\n[场景 E] 运行中切换 412×915  phone → tablet → phone（契约 3.3/G4）");
 	await setViewport(412, 915);

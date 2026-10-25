@@ -9,6 +9,10 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
+import android.net.ConnectivityManager;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkRequest;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -18,13 +22,12 @@ import android.util.Log;
 import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
 import java.util.ArrayList;
-import java.util.Enumeration;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeMap;
-import java.util.TreeSet;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * 隧道前台服务：保活 frpc visitor（stcp/xtcp）。
@@ -72,6 +75,12 @@ public class TunnelService extends Service {
 	private static volatile String sessionTitle = "";
 	private static volatile String sessionText = "";
 
+	// 跨 Service 实例串行：旧实例释放端口/清理文件后，新实例才能启动同名访客。
+	private static final ExecutorService PROCESS_QUEUE = Executors.newSingleThreadExecutor(r -> {
+		Thread thread = new Thread(r, "frpc-service");
+		thread.setDaemon(true);
+		return thread;
+	});
 	private final Object frpcLock = new Object();
 	private final Handler mainHandler = new Handler(Looper.getMainLooper());
 	private FrpcManager frpc;
@@ -84,13 +93,13 @@ public class TunnelService extends Service {
 	/** 粘性回落改写 cfg.strategy 之前的用户档位。交接落盘用它，避免把「暂时中转」写成用户选择。 */
 	private String pendingUserStrategy;
 
-	/** T113：隧道环境巡检（网络变化清零 + 粘性挂载，见 {@link #watchTunnelEnvironment}）。 */
-	private Runnable stickyWatch;
-	/** T113：本次 frpc 启动实际用的配置对象（巡检要它能改到下一次重启写出的 toml）。 */
+	private ConnectivityManager connectivity;
+	private ConnectivityManager.NetworkCallback networkCallback;
+	/** 当前活动配置，重叠交接时用于持久化端口；托管进程的重启配置由 TomlSource 现算。 */
 	private volatile VisitorConfig runningCfg;
 	/** 同一台 frps 一个进程。key 是地址、端口和登录密钥。 */
 	private final Map<String, FrpcManager> fleet = new LinkedHashMap<>();
-	private int fleetGeneration;
+	private volatile int fleetGeneration;
 
 	public static boolean isRunning() {
 		return instance != null;
@@ -188,10 +197,10 @@ public class TunnelService extends Service {
 		final int generation = ++fleetGeneration;
 		getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
 			.putString(ProfileStore.KEY_FLEET_SCOPE, scope).apply();
-		noteStickyOnSync();
-		new Thread(() -> {
+		PROCESS_QUEUE.execute(() -> {
 			synchronized (frpcLock) {
 				if (generation != fleetGeneration || instance != TunnelService.this) return;
+				noteStickyOnSync();
 				SharedPreferences prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
 				List<ProfileStore.Profile> profiles = ProfileStore.list(prefs);
 				String activeId = ProfileStore.getActiveId(prefs);
@@ -258,7 +267,7 @@ public class TunnelService extends Service {
 				for (VisitorFleet.Group group : groups) keepNames.add(group.fileName);
 				FrpcManager.wipeOrphanFleetFiles(TunnelService.this, keepNames);
 			}
-		}, "frpc-fleet").start();
+		});
 		watchTunnelEnvironment();
 	}
 
@@ -322,15 +331,16 @@ public class TunnelService extends Service {
 
 	/** 备用访客。当前 frpc 继续跑，直到 {@link #commitOverlap()}。 */
 	private void startOverlapped(final VisitorConfig cfg, final String userStrategy) {
-		synchronized (frpcLock) {
-			pendingShouldPromote = false;
-			pendingShouldDiscard = false;
-			overlapStarting = true;
-			pendingCfg = cfg;
-			pendingUserStrategy = userStrategy;
-		}
-		Log.i(TAG, "重叠切换：备用隧道端口 " + cfg.bindPort + "，当前隧道保持");
-		new Thread(() -> {
+		PROCESS_QUEUE.execute(() -> {
+			if (instance != TunnelService.this) return;
+			synchronized (frpcLock) {
+				pendingShouldPromote = false;
+				pendingShouldDiscard = false;
+				overlapStarting = true;
+				pendingCfg = cfg;
+				pendingUserStrategy = userStrategy;
+			}
+			Log.i(TAG, "重叠切换：备用隧道端口 " + cfg.bindPort + "，当前隧道保持");
 			FrpcManager next = new FrpcManager(TunnelService.this, "frpc-visitor-pending.toml");
 			next.start(cfg);
 			synchronized (frpcLock) {
@@ -351,11 +361,12 @@ public class TunnelService extends Service {
 					pendingShouldPromote = false;
 				}
 			}
-		}, "frpc-overlap").start();
+		});
 	}
 
 	private void commitOverlap() {
-		new Thread(() -> {
+		PROCESS_QUEUE.execute(() -> {
+			if (instance != TunnelService.this) return;
 			synchronized (frpcLock) {
 				pendingShouldDiscard = false;
 				if (pendingFrpc != null) {
@@ -366,11 +377,12 @@ public class TunnelService extends Service {
 					pendingShouldPromote = true;
 				}
 			}
-		}, "frpc-promote").start();
+		});
 	}
 
 	private void abortOverlap() {
-		new Thread(() -> {
+		PROCESS_QUEUE.execute(() -> {
+			if (instance != TunnelService.this) return;
 			synchronized (frpcLock) {
 				pendingShouldPromote = false;
 				if (pendingFrpc != null) {
@@ -384,7 +396,7 @@ public class TunnelService extends Service {
 					pendingShouldDiscard = true;
 				}
 			}
-		}, "frpc-overlap-abort").start();
+		});
 	}
 
 	/** 调用方持有 {@link #frpcLock}。停旧进程可能要等它退出，不要在主线程调用。 */
@@ -420,53 +432,32 @@ public class TunnelService extends Service {
 			.apply();
 	}
 
-	/**
-	 * T113：隧道环境巡检（每 3 秒一次，随服务生命周期结束而撤销）。两件事：
-	 *
-	 * <ol>
-	 *   <li><b>网络变化清零</b>：重算网络身份，与 {@link TunnelPath} 记的作用域比对；变了就清零粘性
-	 *       （新网络重新试打洞）。这是本 App **真正生效**的联网变化判据 —— 没有
-	 *       ACCESS_NETWORK_STATE 权限时 {@code registerDefaultNetworkCallback} 注册会抛异常，
-	 *       只剩"定期比对网卡快照"这条无权限路径（见 {@link #networkId()}）。</li>
-	 *   <li><b>粘性挂载</b>：一旦判定粘住，把当前配置对象改成 relay —— FrpcManager 的**任何一次**
-	 *       重启都会写出纯中转 toml。**绝不主动重启 frpc**：那会掐断在途连接（页面加载、
-	 *       WS 复用通道），用户看到的是白屏/断线横幅，那是回归不是优化。</li>
-	 * </ol>
-	 */
+	/** 网络事件只更新粘性作用域；存活的 frpc 不重启，重启时由 TomlSource 读取粘性策略。 */
 	private void watchTunnelEnvironment() {
-		if (stickyWatch != null) mainHandler.removeCallbacks(stickyWatch);
-		stickyWatch = new Runnable() {
-			@Override public void run() {
-				if (instance != TunnelService.this) return;
-				try {
-					String netId = networkId();
-					if (TunnelPath.noteStickyContext(stickyContext(netId))) {
-						Log.i(TAG, "T113 网络变化（网卡快照比对）⇒ 粘性回落清零，新网络身份=" + netId
-							+ "（下次 frpc 启动重新试打洞）");
-					}
-					VisitorConfig cfg = runningCfg;
-					if (cfg != null && VisitorConfig.STRATEGY_P2P.equals(cfg.strategy) && TunnelPath.stickyRelay()) {
-						cfg.strategy = VisitorConfig.STRATEGY_RELAY;
-						TunnelPath.noteStickyApplied();
-						Log.i(TAG, "T113 粘性回落已挂到当前配置：后续 frpc 若重启将直接用纯中转 toml（不打断在途连接）");
-					}
-				} catch (Exception e) {
-					Log.w(TAG, "T113 环境巡检失败：" + e);
-				}
-				mainHandler.postDelayed(this, 3000);
+		if (networkCallback != null) return;
+		connectivity = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+		if (connectivity == null) throw new IllegalStateException("系统网络服务不可用");
+		networkCallback = new ConnectivityManager.NetworkCallback() {
+			@Override public void onAvailable(Network network) { networkChanged(); }
+			@Override public void onLost(Network network) { networkChanged(); }
+			@Override public void onLinkPropertiesChanged(Network network, LinkProperties properties) {
+				networkChanged();
 			}
 		};
-		mainHandler.postDelayed(stickyWatch, 3000);
+		// 包含 VPN 和无互联网的局域网；仍以网卡地址快照判定身份，避免能力变化误清零。
+		connectivity.registerNetworkCallback(new NetworkRequest.Builder().clearCapabilities().build(), networkCallback);
+	}
+
+	private void networkChanged() {
+		PROCESS_QUEUE.execute(() -> {
+			if (instance == TunnelService.this) noteStickyOnSync();
+		});
 	}
 
 	/**
 	 * T113：“网络身份”字符串 —— 粘性回落的作用域判据之一。
 	 *
-	 * <p><b>为什么不用 ConnectivityManager 做主判据</b>：本 App 的 Manifest **没有**
-	 * {@code ACCESS_NETWORK_STATE}（T113 不在产品侧加新权限），`getActiveNetwork()` /
-	 * `registerDefaultNetworkCallback()` 在设备上直接抛 SecurityException（装置日志有原文）。
-	 * 因此主判据走**网卡快照**：{@code NetworkInterface.getNetworkInterfaces()} 的
-	 * 「接口名 + 该接口上的地址」集合（排除回环、未启用的接口），Java 侧无需任何权限。
+	 * <p>只在后台处理网络事件或同步配置时计算：接口名 + 地址集合，排除回环、未启用的接口。
 	 *
 	 * <p>能测到的"换网络"：Wi-Fi↔流量（wlan0 出现/消失、rmnet_* 出现）、飞行模式（全部消失 ⇒ none）、
 	 * 换 Wi-Fi/换 AP（wlan0 的 IP 变）、VPN 起停（tun0 出现/消失）。
@@ -487,7 +478,6 @@ public class TunnelService extends Service {
 						up = true;
 					}
 					if (!up) continue;
-					StringBuilder addrs = new StringBuilder();
 					java.util.List<InterfaceAddress> list = ni.getInterfaceAddresses();
 					java.util.TreeSet<String> sorted = new java.util.TreeSet<>();
 					if (list != null) {
@@ -692,30 +682,32 @@ public class TunnelService extends Service {
 
 	@Override
 	public void onDestroy() {
-		if (instance == this) instance = null;
-		sessionRunning = false;
-		sessionTitle = "";
-		sessionText = "";
-		// T113：停掉环境巡检（网络变化清零 + 粘性挂载）。巡检是自续期的，必须显式摘掉，
-		// 否则服务销毁后回调还挂在主线程上（虽然 Runnable 里有 instance 判断兜底）。
-		if (stickyWatch != null) {
-			mainHandler.removeCallbacks(stickyWatch);
-			stickyWatch = null;
+		if (instance == this) {
+			instance = null;
+			sessionRunning = false;
+			sessionTitle = "";
+			sessionText = "";
 		}
-		runningCfg = null;
-		// T104：隧道停止 ⇒ 路径判定一起清掉，诊断行回落「隧道未启动（无法判定）」，，
+		fleetGeneration += 1;
+		if (networkCallback != null) {
+			connectivity.unregisterNetworkCallback(networkCallback);
+			networkCallback = null;
+		}
+		// T104：隧道停止 ⇒ 路径判定一起清掉，诊断行回落「隧道未启动（无法判定）」，
 		// 绝不把上一档的「打洞成功/回退中转」留在屏上冒充这一次。
 		// T113：TunnelPath.clear() **不清**粘性回落状态（同一前台会话内"断开→再连接"不再白等一遍），
 		// 粘性的清零只由 noteStickyContext（网络/配置组/策略变化）与 App 进程退出负责。
-		TunnelPath.clear();
-		synchronized (frpcLock) {
-			pendingShouldPromote = false;
-			pendingShouldDiscard = true;
-			pendingCfg = null;
-			pendingUserStrategy = null;
-			fleetGeneration += 1;
-			stopFleetLocked();
-		}
+		PROCESS_QUEUE.execute(() -> {
+			synchronized (frpcLock) {
+				pendingShouldPromote = false;
+				pendingShouldDiscard = true;
+				pendingCfg = null;
+				pendingUserStrategy = null;
+				runningCfg = null;
+				stopFleetLocked();
+				TunnelPath.clear();
+			}
+		});
 		super.onDestroy();
 	}
 

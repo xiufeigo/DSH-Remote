@@ -129,6 +129,32 @@ public final class StuckRescue {
 		private int reloads;
 		private boolean fresh;
 		private boolean reloadedSinceDown;
+		/**
+		 * T118：<b>回前台快速升级许可</b>——一次性。
+		 *
+		 * <p><b>为什么要有</b>：平板档的温和层（nudge）在"半死 socket"这一类卡法上
+		 * <b>实测无效</b>（scratch/t96/report.md §1.2：派发后 40s 仍 {@code phase=[connecting]}；
+		 * 真机时间线 §4.2 也是 nudge 0s/+8.6s 两次都无效，12s 后才升级）。
+		 * 换句话说，那 12 秒的升级门槛等的是<b>一个已经被证明无效的动作</b>。
+		 * 实测（scratch/t118，见本类 §T118 段）：回前台 → 整页重载 ≈ <b>17.3s</b>，
+		 * 期间页面一直卡死、<b>零提示</b> ⇒ 用户观感是"莫名其妙闪一下，滚动位置也没了"。
+		 *
+		 * <p><b>语义</b>：回前台后，若探针读到「正在重连」，且温和层<b>已经试过一次</b>
+		 * （即页面已拿到那次廉价机会、且没自愈），就<b>不再等满 12s</b>，直接升级。
+		 * ⇒ 平板档的时序从「0s nudge → 8s nudge → 12s 重载」缩到
+		 * 「0s nudge → 约 0.5s 重载」，回前台后很快就有确定结果，不再是"悬着"。
+		 *
+		 * <p><b>为什么只给平板档</b>：手机档 hook 在场，它有自己的一整套自愈
+		 * （二次确认 400ms + 1s 巡检 + nudge），手机档升级阈值 25s 正是
+		 * <b>刻意抬给 hook 让路</b>的（T96 §3.3）。抢掉 hook 的活 = 治好了平板、
+		 * 弄坏了手机。故本许可只在 {@code !hookLive}（平板）生效。
+		 *
+		 * <p><b>为什么不会误伤健康页</b>：健康页在回前台后第一拍探针读 <b>OK</b>
+		 * ⇒ 本许可当场作废（见 {@link #observe} 的 OK 分支）。
+		 * 只有"第一拍就明确读到正在重连"才会用掉它；而升级动作本身仍有四道门
+		 * （会话页 / 主框架未失败 / uiState==WEB / 链路探针 200）与配额闸。
+		 */
+		private boolean foregroundFastPath;
 
 		/**
 		 * 回前台（或从后台恢复）：断开 episode 重开，下一次判定是"新起点"。
@@ -145,6 +171,29 @@ public final class StuckRescue {
 			nudgedAt = 0;
 			nudges = 0;
 			reloadedSinceDown = false;
+			// 注意：**这里不发**快速升级许可。发许可的时机由调用方决定
+			// （必须确认"确实退过后台足够久"），见 {@link #armForegroundFastPath()}。
+		}
+
+		/**
+		 * T118：开一次"回前台快速升级许可"（一次性）。
+		 *
+		 * <p><b>为什么不在 {@link #onForeground()} 里无条件开</b>：冷启动也会走 onResume，
+		 * 而冷启动时页面正在建 WS ⇒ 官方那条指示器本来就在显示「正在重连」⇒
+		 * 探针第一拍读到的就是 RECONNECTING。若此时许可已武装，
+		 * **App 会在冷启后约 1s 内把自己重载一遍**（那才是真·自造故障）。
+		 * 故许可必须由调用方在确认"确实退过后台足够久"之后单独开。
+		 *
+		 * <p>许可是一次性的：健康页第一拍读 OK 即作废（见 {@link #observe}），
+		 * 用掉一次升级后也作废（见 {@link #observe} 的 RELOAD 分支）。
+		 */
+		public void armForegroundFastPath() {
+			foregroundFastPath = true;
+		}
+
+		/** 快速升级许可当前是否还armed（只读，供接线自检/诊断用）。 */
+		public boolean foregroundFastPathArmed() {
+			return foregroundFastPath;
 		}
 
 		/** 新文档（受控重载之后 / 页面导航）：断开episode 全部重开，但**重载配额跨文档保留**。 */
@@ -154,6 +203,8 @@ public final class StuckRescue {
 			nudges = 0;
 			reloadedSinceDown = false;
 			fresh = true;
+			// T118：换文档 = 新 episode ⇒ 快速升级许可作废（否则会连着重载）。
+			foregroundFastPath = false;
 		}
 
 		/**
@@ -175,6 +226,8 @@ public final class StuckRescue {
 				nudges = 0;
 				fresh = false;
 				reloadedSinceDown = false;
+				// T118：页面已恢复 ⇒ 回前台的快速升级许可当场作废（健康页永不会用它）。
+				foregroundFastPath = false;
 				return Action.NONE;
 			}
 			if (downSince == 0) downSince = now;
@@ -196,10 +249,17 @@ public final class StuckRescue {
 			// 否则连续 nudge 会把起点一路推后，升级被无限推迟（实测口径：12s 就是十几秒）。
 			long tier2 = hookLive ? TIER2_AFTER_HOOK_MS : TIER2_AFTER_MS;
 			boolean triedGentle = hookLive || nudges > 0;
+			// T118：回前台快速升级（**仅平板档**）。
+			//   条件：① 本次是回前台后开的许可；② 平板档（hookLive=false）——
+			//         手机档刻意抬到 25s 让 hook 先干活，抢它 = 治好了平板弄坏了手机；
+			//         ③ 温和层**已经试过一次**（nudges>0）——页面已拿到那次廉价机会且没自愈。
+			// 满足时不再等满 12s，直接升级（真机实测 17.3s → 约 0.5s）。
+			boolean fastUpgrade = foregroundFastPath && !hookLive && nudges > 0;
+			boolean tier2Due = fastUpgrade || (now - downSince) >= tier2;
 			if (reloads < MAX_RELOADS
 				&& (now - lastReloadAt) >= RELOAD_MIN_INTERVAL_MS
 				&& triedGentle
-				&& stuck >= tier2) {
+				&& tier2Due) {
 				reloads += 1;
 				lastReloadAt = now;
 				reloadedSinceDown = true;
@@ -207,6 +267,8 @@ public final class StuckRescue {
 				nudgedAt = 0;
 				nudges = 0;
 				fresh = false;
+				// T118：快速升级许可一次性，用掉即作废（后续重载回到 12s 常规门槛）。
+				foregroundFastPath = false;
 				return Action.RELOAD;
 			}
 			return Action.NONE;
