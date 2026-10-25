@@ -330,6 +330,9 @@ test("双网关链路：上游已注入主屏标记时 edge 仍补移动 hook �
 	assert.match(once, /__dsh_remote__\/sw\.js/);
 	assert.match(once, /mobile\.js/);
 	assert.match(once, /__DSHR_OWNS_HOST__/);
+	assert.match(once, /apple-mobile-web-app-capable" content="yes"/);
+	assert.match(once, /apple-mobile-web-app-status-bar-style" content="black"/);
+	assert.doesNotMatch(once, /black-translucent/);
 	const ownsAt = once.indexOf("__DSHR_OWNS_HOST__");
 	const swAt = once.indexOf("/__dsh_remote__/sw.js");
 	assert.ok(ownsAt >= 0 && ownsAt < swAt, "ownsHost 必须排在官方脚本之前");

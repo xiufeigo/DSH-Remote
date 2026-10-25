@@ -68,7 +68,9 @@ export function homeScreenHeadTags(): string {
 		`<meta name="theme-color" content="#1b66ff">`,
 		`<meta name="mobile-web-app-capable" content="yes">`,
 		`<meta name="apple-mobile-web-app-capable" content="yes">`,
-		`<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">`,
+		// 主屏幕图标打开仍是独立全屏（无 Safari 工具栏）。状态栏必须不透明：
+		// black-translucent 会把页面铺到状态栏后面，iPad 再盖一层磨砂，顶栏发糊。
+		`<meta name="apple-mobile-web-app-status-bar-style" content="black">`,
 		`<meta name="apple-mobile-web-app-title" content="DSH">`,
 		`<link rel="apple-touch-icon" href="${APPLE_TOUCH_ICON_PATH}">`,
 		// WEB-01：注册网关 Service Worker（白名单缓存策略，源码见 renderServiceWorker）。
