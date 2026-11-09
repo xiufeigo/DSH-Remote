@@ -311,10 +311,10 @@ function DshRemoteSettingsCard({ as = "li" } = {}) {
 				});
 				return;
 			}
-			if (!/^[\x21-\x7E]{16,512}$/.test(key)) {
+			if (!/^[\x21-\x7E]{8,512}$/.test(key)) {
 				setMessage({
 					kind: "err",
-					text: "访客密钥至少 16 位，且只能使用可见 ASCII 字符"
+					text: "访客密钥至少 8 位，且只能使用可见 ASCII 字符"
 				});
 				return;
 			}
@@ -430,6 +430,10 @@ function DshRemoteSettingsCard({ as = "li" } = {}) {
 		}), open && form !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 			className: "dshr-body",
 			children: [
+				!gatewayRunning && typeof status?.gatewayLastError === "string" && status.gatewayLastError.length > 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "dshr-note",
+					children: ["上次启动网关失败：", status.gatewayLastError]
+				}) : null,
 				/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 					className: "dshr-section",
 					children: "常规"
@@ -565,7 +569,7 @@ function DshRemoteSettingsCard({ as = "li" } = {}) {
 						password: true,
 						value: visitorKey,
 						onChange: setVisitorKey,
-						hint: "至少 16 位可见 ASCII。Android 和公网网页使用同一密钥；修改并保存后，浏览器需重新验证，Android 也需更新密钥。"
+						hint: "至少 8 位可见 ASCII。Android 和公网网页使用同一密钥；修改并保存后，浏览器需重新验证，Android 也需更新密钥。"
 					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(TextField, {
 						label: "frps CA 文件（可选）",

@@ -385,6 +385,8 @@ export async function createTestGateway({
 		},
 		/** 目前收集到的子进程全部 stdout。 */
 		output: () => stdoutBuffer,
+		/** 目前收集到的子进程全部 stderr（启动诊断/陈旧锁清理等日志走这里）。 */
+		errorOutput: () => stderrBuffer,
 		/** 继续等待子进程输出匹配某正则的行（如等待 frp 适配器就绪日志）。 */
 		waitForLine(regex, ms = 15_000) {
 			return new Promise((resolve, reject) => {

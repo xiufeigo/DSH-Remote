@@ -235,11 +235,16 @@ const TAG = "[dsh-remote]";
  *   writeSecrets?: (next: object) => Promise<void> | void,
  *   restartGateway: () => void,
  *   adminRequest: (path: string, method?: string) => Promise<{ status: number, body: string } | undefined>,
+ *   gatewayDiagnostics?: () => { lastError?: string | null, lastExit?: object | null },
+ *   clearGatewayError?: () => void,
  * }}
  */
 export function createRouteHandlers(deps) {
 	const readSecrets = typeof deps.readSecrets === "function" ? deps.readSecrets : () => ({});
 	const writeSecrets = typeof deps.writeSecrets === "function" ? deps.writeSecrets : async () => {};
+	// 网关启动诊断（apply 里注入；离线时把最近一次失败原因带给设置卡）
+	const gatewayDiagnostics = typeof deps.gatewayDiagnostics === "function" ? deps.gatewayDiagnostics : () => ({});
+	const clearGatewayError = typeof deps.clearGatewayError === "function" ? deps.clearGatewayError : () => {};
 	function sendJson(res, payload, status = 200) {
 		res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
 		res.end(JSON.stringify(payload));
@@ -324,6 +329,9 @@ export function createRouteHandlers(deps) {
 			};
 			const gatewayStatus = parseSafe(status);
 			const deviceList = parseSafe(devices);
+			// 管理端点能应答 = 网关确实起来了：清掉上一次的启动失败记录。
+			if (gatewayStatus !== undefined) clearGatewayError();
+			const diagnostics = gatewayStatus !== undefined ? {} : (gatewayDiagnostics() ?? {});
 			sendJson(res, {
 				gatewayRunning: gatewayStatus !== undefined,
 				config,
@@ -333,6 +341,11 @@ export function createRouteHandlers(deps) {
 					: null,
 				listenPort,
 				tunnel: config.frp?.enabled === true ? readTunnelSnapshot(deps.home) : null,
+				// 上一次网关启动失败原因（离线时展示；在线恒为 null）
+				gatewayLastError: typeof diagnostics.lastError === "string" && diagnostics.lastError.length > 0
+					? diagnostics.lastError
+					: null,
+				gatewayLastExit: diagnostics.lastExit ?? null,
 			});
 		},
 
@@ -468,6 +481,10 @@ var plugin_default = {
 		let disposed = false;
 		let restartTimer = null;
 		let plannedStop = false;
+		// 最近一次网关启动失败原因（设置卡状态区展示，避免静默重试）：
+		// 子进程 stderr 尾部 + 退出码；网关管理端点能应答后自动清空。
+		let lastGatewayError = null;
+		let lastGatewayExit = null;
 
 		// ── 上游端口精确交接（官方桌面端加固） ─────────────────────
 		// 官方桌面宿主（dsh-desktop-host）每次启动可能为内嵌 Web 宿主随机分配
@@ -493,6 +510,7 @@ var plugin_default = {
 			try {
 				cliPath = locateGatewayCli();
 			} catch (error) {
+				lastGatewayError = `未找到网关入口：${String(error.message ?? error)}`;
 				console.warn(`${TAG} 未找到网关入口，跳过自动拉起。${String(error.message ?? error)}`);
 				return;
 			}
@@ -514,6 +532,7 @@ var plugin_default = {
 				});
 			} catch (error) {
 				// spawn 同步失败（如权限/沙箱限制）：不拖垮宿主，记录后放弃本轮拉起
+				lastGatewayError = `拉起网关子进程失败：${String(error.message ?? error)}`;
 				console.warn(`${TAG} 拉起网关子进程失败：${String(error.message ?? error)}`);
 				return;
 			}
@@ -523,17 +542,31 @@ var plugin_default = {
 			if (launchTokenDelivery.token !== undefined) {
 				setTimeout(() => { void launchTokenDelivery.deliver(); }, 1_500);
 			}
+			const stderrTail = [];
+			const forwardLine = (trimmed) => {
+				console.log(trimmed.startsWith("[dsh-remote]") ? trimmed : `${TAG} ${trimmed}`);
+			};
 			const forward = (chunk) => {
 				for (const line of chunk.toString("utf8").split("\n")) {
 					const trimmed = line.trimEnd();
 					if (trimmed.length === 0) continue;
-					console.log(trimmed.startsWith("[dsh-remote]") ? trimmed : `${TAG} ${trimmed}`);
+					forwardLine(trimmed);
+				}
+			};
+			const forwardStderr = (chunk) => {
+				for (const line of chunk.toString("utf8").split("\n")) {
+					const trimmed = line.trimEnd();
+					if (trimmed.length === 0) continue;
+					stderrTail.push(trimmed);
+					if (stderrTail.length > 8) stderrTail.shift();
+					forwardLine(trimmed);
 				}
 			};
 			proc.stdout?.on("data", forward);
-			proc.stderr?.on("data", forward);
+			proc.stderr?.on("data", forwardStderr);
 			proc.on("error", (error) => {
 				// spawn 异步失败（如入口不可执行）：清掉子进程引用，避免未处理错误
+				lastGatewayError = `网关子进程错误：${String(error.message ?? error)}`;
 				console.warn(`${TAG} 网关子进程错误：${String(error.message ?? error)}`);
 				if (child === proc) child = null;
 			});
@@ -541,6 +574,10 @@ var plugin_default = {
 				if (child === proc) child = null;
 				if (disposed || plannedStop) return;
 				if (child !== null && child !== proc) return;
+				lastGatewayExit = { code: code ?? null, signal: signal ?? null, at: new Date().toISOString() };
+				lastGatewayError = stderrTail.length > 0
+					? stderrTail.slice(-3).join(" | ")
+					: `网关进程退出（code=${String(code)} signal=${String(signal)}）`;
 				console.warn(`${TAG} 网关退出（code=${String(code)} signal=${String(signal)}），3s 后重启`);
 				restartTimer = setTimeout(spawnGateway, 3_000);
 			});
@@ -655,6 +692,12 @@ var plugin_default = {
 				},
 				writeSecrets: (next) => writeJsonAtomic(join(home, "state", "secrets.json"), next),
 				restartGateway,
+				// 网关启动诊断：离线时把最近一次失败原因（stderr 尾部/退出码）带给设置卡
+				gatewayDiagnostics: () => ({ lastError: lastGatewayError, lastExit: lastGatewayExit }),
+				clearGatewayError: () => {
+					lastGatewayError = null;
+					lastGatewayExit = null;
+				},
 				adminRequest: async (path, method = "GET") => {
 					const cfg = readConfigFile(home);
 					const port = Number.isInteger(cfg.listenPort) ? cfg.listenPort : 18443;

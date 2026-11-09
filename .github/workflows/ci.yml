@@ -75,7 +75,7 @@ jobs:
           test -x "$dest/frpc"
           test -x "$dest/frps"
 
-      - name: 快测（smoke / edge / frp 全链路 / routes / session / fixes / perf / desktop-compat / security）
+      - name: 快测（smoke / edge / frp 全链路 / routes / lock / session / fixes / perf / desktop-compat / security）
         env:
           DSHR_REQUIRE_FRP: "1"
         run: |
@@ -84,6 +84,7 @@ jobs:
           pnpm smoke:edge:frp
           pnpm smoke:dual:frp
           pnpm test:routes
+          pnpm test:lock
           pnpm test:frp
           pnpm test:visitor
           pnpm test:session

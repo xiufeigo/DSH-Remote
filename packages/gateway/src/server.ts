@@ -94,6 +94,8 @@ export interface GatewayServerOptions {
 	log?: (line: string) => void;
 	/** 环境变量源（测试注入用）；缺省 process.env */
 	env?: NodeJS.ProcessEnv;
+	/** 单实例锁令牌：admin/status 原样回显，供 CLI 判活时核对「锁的主人」。 */
+	lockToken?: string;
 }
 
 export class GatewayServer {
@@ -116,6 +118,8 @@ export class GatewayServer {
 	private loginCredential?: { kind: LoginKind; hash: string };
 	/** P0-2：管理端点共享密钥（state/secrets.json 的 adminToken），start() 时加载。 */
 	private adminToken?: string;
+	/** 单实例锁令牌（cli start 注入）；admin/status 回显给锁判活核对身份。 */
+	private readonly lockToken?: string;
 	private htmlInjector: (body: Buffer) => Buffer = injectIntoHtml;
 	/**
 	 * DSH 0.1.2+ 上游浏览器会话（令牌由插件宿主半边经 admin 端点下发）。
@@ -131,6 +135,7 @@ export class GatewayServer {
 		this.config = options.config;
 		this.log = options.log ?? (() => {});
 		this.env = options.env ?? process.env;
+		this.lockToken = options.lockToken;
 		this.session = new UpstreamSession({ log: (line) => this.log(line) });
 		this.limiter = new RateLimiter(
 			options.config.rateLimitPerMinute,
@@ -261,8 +266,8 @@ export class GatewayServer {
 		if (desktopTunnel || (this.config.role !== "edge" && publicEntryEnabled(this.config.frp))) {
 			// 主隧道口和公网入口都用访客密钥换设备 Cookie，不再凭隧道密钥直通。
 			this.loginCredential = { kind: "visitor-key", hash: hashAccessToken(secrets.frpVisitorKey) };
-			if (secrets.frpVisitorKey.trim().length < 16) {
-				this.log("警告：访客密钥短于 16 位。面板只接受至少 16 位可见 ASCII；已保存的短密钥仍可登录，避免把现有隧道锁在外面。");
+			if (secrets.frpVisitorKey.trim().length < 8) {
+				this.log("警告：访客密钥短于 8 位。面板只接受至少 8 位可见 ASCII；已保存的短密钥仍可登录，避免把现有隧道锁在外面。");
 			}
 		} else {
 			const hash = await ensureAccessTokenHash(this.store, this.env);
@@ -898,6 +903,8 @@ export class GatewayServer {
 				const upstream = this.upstreamAddress();
 				res.writeHead(200, { "content-type": "application/json" });
 				res.end(JSON.stringify({
+					pid: process.pid,
+					lockToken: this.lockToken ?? null,
 					port: this.actualPort,
 					role: this.config.role ?? "desktop",
 					edgeFrpRole: effectiveEdgeFrpRole(this.config),

@@ -62,8 +62,11 @@ test("validateConfigPatch：登录密钥与访客密钥进 secrets 不进 config
 	const bad = validateConfigPatch({ authToken: "has\nnewline" });
 	assert.equal(bad.ok, false);
 	assert.equal(validateConfigPatch({ visitorKey: "   " }).ok, false);
-	assert.equal(validateConfigPatch({ visitorKey: "visit-key\n" }).ok, false);
-	assert.equal(validateConfigPatch({ visitorKey: " visit-key " }).ok, false);
+	// 下限 8 位：trim 后不足 8 位拒绝，恰好 8 位通过
+	assert.equal(validateConfigPatch({ visitorKey: "visit-k" }).ok, false);
+	assert.deepEqual(validateConfigPatch({ visitorKey: "12345678" }).secrets, { visitorKey: "12345678" });
+	// 首尾空白由 trim 归一；内部空格仍拒绝（可见 ASCII 不含空格）
+	assert.equal(validateConfigPatch({ visitorKey: "visit key" }).ok, false);
 	assert.deepEqual(validateConfigPatch({ visitorKey: " visitor-key-ok!! " }).secrets, { visitorKey: "visitor-key-ok!!" });
 });
 
@@ -307,6 +310,49 @@ test("handleStatusGet：网关在线时聚合数据", async () => {
 	assert.equal(payload.gatewayRunning, true);
 	assert.equal(payload.gateway.certFingerprint, "AB12");
 	assert.equal(payload.deviceCount, 1, "已吊销设备不计数");
+});
+
+test("handleStatusGet：网关离线时带出最近一次启动失败原因", async () => {
+	let cleared = 0;
+	const handlers = createRouteHandlers({
+		home: ".",
+		log: () => {},
+		readConfig: () => ({ listenPort: 18443 }),
+		writeConfig: async () => {},
+		restartGateway: () => {},
+		adminRequest: async () => undefined,
+		gatewayDiagnostics: () => ({ lastError: "已有网关实例在运行（pid=9764）", lastExit: { code: 1 } }),
+		clearGatewayError: () => { cleared += 1; },
+	});
+	const res = fakeRes();
+	await handlers.handleStatusGet(fakeReq(), res);
+	const payload = JSON.parse(res.calls.body);
+	assert.equal(payload.gatewayRunning, false);
+	assert.equal(payload.gatewayLastError, "已有网关实例在运行（pid=9764）");
+	assert.equal(payload.gatewayLastExit.code, 1);
+	assert.equal(cleared, 0, "离线时不应清空失败记录");
+});
+
+test("handleStatusGet：网关在线时清空启动失败记录", async () => {
+	let cleared = 0;
+	const handlers = createRouteHandlers({
+		home: ".",
+		log: () => {},
+		readConfig: () => ({ listenPort: 18443 }),
+		writeConfig: async () => {},
+		restartGateway: () => {},
+		adminRequest: async (path) => path === "/__dsh_remote__/admin/status"
+			? { status: 200, body: JSON.stringify({ port: 18443 }) }
+			: { status: 200, body: JSON.stringify({ devices: [] }) },
+		gatewayDiagnostics: () => ({ lastError: "旧错误", lastExit: { code: 1 } }),
+		clearGatewayError: () => { cleared += 1; },
+	});
+	const res = fakeRes();
+	await handlers.handleStatusGet(fakeReq(), res);
+	const payload = JSON.parse(res.calls.body);
+	assert.equal(payload.gatewayRunning, true);
+	assert.equal(payload.gatewayLastError, null);
+	assert.equal(cleared, 1, "网关能应答管理端点即应清空启动失败记录");
 });
 
 test("readTunnelSnapshot：解析 xtcp + stcp 双 proxy", async () => {

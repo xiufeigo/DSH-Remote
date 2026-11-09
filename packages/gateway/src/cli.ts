@@ -11,13 +11,14 @@
  *   dsh-remote doctor             体检：证书/端口/上游指纹/frp 配置
  */
 
-import { open, readFile, unlink } from "node:fs/promises";
+import { unlink } from "node:fs/promises";
 import https from "node:https";
 import { connect } from "node:net";
 import { join } from "node:path";
 import process from "node:process";
 import { GatewayServer } from "./server.ts";
 import { Store } from "./store.ts";
+import { acquireInstanceLock, newLockToken, probePidAlive, probeTimeoutMs, updateLockRecord, type InstanceLockRecord, type LockHolderProbe } from "./instance-lock.ts";
 import { applyEnvOverrides, type GatewayConfig, normalizeEdgeFrpRole } from "./config.ts";
 import { locateFrBinary, locateFrpcBinary, normalizeFrpMode, normalizeTunnelName, publicEntryEnabled, renderVisitorToml, visitorBindPortOf, visitorConnectionString } from "./frp.ts";
 import { ADMIN_TOKEN_HEADER, ensureAccessTokenHash, generatePairingCode } from "./auth.ts";
@@ -133,51 +134,65 @@ async function main(): Promise<number> {
 
 // ---------- start ----------
 
-/** 锁文件里的 pid 是否还活着（信号 0 探测；EPERM 说明进程存在但无权发信号）。 */
-function isPidAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
-	}
+/** 管理端点探测结果（锁身份核对用）。 */
+interface AdminProbeResponse {
+	status: number;
+	body: string;
+}
+
+/** listenHost 归一化成回环探测地址（0.0.0.0 / :: 不能直接连）。 */
+function lockProbeHost(listenHost: string): string {
+	if (listenHost === "0.0.0.0") return "127.0.0.1";
+	if (listenHost === "::" || listenHost === "[::]") return "::1";
+	return listenHost;
+}
+
+/** GET 网关管理端点（自签证书跳过校验；带 adminToken 头）。 */
+function probeAdminStatus(host: string, port: number, adminToken: string | undefined): Promise<AdminProbeResponse | undefined> {
+	return new Promise((resolveProbe) => {
+		const headers: Record<string, string> = {};
+		if (typeof adminToken === "string" && adminToken.length > 0) headers[ADMIN_TOKEN_HEADER] = adminToken;
+		const req = https.request(
+			{
+				host,
+				port,
+				path: "/__dsh_remote__/admin/status",
+				method: "GET",
+				headers,
+				rejectUnauthorized: false,
+				timeout: probeTimeoutMs(),
+			},
+			(res) => {
+				const chunks: Buffer[] = [];
+				res.on("data", (chunk: Buffer) => chunks.push(chunk));
+				res.on("end", () => resolveProbe({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+			},
+		);
+		req.on("timeout", () => {
+			req.destroy();
+			resolveProbe(undefined);
+		});
+		req.on("error", () => resolveProbe(undefined));
+		req.end();
+	});
 }
 
 /**
- * CLI-01：获取单实例排他锁 <home>/gateway.lock（'wx' 新建并写入 pid）。
- * - 拿到返回锁文件路径（调用方负责退出时清理）；冲突返回 undefined。
- * - 陈旧锁（上次崩溃/硬杀残留、记录 pid 已不存在）自动清除并重抢一次；
- *   pid 复用导致误判存活时，按提示手工删除锁文件即可恢复。
+ * 锁身份核对：锁里的 token 必须与运行中网关在 admin/status 回显的 lockToken 一致。
+ * 旧格式锁（纯 pid）没有 token：端口上有管理端点响应即视为在用网关。
  */
-async function acquireInstanceLock(store: Store): Promise<string | undefined> {
-	const lockPath = join(store.home, "gateway.lock");
+async function probeGatewayLockHolder(holder: LockHolderProbe, store: Store): Promise<boolean | undefined> {
+	const secrets = await store.ensureSecrets().catch(() => undefined);
+	const response = await probeAdminStatus(holder.host, holder.port, secrets?.adminToken);
+	if (response === undefined) return undefined;
+	if (holder.token === undefined) return true;
+	if (response.status !== 200) return undefined;
 	try {
-		const fd = await open(lockPath, "wx");
-		await fd.writeFile(`${String(process.pid)}\n`);
-		await fd.close();
-		return lockPath;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-	}
-	let stalePid = Number.NaN;
-	try {
-		stalePid = Number.parseInt((await readFile(lockPath, "utf8")).trim(), 10);
-	} catch {
-		// 读不出来按陈旧锁处理，尝试清除重抢
-	}
-	if (Number.isInteger(stalePid) && stalePid > 0 && isPidAlive(stalePid)) {
-		console.error(`已有网关实例在运行（pid=${String(stalePid)}，锁文件 ${lockPath}）。`);
+		const body = JSON.parse(response.body) as { lockToken?: unknown; pid?: unknown };
+		if (typeof body.lockToken === "string") return body.lockToken === holder.token;
+		if (Number.isInteger(body.pid)) return body.pid === holder.pid;
 		return undefined;
-	}
-	await unlink(lockPath).catch(() => {});
-	try {
-		const fd = await open(lockPath, "wx");
-		await fd.writeFile(`${String(process.pid)}\n`);
-		await fd.close();
-		console.error(`[dsh-remote] 已清除陈旧锁文件（原 pid=${Number.isInteger(stalePid) ? String(stalePid) : "不可读"}）`);
-		return lockPath;
 	} catch {
-		console.error(`已有网关实例在运行（锁文件 ${lockPath}）。`);
 		return undefined;
 	}
 }
@@ -187,14 +202,29 @@ async function cmdStart(store: Store, flags: Map<string, string | boolean>): Pro
 		console.error("后台化请交给 cordis 插件或系统服务管理；本命令保持前台。");
 		return 1;
 	}
-	// CLI-01：单实例排他锁——防止双开网关并发写 state/ 文件
-	const lockPath = await acquireInstanceLock(store);
+	// CLI-01：单实例排他锁——防止双开网关并发写 state/ 文件。
+	// 锁内容带 pid/startedAt/token；冲突时用管理端点核对身份，避免 PID 复用/EPERM 误判。
+	const config = applyEnvOverrides(await store.loadConfig());
+	const lockRecord: InstanceLockRecord = {
+		version: 1,
+		pid: process.pid,
+		startedAt: new Date().toISOString(),
+		exe: process.execPath,
+		host: lockProbeHost(config.listenHost),
+		port: config.listenPort,
+		token: newLockToken(),
+	};
+	const lockPath = await acquireInstanceLock(store.path("gateway.lock"), lockRecord, {
+		isPidAlive: probePidAlive,
+		probeLockHolder: (holder) => probeGatewayLockHolder(holder, store),
+		log: (line) => console.error(line),
+	});
 	if (lockPath === undefined) return 1;
 	try {
-		const config = applyEnvOverrides(await store.loadConfig());
 		const server = new GatewayServer({
 			store,
 			config,
+			lockToken: lockRecord.token,
 			log: (line) => console.log(`[dsh-remote] ${line}`),
 		});
 
@@ -218,6 +248,14 @@ async function cmdStart(store: Store, flags: Map<string, string | boolean>): Pro
 		process.on("SIGINT", quit);
 		process.on("SIGTERM", quit);
 		await server.start();
+
+		// listenPort=0 时锁里记的是 0，回填 OS 分配的真实端口供后续判活探测。
+		const actualListenPort = server.actualPort ?? config.listenPort;
+		if (actualListenPort !== lockRecord.port) {
+			await updateLockRecord(lockPath, { port: actualListenPort }).catch((error: unknown) => {
+				console.error(`[dsh-remote] 锁端口回填失败（不影响本次运行）：${error instanceof Error ? error.message : String(error)}`);
+			});
+		}
 
 		if (config.role === "edge") {
 			printEdgeBanner(config, server.actualPort ?? config.listenPort);

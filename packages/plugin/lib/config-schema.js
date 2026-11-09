@@ -60,11 +60,11 @@ function isSecret(value) {
 	return typeof value === "string" && value.trim().length > 0 && value.length <= 512 && !/[\u0000-\u001F\u007F]/.test(value);
 }
 
-/** 自定义访客密钥：至少 16 位可见 ASCII，拒绝空格和控制字符。 */
+/** 自定义访客密钥：至少 8 位可见 ASCII，拒绝空格和控制字符。 */
 function isVisitorKey(value) {
 	if (typeof value !== "string") return false;
 	const trimmed = value.trim();
-	return trimmed.length >= 16 && trimmed.length <= 512 && /^[\x21-\x7E]+$/.test(trimmed);
+	return trimmed.length >= 8 && trimmed.length <= 512 && /^[\x21-\x7E]+$/.test(trimmed);
 }
 
 /**
@@ -97,7 +97,7 @@ export function validateConfigPatch(input) {
 				else secrets[key] = value.trim();
 				break;
 			case "visitorKey":
-				if (!isVisitorKey(value)) errors.push("访客密钥至少 16 位、最长 512 位，且只能使用可见 ASCII 字符");
+				if (!isVisitorKey(value)) errors.push("访客密钥至少 8 位、最长 512 位，且只能使用可见 ASCII 字符");
 				else secrets[key] = value.trim();
 				break;
 			case "autoFixUpstreamPort":

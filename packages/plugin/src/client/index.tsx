@@ -318,8 +318,8 @@ export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {})
         setMessage({ kind: 'err', text: '请填写 VPS 地址、登录密钥和访客密钥' })
         return
       }
-      if (!/^[\x21-\x7E]{16,512}$/.test(key)) {
-        setMessage({ kind: 'err', text: '访客密钥至少 16 位，且只能使用可见 ASCII 字符' })
+      if (!/^[\x21-\x7E]{8,512}$/.test(key)) {
+        setMessage({ kind: 'err', text: '访客密钥至少 8 位，且只能使用可见 ASCII 字符' })
         return
       }
     }
@@ -421,6 +421,9 @@ export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {})
       {open && form !== null
         ? (
           <div className="dshr-body">
+            {!gatewayRunning && typeof status?.gatewayLastError === 'string' && status.gatewayLastError.length > 0
+              ? <div className="dshr-note">上次启动网关失败：{status.gatewayLastError}</div>
+              : null}
             <div className="dshr-section">常规</div>
             <Row label="DSH 启动时自动拉起网关">
               <Toggle checked={form.autoStart} ariaLabel="DSH 启动时自动拉起网关" onChange={v => { patchForm({ autoStart: v }) }} />
@@ -487,7 +490,7 @@ export function DshRemoteSettingsCard({ as = 'li' }: { as?: 'li' | 'div' } = {})
                     password
                     value={visitorKey}
                     onChange={setVisitorKey}
-                    hint="至少 16 位可见 ASCII。Android 和公网网页使用同一密钥；修改并保存后，浏览器需重新验证，Android 也需更新密钥。"
+                    hint="至少 8 位可见 ASCII。Android 和公网网页使用同一密钥；修改并保存后，浏览器需重新验证，Android 也需更新密钥。"
                   />
                   <TextField
                     label="frps CA 文件（可选）"

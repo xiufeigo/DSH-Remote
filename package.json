@@ -24,6 +24,7 @@
     "ver:bump": "node scripts/version.mjs bump",
     "test:plugin": "node scripts/test-plugin-sim.mjs",
     "test:routes": "node --test scripts/test-plugin-routes.mjs",
+    "test:lock": "node --test scripts/test-instance-lock.mjs",
     "test:session": "node --test scripts/test-session-auth.mjs",
     "test:panel": "node scripts/test-panel-e2e.mjs",
     "test:client": "node scripts/test-client-bundle.mjs",

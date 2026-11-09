@@ -4,6 +4,35 @@
 
 ---
 
+## 待发布（2026-11-09）：陈旧锁 PID 复用导致网关起不来 + 访客密钥下限回退
+
+### ① 网关「起不来」：陈旧锁 + Windows PID 复用误判
+
+- **现象**：DSH 启动后设置卡一直「网关未运行」，手机连不上；`18443` 无监听，
+  `~/.dsh-remote/gateway.lock` 仍是几天前的 pid，插件每 3s 静默重试。
+- **根因**：旧锁只写一行 pid，判活用 `process.kill(pid, 0)` 并把 `EPERM` 当作
+  「进程存在但无权发信号」。Windows 的 PID 会被系统复用：11/6 残留的 pid 被系统
+  进程回收后 `kill(0)` 抛 EPERM，陈旧锁被永久误判成「已有网关在运行」，网关再也起不来。
+- **修复**（`packages/gateway/src/instance-lock.ts`）：锁文件升级为 JSON
+  （`pid/startedAt/exe/host/port/token`），判活三级：`ESRCH` 确认不存在 → 清锁；
+  pid 存活或 EPERM → 用管理端点回显的 `lockToken` 核对身份，令牌一致才拒绝启动，
+  否则清锁重抢；管理端点不可判定时，只有 15s 启动窗口内的新锁才保守拒绝。
+  `listenPort=0` 时监听后回填真实端口；旧格式纯 pid 锁保持兼容。
+- **可观测性**：插件捕获网关子进程 stderr 尾部与退出码，`/dsh-remote/status` 新增
+  `gatewayLastError` / `gatewayLastExit`，设置卡在网关未运行时显示「上次启动网关失败：…」，
+  不再静默重试。
+- **测试**：新增 `scripts/test-instance-lock.mjs`（含 PID 复用、在跑拒绝两条真启动 E2E），
+  接入 CI（`pnpm test:lock`）。
+
+### ② 访客密钥最小长度 16 → 8（部署方要求回退）
+
+- rc.2.23 的安全加固「至少 16 位可见 ASCII」回退为「至少 8 位」：客户端预检、
+  插件服务端 schema、网关启动警告阈值与文案、`scripts/test-plugin-routes.mjs` 同步调整。
+- ⚠️ 安全提示：8 位口令强度回到 rc.2.22 之前；公网入口（`entryEnabled`）与 edge
+  场景仍建议使用 ≥16 位随机密钥。
+
+---
+
 ## v0.2.0-rc.2.24（手机档终端「弹出来后点击没反应」修复）
 
 - **现象（用户口径）**：手机上打开工作区终端后，点终端没有任何反应——点不动、软键盘不弹、打字没有回显。
