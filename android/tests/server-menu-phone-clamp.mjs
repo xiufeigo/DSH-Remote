@@ -126,6 +126,40 @@ try {
   assert.equal(later.officialMarked, true, 'official menus are still clamped');
   assert.ok(later.officialTop < 120, 'official menu was actually moved, not merely marked: ' + JSON.stringify(later));
   console.log('server menu stays under the trigger after the phone float clamp');
+
+  await evaluate(`__dshRemoteServerPicker.update(${JSON.stringify(data)}, function(){}, function(){return JSON.stringify({ok:false, error:'请填写完整'})})`);
+  await evaluate(`document.querySelector('.dshr-server-add').click()`);
+  await evaluate(`new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))`);
+  const form = JSON.parse(await evaluate(`(()=>{
+    const menu = document.querySelector('#dshr-server-menu');
+    const save = menu.querySelector('.dshr-server-save');
+    save.scrollIntoView({block:'nearest'});
+    const mr = menu.getBoundingClientRect();
+    const nodes = [...menu.querySelectorAll('input, .dshr-server-seg button, .dshr-server-choice, .dshr-server-save')];
+    const clipped = nodes.filter(node => {
+      const r = node.getBoundingClientRect();
+      return r.width < 2 || r.left < mr.left - 1 || r.right > mr.right + 1;
+    }).map(node => (node.value || node.textContent || '').trim().slice(0, 16));
+    const sr = save.getBoundingClientRect();
+    return JSON.stringify({
+      title: menu.textContent.includes('添加服务器'),
+      save: save.textContent,
+      menuLeft: Math.round(mr.left), menuRight: Math.round(mr.right),
+      menuTop: Math.round(mr.top), menuBottom: Math.round(mr.bottom),
+      vw: window.innerWidth, vh: window.innerHeight,
+      saveLeft: Math.round(sr.left), saveRight: Math.round(sr.right),
+      saveTop: Math.round(sr.top), saveBottom: Math.round(sr.bottom),
+      clipped
+    });
+  })()`));
+  console.log('add-server sheet ' + JSON.stringify(form));
+  assert.equal(form.title, true, 'phone add-server form shows its title');
+  assert.equal(form.save, '保存并连接', 'save label is intact');
+  assert.ok(form.menuLeft >= 8 && form.menuRight <= form.vw - 8, 'form sheet stays inside the screen horizontally: ' + JSON.stringify(form));
+  assert.ok(form.menuTop >= 8 && form.menuBottom <= form.vh - 8, 'form sheet stays inside the screen vertically: ' + JSON.stringify(form));
+  assert.deepEqual(form.clipped, [], 'fields and save button are not clipped by the sheet: ' + JSON.stringify(form));
+  assert.ok(form.saveLeft >= form.menuLeft && form.saveRight <= form.menuRight + 1, 'save button is fully inside the sheet');
+  assert.ok(form.saveTop >= form.menuTop - 1 && form.saveBottom <= form.menuBottom + 1, 'save button is scrolled into the sheet');
 } finally {
   clearTimeout(deadline);
   if (ws && ws.readyState === WebSocket.OPEN) { try { await call('Browser.close'); } catch { /* already closed */ } ws.close(); }

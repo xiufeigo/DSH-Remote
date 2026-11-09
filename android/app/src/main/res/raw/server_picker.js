@@ -47,9 +47,9 @@
 html[data-dshr-dark="1"] #dshr-server-menu .dshr-server-mark,body[data-ds-dark-theme] #dshr-server-menu .dshr-server-mark{background:rgba(255,255,255,.14);color:var(--dsw-alias-label-primary,#f5f5f7)}
 #dshr-server-menu .dshr-server-mark svg{width:12px;height:12px;display:block;stroke:currentColor}
 #dshr-server-menu .dshr-server-back{width:auto;padding:6px 8px}
-#dshr-server-menu label{display:block;margin:0 8px 8px;font-size:12px;color:var(--dsw-alias-label-tertiary,#888)}
-#dshr-server-menu input{box-sizing:border-box;width:100%;height:34px;margin-top:4px;border:1px solid var(--dsw-alias-border-l3,#e5e5e5);border-radius:9px;padding:0 10px;font:inherit;font-size:14px;color:inherit;background:#fff}
-#dshr-server-menu .dshr-server-pair{display:grid;grid-template-columns:88px 1fr;gap:8px;margin:0 8px}
+#dshr-server-menu label{display:block;margin:0 8px 8px;min-width:0;max-width:100%;font-size:12px;color:var(--dsw-alias-label-tertiary,#888)}
+#dshr-server-menu input{box-sizing:border-box;width:100%;max-width:100%;min-width:0;height:34px;margin-top:4px;border:1px solid var(--dsw-alias-border-l3,#e5e5e5);border-radius:9px;padding:0 10px;font:inherit;font-size:14px;color:inherit;background:#fff}
+#dshr-server-menu .dshr-server-pair{display:grid;grid-template-columns:minmax(0,34%) minmax(0,1fr);gap:8px;margin:0 8px;min-width:0}
 #dshr-server-menu .dshr-server-pair label{margin:0 0 8px}
 #dshr-server-menu .dshr-server-secret{position:relative}
 #dshr-server-menu .dshr-server-secret input{padding-right:48px}
@@ -57,12 +57,13 @@ html[data-dshr-dark="1"] #dshr-server-menu .dshr-server-mark,body[data-ds-dark-t
 #dshr-server-menu .dshr-server-seg{display:flex;gap:4px;margin:0 8px 8px;padding:2px;border-radius:10px;background:var(--dsw-alias-button-floating-hover,#eee)}
 #dshr-server-menu .dshr-server-seg button{flex:1;width:auto;justify-content:center;padding:6px 8px}
 #dshr-server-menu .dshr-server-seg button[aria-pressed=true]{background:#fff}
-#dshr-server-menu .dshr-server-choice{align-items:flex-start}
+#dshr-server-menu .dshr-server-choice{align-items:flex-start;min-width:0;max-width:100%;white-space:normal}
 #dshr-server-menu .dshr-server-choice[aria-pressed=true]{background:#fff;box-shadow:inset 0 0 0 1px var(--dsw-alias-border-l3,#e5e5e5)}
-#dshr-server-menu .dshr-server-choice small{display:block;margin-top:2px;color:var(--dsw-alias-label-tertiary,#888);font-size:12px}
+#dshr-server-menu .dshr-server-choice span{min-width:0}
+#dshr-server-menu .dshr-server-choice small{display:block;margin-top:2px;color:var(--dsw-alias-label-tertiary,#888);font-size:12px;white-space:normal}
 #dshr-server-menu .dshr-server-error{margin:0 10px 8px;color:#c2413a;font-size:12px}
-#dshr-server-menu .dshr-server-actions{display:flex;justify-content:flex-end;gap:8px;padding:4px 8px 8px}
-#dshr-server-menu .dshr-server-actions button{width:auto;padding:8px 14px}
+#dshr-server-menu .dshr-server-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px;padding:4px 8px 8px;max-width:100%}
+#dshr-server-menu .dshr-server-actions button{width:auto;max-width:100%;padding:8px 14px}
 #dshr-server-menu .dshr-server-save{background:#1c1c1e;color:#fff}
 #dshr-server-menu .dshr-server-delete{width:auto;margin:0 8px 4px;padding:4px 2px;color:#c2413a}
 `;
@@ -130,7 +131,40 @@ html[data-dshr-dark="1"] #dshr-server-menu .dshr-server-mark,body[data-ds-dark-t
 		menu.style.setProperty('margin', '0', 'important');
 	}
 
+	function viewportFrame() {
+		var vv = window.visualViewport;
+		return {
+			left: vv && vv.offsetLeft ? vv.offsetLeft : 0,
+			top: vv && vv.offsetTop ? vv.offsetTop : 0,
+			width: vv && vv.width ? vv.width : (window.innerWidth || 360),
+			height: vv && vv.height ? vv.height : (window.innerHeight || 640)
+		};
+	}
+
+	// 手机宽度上添加/编辑表单不再跟触发按钮一样窄，也不再允许探出屏幕。
+	// 列表菜单仍贴着按钮；表单铺成视口内的一整张卡片，键盘弹出时跟着 visualViewport 缩短。
+	function formNeedsSheet() {
+		return view === 'form' && (window.innerWidth || 0) <= 560;
+	}
+
+	function positionFormSheet() {
+		var box = viewportFrame();
+		var edge = 12;
+		var left = Math.round(box.left + edge);
+		var top = Math.round(box.top + edge);
+		var width = Math.max(160, Math.round(box.width - edge * 2));
+		var maxHeight = Math.max(160, Math.round(box.height - edge * 2));
+		var signature = 'sheet|' + left + '|' + width + '|' + top + '|' + maxHeight;
+		if (signature === placed) return;
+		placed = signature;
+		writeMenuBox(left, width, top, maxHeight);
+	}
+
 	function positionMenu() {
+		if (formNeedsSheet()) {
+			positionFormSheet();
+			return;
+		}
 		var rect = trigger.getBoundingClientRect();
 		if (rect.width < 2 || rect.height < 2) return;
 		var gap = 6;
@@ -607,6 +641,10 @@ html[data-dshr-dark="1"] #dshr-server-menu .dshr-server-mark,body[data-ds-dark-t
 		document.removeEventListener('keydown', keydown);
 		window.removeEventListener('resize', scheduleSync);
 		window.removeEventListener('scroll', onScroll, true);
+		if (window.visualViewport) {
+			window.visualViewport.removeEventListener('resize', scheduleSync);
+			window.visualViewport.removeEventListener('scroll', scheduleSync);
+		}
 		root.remove();
 		menu.remove();
 		style.remove();
@@ -619,6 +657,10 @@ html[data-dshr-dark="1"] #dshr-server-menu .dshr-server-mark,body[data-ds-dark-t
 	document.addEventListener('keydown', keydown);
 	window.addEventListener('resize', scheduleSync);
 	window.addEventListener('scroll', onScroll, true);
+	if (window.visualViewport) {
+		window.visualViewport.addEventListener('resize', scheduleSync);
+		window.visualViewport.addEventListener('scroll', scheduleSync);
+	}
 	(document.head || document.documentElement).appendChild(style);
 	document.body.appendChild(menu);
 	observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-sidebar-collapsed'] });

@@ -188,6 +188,7 @@ public class MainActivity extends Activity {
 	private TextView tvTunnelState;
 	private Button resumeSessionBtn;
 	private ScrollView welcomeScroll;
+	private LinearLayout welcomeCard;
 	private LinearLayout welcomeTunnelBlock;
 	private LinearLayout welcomeDirectBlock;
 	private EditText welcomeName;
@@ -330,6 +331,11 @@ public class MainActivity extends Activity {
 	private int currentImePadding = -1;
 	/** 当前实际平移量（可能小于 IME 高度，避免把输入框顶出屏幕）。 */
 	private int currentImeShift = Integer.MIN_VALUE;
+	/**
+	 * 原生表单可见时键盘加在滚动区底边距上，字段和保存按钮可以滚到键盘上方。
+	 * 会话 WebView 仍用根布局 translationY，不读这个值。
+	 */
+	private int nativeFormImePx;
 	/** WebView 内焦点输入框相对 WebView 顶部的 CSS 像素，已换算成设备像素。 */
 	private int lastImeFocusTopPx = -1;
 	private int lastImeFocusBottomPx = -1;
@@ -965,15 +971,18 @@ public class MainActivity extends Activity {
 			new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 	}
 
-	/** 还没有服务器时的启动页：灰底，表单居中，样式对齐侧栏里的添加卡片。 */
+	/**
+	 * 还没有服务器时的启动页。会话本身仍是官方 DSH WebView；这一页只收集连接信息。
+	 * 卡片宽度必须落在屏幕内：以前写死 400dp 再水平居中，360dp 一类手机上左右都会被裁掉，
+	 * 「保存并连接」会探出屏幕右缘。
+	 */
 	private void buildWelcome() {
 		float d = getResources().getDisplayMetrics().density;
 		LinearLayout page = new LinearLayout(this);
 		page.setOrientation(LinearLayout.VERTICAL);
-		page.setGravity(android.view.Gravity.CENTER);
+		page.setGravity(android.view.Gravity.TOP | android.view.Gravity.CENTER_HORIZONTAL);
 		page.setBackgroundColor(0xFFF4F5F7);
-		int side = dp(24, d);
-		page.setPadding(side, side, side, side);
+		page.setPadding(0, dp(12, d), 0, dp(28, d));
 
 		LinearLayout card = new LinearLayout(this);
 		card.setOrientation(LinearLayout.VERTICAL);
@@ -1013,8 +1022,8 @@ public class MainActivity extends Activity {
 		tunnelCol.setOrientation(LinearLayout.VERTICAL);
 		welcomeTunnel = welcomeField(tunnelCol, "隧道名", "dsh-remote", d, InputType.TYPE_CLASS_TEXT);
 		welcomeTunnel.setText(ProfileStore.DEFAULT_TUNNEL_NAME);
-		pair.addView(portCol, new LinearLayout.LayoutParams(dp(104, d), LinearLayout.LayoutParams.WRAP_CONTENT));
-		LinearLayout.LayoutParams tunnelColParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+		pair.addView(portCol, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.42f));
+		LinearLayout.LayoutParams tunnelColParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.58f);
 		tunnelColParams.leftMargin = dp(8, d);
 		pair.addView(tunnelCol, tunnelColParams);
 		welcomeTunnelBlock.addView(pair);
@@ -1051,19 +1060,50 @@ public class MainActivity extends Activity {
 		saveBg.setCornerRadius(10 * d);
 		save.setBackground(saveBg);
 		save.setOnClickListener(v -> saveWelcome());
-		actions.addView(save, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(40, d)));
+		save.setMinWidth(0);
+		save.setMinimumWidth(0);
+		save.setMinHeight(dp(44, d));
+		save.setMinimumHeight(dp(44, d));
+		save.setPadding(dp(16, d), dp(8, d), dp(16, d), dp(8, d));
+		actions.addView(save, new LinearLayout.LayoutParams(
+			LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 		LinearLayout.LayoutParams actionParams = new LinearLayout.LayoutParams(
 			LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
 		actionParams.topMargin = dp(8, d);
 		card.addView(actions, actionParams);
 
-		int max = dp(400, d);
-		LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(max, LinearLayout.LayoutParams.WRAP_CONTENT);
+		welcomeCard = card;
+		LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(
+			LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
 		page.addView(card, cardParams);
+		applyWelcomeWidth();
 		welcomeScroll = insetScroll(page);
+		welcomeScroll.setFillViewport(true);
 		welcomeScroll.setBackgroundColor(0xFFF4F5F7);
+		welcomeScroll.addOnLayoutChangeListener((v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
+			if (right - left != oldRight - oldLeft) applyWelcomeWidth();
+		});
 		rootLayout.addView(welcomeScroll, new FrameLayout.LayoutParams(
 			FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+	}
+
+	/** 按当前窗口宽度收卡片，宽屏不超过 400dp，窄屏两侧留 16dp，绝不超出屏幕。 */
+	private void applyWelcomeWidth() {
+		if (welcomeCard == null) return;
+		float d = getResources().getDisplayMetrics().density;
+		int screen = welcomeScroll != null && welcomeScroll.getWidth() > 0
+			? welcomeScroll.getWidth()
+			: (rootLayout != null && rootLayout.getWidth() > 0
+				? rootLayout.getWidth()
+				: getResources().getDisplayMetrics().widthPixels);
+		int width = WelcomeMetrics.cardWidthPx(screen, dp(16, d), dp(400, d));
+		ViewGroup.LayoutParams lp = welcomeCard.getLayoutParams();
+		if (!(lp instanceof LinearLayout.LayoutParams)) return;
+		LinearLayout.LayoutParams params = (LinearLayout.LayoutParams) lp;
+		if (params.width == width && params.gravity == android.view.Gravity.CENTER_HORIZONTAL) return;
+		params.width = width;
+		params.gravity = android.view.Gravity.CENTER_HORIZONTAL;
+		welcomeCard.setLayoutParams(params);
 	}
 
 	private Button welcomeSegButton(String text, float d) {
@@ -1071,6 +1111,8 @@ public class MainActivity extends Activity {
 		button.setText(text);
 		button.setAllCaps(false);
 		button.setTextSize(13);
+		button.setMinWidth(0);
+		button.setMinimumWidth(0);
 		button.setPadding(0, 0, 0, 0);
 		return button;
 	}
@@ -1158,6 +1200,9 @@ public class MainActivity extends Activity {
 		input.setTextSize(14);
 		input.setTextColor(0xFF1C1C1E);
 		input.setPadding(dp(12, d), 0, dp(12, d), 0);
+		input.setMinWidth(0);
+		input.setMinimumWidth(0);
+		input.setHorizontallyScrolling(true);
 		GradientDrawable bg = new GradientDrawable();
 		bg.setColor(Color.WHITE);
 		bg.setCornerRadius(10 * d);
@@ -1183,6 +1228,7 @@ public class MainActivity extends Activity {
 
 	private void hideWelcome() {
 		if (welcomeScroll != null) welcomeScroll.setVisibility(View.GONE);
+		if (visibleNativeScroll() == null) clearNativeFormIme();
 	}
 
 	private boolean hasSavedServer() {
@@ -1592,22 +1638,51 @@ public class MainActivity extends Activity {
 		//     与 clickable 无关（clickable 只决定"没人要时要不要自己吃掉"）。
 		scroll.setClickable(true);
 		scroll.setOnApplyWindowInsetsListener((view, insets) -> {
-			int top;
-			int bottom;
-			if (Build.VERSION.SDK_INT >= 30) {
-				top = insets.getInsets(WindowInsets.Type.statusBars()).top;
-				int nav = insets.getInsets(WindowInsets.Type.navigationBars()).bottom;
-				// IME 由根布局 translationY 处理；这里只垫导航栏，避免设置页跟着改高度。
-				bottom = nav;
-			} else {
-				top = insets.getSystemWindowInsetTop();
-				bottom = insets.getStableInsetBottom();
-			}
-			float density = getResources().getDisplayMetrics().density;
-			view.setPadding(0, top + dp(8, density), 0, bottom);
+			applyNativeScrollInsets((ScrollView) view);
 			return insets;
 		});
 		return scroll;
+	}
+
+	/**
+	 * 原生滚动页的系统栏留白。键盘打开且这一页正在显示时，把 IME 高度加进底边距，
+	 * 内容可以滚到键盘上方；会话 WebView 不走这里。
+	 */
+	private void applyNativeScrollInsets(ScrollView view) {
+		WindowInsets insets = view.getRootWindowInsets();
+		if (insets == null && rootLayout != null) insets = rootLayout.getRootWindowInsets();
+		int ime = view.getVisibility() == View.VISIBLE ? nativeFormImePx : 0;
+		if (insets == null) {
+			if (ime == 0) return;
+			view.setPadding(view.getPaddingLeft(), view.getPaddingTop(), 0, ime);
+			return;
+		}
+		int top;
+		int bottom;
+		if (Build.VERSION.SDK_INT >= 30) {
+			top = insets.getInsets(WindowInsets.Type.statusBars()).top;
+			bottom = insets.getInsets(WindowInsets.Type.navigationBars()).bottom;
+		} else {
+			top = insets.getSystemWindowInsetTop();
+			bottom = insets.getStableInsetBottom();
+		}
+		float density = getResources().getDisplayMetrics().density;
+		view.setPadding(0, top + dp(8, density), 0, bottom + ime);
+	}
+
+	private ScrollView visibleNativeScroll() {
+		if (welcomeScroll != null && welcomeScroll.getVisibility() == View.VISIBLE) return welcomeScroll;
+		if (setupScroll != null && setupScroll.getVisibility() == View.VISIBLE) return setupScroll;
+		if (homeScroll != null && homeScroll.getVisibility() == View.VISIBLE) return homeScroll;
+		return null;
+	}
+
+	private void clearNativeFormIme() {
+		if (nativeFormImePx == 0) return;
+		nativeFormImePx = 0;
+		if (welcomeScroll != null) applyNativeScrollInsets(welcomeScroll);
+		if (setupScroll != null) applyNativeScrollInsets(setupScroll);
+		if (homeScroll != null) applyNativeScrollInsets(homeScroll);
 	}
 
 	// ---------- 卡片式设置控件（与电脑端插件面板观感对齐） ----------
@@ -4333,6 +4408,28 @@ public class MainActivity extends Activity {
 		if (rootLayout == null) return;
 		if (Build.VERSION.SDK_INT < 30) return;
 		if (imePx < 0) imePx = 0;
+		ScrollView nativeScroll = visibleNativeScroll();
+		if (nativeScroll != null) {
+			if (rootLayout.getTranslationY() != 0f) rootLayout.setTranslationY(0f);
+			if (rootLayout.getPaddingTop() != 0 || rootLayout.getPaddingBottom() != 0) {
+				rootLayout.setPadding(0, 0, 0, 0);
+			}
+			currentImeShift = 0;
+			if (imePx == currentImePadding && nativeFormImePx == imePx) return;
+			currentImePadding = imePx;
+			nativeFormImePx = imePx;
+			applyNativeScrollInsets(nativeScroll);
+			View focused = getCurrentFocus();
+			if (focused != null && focused != nativeScroll) {
+				focused.post(() -> {
+					if (destroyed || focused.getWindowToken() == null) return;
+					focused.requestRectangleOnScreen(
+						new Rect(0, 0, focused.getWidth(), focused.getHeight()), false);
+				});
+			}
+			return;
+		}
+		clearNativeFormIme();
 		int shift = computeImeShift(imePx);
 		if (imePx == currentImePadding && shift == currentImeShift) return;
 		currentImePadding = imePx;
@@ -5606,6 +5703,7 @@ public class MainActivity extends Activity {
 			webView.setBackgroundColor(shellColor(R.color.shell_background));
 		}
 		applySystemBars();
+		applyWelcomeWidth();
 		if (webView != null && uiState == UiState.WEB) {
 			// 折叠/展开、旋转后按新档位即时生效（契约 3.1/3.3）：
 			// 只改注入配置 + 调 hook 的幂等切换 API，绝不重载 WebView、绝不碰隧道。
