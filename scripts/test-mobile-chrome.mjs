@@ -136,6 +136,15 @@ function assertSourceContracts() {
 	if (!/if \(isAndroidShell\(\)\) return portrait/.test(matrix[0]) || !/return !!mql\.matches/.test(matrix[0])) {
 		throw new Error("源码契约：device='auto' 必须等价于改动前行为（壳内只看竖屏，web 端只看宽度断点）");
 	}
+	if (!/if \(officialAndroidShell\(\)\) return false;/.test(matrix[0])) {
+		throw new Error("源码契约：Android 壳 chrome:false 必须关掉自有移动 chrome");
+	}
+	if (!src.includes("function officialGesturePlan") || !src.includes("function installOfficialHost")) {
+		throw new Error("源码契约：官方抽屉跟手接线缺失");
+	}
+	if (!src.includes("[data-sidebar-opener]") || !src.includes("[data-sidebar-right-expand]") || !src.includes("[data-sidebar-right-toggle]")) {
+		throw new Error("源码契约：跟手松手必须点官方开关，不能自造抽屉");
+	}
 	// 契约 3.3：运行时切换 API 必须挂在脚本顶层且幂等。
 	if (!/window\.__dshrSetDevice = function \(mode\)/.test(src)) {
 		throw new Error("源码契约：缺少 window.__dshrSetDevice 运行时档位切换 API");
@@ -1446,6 +1455,11 @@ function assertSourceContracts() {
 
 function findBrowser() {
 	const candidates = [
+		process.env.CHROME_PATH || "",
+		"/usr/local/bin/google-chrome",
+		"/usr/bin/google-chrome",
+		"/usr/bin/chromium",
+		"/usr/bin/chromium-browser",
 		join(process.env.ProgramFiles || "", "Google/Chrome/Application/chrome.exe"),
 		join(process.env["ProgramFiles(x86)"] || "", "Google/Chrome/Application/chrome.exe"),
 		join(process.env.LOCALAPPDATA || "", "Google/Chrome/Application/chrome.exe"),

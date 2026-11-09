@@ -4676,7 +4676,7 @@ public class MainActivity extends Activity {
 	private String deviceModeScript() {
 		String mode = deviceMode();
 		return "(function(){window.__DSHR_MOBILE__=Object.assign(window.__DSHR_MOBILE__||{},{device:'" + mode
-			+ "'});var s=window.__dshrSetDevice;if(typeof s==='function')s('" + mode + "');})()";
+			+ "',chrome:false});var s=window.__dshrSetDevice;if(typeof s==='function')s('" + mode + "');})()";
 	}
 
 	/**
@@ -5556,18 +5556,14 @@ public class MainActivity extends Activity {
 	private static final String ADAPT_EFFECT_JS =
 		"(function(){try{"
 		+ "var r=document.documentElement;"
-		+ "var root=r.classList.contains('dshr-mobile');"
-		+ "var w=document.getElementById('dshr-mobile-whale');"
-		+ "var whale=!!(w&&w.getClientRects&&w.getClientRects().length>0);"
-		// hook 主动收起鲸鱼的两个状态（右侧栏全屏 / Explorer 详情替换模式）不判为
-		// 未生效：那两条 display:none!important 是 hook 自己打的，能读到这两个
-		// data-dshr-* 就证明脚本已经跑过并写过痕迹。
-		+ "var hidden=r.getAttribute('data-dshr-rightbar-fullscreen')==='1'"
-		+ "||r.getAttribute('data-dshr-explorer-details')==='1';"
-		+ "return {root:root,whale:whale,hidden:hidden,"
-		+ "ready:r.getAttribute('data-dshr-ready')==='1',"
+		+ "var whaleEl=document.getElementById('dshr-mobile-whale');"
+		+ "var official=window.__dshrOfficialHost===true"
+		+ "&&!r.classList.contains('dshr-mobile')"
+		+ "&&!whaleEl"
+		+ "&&window.__dshRemoteInsets&&typeof window.__dshRemoteInsets.set==='function';"
+		+ "return {official:!!official,root:false,whale:false,hidden:false,"
 		+ "cls:r.className||'',href:(location&&location.href)||''};"
-		+ "}catch(e){return {root:false,whale:false,hidden:false,err:String(e)};}})()";
+		+ "}catch(e){return {official:false,err:String(e)};}})()";
 
 	/** 自检轮数上限：有界重试，避免「永久不生效」时无限补注。 */
 	private static final int ADAPT_PROBE_MAX_ROUNDS = 3;
@@ -5668,8 +5664,7 @@ public class MainActivity extends Activity {
 		if (TextUtils.isEmpty(json)) return false;
 		try {
 			JSONObject o = new JSONObject(json);
-			if (!o.optBoolean("root", false)) return false;
-			return o.optBoolean("whale", false) || o.optBoolean("hidden", false);
+			return o.optBoolean("official", false);
 		} catch (Exception e) {
 			return false;
 		}

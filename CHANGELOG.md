@@ -31,6 +31,13 @@
 - ⚠️ 安全提示：8 位口令强度回到 rc.2.22 之前；公网入口（`entryEnabled`）与 edge
   场景仍建议使用 ≥16 位随机密钥。
 
+### ③ Android 壳会话页改走官方 Harness
+
+- Android 注入 `mobile.js` 前写入 `__DSHR_MOBILE__.chrome = false`。壳内不再创建悬浮鲸鱼、圆角抽屉、全屏设置改写和焦点守卫效果。
+- 官方空会话上的品牌鲸鱼和「探索未至之境」仍会显示，那是 deepseek-harness 自己的首页（对照 `master` `fcc0ad4`，dsh-v0.2.2-rc.1 合入 master）。
+- 视口低于 768px 时，跟手滑动只推动官方 `data-sidebar-drawer` 和右侧 dock，松手过半后点击官方开关。左抽屉里的服务器切换保留。隧道、证书、配对和添加/编辑服务器页面不动。
+- 浏览器和 edge 不写 `chrome: false`，原有窄屏 hook 保持原样。
+
 ---
 
 ## v0.2.0-rc.2.24（手机档终端「弹出来后点击没反应」修复）
