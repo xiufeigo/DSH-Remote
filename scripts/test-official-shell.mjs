@@ -9,6 +9,7 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { inflateSync } from "node:zlib";
 import vm from "node:vm";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -23,6 +24,11 @@ assert.match(hook, /function officialAndroidShell\(\)/);
 assert.match(hook, /if \(officialAndroidShell\(\)\) return false;/);
 assert.match(hook, /\[data-sidebar-opener\]/);
 assert.match(hook, /\[data-sidebar-right-expand\]/);
+assert.match(
+	hook,
+	/\[data-sidebar-right-panel="fullscreen"\]:not\(\[data-sidebar-right-open\]\)/,
+	"收起的 fullscreen 右栏不得再铺不透明底",
+);
 assert.doesNotMatch(
 	hook.slice(hook.indexOf("function installOfficialDrawerGestures"), hook.indexOf("function installOfficialHost")),
 	/dshr-mobile-whale|createElement\(/,
@@ -142,6 +148,106 @@ document.getElementById('collapse').onclick = function () {
 </body>
 </html>`;
 
+const transcript = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; background: #fff; }
+  #frame {
+    position: relative; display: grid;
+    grid-template-columns: 0px minmax(0, 1fr) minmax(0, 0px);
+    width: 390px; height: 844px; overflow: clip;
+  }
+  #center { grid-column: 2; grid-row: 1; position: relative; min-width: 0; }
+  #tab { position: relative; z-index: 1; height: 48px; }
+  #msg { height: 72px; margin: 16px; background: #1a7f37; color: #fff; }
+  #composer { position: relative; z-index: 9; height: 64px; margin: 16px; background: #f3f3f3; }
+  #rightcol { grid-column: 3; grid-row: 1; position: relative; overflow: visible; }
+  #panel {
+    position: absolute; top: 0; right: 0; bottom: 0; width: 100vw;
+    pointer-events: none; --dsh-sidebar-width: 100vw;
+  }
+  #dock { height: 100%; background: #d6e4ff; transform: translateX(100vw); visibility: hidden; }
+</style>
+</head>
+<body>
+<script>
+window.__DSHR_MOBILE__ = { device: 'phone', chrome: false };
+document.documentElement.style.setProperty('--dshr-inset-top', '47px');
+document.documentElement.style.setProperty('--dshr-inset-bottom', '34px');
+document.documentElement.style.setProperty('--dshr-inset-left', '0px');
+document.documentElement.style.setProperty('--dshr-inset-right', '0px');
+</script>
+<div id="frame" data-sidebar-drawer data-sidebar-collapsed>
+  <div id="center">
+    <div id="tab" data-slot="header">对话</div>
+    <div id="msg">可见消息</div>
+    <div id="composer" data-composer-seat>发消息或创建任务</div>
+  </div>
+  <div id="rightcol">
+    <div id="panel" data-sidebar-right-panel="fullscreen" aria-hidden="true">
+      <div id="dock" data-dockkit-host="dock">dock</div>
+    </div>
+  </div>
+</div>
+<script src="/packages/gateway/assets/mobile-web.js"></script>
+</body>
+</html>`;
+
+function pngPixel(buf, x, y) {
+	let offset = 8;
+	let width = 0;
+	let height = 0;
+	let color = 0;
+	const idats = [];
+	while (offset + 8 <= buf.length) {
+		const len = buf.readUInt32BE(offset);
+		const type = buf.toString("ascii", offset + 4, offset + 8);
+		const data = buf.subarray(offset + 8, offset + 8 + len);
+		if (type === "IHDR") {
+			width = data.readUInt32BE(0);
+			height = data.readUInt32BE(4);
+			color = data[9];
+		} else if (type === "IDAT") idats.push(data);
+		else if (type === "IEND") break;
+		offset += 12 + len;
+	}
+	const raw = inflateSync(Buffer.concat(idats));
+	const bpp = color === 6 ? 4 : 3;
+	const stride = width * bpp;
+	let cursor = 0;
+	let prev = null;
+	const row = Buffer.alloc(stride);
+	const targetY = Math.max(0, Math.min(height - 1, y));
+	for (let py = 0; py <= targetY; py++) {
+		const filter = raw[cursor++];
+		for (let i = 0; i < stride; i++) {
+			const value = raw[cursor++];
+			const left = i >= bpp ? row[i - bpp] : 0;
+			const up = prev ? prev[i] : 0;
+			const upLeft = prev && i >= bpp ? prev[i - bpp] : 0;
+			let out = value;
+			if (filter === 1) out = value + left;
+			else if (filter === 2) out = value + up;
+			else if (filter === 3) out = value + Math.floor((left + up) / 2);
+			else if (filter === 4) {
+				const guess = left + up - upLeft;
+				const pa = Math.abs(guess - left);
+				const pb = Math.abs(guess - up);
+				const pc = Math.abs(guess - upLeft);
+				const pick = pa <= pb && pa <= pc ? left : pb <= pc ? up : upLeft;
+				out = value + pick;
+			}
+			row[i] = out & 255;
+		}
+		prev = Buffer.from(row);
+	}
+	const px = Math.max(0, Math.min(width - 1, x));
+	const i = px * bpp;
+	return { r: row[i], g: row[i + 1], b: row[i + 2], width, height };
+}
+
 function findBrowser() {
 	const candidates = [
 		process.env.CHROME_PATH || "",
@@ -161,6 +267,11 @@ const server = createServer((req, res) => {
 	if (url === "/fixture") {
 		res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
 		res.end(fixture);
+		return;
+	}
+	if (url === "/transcript") {
+		res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+		res.end(transcript);
 		return;
 	}
 	if (url === "/packages/gateway/assets/mobile-web.js") {
@@ -324,6 +435,52 @@ try {
 	assert.equal(afterComposer.clicks, beforeComposer);
 	assert.equal(afterComposer.collapsed, true);
 	assert.equal(afterComposer.transform, "");
+
+	await call("Page.navigate", { url: `http://127.0.0.1:${port}/transcript` });
+	await wait(600);
+	const closedSample = await evaluate(`(() => {
+		const msg = document.getElementById('msg').getBoundingClientRect();
+		const panel = document.getElementById('panel');
+		return {
+			x: msg.x + msg.width / 2,
+			y: msg.y + msg.height / 2,
+			bg: getComputedStyle(panel).backgroundColor,
+			open: panel.hasAttribute('data-sidebar-right-open'),
+			official: window.__dshrOfficialHost === true,
+			whale: !!document.getElementById('dshr-mobile-whale'),
+			w: window.innerWidth,
+			h: window.innerHeight,
+		};
+	})()`);
+	assert.equal(closedSample.official, true, JSON.stringify(closedSample));
+	assert.equal(closedSample.whale, false);
+	assert.equal(closedSample.open, false);
+	assert.equal(closedSample.bg, "rgba(0, 0, 0, 0)", JSON.stringify(closedSample));
+	const closedShot = Buffer.from((await call("Page.captureScreenshot", { format: "png" })).data, "base64");
+	const closedSize = { width: closedShot.readUInt32BE(16), height: closedShot.readUInt32BE(20) };
+	const closedPixel = pngPixel(
+		closedShot,
+		Math.round(closedSample.x * closedSize.width / closedSample.w),
+		Math.round(closedSample.y * closedSize.height / closedSample.h),
+	);
+	assert.ok(
+		closedPixel.g > 90 && closedPixel.r < 80 && closedPixel.b < 100,
+		`收起右栏不应盖住消息，像素 ${JSON.stringify(closedPixel)} @ ${closedSize.width}x${closedSize.height}`,
+	);
+
+	await evaluate("document.getElementById('panel').setAttribute('data-sidebar-right-open','')");
+	const openBg = await evaluate("getComputedStyle(document.getElementById('panel')).backgroundColor");
+	assert.equal(openBg, "rgb(255, 255, 255)", openBg);
+	const openShot = Buffer.from((await call("Page.captureScreenshot", { format: "png" })).data, "base64");
+	const openPixel = pngPixel(
+		openShot,
+		Math.round(closedSample.x * closedSize.width / closedSample.w),
+		Math.round(closedSample.y * closedSize.height / closedSample.h),
+	);
+	assert.ok(
+		openPixel.r > 240 && openPixel.g > 240 && openPixel.b > 240,
+		`打开的右栏仍应铺底盖住消息，像素 ${JSON.stringify(openPixel)}`,
+	);
 	ws.close();
 } finally {
 	child.kill("SIGKILL");

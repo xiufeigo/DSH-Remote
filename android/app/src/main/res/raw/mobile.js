@@ -450,6 +450,19 @@
 		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
 		'  background: var(--dsw-alias-bg-base, var(--dsw-specific-background, #ffffff)) !important;',
 		'}',
+		// 手机档（视口 <768）官方右栏**收起时**也是 fullscreen：盒子 width:100vw、
+		// position:absolute、z-index:auto，从 0 宽右栏列向左盖住整屏；内层 dock
+		// translateX(100vw) 且 visibility:hidden。自有 chrome 靠主列 z-index:20
+		// 把这张收起的板压在会话下面，所以上面那条白底看不见。
+		// Android 壳 chrome:false 不挂 dshr-mobile，主列没有这个层叠上下文。
+		// 收起板的不透明底就会盖住正文（in-flow），顶栏（z-index:1）和 composer
+		// （z-index:9）仍画在上面，会话看起来整片空白，轮次/token 却还在。
+		// 只在官方壳 / 平板档、且面板未打开时把底色改回透明。打开
+		// （data-sidebar-right-open）仍用上面的 token 垫系统栏。
+		// 自有 chrome 的主列压盖关系不动。
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) [data-sidebar-right-panel="fullscreen"]:not([data-sidebar-right-open]) {',
+		'  background: transparent !important;',
+		'}',
 		// ── T136：docked（push）态的右栏面板也必须让开系统栏（本轮用户实机 bug）──
 		//
 		// 官方布局实测（DSH 0.2.0-rc.2 / @deepseek-ai/dsh-client-ui-sidebar-right）：
@@ -3045,6 +3058,8 @@
 	 *      重新逐字成立，唯一的例外只剩下面 T115 这一组。
 	 *      ⚠ T115 起再有**一组例外**：以同一作用域开头的平板档让位规则（三列 padding 四向
 	 *      + 会话面板列的底色）。它同样是「改绘制/布局、不写节点/属性/类名」。
+	 *      收起的 fullscreen 右栏不铺不透明底（:not([data-sidebar-right-open])）：
+	 *      chrome:false 没有主列 z-index:20，100vw 的收起板会把会话正文刷白。
 	 *      另外 <html> 上的四个 --dshr-inset-* 变量本函数**刻意不摘**——平板档正靠它们让位，
 	 *      摘掉就等于把让位一起摘掉（换回 phone 档时 set() 会重写同一批变量，不留脏值）。
 	 *   2. MutationObserver——严格 OFF 下根本不安装（它会在 <html> 上写
