@@ -22,6 +22,10 @@
  *     （'phone' | 'tablet' | 'auto'，缺省 'auto'）。'tablet' 任意朝向都走官方
  *     DSH 桌面布局（本脚本在 OFF 态逐项拆除自身痕迹，见 teardownHookTraces）；
  *     'phone' 竖屏启用、横屏 OFF；'auto' 完全等价于本文件改动前的既有行为，
+ *   - Android 壳另外写 `__DSHR_MOBILE__.chrome = false`。这时手机和平板都不套
+ *     自有 chrome（没有悬浮鲸鱼、圆角抽屉、全屏设置改写）。连上后的页面就是
+ *     官方 Harness。系统栏仍用既有 inset 变量；窄屏官方抽屉上另有一段跟手滑动，
+ *     松手后点官方开关提交。浏览器 / edge 不写 chrome:false，窄屏 hook 不变。
  *     web/edge 路径逐字节不变。档位只由原生判定，JS 侧不看视口宽度（WEB-02）。
  *   - 运行时切换：window.__dshrSetDevice(mode) 幂等重算，hook 未装完时先落
  *     配置、装完后按最新值生效（不抛错），供原生 onConfigurationChanged 调用。
@@ -345,7 +349,8 @@
 		// （frame 只有一种底色，垫在它身上必然让某一边露出异色）。
 		// box-sizing: border-box 是硬要求：三列的官方高度是 100%，不加它 padding 会把列撑高。
 		//
-		// 作用域仍是 `html:not(.dshr-mobile):not(.dshr-official-inset)`（恰好等于 deviceMode==='tablet'），
+		// 作用域仍是 `html:not(.dshr-mobile):not(.dshr-official-inset)`（平板档，以及
+		// Android 壳 `chrome: false` 的官方界面），
 		// 规则住在**既有的** <style data-dshr-mobile-css> 里 ⇒ 不新增 DOM 节点 / 类名 /
 		// data-dshr-* 属性；元素锚点全部走官方结构属性（单层 :has()），不碰 CSS module 哈希类名。
 		// 值语义与手机档逐字同源：var(--dshr-inset-*, env(safe-area-inset-*, 0px))。
@@ -362,6 +367,11 @@
 		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
 		'  padding-left: var(--dshr-inset-left, env(safe-area-inset-left, 0px)) !important;',
 		'  padding-right: var(--dshr-inset-right, env(safe-area-inset-right, 0px)) !important;',
+		'}',
+		// Android 官方界面：窄屏重开侧栏的按钮在 frame 的 leading seat 上，不在被 padding 的列里。
+		// 只把它从状态栏下移，不改官方图标、不另做品牌按钮。
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) [data-shell-leading] {',
+		'  top: calc(11px + var(--dshr-inset-top, env(safe-area-inset-top, 0px))) !important;',
 		'}',
 		// 会话面板列官方自己的 background 是 transparent（白底在更深的子节点上）⇒ 只垫 padding
 		// 会把 frame 的侧栏底色透出来，形成一条新的异色带。这里显式给列铺上和「面板同源」的
@@ -2990,18 +3000,31 @@
 	 *   - 'auto'  ：完全等价于本文件改动前的既有行为——壳内只看竖屏，web 端只看
 	 *     视口宽度 ≤ 断点，逐字节不变。
 	 */
+	/**
+	 * Android 壳在注入前写 `__DSHR_MOBILE__.chrome === false`。
+	 * 这时不启用自有移动 chrome（悬浮鲸鱼、圆角抽屉、全屏设置改写）。
+	 * 浏览器 / edge 不写该字段，窄屏 hook 保持原样。
+	 */
+	function officialAndroidShell() {
+		try {
+			var cfg = window.__DSHR_MOBILE__;
+			return !!(isAndroidShell() && cfg && cfg.chrome === false);
+		} catch (ignoredOfficial) { return false; }
+	}
+
 	function resolveHookEnabled(portrait) {
+		if (officialAndroidShell()) return false;
 		if (deviceMode === 'tablet') return false;
 		if (deviceMode === 'phone') return portrait;
 		if (isAndroidShell()) return portrait;
 		return !!mql.matches;
 	}
 
-	// 严格 OFF 只属于 'tablet' 档：T115 起页面要自己让位，因此它在 <html> 上**保留**
-	// 四个 --dshr-inset-* 变量（那是让位的输入），其余一切照旧回到零痕迹状态。
-	// 'phone' 横屏与 'auto' 仍走既有 OFF 分支。
+	// 严格 OFF：平板档，以及 Android 壳 chrome:false。T115 起页面要自己让位，
+	// 因此 <html> 上保留四个 --dshr-inset-*。不写 dshr-mobile / dshr-official-inset。
+	// 未写 chrome:false 的手机横屏与 auto 仍走既有 OFF 分支。
 	function isStrictOff() {
-		return deviceMode === 'tablet';
+		return officialAndroidShell() || deviceMode === 'tablet';
 	}
 
 	// hook 当前启用态。__dshrSetDevice 与 applyWidthScope 共用，保证同值零副作用。
@@ -3116,7 +3139,7 @@
 		// T90：连接态观测跟着 hook 启用态走 —— 严格 OFF（平板）与关闭态一律还原
 		// `window.WebSocket`（零痕迹不只 DOM），启用态安装（幂等）。必须放在下面那条
 		// strictOff 早退**之前**，否则切到平板档时构造器还原不掉。
-		syncWsStateWatch(on && !isStrictOff());
+		syncWsStateWatch((officialAndroidShell() && deviceMode !== 'tablet') || (on && !isStrictOff()));
 		// T97/T103：档位闸（T103 起手机档也挂）。**只**由 brandLongPressWanted() 决定：
 		// 平板档（严格 OFF）与手机档（hook 启用态 = 竖屏）挂；手机横屏 / auto 档
 		// **一个监听器都不挂** ⇒ 那些档位的既有鲸鱼、抽屉拖动、右栏、焦点守卫零影响。
@@ -5744,12 +5767,280 @@
 		return true;
 	}
 
+	/**
+	 * 官方抽屉跟手计划。不创建节点。
+	 * 右滑（dx>0）开左抽屉，左滑开右抽屉；已经开着的那一侧只接受收回方向。
+	 * progress 0 = 完全收起，1 = 完全打开。松手过半则 open=true。
+	 */
+	function officialGesturePlan(input) {
+		var dx = Number(input.dx) || 0;
+		var dy = Number(input.dy) || 0;
+		if (input.blocked) return null;
+		if (Math.abs(dx) < 12 || Math.abs(dx) < Math.abs(dy) * 1.15) return null;
+		var leftOpen = !!input.leftOpen;
+		var rightOpen = !!input.rightOpen;
+		var side = null;
+		if (leftOpen) side = dx < 0 ? 'left' : null;
+		else if (rightOpen) side = dx > 0 ? 'right' : null;
+		else side = dx > 0 ? 'left' : 'right';
+		if (!side) return null;
+		var leftWidth = Number(input.leftWidth) > 0 ? Number(input.leftWidth) : (Number(input.width) > 0 ? Number(input.width) : 1);
+		var rightWidth = Number(input.rightWidth) > 0 ? Number(input.rightWidth) : leftWidth;
+		var width = side === 'left' ? leftWidth : rightWidth;
+		var travel = side === 'left'
+			? (leftOpen ? width + Math.min(0, dx) : Math.max(0, dx))
+			: (rightOpen ? width - Math.max(0, dx) : Math.max(0, -dx));
+		var progress = travel / width;
+		if (progress < 0) progress = 0;
+		if (progress > 1) progress = 1;
+		var wasOpen = side === 'left' ? leftOpen : rightOpen;
+		return { side: side, progress: progress, open: progress >= 0.5, toggle: (progress >= 0.5) !== wasOpen };
+	}
+
+	function installOfficialDrawerGestures() {
+		if (window.__dshrOfficialGestures) return;
+		window.__dshrOfficialGestures = true;
+		var active = null;
+		var settleTimer = 0;
+
+		function drawerFrame() {
+			return document.querySelector('[data-sidebar-drawer]');
+		}
+		function leftIsOpen() {
+			var frame = drawerFrame();
+			return !!(frame && !frame.hasAttribute('data-sidebar-collapsed'));
+		}
+		function rightPanel() {
+			return document.querySelector('[data-sidebar-right-panel]');
+		}
+		function rightIsOpen() {
+			var panel = rightPanel();
+			return !!(panel && panel.hasAttribute('data-sidebar-right-open'));
+		}
+		function leftColumn() {
+			var frame = drawerFrame();
+			if (!frame) return null;
+			var node = frame.querySelector('[data-shortcut-modal="sidebar"]') || frame.querySelector('[data-slot="sidebar"]');
+			if (!node) return null;
+			while (node.parentElement && node.parentElement !== frame) node = node.parentElement;
+			return node.parentElement === frame ? node : null;
+		}
+		function rightPieces() {
+			var panel = rightPanel();
+			return panel ? panel.querySelectorAll('[data-dockkit-host="dock"], [data-dockkit-empty], [data-dockkit-divider]') : [];
+		}
+		function gestureBlocked(target) {
+			if (!target || !target.closest) return true;
+			if (target.closest('input, textarea, select, [contenteditable="true"], .xterm, .xterm-screen')) return true;
+			var menu = document.getElementById('dshr-server-menu');
+			if (menu && !menu.hidden && menu.contains(target)) return true;
+			var dialog = target.closest('[role="dialog"][aria-modal="true"]');
+			if (dialog && dialog.getAttribute('data-shortcut-modal') !== 'sidebar') return true;
+			var node = target;
+			while (node && node !== document.documentElement) {
+				if (node.scrollWidth > node.clientWidth + 16) {
+					try {
+						var overflowX = window.getComputedStyle(node).overflowX;
+						if (overflowX === 'auto' || overflowX === 'scroll') return true;
+					} catch (ignoredOverflow) { /* 读不到就不当滚动容器 */ }
+				}
+				node = node.parentElement;
+			}
+			return false;
+		}
+		function clickSelector(selector) {
+			var el = document.querySelector(selector);
+			if (!el || el.disabled) return false;
+			try { el.click(); return true; } catch (ignoredClick) { return false; }
+		}
+		function syncOfficialOpen(plan) {
+			if (!plan || !plan.toggle) return;
+			if (plan.side === 'left') {
+				if (plan.open) {
+					if (!clickSelector('[data-sidebar-opener]')) {
+						clickSelector('button[aria-label="打开侧边栏"], button[aria-label="Open sidebar"]');
+					}
+				} else if (!clickSelector('[data-sidebar-toggle]')) {
+					clickSelector('button[aria-label="收起侧边栏"], button[aria-label="Collapse sidebar"]');
+				}
+				return;
+			}
+			if (plan.open) clickSelector('[data-sidebar-right-expand]');
+			else clickSelector('[data-sidebar-right-toggle]');
+		}
+		function paintGesture(plan, drag) {
+			if (plan.side === 'left' && drag.col) {
+				drag.col.style.transition = 'none';
+				drag.col.style.visibility = 'visible';
+				drag.col.inert = false;
+				drag.col.style.transform = 'translateX(' + ((plan.progress - 1) * 100) + '%)';
+				if (drag.mask) {
+					drag.mask.style.transition = 'none';
+					drag.mask.style.opacity = String(plan.progress);
+					drag.mask.style.pointerEvents = plan.progress > 0.02 ? 'auto' : 'none';
+				}
+				return;
+			}
+			if (plan.side !== 'right' || !drag.pieces) return;
+			var shift = Math.round((1 - plan.progress) * drag.travel);
+			for (var i = 0; i < drag.pieces.length; i++) {
+				drag.pieces[i].style.transition = 'none';
+				drag.pieces[i].style.visibility = 'visible';
+				drag.pieces[i].style.transform = 'translateX(' + shift + 'px)';
+			}
+		}
+		function clearGesture(drag) {
+			if (!drag) return;
+			if (drag.col) {
+				drag.col.style.transition = '';
+				drag.col.style.visibility = '';
+				drag.col.style.transform = '';
+				var frame = drawerFrame();
+				drag.col.inert = !!(frame && frame.hasAttribute('data-sidebar-collapsed'));
+			}
+			if (drag.mask) {
+				drag.mask.style.transition = '';
+				drag.mask.style.opacity = '';
+				drag.mask.style.pointerEvents = '';
+			}
+			if (drag.pieces) {
+				for (var i = 0; i < drag.pieces.length; i++) {
+					drag.pieces[i].style.transition = '';
+					drag.pieces[i].style.visibility = '';
+					drag.pieces[i].style.transform = '';
+				}
+			}
+		}
+		function finishGesture(drag, plan) {
+			var reduced = false;
+			try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (ignoredMotion) {}
+			var ms = reduced ? 0 : 180;
+			if (plan.side === 'left' && drag.col) {
+				drag.col.style.transition = ms ? ('transform ' + ms + 'ms ease') : 'none';
+				drag.col.style.transform = 'translateX(' + (plan.open ? 0 : -100) + '%)';
+				if (drag.mask) {
+					drag.mask.style.transition = ms ? ('opacity ' + ms + 'ms ease') : 'none';
+					drag.mask.style.opacity = plan.open ? '1' : '0';
+				}
+			} else if (plan.side === 'right' && drag.pieces) {
+				var shift = plan.open ? 0 : Math.round(drag.travel);
+				for (var i = 0; i < drag.pieces.length; i++) {
+					drag.pieces[i].style.transition = ms ? ('transform ' + ms + 'ms ease') : 'none';
+					drag.pieces[i].style.transform = 'translateX(' + shift + 'px)';
+				}
+			}
+			settleTimer = window.setTimeout(function () {
+				syncOfficialOpen(plan);
+				var tries = 0;
+				var release = function () {
+					var matched = plan.side === 'left' ? leftIsOpen() === plan.open : rightIsOpen() === plan.open;
+					if (matched || tries > 12) {
+						settleTimer = 0;
+						clearGesture(drag);
+						return;
+					}
+					tries += 1;
+					settleTimer = window.setTimeout(release, 50);
+				};
+				release();
+			}, ms + 20);
+		}
+
+		document.addEventListener('touchstart', function (event) {
+			if (settleTimer || !drawerFrame() || !event.touches || event.touches.length !== 1) return;
+			var touch = event.touches[0];
+			if (gestureBlocked(event.target)) return;
+			var column = leftColumn();
+			var panel = rightPanel();
+			var travel = window.innerWidth || 320;
+			if (panel) {
+				var raw = '';
+				try { raw = window.getComputedStyle(panel).getPropertyValue('--dsh-sidebar-width'); } catch (ignoredWidth) {}
+				var parsed = parseFloat(raw);
+				var box = panel.getBoundingClientRect();
+				travel = parsed > 0 ? parsed : (box.width || travel);
+			}
+			var leftWidth = (column && column.getBoundingClientRect().width) || Math.min(360, (window.innerWidth || 360) - 48);
+			active = {
+				x: touch.clientX,
+				y: touch.clientY,
+				plan: null,
+				col: column,
+				mask: drawerFrame().querySelector('[data-sidebar-mask]'),
+				pieces: rightPieces(),
+				travel: travel,
+				leftWidth: leftWidth > 0 ? leftWidth : 280,
+				leftOpen: leftIsOpen(),
+				rightOpen: rightIsOpen(),
+			};
+		}, { passive: true, capture: true });
+
+		document.addEventListener('touchmove', function (event) {
+			if (!active || !event.touches || event.touches.length !== 1) return;
+			var touch = event.touches[0];
+			var plan = officialGesturePlan({
+				dx: touch.clientX - active.x,
+				dy: touch.clientY - active.y,
+				leftWidth: active.leftWidth,
+				rightWidth: active.travel,
+				blocked: false,
+				leftOpen: active.leftOpen,
+				rightOpen: active.rightOpen,
+			});
+			if (!plan) return;
+			active.plan = plan;
+			paintGesture(plan, active);
+			if (event.cancelable) event.preventDefault();
+		}, { passive: false, capture: true });
+
+		document.addEventListener('touchend', function () {
+			if (!active) return;
+			var drag = active;
+			active = null;
+			if (!drag.plan) return;
+			finishGesture(drag, drag.plan);
+		}, { passive: true, capture: true });
+
+		document.addEventListener('touchcancel', function () {
+			if (!active) return;
+			var drag = active;
+			active = null;
+			clearGesture(drag);
+		}, { passive: true, capture: true });
+	}
+
+	function installOfficialHost() {
+		if (window.__dshrOfficialHost) return;
+		window.__dshrOfficialHost = true;
+		installOfficialDrawerGestures();
+		var arm = function () {
+			try { syncPageTheme(); } catch (ignoredTheme) {}
+			if (!document.body || window.__dshrOfficialObs) return;
+			window.__dshrOfficialObs = true;
+			if (typeof MutationObserver === 'undefined') return;
+			var observer = new MutationObserver(function () {
+				try { syncPageTheme(); } catch (ignoredThemeObs) {}
+				try { scheduleSessionNotice(); } catch (ignoredNoticeObs) {}
+			});
+			observer.observe(document.body, {
+				childList: true,
+				subtree: true,
+				attributes: true,
+				attributeFilter: ['data-ds-dark-theme', 'aria-label'],
+			});
+			try { scheduleSessionNotice(); } catch (ignoredNotice) {}
+		};
+		if (document.body) arm();
+		else document.addEventListener('DOMContentLoaded', arm, { once: true });
+	}
+
 	var bootTicks = 0;
 	function boot() {
 		// 平板档：官方 DOM 探针与 hook 无关，不做有界重试（否则白烧 12s 定时器）。
 		// 但状态仍要报给原生（on=false），否则「平板档装上了没生效」在原生侧不可见。
 		if (isStrictOff()) {
 			reportUiDiag();
+			if (officialAndroidShell()) installOfficialHost();
 			return;
 		}
 		var observing = startObserver();
