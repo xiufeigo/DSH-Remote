@@ -43,8 +43,8 @@ test("parseCookies：坏的百分号编码跳过，不抛", () => {
 });
 
 test("短访客密钥被拒，IPv6 主机名可以保存", () => {
-	assert.equal(validateConfigPatch({ visitorKey: "k".repeat(15) }).ok, false);
-	assert.equal(validateConfigPatch({ visitorKey: "k".repeat(16) }).ok, true);
+	assert.equal(validateConfigPatch({ visitorKey: "k".repeat(7) }).ok, false);
+	assert.equal(validateConfigPatch({ visitorKey: "k".repeat(8) }).ok, true);
 	assert.equal(validateConfigPatch({ visitorKey: "has\nline-and-more" }).ok, false);
 	assert.equal(validateConfigPatch({ frp: { serverAddr: "2001:db8::1" } }).ok, true);
 	assert.equal(validateConfigPatch({ frp: { serverAddr: "[2001:db8::1]" } }).ok, true);

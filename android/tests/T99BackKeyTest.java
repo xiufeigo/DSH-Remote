@@ -191,6 +191,10 @@ public final class T99BackKeyTest {
 			"探针覆盖模态弹框（桥的第 3 个分支，不许因 T99 丢语义）");
 		check(probe.indexOf("[data-dshr-sheet-panel]") >= 0,
 			"探针覆盖 sheet 面板（桥的第 1 个分支）");
+		check(probe.indexOf("[data-plugin-panel]") >= 0,
+			"探针覆盖插件全页（返回键回到上一级，不退桌面）");
+		check(probe.indexOf("[data-global-panel]") >= 0,
+			"探针覆盖无会话的全局全页");
 		check(probe.indexOf("data-dshr-explorer-details") >= 0,
 			"探针覆盖 Explorer 详情（桥的第 2 个分支）");
 		check(probe.indexOf("getClientRects") >= 0,

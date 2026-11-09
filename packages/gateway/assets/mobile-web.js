@@ -354,14 +354,14 @@
 		// 规则住在**既有的** <style data-dshr-mobile-css> 里 ⇒ 不新增 DOM 节点 / 类名 /
 		// data-dshr-* 属性；元素锚点全部走官方结构属性（单层 :has()），不碰 CSS module 哈希类名。
 		// 值语义与手机档逐字同源：var(--dshr-inset-*, env(safe-area-inset-*, 0px))。
-		// T126：右栏列加第二锚点 `div:has(> [data-sidebar-right-panel])` —— 官方 docked
-		// 右栏的列直接子节点不一定带 `data-slot="rightbar"`（以面板自身属性为准才是稳定的；
-		// 左栏/主列沿用 data-slot 锚点，那两列经用户实测让位正常，不动）。
-		// 两条候选命中同一 div 时声明逐字相同 ⇒ 幂等，不存在双重 padding。
+		// T126：右栏列加第二锚点只认 docked 的 `=push`。手机档全屏右侧栏
+		// `[data-sidebar-right-panel=fullscreen]` 关闭后仍绝对定位铺满视口、
+		// visibility 仍是 visible、只靠 pointer-events:none 不接点击——给它或它
+		// 的宿主铺不透明底会把会话消息盖成空白（真机：顶栏/输入区还在，中间没了）。
 		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="sidebar"]),',
 		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="main"]),',
 		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="rightbar"]),',
-		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-sidebar-right-panel]) {',
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-sidebar-right-panel="push"]) {',
 		'  box-sizing: border-box !important;',
 		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
 		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
@@ -380,7 +380,7 @@
 		// T126：与上一组 padding 规则同理，右栏列背景补第二锚点。
 		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="main"]),',
 		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-slot="rightbar"]),',
-		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-sidebar-right-panel]) {',
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) div:has(> [data-sidebar-right-panel="push"]) {',
 		'  background: var(--dsw-alias-bg-base, var(--dsw-specific-background, #ffffff)) !important;',
 		'}',
 		// 深色档不另写规则（与 T101 同口径）：--dsw-alias-bg-base / --dsw-specific-sidebar-fill
@@ -441,14 +441,22 @@
 		// 平板档同样要垫：syncDom 在严格 OFF 下直接返回（无 data-dshr-* 标记），
 		// 所以平板这条走纯结构选择器（官方自己的 =fullscreen 值，不依赖任何 hook 标记）；
 		// 背景走同一个官方 token，深浅色由 token 自己跟随（平板不挂 data-dshr-dark）。
-		'html.dshr-official-inset [data-sidebar-right-panel="fullscreen"],',
-		'html.' + ROOT_CLASS + ' [data-sidebar-right-panel="fullscreen"],',
-		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) [data-sidebar-right-panel="fullscreen"],',
+		// 只在面板打开时铺底：关闭态官方仍把 fullscreen 面板铺满视口且可见，
+		// 只是不接点击。关着也写 background 会盖住会话。
+		'html.dshr-official-inset [data-sidebar-right-panel="fullscreen"][data-sidebar-right-open],',
+		'html.' + ROOT_CLASS + ' [data-sidebar-right-panel="fullscreen"][data-sidebar-right-open],',
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) [data-sidebar-right-panel="fullscreen"][data-sidebar-right-open],',
 		'html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen="1"] [data-sidebar-right-panel] {',
 		'  box-sizing: border-box !important;',
 		'  padding-top: var(--dshr-inset-top, env(safe-area-inset-top, 0px)) !important;',
 		'  padding-bottom: var(--dshr-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;',
 		'  background: var(--dsw-alias-bg-base, var(--dsw-specific-background, #ffffff)) !important;',
+		'}',
+		'html.dshr-official-inset [data-sidebar-right-panel="fullscreen"]:not([data-sidebar-right-open]),',
+		'html:not(.' + ROOT_CLASS + '):not(.dshr-official-inset) [data-sidebar-right-panel="fullscreen"]:not([data-sidebar-right-open]) {',
+		'  background: transparent !important;',
+		'  padding-top: 0 !important;',
+		'  padding-bottom: 0 !important;',
 		'}',
 		// ── T136：docked（push）态的右栏面板也必须让开系统栏（本轮用户实机 bug）──
 		//
@@ -5767,10 +5775,109 @@
 		return true;
 	}
 
+	var lastConversationTitle = '';
+	var lastSessionRowKey = '';
+	function visibleRect(el) {
+		if (!el || !el.getBoundingClientRect) return null;
+		var box = el.getBoundingClientRect();
+		if (!(box.width > 0 && box.height > 0)) return null;
+		return box;
+	}
+	function hasVisibleConversation() {
+		var nodes = document.querySelectorAll('[data-composer-seat], [data-composer-card], [data-slot="conversation.header"]');
+		for (var i = 0; i < nodes.length; i++) {
+			if (visibleRect(nodes[i])) return true;
+		}
+		return false;
+	}
+	function isWorkspaceRowKey(key) {
+		return String(key || '').indexOf('workspace:') === 0;
+	}
+	function findRowByKey(key) {
+		if (!key) return null;
+		var rows = document.querySelectorAll('[data-row-key]');
+		for (var i = 0; i < rows.length; i++) {
+			if (rows[i].getAttribute('data-row-key') === key) return rows[i];
+		}
+		return null;
+	}
+	function rememberSessionRow(row) {
+		if (!row || !row.getAttribute) return;
+		var key = row.getAttribute('data-row-key') || '';
+		if (key && !isWorkspaceRowKey(key)) lastSessionRowKey = key;
+	}
+	function rememberSessionIfAny() {
+		if (document.querySelector('[data-plugin-panel]')) return;
+		if (!hasVisibleConversation()) return;
+		var header = document.querySelector('[data-slot="conversation.header"]');
+		var name = header ? String(header.innerText || '').replace(/\s+/g, ' ').trim() : '';
+		name = name.replace(/\s+(Chat|Trajectory|对话|轨迹)\b[\s\S]*$/i, '').trim();
+		if (!name) {
+			var pageTitle = String(document.title || '');
+			name = pageTitle.replace(/\s*[—–-]\s*DeepSeek Harness\s*$/i, '').trim();
+			if (name === pageTitle) name = '';
+		}
+		if (name && name.length < 80) lastConversationTitle = name;
+		var rows = document.querySelectorAll('[data-row-key]');
+		for (var r = 0; r < rows.length; r++) {
+			var cur = rows[r].getAttribute('aria-current') || rows[r].getAttribute('aria-selected');
+			if (cur === 'page' || cur === 'true') rememberSessionRow(rows[r]);
+		}
+	}
+	function isOfficialShellSubpage() {
+		if (hasVisibleConversation()) return false;
+		if (document.querySelector('[data-plugin-panel], [data-global-panel]')) return true;
+		var current = document.querySelector('[aria-current="page"]');
+		return !!(current && current.closest('[data-slot="sidebar"], [data-shortcut-modal="sidebar"]'));
+	}
+	function clickVisibleBackIn(root) {
+		if (!root || !root.querySelectorAll) return false;
+		var nodes = root.querySelectorAll('button, a, [role="button"]');
+		for (var i = 0; i < nodes.length; i++) {
+			var el = nodes[i];
+			if (!visibleRect(el)) continue;
+			var t = (el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText || '').replace(/\s+/g, ' ').trim();
+			if (/^(Back|Close|返回|关闭)$/i.test(t) || /^(Go back|Navigate back)$/i.test(t)) {
+				try { el.click(); } catch (ignoredBackClick) { /* 官方自己处理 */ }
+				return true;
+			}
+		}
+		return false;
+	}
+	function findSessionReturnTarget() {
+		var hit = findRowByKey(lastSessionRowKey);
+		if (hit) return hit;
+		var title = lastConversationTitle;
+		if (title) {
+			var rows = document.querySelectorAll('[role="treeitem"][data-row-key], [data-row-key]');
+			for (var i = 0; i < rows.length; i++) {
+				var el = rows[i];
+				if (isWorkspaceRowKey(el.getAttribute('data-row-key'))) continue;
+				var text = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+				if (text === title || text.indexOf(title) === 0) return el;
+			}
+		}
+		var buttons = document.querySelectorAll('button');
+		for (var j = 0; j < buttons.length; j++) {
+			var lab = (buttons[j].getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+			if (/^New session$|^新会话$/i.test(lab)) return buttons[j];
+		}
+		return null;
+	}
+	function dismissOfficialShellSubpage() {
+		if (clickVisibleBackIn(document.querySelector('[data-plugin-panel], [data-global-panel]'))) return true;
+		var hit = findSessionReturnTarget();
+		if (hit) {
+			try { hit.click(); } catch (ignoredLeaveClick) { /* 官方自己处理 */ }
+		}
+		return true;
+	}
+
 	/**
 	 * 官方抽屉跟手计划。不创建节点。
-	 * 右滑（dx>0）开左抽屉，左滑开右抽屉；已经开着的那一侧只接受收回方向。
-	 * progress 0 = 完全收起，1 = 完全打开。松手过半则 open=true。
+	 * 左抽屉：右滑打开、左滑收回，跟手画位移，松手过半点官方按钮。
+	 * 右栏：只从屏幕右缘左滑打开（防误触）；松手后点官方
+	 * [data-sidebar-right-expand]，开合动画交给 Harness。不跟手、不代关。
 	 */
 	function officialGesturePlan(input) {
 		var dx = Number(input.dx) || 0;
@@ -5781,20 +5888,23 @@
 		var rightOpen = !!input.rightOpen;
 		var side = null;
 		if (leftOpen) side = dx < 0 ? 'left' : null;
-		else if (rightOpen) side = dx > 0 ? 'right' : null;
+		else if (rightOpen) return null;
 		else side = dx > 0 ? 'left' : 'right';
 		if (!side) return null;
+		if (side === 'right') {
+			var width = Number(input.width) > 0 ? Number(input.width) : 0;
+			var startX = Number(input.startX);
+			var edge = Math.max(24, Math.min(40, width * 0.1));
+			if (!(width > 0) || !(startX >= width - edge)) return null;
+			if (-dx < 48) return null;
+			return { side: 'right', progress: 1, open: true, toggle: true };
+		}
 		var leftWidth = Number(input.leftWidth) > 0 ? Number(input.leftWidth) : (Number(input.width) > 0 ? Number(input.width) : 1);
-		var rightWidth = Number(input.rightWidth) > 0 ? Number(input.rightWidth) : leftWidth;
-		var width = side === 'left' ? leftWidth : rightWidth;
-		var travel = side === 'left'
-			? (leftOpen ? width + Math.min(0, dx) : Math.max(0, dx))
-			: (rightOpen ? width - Math.max(0, dx) : Math.max(0, -dx));
-		var progress = travel / width;
+		var travel = leftOpen ? leftWidth + Math.min(0, dx) : Math.max(0, dx);
+		var progress = travel / leftWidth;
 		if (progress < 0) progress = 0;
 		if (progress > 1) progress = 1;
-		var wasOpen = side === 'left' ? leftOpen : rightOpen;
-		return { side: side, progress: progress, open: progress >= 0.5, toggle: (progress >= 0.5) !== wasOpen };
+		return { side: 'left', progress: progress, open: progress >= 0.5, toggle: (progress >= 0.5) !== leftOpen };
 	}
 
 	function installOfficialDrawerGestures() {
@@ -5815,7 +5925,7 @@
 		}
 		function rightIsOpen() {
 			var panel = rightPanel();
-			return !!(panel && panel.hasAttribute('data-sidebar-right-open'));
+			return !!(panel && panel.hasAttribute('data-sidebar-right-open') && panel.getAttribute('aria-hidden') !== 'true');
 		}
 		function leftColumn() {
 			var frame = drawerFrame();
@@ -5824,10 +5934,6 @@
 			if (!node) return null;
 			while (node.parentElement && node.parentElement !== frame) node = node.parentElement;
 			return node.parentElement === frame ? node : null;
-		}
-		function rightPieces() {
-			var panel = rightPanel();
-			return panel ? panel.querySelectorAll('[data-dockkit-host="dock"], [data-dockkit-empty], [data-dockkit-divider]') : [];
 		}
 		function gestureBlocked(target) {
 			if (!target || !target.closest) return true;
@@ -5866,27 +5972,17 @@
 				return;
 			}
 			if (plan.open) clickSelector('[data-sidebar-right-expand]');
-			else clickSelector('[data-sidebar-right-toggle]');
 		}
 		function paintGesture(plan, drag) {
-			if (plan.side === 'left' && drag.col) {
-				drag.col.style.transition = 'none';
-				drag.col.style.visibility = 'visible';
-				drag.col.inert = false;
-				drag.col.style.transform = 'translateX(' + ((plan.progress - 1) * 100) + '%)';
-				if (drag.mask) {
-					drag.mask.style.transition = 'none';
-					drag.mask.style.opacity = String(plan.progress);
-					drag.mask.style.pointerEvents = plan.progress > 0.02 ? 'auto' : 'none';
-				}
-				return;
-			}
-			if (plan.side !== 'right' || !drag.pieces) return;
-			var shift = Math.round((1 - plan.progress) * drag.travel);
-			for (var i = 0; i < drag.pieces.length; i++) {
-				drag.pieces[i].style.transition = 'none';
-				drag.pieces[i].style.visibility = 'visible';
-				drag.pieces[i].style.transform = 'translateX(' + shift + 'px)';
+			if (plan.side !== 'left' || !drag.col) return;
+			drag.col.style.transition = 'none';
+			drag.col.style.visibility = 'visible';
+			drag.col.inert = false;
+			drag.col.style.transform = 'translateX(' + ((plan.progress - 1) * 100) + '%)';
+			if (drag.mask) {
+				drag.mask.style.transition = 'none';
+				drag.mask.style.opacity = String(plan.progress);
+				drag.mask.style.pointerEvents = plan.progress > 0.02 ? 'auto' : 'none';
 			}
 		}
 		function clearGesture(drag) {
@@ -5903,38 +5999,28 @@
 				drag.mask.style.opacity = '';
 				drag.mask.style.pointerEvents = '';
 			}
-			if (drag.pieces) {
-				for (var i = 0; i < drag.pieces.length; i++) {
-					drag.pieces[i].style.transition = '';
-					drag.pieces[i].style.visibility = '';
-					drag.pieces[i].style.transform = '';
-				}
-			}
 		}
 		function finishGesture(drag, plan) {
+			if (plan.side === 'right') {
+				syncOfficialOpen(plan);
+				return;
+			}
 			var reduced = false;
 			try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (ignoredMotion) {}
 			var ms = reduced ? 0 : 180;
-			if (plan.side === 'left' && drag.col) {
+			if (drag.col) {
 				drag.col.style.transition = ms ? ('transform ' + ms + 'ms ease') : 'none';
 				drag.col.style.transform = 'translateX(' + (plan.open ? 0 : -100) + '%)';
 				if (drag.mask) {
 					drag.mask.style.transition = ms ? ('opacity ' + ms + 'ms ease') : 'none';
 					drag.mask.style.opacity = plan.open ? '1' : '0';
 				}
-			} else if (plan.side === 'right' && drag.pieces) {
-				var shift = plan.open ? 0 : Math.round(drag.travel);
-				for (var i = 0; i < drag.pieces.length; i++) {
-					drag.pieces[i].style.transition = ms ? ('transform ' + ms + 'ms ease') : 'none';
-					drag.pieces[i].style.transform = 'translateX(' + shift + 'px)';
-				}
 			}
 			settleTimer = window.setTimeout(function () {
 				syncOfficialOpen(plan);
 				var tries = 0;
 				var release = function () {
-					var matched = plan.side === 'left' ? leftIsOpen() === plan.open : rightIsOpen() === plan.open;
-					if (matched || tries > 12) {
+					if (leftIsOpen() === plan.open || tries > 12) {
 						settleTimer = 0;
 						clearGesture(drag);
 						return;
@@ -5951,15 +6037,6 @@
 			var touch = event.touches[0];
 			if (gestureBlocked(event.target)) return;
 			var column = leftColumn();
-			var panel = rightPanel();
-			var travel = window.innerWidth || 320;
-			if (panel) {
-				var raw = '';
-				try { raw = window.getComputedStyle(panel).getPropertyValue('--dsh-sidebar-width'); } catch (ignoredWidth) {}
-				var parsed = parseFloat(raw);
-				var box = panel.getBoundingClientRect();
-				travel = parsed > 0 ? parsed : (box.width || travel);
-			}
 			var leftWidth = (column && column.getBoundingClientRect().width) || Math.min(360, (window.innerWidth || 360) - 48);
 			active = {
 				x: touch.clientX,
@@ -5967,8 +6044,6 @@
 				plan: null,
 				col: column,
 				mask: drawerFrame().querySelector('[data-sidebar-mask]'),
-				pieces: rightPieces(),
-				travel: travel,
 				leftWidth: leftWidth > 0 ? leftWidth : 280,
 				leftOpen: leftIsOpen(),
 				rightOpen: rightIsOpen(),
@@ -5982,7 +6057,8 @@
 				dx: touch.clientX - active.x,
 				dy: touch.clientY - active.y,
 				leftWidth: active.leftWidth,
-				rightWidth: active.travel,
+				width: window.innerWidth || 0,
+				startX: active.x,
 				blocked: false,
 				leftOpen: active.leftOpen,
 				rightOpen: active.rightOpen,
@@ -6021,6 +6097,7 @@
 			var observer = new MutationObserver(function () {
 				try { syncPageTheme(); } catch (ignoredThemeObs) {}
 				try { scheduleSessionNotice(); } catch (ignoredNoticeObs) {}
+				try { rememberSessionIfAny(); } catch (ignoredRememberObs) {}
 			});
 			observer.observe(document.body, {
 				childList: true,
@@ -6029,6 +6106,16 @@
 				attributeFilter: ['data-ds-dark-theme', 'aria-label'],
 			});
 			try { scheduleSessionNotice(); } catch (ignoredNotice) {}
+			try { rememberSessionIfAny(); } catch (ignoredRemember) {}
+			document.addEventListener('click', function (ev) {
+				try {
+					var t = ev && ev.target;
+					rememberSessionRow(t && t.closest ? t.closest('[data-row-key]') : null);
+				} catch (ignoredRowClick) {}
+				window.setTimeout(function () {
+					try { rememberSessionIfAny(); } catch (ignoredRememberClick) {}
+				}, 0);
+			}, true);
 		};
 		if (document.body) arm();
 		else document.addEventListener('DOMContentLoaded', arm, { once: true });
@@ -7090,6 +7177,7 @@
 				setRightbarOpen(false);
 				return true;
 			}
+			if (isOfficialShellSubpage()) return dismissOfficialShellSubpage();
 			if (isSidebarOpen() || toggleBusy) return setSidebarOpen(false);
 			return false;
 		},

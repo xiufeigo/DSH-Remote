@@ -97,6 +97,9 @@ function domeModel(model) {
 			if (model.boom) throw new Error("boom");
 			if (sel === "[data-dshr-sheet-panel]") return model.sheet ?? null;
 			if (sel === "[data-sidebar-right-panel][data-sidebar-right-open]") return model.rightPanel ?? null;
+			if (sel === "[data-plugin-panel]") return model.pluginPanel ?? null;
+			if (sel === "[data-global-panel]") return model.globalPanel ?? null;
+			if (sel === "[data-composer-seat], [data-composer-card]") return model.composer ?? null;
 			return null;
 		},
 		querySelectorAll: (sel) => {
@@ -161,6 +164,18 @@ const rightPanelHidden = () => node({ rects: 1, attrs: { "data-sidebar-right-ope
 	const r = run({ explorerDetails: true });
 	check(r.value === "overlay", "Explorer 详情展开 ⇒ 'overlay'（桥的第 2 分支语义保住）", String(r.value));
 }
+{
+	const r = run({ pluginPanel: node({ rects: 1 }) });
+	check(r.value === "overlay", "插件全页 ⇒ 'overlay'（返回键回到上一级，不退桌面）", String(r.value));
+}
+{
+	const r = run({ globalPanel: node({ rects: 1 }) });
+	check(r.value === "overlay", "无会话的全局全页 ⇒ 'overlay'", String(r.value));
+}
+{
+	const r = run({ globalPanel: node({ rects: 1 }), composer: node({ rects: 1 }) });
+	check(r.value === "none", "有输入框的会话页即使包着 global-panel 也不是 overlay", String(r.value));
+}
 
 // ── T99 核心：左抽屉展开但无弹层 ⇒ 'none'（原生据此直接进设置页，不调桥） ──
 {
@@ -185,7 +200,7 @@ const rightPanelHidden = () => node({ rects: 1, attrs: { "data-sidebar-right-ope
 check(
 	writeCalls.setAttribute === 0 && writeCalls.removeAttribute === 0 && writeCalls.appendChild === 0 &&
 	writeCalls.dispatchEvent === 0 && writeCalls.click === 0 && writeCalls.styleSet === 0,
-	"全部 11 个场景跑完：DOM 写/事件/点击计数全为 0（行为级只读证明）",
+	"全部场景跑完：DOM 写/事件/点击计数全为 0（行为级只读证明）",
 	JSON.stringify(writeCalls),
 );
 

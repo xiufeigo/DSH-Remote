@@ -1157,6 +1157,12 @@ function assertSourceContracts() {
 	if (!src.includes("[data-sidebar-right-panel]") || !src.includes("html.' + ROOT_CLASS + '[data-dshr-rightbar-fullscreen=\"1\"] #dshr-mobile-whale")) {
 		throw new Error("源码契约：官方右侧栏全屏态必须垫出系统栏 inset（[data-sidebar-right-panel]）并收起悬浮控件");
 	}
+	if (!src.includes('[data-sidebar-right-panel="fullscreen"][data-sidebar-right-open]')) {
+		throw new Error("源码契约：全屏右侧栏只在打开时铺底让位");
+	}
+	if (!src.includes('[data-sidebar-right-panel="fullscreen"]:not([data-sidebar-right-open])')) {
+		throw new Error("源码契约：关闭的全屏右侧栏必须 background:transparent，否则会话被盖成空白");
+	}
 	// ── T136：docked(push) 态右栏面板也必须自己让开系统栏（用户实机 bug）──
 	// 官方布局实测（DSH 0.2.0-rc.2 / @deepseek-ai/dsh-client-ui-sidebar-right）：
 	//   面板 div[data-sidebar-right-panel="push"] 官方 CSS 是

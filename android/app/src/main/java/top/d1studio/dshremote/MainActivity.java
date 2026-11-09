@@ -7373,6 +7373,8 @@ public class MainActivity extends Activity {
 		+ "for(var i=0;i<ds.length;i++){if(vis(ds[i]))return 'overlay';}"
 		+ "var rp=document.querySelector('[data-sidebar-right-panel][data-sidebar-right-open]');"
 		+ "if(rp&&rp.getAttribute('aria-hidden')!=='true')return 'overlay';"
+		+ "if(document.querySelector('[data-plugin-panel]'))return 'overlay';"
+		+ "if(document.querySelector('[data-global-panel]')&&!document.querySelector('[data-composer-seat], [data-composer-card]'))return 'overlay';"
 		+ "return 'none';}catch(e){return 'error';}})()";
 
 	private final class AppBridge {

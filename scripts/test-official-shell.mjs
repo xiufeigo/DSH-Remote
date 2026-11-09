@@ -23,10 +23,27 @@ assert.match(hook, /function officialAndroidShell\(\)/);
 assert.match(hook, /if \(officialAndroidShell\(\)\) return false;/);
 assert.match(hook, /\[data-sidebar-opener\]/);
 assert.match(hook, /\[data-sidebar-right-expand\]/);
+assert.match(hook, /startX >= width - edge/);
+assert.match(hook, /data-plugin-panel/);
+assert.match(hook, /function dismissOfficialShellSubpage/);
+assert.match(
+	hook.slice(hook.indexOf("closeSidebarIfExpanded: function"), hook.indexOf("openSidebarIfCollapsed")),
+	/if \(isOfficialShellSubpage\(\)\) return dismissOfficialShellSubpage\(\);[\s\S]*if \(isSidebarOpen\(\) \|\| toggleBusy\)/,
+	"插件等全页必须先于收左栏处理，避免返回键先把侧栏关掉再退桌面",
+);
+assert.doesNotMatch(
+	hook.slice(hook.indexOf("function dismissOfficialShellSubpage"), hook.indexOf("function officialGesturePlan")),
+	/data-sidebar-opener/,
+	"离开插件页不得先点开左侧栏",
+);
+assert.match(hook, /function findSessionReturnTarget/);
+assert.match(hook, /\[data-sidebar-right-panel="fullscreen"\]\[data-sidebar-right-open\]/);
+assert.match(hook, /\[data-sidebar-right-panel="fullscreen"\]:not\(\[data-sidebar-right-open\]\)/);
+assert.match(hook, /div:has\(> \[data-sidebar-right-panel="push"\]\)/);
 assert.doesNotMatch(
 	hook.slice(hook.indexOf("function installOfficialDrawerGestures"), hook.indexOf("function installOfficialHost")),
-	/dshr-mobile-whale|createElement\(/,
-	"跟手接线不得创建鲸鱼或任何节点",
+	/dshr-mobile-whale|createElement\(|data-dockkit-host|rightPieces/,
+	"跟手接线不得创建节点，也不得自己平移右栏 dock",
 );
 
 function extract(name) {
@@ -69,16 +86,14 @@ assert.equal(closeLeft.open, false);
 assert.equal(closeLeft.toggle, true);
 assert.equal(plan({ dx: 80, dy: 0, leftWidth: 280, rightWidth: 320, leftOpen: true }), null);
 
-const openRight = plan({ dx: -200, dy: 0, leftWidth: 280, rightWidth: 320 });
+const openRight = plan({ dx: -80, dy: 0, leftWidth: 280, startX: 360, width: 390 });
 assert.equal(openRight.side, "right");
 assert.equal(openRight.open, true);
 assert.equal(openRight.toggle, true);
-
-const closeRight = plan({ dx: 200, dy: 0, leftWidth: 280, rightWidth: 320, rightOpen: true });
-assert.equal(closeRight.side, "right");
-assert.equal(closeRight.open, false);
-assert.equal(closeRight.toggle, true);
-assert.equal(plan({ dx: -80, dy: 0, leftWidth: 280, rightWidth: 320, rightOpen: true }), null);
+assert.equal(plan({ dx: -200, dy: 0, leftWidth: 280, startX: 200, width: 390 }), null, "屏幕中间左滑不得打开右栏");
+assert.equal(plan({ dx: -20, dy: 0, leftWidth: 280, startX: 360, width: 390 }), null, "左滑太短不打开右栏");
+assert.equal(plan({ dx: 200, dy: 0, leftWidth: 280, rightWidth: 320, rightOpen: true }), null, "右栏开着时不代关，交给官方");
+assert.equal(plan({ dx: -80, dy: 0, leftWidth: 280, startX: 360, width: 390, rightOpen: true }), null);
 
 const picker = readFileSync(join(root, "android/app/src/main/res/raw/server_picker.js"), "utf8");
 assert.match(picker, /dshr-server-picker/);
@@ -145,6 +160,9 @@ document.getElementById('collapse').onclick = function () {
 function findBrowser() {
 	const candidates = [
 		process.env.CHROME_PATH || "",
+		join(process.env.ProgramFiles || "", "Google/Chrome/Application/chrome.exe"),
+		join(process.env["ProgramFiles(x86)"] || "", "Google/Chrome/Application/chrome.exe"),
+		join(process.env.LOCALAPPDATA || "", "Google/Chrome/Application/chrome.exe"),
 		"/usr/local/bin/google-chrome",
 		"/usr/bin/google-chrome",
 		"/usr/bin/chromium",
@@ -251,6 +269,31 @@ try {
 	assert.equal(host.handle, false);
 	assert.equal(host.klass.includes("dshr-mobile"), false);
 
+	const closedCover = await evaluate(`(() => {
+		const el = document.getElementById("right");
+		el.setAttribute("data-sidebar-right-panel", "fullscreen");
+		el.removeAttribute("data-sidebar-right-open");
+		document.documentElement.style.setProperty("--dshr-inset-top", "24px");
+		const cs = getComputedStyle(el);
+		return { bg: cs.backgroundColor, padTop: cs.paddingTop };
+	})()`);
+	assert.equal(closedCover.bg, "rgba(0, 0, 0, 0)", "关闭的全屏右侧栏不能铺底，否则会话被盖成空白: " + JSON.stringify(closedCover));
+	assert.equal(closedCover.padTop, "0px", "关闭的全屏右侧栏不能垫状态栏，否则会挤开看不见的遮罩: " + JSON.stringify(closedCover));
+
+	const openCover = await evaluate(`(() => {
+		const el = document.getElementById("right");
+		el.setAttribute("data-sidebar-right-panel", "fullscreen");
+		el.setAttribute("data-sidebar-right-open", "");
+		const cs = getComputedStyle(el);
+		const out = { bg: cs.backgroundColor, padTop: cs.paddingTop };
+		el.removeAttribute("data-sidebar-right-open");
+		el.setAttribute("data-sidebar-right-panel", "");
+		document.documentElement.style.removeProperty("--dshr-inset-top");
+		return out;
+	})()`);
+	assert.notEqual(openCover.bg, "rgba(0, 0, 0, 0)", "打开的全屏右侧栏仍要铺底让位: " + JSON.stringify(openCover));
+	assert.equal(openCover.padTop, "24px", "打开的全屏右侧栏仍要垫状态栏: " + JSON.stringify(openCover));
+
 	const touch = (type, x, y) => call("Input.dispatchTouchEvent", {
 		type, touchPoints: type === "touchEnd" ? [] : [{ x, y }],
 	});
@@ -288,11 +331,18 @@ try {
 	assert.equal(closed.clicks.toggle, 1);
 	assert.equal(closed.clicks.opener, 1);
 
-	await drag(300, 40, 280);
-	const rightMid = await evaluate("document.getElementById('dock').style.transform");
-	assert.match(String(rightMid), /translateX\(/, `右栏跟手缺失：${rightMid}`);
+	await drag(200, 40, 280);
 	await touch("touchEnd");
-	await wait(900);
+	await wait(200);
+	const fromMiddle = await evaluate("window.__clicks");
+	assert.equal(fromMiddle.expand, 0, "屏幕中间左滑不得打开右栏: " + JSON.stringify(fromMiddle));
+
+	const vw = await evaluate("window.innerWidth");
+	await drag(Math.max(8, vw - 8), 40, 280);
+	const rightMid = await evaluate("document.getElementById('dock').style.transform");
+	assert.equal(String(rightMid), "", `左滑过程不得自己平移右栏：${rightMid}`);
+	await touch("touchEnd");
+	await wait(400);
 	const rightOpen = await evaluate(`({
 		open: document.getElementById('right').hasAttribute('data-sidebar-right-open'),
 		transform: document.getElementById('dock').style.transform,
@@ -301,16 +351,18 @@ try {
 	assert.equal(rightOpen.open, true, JSON.stringify(rightOpen));
 	assert.equal(rightOpen.transform, "");
 	assert.equal(rightOpen.clicks.expand, 1);
+	assert.equal(rightOpen.clicks.collapse, 0);
 
 	await drag(40, 300, 280);
 	await touch("touchEnd");
-	await wait(900);
-	const rightClosed = await evaluate(`({
+	await wait(400);
+	const rightStillOpen = await evaluate(`({
 		open: document.getElementById('right').hasAttribute('data-sidebar-right-open'),
 		clicks: window.__clicks,
 	})`);
-	assert.equal(rightClosed.open, false, JSON.stringify(rightClosed));
-	assert.equal(rightClosed.clicks.collapse, 1);
+	assert.equal(rightStillOpen.open, true, JSON.stringify(rightStillOpen));
+	assert.equal(rightStillOpen.clicks.collapse, 0, "收回右栏不得走自制手势");
+	assert.equal(rightStillOpen.clicks.expand, 1);
 
 	const beforeComposer = await evaluate("JSON.stringify(window.__clicks)");
 	await drag(30, 250, 780);

@@ -62,6 +62,9 @@ function shellRequire(id) {
 // 执行工厂体
 new Function("window", "require", code)(globalThis.window, shellRequire);
 
+assert.match(code, /\[\\x21-\\x7E\]\{8,512\}/, "访客密钥客户端预检必须是 8 位及以上");
+assert.match(code, /访客密钥至少 8 位/, "设置卡错误文案必须是至少 8 位");
+assert.match(code, /至少 8 位可见 ASCII/, "设置卡提示必须是至少 8 位");
 assert.ok(loaded !== undefined, "__ModuleLoader__.load 应被调用");
 assert.equal(loaded.id, "dsh-remote-plugin");
 
