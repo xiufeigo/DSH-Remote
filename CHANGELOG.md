@@ -38,6 +38,13 @@
 - 视口低于 768px 时，跟手滑动只推动官方 `data-sidebar-drawer` 和右侧 dock，松手过半后点击官方开关。左抽屉里的服务器切换保留。隧道、证书、配对和添加/编辑服务器页面不动。
 - 浏览器和 edge 不写 `chrome: false`，原有窄屏 hook 保持原样。
 
+### ④ Android 官方壳会话正文被收起的右栏刷白
+
+- **现象**：v0.2.0-rc.2.26 实机上，官方顶栏（对话 / 轨迹）和底部 composer 都在，页脚还能看到「1 轮 45 步」「4.4M tok」，中间消息列表整片空白。
+- **根因**：视口低于 768px 时，官方右栏即使收起也是 `[data-sidebar-right-panel="fullscreen"]`，盒子 `width:100vw`、`position:absolute`、`z-index:auto`，从 0 宽右栏列向左盖住整屏；内层 dock 被 `translateX(100vw)` 且 `visibility:hidden`。`mobile-web.js` 为系统栏让位给这块面板铺了不透明底（`--dsw-alias-bg-base`，回退白色）。自有 chrome 靠主列 `z-index:20` 把收起的板压在会话下面，所以以前看不见；`chrome:false` 不再挂 `html.dshr-mobile`，这张白底就盖住正文。顶栏（`z-index:1`）和 composer（`z-index:9`）层叠更高，所以还露在外面。
+- **修复**（`packages/gateway/assets/mobile-web.js`，`android/.../res/raw/mobile.js` 字节同步）：官方壳 / 平板档下，未打开的 fullscreen 右栏底色改回透明。打开（`data-sidebar-right-open`）仍用原来的 token 垫系统栏。不恢复悬浮鲸鱼或自有抽屉。跟手滑动和侧栏里的服务器切换不动。
+- **测试**：`scripts/test-official-shell.mjs` 增加收起态取样：消息像素保持正文色，打开后面板底色重新不透明。原有左右缘跟手断言保留。
+
 ---
 
 ## v0.2.0-rc.2.24（手机档终端「弹出来后点击没反应」修复）
