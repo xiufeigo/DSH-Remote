@@ -11,20 +11,36 @@ import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { brotliCompress, constants as zlibConstants, gzip } from "node:zlib";
 import { DEFAULT_MOBILE_BREAKPOINT } from "./config.ts";
+import { selectGatewayEncoding } from "./proxy.ts";
+
+const brotliCompressAsync = promisify(brotliCompress);
+const gzipAsync = promisify(gzip);
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const ASSET_PATH = join(MODULE_DIR, "..", "assets", "mobile-web.js");
 
+export interface MobileScriptVariant {
+	etag: string;
+	body: Buffer;
+	encoding?: "br" | "gzip";
+}
+
 export interface MobileScriptAsset {
 	etag: string;
 	body: Buffer;
+	br: MobileScriptVariant;
+	gzip: MobileScriptVariant;
 }
 
 let cache: MobileScriptAsset | undefined;
 /** 缓存命中时用来判断「文件是不是被改过」的指纹（mtimeMs + size）。 */
 let cacheStamp = "";
 let missingWarned = false;
+/** 首个并发请求共享的「读取 + 压缩」单飞承诺；完成后在 finally 里清空。 */
+let loading: Promise<MobileScriptAsset | undefined> | undefined;
 
 /** 当前文件的轻量指纹。取不到就返回空串（⇒ 退化为每次都重读，代价只是多一次 readFile）。 */
 async function assetStamp(): Promise<string> {
@@ -53,10 +69,36 @@ async function assetStamp(): Promise<string> {
 export async function loadMobileScript(): Promise<MobileScriptAsset | undefined> {
 	const stamp = await assetStamp();
 	if (cache !== undefined && (stamp === "" || stamp === cacheStamp)) return cache;
+	if (loading === undefined) {
+		loading = loadAsset(stamp).finally(() => {
+			loading = undefined;
+		});
+	}
+	return loading;
+}
+
+async function loadAsset(stamp: string): Promise<MobileScriptAsset | undefined> {
 	try {
 		const body = await readFile(ASSET_PATH);
-		const etag = `"${createHash("sha256").update(body).digest("hex").slice(0, 32)}"`;
-		cache = { etag, body };
+		const hash = createHash("sha256").update(body).digest("hex").slice(0, 32);
+		const etag = `"${hash}"`;
+		// PERF-07：资产加载时一次压好 br / gzip。这条路由不经反代，原先 37 万字节裸传；
+		// 异步压缩走线程池，不阻塞事件循环（br q9 实测 35ms、约 10.6 万字节）。
+		const [brBody, gzipBody] = await Promise.all([
+			brotliCompressAsync(body, {
+				params: {
+					[zlibConstants.BROTLI_PARAM_QUALITY]: 9,
+					[zlibConstants.BROTLI_PARAM_SIZE_HINT]: body.length,
+				},
+			}),
+			gzipAsync(body, { level: 9 }),
+		]);
+		cache = {
+			etag,
+			body,
+			br: { etag: `"${hash}-br"`, body: brBody, encoding: "br" },
+			gzip: { etag: `"${hash}-gz"`, body: gzipBody, encoding: "gzip" },
+		};
 		cacheStamp = stamp;
 		return cache;
 	} catch {
@@ -66,6 +108,14 @@ export async function loadMobileScript(): Promise<MobileScriptAsset | undefined>
 		}
 		return undefined;
 	}
+}
+
+/** 按客户端 accept-encoding 选预压缩变体；不支持的编码回退 identity（不额外压缩）。 */
+export function selectMobileScriptVariant(asset: MobileScriptAsset, acceptEncoding: unknown): MobileScriptVariant {
+	const encoding = selectGatewayEncoding(acceptEncoding);
+	if (encoding === "br") return asset.br;
+	if (encoding === "gzip") return asset.gzip;
+	return { etag: asset.etag, body: asset.body };
 }
 
 /** 注入 <head> 的移动 hook 标记块：断点经内联变量下发，脚本本体走独立路由（带 ETag 缓存）。 */

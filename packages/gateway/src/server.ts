@@ -63,7 +63,7 @@ import {
 	visitorBindPortOf,
 	type FrpHeartbeatInput,
 } from "./frp.ts";
-import { loadMobileScript } from "./mobile.ts";
+import { loadMobileScript, selectMobileScriptVariant } from "./mobile.ts";
 import { BRAND_SVG, iconPng, injectIntoHtml, makeHtmlInjector, renderServiceWorker, renderShellManifest } from "./pwa.ts";
 import { proxyHttp, type Upstream } from "./proxy.ts";
 import { UpstreamSession } from "./session.ts";
@@ -79,6 +79,13 @@ import {
 } from "./views.ts";
 import { parseProxyV2, proxyClientIpOf, setProxyClientIp } from "./proxyproto.ts";
 import { handleGatewayUpgrade } from "./ws.ts";
+
+/**
+ * PERF-08：客户端空闲连接保留时长。Node 缺省 5s，手机停顿几秒后的下一个请求就得
+ * 重新建连（隧道新开一条流 + TLS 握手；T111 实测每条新连接都有固定成本）。
+ * 60s 覆盖「读一会儿再点」的间隔，且低于常见 NAT 的 TCP 空闲回收阈值。
+ */
+const CLIENT_KEEP_ALIVE_TIMEOUT_MS = 60_000;
 
 /**
  * T31-1：把 `frp.heartbeatInterval/Timeout` 翻译成模板入参。
@@ -313,6 +320,7 @@ export class GatewayServer {
 				void this.handle(req, res, publicEntry).catch(() => res.destroy());
 			},
 		);
+		server.keepAliveTimeout = CLIENT_KEEP_ALIVE_TIMEOUT_MS;
 		server.on("upgrade", (req, socket, head) => {
 			// 认证门与直通转发都在 ws.ts；这里只做接线（P0-1 同款兜底）
 			void handleGatewayUpgrade(req, socket as Duplex, head, {
@@ -857,17 +865,21 @@ export class GatewayServer {
 			res.writeHead(404, { "content-type": "text/plain; charset=utf-8" }).end("dsh-remote: mobile.js 缺失");
 			return;
 		}
-		if (req.headers["if-none-match"] === asset.etag) {
-			res.writeHead(304, { etag: asset.etag }).end();
+		const variant = selectMobileScriptVariant(asset, req.headers["accept-encoding"]);
+		if (req.headers["if-none-match"] === variant.etag) {
+			res.writeHead(304, { etag: variant.etag, vary: "Accept-Encoding" }).end();
 			return;
 		}
-		res.writeHead(200, {
+		const headers: Record<string, string> = {
 			"content-type": "text/javascript; charset=utf-8",
 			"cache-control": "public, max-age=3600",
-			etag: asset.etag,
+			etag: variant.etag,
+			vary: "Accept-Encoding",
 			"x-content-type-options": "nosniff",
-		});
-		res.end(asset.body);
+		};
+		if (variant.encoding !== undefined) headers["content-encoding"] = variant.encoding;
+		res.writeHead(200, headers);
+		res.end(variant.body);
 	}
 
 	// ---------- 管理（仅回环） ----------

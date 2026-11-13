@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import { rm } from "node:fs/promises";
 import { test, before, after } from "node:test";
+import zlib from "node:zlib";
 // PLG-03：公共夹具收敛到 scripts/test-harness.mjs（本文件不再复刻请求/WS/假上游实现）。
 import { startFakeUpstream, requestTls, wsConnect, makeTempHome, deviceCookieHeader } from "./test-harness.mjs";
 
@@ -204,6 +205,33 @@ test("mobile.js 需认证；带 Cookie 可获取且支持 ETag 304", async () =>
 		headers: { cookie: fixture.deviceCookie, "if-none-match": ok.headers.etag },
 	});
 	assert.equal(cached.status, 304);
+});
+
+test("PERF-07：mobile.js 协商 br 预压缩、vary 与按编码分 etag", async () => {
+	const identity = await callGateway(fixture.gatewayPort, "/__dsh_remote__/mobile.js", {
+		headers: { cookie: fixture.deviceCookie },
+	});
+	assert.equal(identity.status, 200);
+	assert.equal(identity.headers["content-encoding"], undefined);
+
+	const br = await callGateway(fixture.gatewayPort, "/__dsh_remote__/mobile.js", {
+		headers: { cookie: fixture.deviceCookie, "accept-encoding": "br" },
+	});
+	assert.equal(br.status, 200);
+	assert.equal(br.headers["content-encoding"], "br");
+	assert.match(br.headers.vary ?? "", /accept-encoding/i);
+	assert.ok(zlib.brotliDecompressSync(br.raw).equals(identity.raw), "br 解压后必须与 identity 字节一致");
+	assert.notEqual(br.headers.etag, identity.headers.etag, "br 变体应有独立 etag");
+
+	const brCached = await callGateway(fixture.gatewayPort, "/__dsh_remote__/mobile.js", {
+		headers: { cookie: fixture.deviceCookie, "accept-encoding": "br", "if-none-match": br.headers.etag },
+	});
+	assert.equal(brCached.status, 304, "if-none-match 命中 br etag 应 304");
+
+	const wrongEtag = await callGateway(fixture.gatewayPort, "/__dsh_remote__/mobile.js", {
+		headers: { cookie: fixture.deviceCookie, "accept-encoding": "br", "if-none-match": identity.headers.etag },
+	});
+	assert.equal(wrongEtag.status, 200, "identity etag 不得命中 br 变体缓存");
 });
 
 test("认证后反代上游：注入主屏标记+移动 hook+viewport 兜底，设备 Cookie 不外泄", async () => {

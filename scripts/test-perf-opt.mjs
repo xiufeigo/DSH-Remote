@@ -45,6 +45,7 @@ import {
 	wantsHtmlIdentity,
 } from "../packages/gateway/src/proxy.ts";
 import { renderServiceWorker } from "../packages/gateway/src/pwa.ts";
+import { loadMobileScript, selectMobileScriptVariant } from "../packages/gateway/src/mobile.ts";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 /** APK 内嵌的 SW 脚本（build.ps1 从 pwa.ts 渲染而来，副本禁止手改）。 */
@@ -821,5 +822,30 @@ test("T51/R6 SW 行为：/plugins/ 写失败也必须可见（这条以前是 .c
 		host.ctl.consoleWarns.some((w) => w.includes("缓存写入失败")),
 		`/plugins/ 写失败也必须喊出来，实际：${JSON.stringify(host.ctl.consoleWarns)}`,
 	);
+});
+
+test("PERF-07：mobile.js 资产预压缩 br/gzip、独立 ETag 与协商", async () => {
+	const asset = await loadMobileScript();
+	assert.ok(asset, "mobile.js 资产应可读");
+	assert.ok(zlib.brotliDecompressSync(asset.br.body).equals(asset.body), "br 变体解压后必须与原文一致");
+	assert.ok(zlib.gunzipSync(asset.gzip.body).equals(asset.body), "gzip 变体解压后必须与原文一致");
+	assert.ok(asset.br.body.length < asset.body.length * 0.35, `br 应压到 35% 以内：${asset.br.body.length}/${asset.body.length}`);
+	assert.ok(asset.gzip.body.length < asset.body.length * 0.4, `gzip 应压到 40% 以内：${asset.gzip.body.length}/${asset.body.length}`);
+	assert.notEqual(asset.br.etag, asset.etag);
+	assert.notEqual(asset.gzip.etag, asset.etag);
+	assert.notEqual(asset.br.etag, asset.gzip.etag);
+	assert.match(asset.etag, /^"[0-9a-f]{32}"$/, "identity etag 保持原 32 位 hex 形态");
+
+	assert.equal(selectMobileScriptVariant(asset, "br, gzip"), asset.br);
+	assert.equal(selectMobileScriptVariant(asset, "gzip"), asset.gzip);
+	assert.equal(selectMobileScriptVariant(asset, "br;q=0, gzip"), asset.gzip);
+	const identity = selectMobileScriptVariant(asset, undefined);
+	assert.equal(identity.encoding, undefined);
+	assert.equal(identity.etag, asset.etag);
+	assert.equal(identity.body, asset.body);
+	assert.equal(selectMobileScriptVariant(asset, "deflate").encoding, undefined, "deflate 不预压，回退 identity");
+
+	const [a, b] = await Promise.all([loadMobileScript(), loadMobileScript()]);
+	assert.equal(a, b, "并发首次加载必须共享同一次读取（单飞）");
 });
 

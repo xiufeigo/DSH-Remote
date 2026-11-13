@@ -31,6 +31,7 @@
 
 import assert from "node:assert/strict";
 import http from "node:http";
+import https from "node:https";
 import tls from "node:tls";
 import { test, after } from "node:test";
 import { requestTls, createTestGateway, makeTempHome, deviceCookieHeader } from "./test-harness.mjs";
@@ -491,5 +492,26 @@ test("P3-8：POSIX 监听枚举解析器（ss / netstat / lsof）", async () => 
 	// 空输出/全脏行：空表（fail-safe 同旧版行为）
 	assert.deepEqual(parsePosixListeners("", "ss"), []);
 	assert.deepEqual(parsePosixListeners("garbage line\nanother", "lsof"), []);
+});
+
+test("PERF-08：空闲 7s 后的请求复用同一条连接", async () => {
+	const agent = new https.Agent({ keepAlive: true, maxSockets: 1, rejectUnauthorized: false });
+	try {
+		const get = () => new Promise((resolve, reject) => {
+			const req = https.get(gwUrl("/__dsh_remote__/health"), { agent }, (res) => {
+				res.resume();
+				res.on("end", () => resolve({ status: res.statusCode, reused: req.reusedSocket }));
+			});
+			req.on("error", reject);
+		});
+		const first = await get();
+		assert.equal(first.status, 200);
+		await new Promise((resolve) => setTimeout(resolve, 7_000));
+		const second = await get();
+		assert.equal(second.status, 200);
+		assert.equal(second.reused, true, "空闲 7s 后必须复用同一条连接");
+	} finally {
+		agent.destroy();
+	}
 });
 console.log("fix-regressions：阶段 0/1 修复行为钉桩已就绪");

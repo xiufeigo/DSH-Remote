@@ -5371,12 +5371,28 @@
 	}
 
 	function readLastUserPrompt() {
+		// 官方用户气泡带稳定语义标记 data-message-bubble：UserMessageBubble 把
+		// data-* 透传到根 div，且全前端仅会话消息渲染点设置它；排队中的
+		// steering / submission echo 走同一渲染，故 DOM 序即时间序，最后一条
+		// 可见气泡就是最新输入。官方壳（严格 OFF）不标 [data-dshr-main-col]
+		// （rc.2.26 起通知正文恒为「正在生成…」的根因），作用域按可用锚点回退。
+		var scope = document.querySelector('[data-dshr-main-col], [data-slot="main"], [data-conversation-content]') || document;
+		var bubbles = scope.querySelectorAll('[data-message-bubble]');
+		for (var i = bubbles.length - 1; i >= 0; i--) {
+			var bubble = bubbles[i];
+			if (bubble.closest && bubble.closest('[hidden], [inert], [data-composer-card], [data-composer-seat]')) {
+				continue;
+			}
+			var text = clipNoticeText(bubble.textContent, 160);
+			if (text) return text;
+		}
+		// 旧版 harness 没有语义标记：仅移动档已标主列时沿用原启发式兜底。
 		var main = document.querySelector('[data-dshr-main-col]');
 		if (!isElement(main)) return '';
 		var nodes = main.querySelectorAll('div, p');
 		var last = '';
-		for (var i = 0; i < nodes.length; i++) {
-			var el = nodes[i];
+		for (var j = 0; j < nodes.length; j++) {
+			var el = nodes[j];
 			if (el.closest && el.closest('[data-composer-card], [data-composer-seat], header, nav, [data-dshr-msg-actions], [data-dshr-stats-line]')) {
 				continue;
 			}
@@ -5443,13 +5459,22 @@
 		lastNoticeAt = now;
 		lastNoticeRunning = notice.running;
 		try {
-			if (window.DshRemoteApp && typeof window.DshRemoteApp.setSessionNotice === 'function') {
+			if (hasSessionNoticeSink()) {
 				window.DshRemoteApp.setSessionNotice(notice.title, notice.text, notice.running);
 			}
 		} catch (ignoredNotice) {}
 	}
 
+	// PERF-06：通知只有一个去处（原生桥）。浏览器 / edge 没有桥时，探测与全量扫描的
+	// 结果无处可送，流式期间却每秒白做一次；没有桥就不排程。
+	function hasSessionNoticeSink() {
+		try {
+			return !!(window.DshRemoteApp && typeof window.DshRemoteApp.setSessionNotice === 'function');
+		} catch (ignoredSink) { return false; }
+	}
+
 	function scheduleSessionNotice() {
+		if (!hasSessionNoticeSink()) return;
 		var nowMs = Date.now ? Date.now() : 0;
 		// running 翻转立即上报（开始生成/结束的感知不能等 1s）。
 		// 翻转检查本身也是 querySelectorAll，最多 500ms 查一次，免得节流反被检查吃掉。
@@ -6085,6 +6110,11 @@
 		}, { passive: true, capture: true });
 	}
 
+	// PERF-05：官方壳观察器按批合并。流式输出的每次提交都会进观察器，而主题与
+	// 「上一个会话」只在换主题 / 换会话时才变；逐批做全文档扫描 + 强制同步布局是白付。
+	// 主题属性翻转仍当场同步（状态栏配色不能迟到）；其余最多每 300ms 跑一次，
+	// 且末次变更后 300ms 内必跑一次（定时器不随后续变更重置），不丢最终状态。
+	var OFFICIAL_HOST_SYNC_MS = 300;
 	function installOfficialHost() {
 		if (window.__dshrOfficialHost) return;
 		window.__dshrOfficialHost = true;
@@ -6094,10 +6124,21 @@
 			if (!document.body || window.__dshrOfficialObs) return;
 			window.__dshrOfficialObs = true;
 			if (typeof MutationObserver === 'undefined') return;
-			var observer = new MutationObserver(function () {
+			var hostSyncTimer = 0;
+			var flushHostSync = function () {
+				hostSyncTimer = 0;
 				try { syncPageTheme(); } catch (ignoredThemeObs) {}
-				try { scheduleSessionNotice(); } catch (ignoredNoticeObs) {}
 				try { rememberSessionIfAny(); } catch (ignoredRememberObs) {}
+			};
+			var observer = new MutationObserver(function (records) {
+				for (var i = 0; i < records.length; i++) {
+					if (records[i].type === 'attributes' && records[i].attributeName === 'data-ds-dark-theme') {
+						try { syncPageTheme(); } catch (ignoredThemeFlip) {}
+						break;
+					}
+				}
+				try { scheduleSessionNotice(); } catch (ignoredNoticeObs) {}
+				if (!hostSyncTimer) hostSyncTimer = window.setTimeout(flushHostSync, OFFICIAL_HOST_SYNC_MS);
 			});
 			observer.observe(document.body, {
 				childList: true,

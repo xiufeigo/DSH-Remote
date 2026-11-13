@@ -157,6 +157,74 @@ document.getElementById('collapse').onclick = function () {
 </body>
 </html>`;
 
+/**
+ * PERF-05/06 流式夹具：30 轮问答 + 一个可追加 token 的 live 气泡。
+ * mode=android 走官方壳观察器路径（installOfficialHost），mode=web 走普通
+ * 移动 hook 路径；bridge=1 时补一个原生桥接收 setSessionNotice。
+ * 探针统计：gbcr（强制布局读取）、qsa（全文档 querySelectorAll）、
+ * noticeScans（通知链路特有的 DOM 扫描：'停止生成' 探测与 'div, p' 全量扫）。
+ */
+function streamFixture(mode, bridge) {
+	const mobileCfg = mode === "android" ? "{ device: 'phone', chrome: false }" : "{ breakpoint: 980 }";
+	const bridgeJs = bridge
+		? "window.DshRemoteApp = { setSessionNotice: function (title, text, running) { window.__notices.push([title, text, running]); } };\n"
+		: "";
+	let turns = "";
+	for (let i = 1; i <= 30; i++) {
+		// 用户气泡按官方 0.2.2 真实结构造：userRow > userStack > [data-message-bubble]。
+		turns += `<div class="turn"><div class="userRow"><div class="userStack"><div data-message-bubble=""><p>question ${String(i)}</p></div></div></div></div>`
+			+ `<div class="turn"><div class="msg"><p>answer ${String(i)}</p></div><div data-turn-tail><button type="button" aria-label="Copy">c</button></div></div>`;
+	}
+	// 探针：隐藏容器与输入区里的同名标记不得被当成最新用户消息。
+	turns += `<div hidden><div data-message-bubble=""><p>hidden draft</p></div></div>`;
+	return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>html,body{margin:0;height:100%}#frame{position:relative;height:100vh}#col{position:absolute;left:0;top:0;width:280px;height:100%}#frame[data-sidebar-collapsed] #col{transform:translateX(-100%);visibility:hidden}main{height:100vh;overflow:auto}</style></head>
+<body>
+<script>
+window.__DSHR_MOBILE__ = ${mobileCfg};
+window.__notices = []; window.__rowClicks = [];
+${bridgeJs}window.__spy = { gbcr: 0, qsa: 0, noticeScans: 0 };
+(function () {
+  var gbcr = Element.prototype.getBoundingClientRect;
+  Element.prototype.getBoundingClientRect = function () { window.__spy.gbcr += 1; return gbcr.apply(this, arguments); };
+  var dqsa = Document.prototype.querySelectorAll;
+  Document.prototype.querySelectorAll = function () { window.__spy.qsa += 1; return dqsa.apply(this, arguments); };
+  var eqsa = Element.prototype.querySelectorAll;
+  Element.prototype.querySelectorAll = function (sel) { if (sel === 'div, p') window.__spy.noticeScans += 1; return eqsa.apply(this, arguments); };
+  var dqs = Document.prototype.querySelector;
+  Document.prototype.querySelector = function (sel) { if (String(sel).indexOf('停止生成') >= 0) window.__spy.noticeScans += 1; return dqs.apply(this, arguments); };
+})();
+</script>
+<div id="frame" data-sidebar-drawer data-sidebar-collapsed>
+  <div id="col" data-shortcut-modal="sidebar"><div data-slot="sidebar">
+    <div role="treeitem" data-row-key="session:a" aria-current="page" onclick="window.__rowClicks.push('session:a')">Alpha</div>
+    <div role="treeitem" data-row-key="session:b" onclick="window.__rowClicks.push('session:b')">Beta</div>
+  </div><button data-sidebar-toggle aria-label="收起侧边栏" type="button">x</button></div>
+  <div data-sidebar-mask></div>
+  <main data-slot="main" id="main">
+    <header data-slot="conversation.header"><span id="title">Alpha</span></header>
+    <div id="list">
+      ${turns}
+      <div class="turn"><div class="msg" id="live"><p></p></div></div>
+    </div>
+    <div data-composer-seat><div data-composer-card><div data-message-bubble=""><p>queued preview</p></div><textarea></textarea><button type="button" aria-label="停止生成">stop</button></div></div>
+  </main>
+</div>
+<script>
+window.__stream = function (ticks) { return new Promise(function (done) {
+  var p = document.getElementById('live').lastElementChild, i = 0, ch = new MessageChannel();
+  ch.port1.onmessage = function () {
+    if (i >= ticks) { done(i); return; }
+    i += 1; var s = document.createElement('span'); s.textContent = 'tok' + i + ' '; p.appendChild(s);
+    ch.port2.postMessage(0);
+  };
+  ch.port2.postMessage(0);
+}); };
+</script>
+<script src="/packages/gateway/assets/mobile-web.js"></script>
+</body></html>`;
+}
+
 function findBrowser() {
 	const candidates = [
 		process.env.CHROME_PATH || "",
@@ -179,6 +247,12 @@ const server = createServer((req, res) => {
 	if (url === "/fixture") {
 		res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
 		res.end(fixture);
+		return;
+	}
+	if (url === "/fixture-stream") {
+		const params = new URL(req.url || "/", "http://fixture.local").searchParams;
+		res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+		res.end(streamFixture(params.get("mode"), params.get("bridge") === "1"));
 		return;
 	}
 	if (url === "/packages/gateway/assets/mobile-web.js") {
@@ -376,6 +450,90 @@ try {
 	assert.equal(afterComposer.clicks, beforeComposer);
 	assert.equal(afterComposer.collapsed, true);
 	assert.equal(afterComposer.transform, "");
+
+	// ---- PERF-05：官方壳观察器按批合并，不逐次提交做布局读取/全文档扫描 ----
+	await call("Page.navigate", { url: `http://127.0.0.1:${port}/fixture-stream?mode=android` });
+	await wait(600);
+	assert.equal(await evaluate("window.__dshrOfficialHost === true"), true, "官方壳观察器应已安装");
+	await wait(500);
+	const streamCost = await evaluate(`(async () => {
+		window.__spy.gbcr = 0; window.__spy.qsa = 0;
+		await window.__stream(200);
+		return { gbcr: window.__spy.gbcr, qsa: window.__spy.qsa };
+	})()`);
+	assert.ok(streamCost.gbcr <= 10, `官方壳观察器不得逐次提交做布局读取/全文档扫描：gbcr=${String(streamCost.gbcr)} qsa=${String(streamCost.qsa)}`);
+	assert.ok(streamCost.qsa <= 20, `官方壳观察器不得逐次提交做布局读取/全文档扫描：gbcr=${String(streamCost.gbcr)} qsa=${String(streamCost.qsa)}`);
+	await wait(500);
+	const tailGbcr = await evaluate("window.__spy.gbcr");
+	assert.ok(tailGbcr >= 1, `尾沿同步必须仍然发生：gbcr=${String(tailGbcr)}`);
+	assert.ok(tailGbcr <= 12, `尾沿同步不应放大布局读取：gbcr=${String(tailGbcr)}`);
+
+	// ---- PERF-05 护栏：主题属性翻转仍当场同步（状态栏配色不能迟到）----
+	await evaluate(`document.body.setAttribute('data-ds-dark-theme','')`);
+	assert.equal(await evaluate(`document.documentElement.getAttribute('data-dshr-dark')`), "1", "主题翻转必须当场同步");
+	await evaluate(`document.body.removeAttribute('data-ds-dark-theme')`);
+	assert.equal(await evaluate(`document.documentElement.getAttribute('data-dshr-dark')`), "0", "主题翻转恢复必须当场同步");
+
+	// ---- PERF-05 护栏：合并后仍能记住最近会话行（无点击路径）----
+	await evaluate(`(() => {
+		const a = document.querySelector('[data-row-key="session:a"]');
+		const b = document.querySelector('[data-row-key="session:b"]');
+		a.removeAttribute('aria-current');
+		b.setAttribute('aria-current', 'page');
+		document.getElementById('title').textContent = 'Beta';
+	})()`);
+	await wait(500);
+	const subpageClosed = await evaluate(`(() => {
+		document.getElementById('main').style.display = 'none';
+		const p = document.createElement('div');
+		p.setAttribute('data-plugin-panel', '');
+		p.textContent = 'plugin';
+		document.body.appendChild(p);
+		return window.__dshRemoteAndroidMobile.closeSidebarIfExpanded();
+	})()`);
+	assert.equal(subpageClosed, true, "插件子页应走会话行回退路径");
+	assert.deepEqual(await evaluate("window.__rowClicks"), ["session:b"], "应点击记住的 session:b 行");
+
+	// ---- 通知正文：官方壳没有 [data-dshr-main-col]，必须按官方语义标记
+	// [data-message-bubble] 取最后一条可见用户气泡（rc.2.26 起恒为「正在生成…」）----
+	await call("Page.navigate", { url: `http://127.0.0.1:${port}/fixture-stream?mode=android&bridge=1` });
+	await wait(800);
+	assert.equal(await evaluate("window.__dshrOfficialHost === true"), true, "官方壳观察器应已安装");
+	assert.equal(await evaluate("!!document.querySelector('[data-dshr-main-col]')"), false, "官方壳下不得有主列标记");
+	await evaluate("window.__stream(30)");
+	await wait(2600);
+	const androidNotices = await evaluate("window.__notices");
+	assert.ok(androidNotices.length >= 1, "官方壳有桥时通知照常上报: " + JSON.stringify(androidNotices));
+	const androidLast = androidNotices[androidNotices.length - 1];
+	assert.equal(androidLast[2], true, "应上报 running=true 的通知: " + JSON.stringify(androidLast));
+	assert.equal(androidLast[1], "question 30",
+		"通知正文应取最后一条可见用户气泡（隐藏/输入区标记不计）: " + JSON.stringify(androidLast));
+	await evaluate("document.querySelectorAll('[data-message-bubble]').forEach((el) => el.remove())");
+	await evaluate("window.__stream(5)");
+	await wait(2600);
+	const androidFallback = (await evaluate("window.__notices")).pop();
+	assert.equal(androidFallback[1], "正在生成…", "没有用户气泡时仍回退占位文案: " + JSON.stringify(androidFallback));
+
+	// ---- PERF-06：没有原生桥时不得为通知扫描 DOM；有桥照常上报 ----
+	await call("Emulation.setUserAgentOverride", {
+		userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+	});
+	await call("Page.navigate", { url: `http://127.0.0.1:${port}/fixture-stream?mode=web` });
+	await wait(800);
+	assert.equal(await evaluate(`document.documentElement.classList.contains('dshr-mobile')`), true, "浏览器模式手机档 hook 应生效");
+	await evaluate("window.__spy.noticeScans = 0");
+	await evaluate("window.__stream(50)");
+	await wait(2600);
+	assert.equal(await evaluate("window.__spy.noticeScans"), 0, "没有原生桥时不得为通知扫描 DOM");
+
+	await call("Page.navigate", { url: `http://127.0.0.1:${port}/fixture-stream?mode=web&bridge=1` });
+	await wait(800);
+	await evaluate("window.__stream(50)");
+	await wait(2600);
+	const notices = await evaluate("window.__notices");
+	assert.ok(notices.length >= 1, "有桥时通知照常上报");
+	assert.ok(notices.some((n) => n[2] === true), "有桥时应上报 running=true 的通知");
+	assert.equal(notices[notices.length - 1][1], "question 30", "浏览器档通知正文同样取最后一条用户气泡");
 	ws.close();
 } finally {
 	child.kill("SIGKILL");

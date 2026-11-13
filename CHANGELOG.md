@@ -4,6 +4,104 @@
 
 ---
 
+## 待发布（2026-11-13）：流式输出时主线程白耗 + mobile.js 裸传 + 空闲 5 秒断连
+
+先量后改。基准在真 Chrome（headless，CDP）里跑真实 hook：合成的 DSH 形态页面，1000 轮会话 ≈ 1.5 万节点，
+CPU 4 倍降速，每帧提交一次（rAF）共 300 次；夹具自身不读布局。改前 / 改后在同一时段交替各跑两轮，
+每轮都带「不注入 hook」对照。脚本与原始 JSON 在 `scratch/perf-20261113/`（不入库）。
+
+### ① Android 官方壳：观察器逐次提交做全文档扫描 + 强制同步布局（PERF-05）
+
+- **根因**：rc.2.26 起 Android 壳写 `chrome:false`，会话页走 `installOfficialHost()`。它的 MutationObserver
+  （body，childList + subtree）在**每一批**变更里同步调 `syncPageTheme()` 和 `rememberSessionIfAny()`：
+  4–7 次全文档选择器查询，外加 `getBoundingClientRect()` 与 `innerText`（都会强制同步布局），浅色主题再多一次
+  `getComputedStyle`。这两样结果只在换主题、换会话时才变，流式输出的每个 token 都在为它付费。
+  10 月那轮「1000 条消息全局扫描 0 次」验的是手机 hook 的 `onDomMutations`，官方壳这条观察器是之后加的。
+- **实测**：
+  | 指标（300 次提交） | 改前 | 改后 |
+  |---|---|---|
+  | hook 脚本耗时 | 1550–1660 ms | 174–204 ms |
+  | 浅色主题每次提交比不注入多 | 5.9–7.2 ms | −0.6–0.0 ms（噪声内） |
+  | 一帧内连发 300 次提交：强制布局次数 | 300 | 4 |
+  | 同上：每次提交耗时 | 38.5 ms | 0.53 ms |
+- **修复**（`packages/gateway/assets/mobile-web.js`，`res/raw/mobile.js` 字节同步）：主题属性翻转仍当场同步
+  （状态栏配色不能迟到）；其余合并成最多每 300ms 一次，末次变更后 300ms 内必跑。
+- **测试**（`pnpm test:official-shell`）：新增流式夹具，连发 200 次提交期间 `getBoundingClientRect` ≤ 10、
+  全文档 `querySelectorAll` ≤ 20（改前实测 200 / 400，红）。另钉三条护栏：主题翻转当场生效；
+  不经点击换会话后，插件页按返回仍回到新会话；尾沿同步确实发生。
+
+### ② 浏览器 / edge：没有原生桥也在为通知扫 DOM（PERF-06）
+
+- **根因**：`scheduleSessionNotice()` 的结果只有一个去处 `DshRemoteApp.setSessionNotice`。浏览器里没有这个桥，
+  流式期间仍约每秒跑一次 `collectSessionNotice()` → `readLastUserPrompt()`：主列全部 `div, p` 逐个
+  `closest` + `querySelector` + `getComputedStyle`，算完直接丢弃。
+- **实测**（iPhone UA，同一夹具）：hook 脚本耗时 740–829 → 126–128 ms；超过 50ms 的长任务 6–7 个
+  （最长约 92ms）→ 0–1 个。
+- **修复**：没有桥就不排程（`hasSessionNoticeSink()`）。Android 行为不变。
+- **测试**（同文件）：无桥时通知链路的 DOM 扫描次数为 0（改前 4，红）；有桥时仍上报 `running=true`。
+
+### ③ edge：`/__dsh_remote__/mobile.js` 裸传（PERF-07）
+
+- **根因**：内部路由不经 `proxyHttp`，吃不到网关压缩；`deploy/docker/Caddyfile.example` 也没开 `encode`。
+- **修复**（`mobile.ts` / `server.ts`）：资产加载时异步预压 br（q9）与 gzip（-9），按 `accept-encoding` 选；
+  ETag 按编码区分，响应带 `Vary: Accept-Encoding`。不带 `accept-encoding` 的客户端字节与 ETag 同改前。
+- **效果**：379,148 B → 106,526 B（br，−72%）/ 127,649 B（gzip，−66%）。付费时机是首次加载与缓存过期
+  （`max-age=3600` 之后是 304）。Android 壳不走这条路由（脚本在 APK 里）。
+- **测试**：`pnpm test:perf`（解压后逐字节相等、编码选择、并发加载单飞）、`pnpm smoke:edge`（200/304 与变体 ETag）。
+
+### ④ 网关空闲 5 秒就断开客户端连接（PERF-08）
+
+- **根因**：Node `keepAliveTimeout` 缺省 5s。本机实测：空闲 6.5s 后的下一个请求不再复用连接。
+  隧道上每条新连接都要重新开流 + TLS 握手，T111 实机量过这个固定成本（stcp 中转下 49–142ms；
+  打洞失败且未粘住中转时再加 `fallbackTimeoutMs`）。「看几秒再点一下」正好每次都落在新连接上。
+- **修复**（`server.ts`）：`keepAliveTimeout = 60s`，主监听与公网入口都生效。`headersTimeout` 不动
+  （Node 24 实测：空闲时长超过 `headersTimeout` 的连接照常复用）。
+- **测试**（`pnpm test:fixes`）：空闲 7s 后的请求复用同一条连接（改前红）。
+- ⚠️ **没有在手机实网重测省了多少**：依据是 T111 的单连接成本加本机的复用事实。
+
+### ⑤ Android 官方壳：前台通知正文恒为「正在生成…」（功能修复）
+
+- **根因**：`readLastUserPrompt()` 先 `querySelector('[data-dshr-main-col]')`，没有就直接返回空。
+  但这个标记只有手机档 `syncDom()` 会写；rc.2.26 起 Android 壳 `chrome:false` 走 `installOfficialHost()`
+  严格 OFF 路径，`data-dshr-main-col` 从不存在，函数在第一行就出局——不是启发式没猜中，是根本
+  没跑到。真实页面抓包（`scratch/qa/pad/raw/arm-real.html`）里 14 处 `data-dshr-main-col`
+  全部在注入 CSS 文本里，DOM 上零命中。
+- **依据**（DSH 0.2.2-rc.1 安装包，`app.asar` 提取）：
+  - 用户气泡有稳定语义标记：会话消息渲染点（`conversation.chat.user.content` → `UserContent`）
+    给 `UserMessageBubble` 传 `data-message-bubble`，该 primitive 是
+    `({className, ...rest}) => <div {...rest}>`，`data-*` 直达根 `div`；
+  - 全前端只有这一个地方设置它；`PendingSteering` / `PendingSubmission`（排队中的输入回显）
+    走同一渲染路径，故 DOM 序即时间序；
+  - 队列坞（QueueDock）预览也渲染 `conversation.user.text`，但**不带**气泡标记，不会误取。
+- **修复**（`mobile-web.js`，`res/raw/mobile.js` 字节同步）：先按
+  `[data-dshr-main-col] → [data-slot="main"] → [data-conversation-content] → document`
+  定作用域，倒序找 `[data-message-bubble]`，跳过 `[hidden]/[inert]` 祖先与输入区
+  （`data-composer-card/seat`）内的候选，取第一条非空气泡，照旧 `clipNoticeText(..., 160)`；
+  一个候选都没有时才回落旧版式启发式（仅老 harness 的移动档用得上）。
+- **测试**（`pnpm test:official-shell`，红→绿）：官方壳 + 原生桥下通知正文 = 最后一条用户气泡，
+  隐藏容器与输入区里的同名标记不计；删掉全部气泡仍回退「正在生成…」。旧代码在同夹具下
+  稳定输出 `["Alpha","正在生成…",true]`（红）。
+
+### 查过、没改
+
+- **网关反代每请求开销**：回环 p50 0.32ms（直连上游 0.12ms），216KB JS 经 br 1.5ms。不是瓶颈。
+- **WS 上游 socket 的 TCP_NODELAY**：Windows 回环上连续两次小写的到达间隔，开 / 关 Nagle 为 0.12 / 0.11ms，无差别。
+- **Android 重复注入 mobile.js**（每次进页 5 次，SPA 路由切换各 1 次）：4 倍降速下单次约 9.7ms。
+  要省就得动注入时序（T27-B 那一带），收益不抵风险。
+- **SW 缓存 64 条上限**：历史抓包（T44 / T45）里每次加载的 `/assets/*` 只有 4 个，碰不到。
+
+### 顺带发现、未修
+
+- **Android 官方壳的前台通知正文恒为「正在生成…」**：`readLastUserPrompt()` 依赖 `[data-dshr-main-col]`，
+  而 `chrome:false` 下 `syncDom()` 早退、从不打这个标记（实测 Android 档返回兜底文案，浏览器档能读到用户原话）。
+  rc.2.26 起如此。直接改成按官方属性找主列，会把 ② 那种每秒全量扫描带回 Android，需要先有便宜的定位方式。
+
+### 生效条件
+
+- ① 改的是 APK 内置脚本，**要重新打包发版**；②③ 只影响 edge，④ 全角色，**重启网关**生效。
+
+---
+
 ## 待发布（2026-11-09）：陈旧锁 PID 复用导致网关起不来 + 访客密钥下限回退
 
 ### ① 网关「起不来」：陈旧锁 + Windows PID 复用误判
